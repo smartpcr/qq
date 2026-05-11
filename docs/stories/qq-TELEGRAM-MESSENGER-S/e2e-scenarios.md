@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.10-draft (iteration 4)
+**Version:** v0.11-draft (iteration 5)
 
 ---
 
@@ -187,7 +187,7 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Background:
     Given the outbound message queue is operational
-    And retry policy is configured: max 3 attempts, exponential backoff (per architecture.md §5.3 OutboundQueue:MaxRetries default)
+    And retry policy is configured: max 5 attempts, exponential backoff (per architecture.md §5.3 OutboundQueue:MaxRetries default of 5)
 
   Scenario: Transient Telegram API failure triggers retry
     Given agent "test-agent-3" enqueues an outbound alert message
@@ -202,8 +202,8 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
-    When the Telegram Bot API returns HTTP 500 on attempts 1, 2, and 3
-    Then the message is moved to the dead-letter queue after attempt 3
+    When the Telegram Bot API returns HTTP 500 on attempts 1 through 5
+    Then the message is moved to the dead-letter queue after attempt 5
     And an alert is raised to the operations channel
     And the dead-letter record includes CorrelationId, AgentId, message content, and failure reason
 
@@ -303,13 +303,27 @@ Feature: Telegram bot command handling
     When user "operator-1" sends "/reject Q-2001"
     Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
 
-  Scenario: /handoff is accepted syntactically but returns a not-yet-configured stub
-    # tech-spec.md D-4: /handoff semantics are OPEN — stub until policy is decided
+  Scenario: /handoff transfers human oversight of a task to another operator
+    # tech-spec.md D-4 (Decided): /handoff = transfer human oversight to another operator
+    Given task "TASK-099" exists and user "operator-1" has oversight
+    And user "operator-2" with Telegram user ID "222333444" is in the allowlist
     When user "operator-1" sends "/handoff TASK-099 @operator-2"
-    Then the command handler parses the syntax "/handoff TASK-ID @operator-alias" successfully
-    And the bot replies with "Handoff is not yet configured — awaiting policy decision (D-4)"
-    And no oversight transfer, question reassignment, or agent-team transfer occurs
+    Then the HandoffCommandHandler validates TASK-099 exists and @operator-2 is a known operator
+    And oversight of TASK-099 is transferred from "operator-1" to "operator-2" in the OperatorRegistry
+    And the bot notifies "operator-1": "✅ Oversight of TASK-099 transferred to @operator-2"
+    And the bot notifies "operator-2": "📋 You now have oversight of TASK-099 (transferred by @operator-1)"
     And an audit record is persisted with the raw command text, user ID, and CorrelationId
+
+  Scenario: /handoff with invalid task ID is rejected
+    When user "operator-1" sends "/handoff NONEXISTENT-TASK @operator-2"
+    Then the bot replies with "Task NONEXISTENT-TASK not found"
+    And no oversight transfer occurs
+
+  Scenario: /handoff with unknown operator alias is rejected
+    Given task "TASK-099" exists and user "operator-1" has oversight
+    When user "operator-1" sends "/handoff TASK-099 @unknown-user"
+    Then the bot replies with "Operator @unknown-user not found in the allowlist"
+    And no oversight transfer occurs
 
   Scenario: /pause and /resume control agent execution
     When user "operator-1" sends "/pause arch-agent-7"
@@ -506,5 +520,5 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 4._
-_Aligned with sibling tech-spec.md (D-4 /handoff is Open — stub until decided), architecture.md (Messenger="Telegram", /healthz, MaxRetries=3, burst P95 applies to first ~30 messages), and implementation-plan.md._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 5._
+_Aligned with sibling tech-spec.md (D-4 /handoff Decided — transfer human oversight to another operator), architecture.md (Messenger="Telegram", /healthz, MaxRetries=5, burst P95 applies to first ~30 messages, subsequent queue-delayed), and implementation-plan.md._
