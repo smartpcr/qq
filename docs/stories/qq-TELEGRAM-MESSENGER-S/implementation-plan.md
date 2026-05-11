@@ -33,7 +33,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Create `MessengerMessage` record in Abstractions with properties: `MessageId`, `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, `Text`, `Severity`, `Metadata` dictionary
-- [ ] Create `AgentQuestion` record in Abstractions with properties: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `AllowedActions` (list of `HumanAction`), `ExpiresAt`, `DefaultAction`, `CorrelationId`
+- [ ] Create `AgentQuestion` record in Abstractions with properties: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `AllowedActions` (list of `HumanAction`), `ExpiresAt`, `DefaultAction` (nullable `string` matching a `HumanAction.Value` in `AllowedActions`; architecture.md §5 line 177 extends the shared model with this property), `CorrelationId` — note: when stored as a `PendingQuestionRecord` (Stage 3.5), the default is denormalized as `DefaultActionId` for indexed timeout queries
 - [ ] Create `HumanAction` record in Abstractions with properties: `ActionId`, `Label`, `Value`, `RequiresComment`
 - [ ] Create `HumanDecisionEvent` record in Abstractions with properties: `QuestionId`, `ActionValue`, `Comment`, `Messenger`, `ExternalUserId`, `ExternalMessageId`, `ReceivedAt`, `CorrelationId`
 - [ ] Create `MessengerEvent` record in Abstractions representing inbound events with properties: `EventId`, `EventType` enum, `RawCommand`, `UserId`, `ChatId`, `Timestamp`, `CorrelationId`, `Payload`
@@ -52,7 +52,8 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Create `IMessengerConnector` interface in Abstractions with methods: `SendMessageAsync(MessengerMessage, CancellationToken)`, `SendQuestionAsync(AgentQuestion, CancellationToken)`, `ReceiveAsync(CancellationToken)` returning `IReadOnlyList<MessengerEvent>`
-- [ ] Create `ICommandRouter` interface in Abstractions with method: `RouteAsync(MessengerEvent, CancellationToken)` returning `CommandResult`
+- [ ] Create `ICommandRouter` interface in Abstractions with method: `RouteAsync(ParsedCommand, AuthorizedOperator, CancellationToken)` returning `CommandResult` — the pipeline (Stage 2.5) parses and authorizes first, then passes the resolved command and identity to the router
+- [ ] Create `IPendingQuestionStore` interface in Abstractions with methods: `StoreAsync(AgentQuestion, long telegramMessageId, CancellationToken)`, `GetAsync(string questionId, CancellationToken)`, `GetByTelegramMessageIdAsync(long telegramMessageId, CancellationToken)`, `MarkAnsweredAsync(string questionId, CancellationToken)`, `MarkAwaitingCommentAsync(string questionId, CancellationToken)`, `GetExpiredAsync(CancellationToken)` — defined here so Stage 2.5 can reference it for `TextReply` routing; concrete implementation in Stage 3.5
 - [ ] Create `CommandResult` record in Abstractions with properties: `Success`, `ResponseText`, `CorrelationId`, `ErrorCode`
 - [ ] Create `IUserAuthorizationService` interface in Abstractions with method: `AuthorizeAsync(string externalUserId, string chatId, CancellationToken)` returning `AuthorizationResult`
 - [ ] Create `AuthorizationResult` record with properties: `IsAuthorized`, `OperatorId`, `TenantId`, `WorkspaceId`, `DenialReason`
@@ -158,8 +159,8 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Implement `TelegramUpdatePipeline` (the concrete class implementing `ITelegramUpdatePipeline` defined in Stage 1.3) in the Telegram project; inject all dependencies as interfaces: `IDeduplicationService`, `IUserAuthorizationService`, `ICommandParser`, `ICommandRouter`, `ICallbackHandler`
-- [ ] Compose the pipeline as a sequential chain: deduplication check (via `IDeduplicationService`) → allowlist gate (via `IUserAuthorizationService`) → command parsing (via `ICommandParser`) → routing by `EventType`: `Command` events go to `ICommandRouter`, `CallbackResponse` events go to `ICallbackHandler`, `TextReply` events check for pending `RequiresComment` prompts (via `IPendingQuestionStore`) before falling through to default handling
-- [ ] Provide stub/no-op implementations of `ICommandParser`, `ICommandRouter`, `ICallbackHandler`, and `IDeduplicationService` in the Telegram project for initial compilation and testing; concrete implementations are registered in Phase 3 (command processing) and Phase 4 (deduplication)
+- [ ] Compose the pipeline as a sequential chain: deduplication check (via `IDeduplicationService`) → allowlist gate (via `IUserAuthorizationService`, producing `AuthorizedOperator`) → command parsing (via `ICommandParser`, producing `ParsedCommand`) → routing by `EventType`: `Command` events pass `ParsedCommand` and `AuthorizedOperator` to `ICommandRouter.RouteAsync`, `CallbackResponse` events go to `ICallbackHandler`, `TextReply` events check for pending `RequiresComment` prompts (via `IPendingQuestionStore`, defined in Stage 1.3 Abstractions) before falling through to default handling
+- [ ] Provide stub/no-op implementations of `ICommandParser`, `ICommandRouter`, `ICallbackHandler`, `IDeduplicationService`, and `IPendingQuestionStore` in the Telegram project for initial compilation and testing; concrete implementations are registered in Phase 3 (command processing) and Phase 4 (deduplication)
 - [ ] Emit structured log entries at each pipeline stage with `CorrelationId`, `EventId`, and stage name for end-to-end traceability
 - [ ] Return a `PipelineResult` (defined in Abstractions) to callers (webhook endpoint and polling service)
 
@@ -195,7 +196,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ## Stage 3.2: Command Router and Handlers
 
 ### Implementation Steps
-- [ ] Create `CommandRouter` implementing `ICommandRouter` in Core that dispatches `ParsedCommand` to registered `ICommandHandler` instances via a dictionary keyed by command name
+- [ ] Create `CommandRouter` implementing `ICommandRouter` in Core that receives `ParsedCommand` and `AuthorizedOperator`, dispatches to registered `ICommandHandler` instances via a dictionary keyed by command name
 - [ ] Define `ICommandHandler` interface in Core with method `HandleAsync(ParsedCommand, AuthorizedOperator, CancellationToken)` returning `CommandResult`; `AuthorizedOperator` (defined in Stage 1.3) provides the resolved operator identity for authorization and audit
 - [ ] Implement `StartCommandHandler` — registers user, responds with welcome and available commands
 - [ ] Implement `StatusCommandHandler` — queries swarm orchestrator via `ISwarmCommandBus.QueryStatusAsync` (defined in Stage 1.3) for current status summary, returns formatted text
@@ -203,7 +204,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Implement `AskCommandHandler` — creates a work item in the swarm orchestrator via `ISwarmCommandBus.PublishCommandAsync` from the argument text, returns confirmation with task ID and correlation ID
 - [ ] Implement `ApproveCommandHandler` and `RejectCommandHandler` — resolve a pending `AgentQuestion` by emitting a `HumanDecisionEvent` with the appropriate action value
 - [ ] Implement `PauseCommandHandler` and `ResumeCommandHandler` — send pause/resume signals to the target agent via `ISwarmCommandBus.PublishCommandAsync`
-- [ ] Implement `HandoffCommandHandler` — accepts syntax `/handoff TASK-ID @operator-alias`, validates both arguments syntactically (parses task ID and operator alias), but returns a stub response "Handoff is not yet configured — awaiting policy decision (D-4)" without performing any transfer, question reassignment, or agent-team change; persists an audit record with the raw command text, user ID, and CorrelationId for future replay when D-4 is decided (aligns with e2e-scenarios.md which requires a not-yet-configured stub and tech-spec.md D-4 which is still Open)
+- [ ] Implement `HandoffCommandHandler` — accepts syntax `/handoff TASK-ID @operator-alias`; validates that `TASK-ID` exists and the sending operator currently has oversight; validates that `@operator-alias` is a registered operator resolved via `OperatorRegistry`; on success, transfers oversight by updating the `OperatorRegistry` binding for the task, notifies the sender ("✅ Oversight of TASK-ID transferred to @operator-alias") and the receiver ("📋 You now have oversight of TASK-ID (transferred by @sender)") via `ISwarmCommandBus.PublishCommandAsync`; persists an audit record with handoff details, both operator IDs, and `CorrelationId`; returns error for invalid task ID ("Task NONEXISTENT not found") or unregistered operator ("Operator @unknown-user is not registered") — aligns with tech-spec.md D-4 (Decided: transfer human oversight), architecture.md §5.1 handoff semantics, and e2e-scenarios.md handoff Gherkin scenarios
 
 ### Dependencies
 - phase-command-processing-and-agent-routing/stage-command-parser
@@ -212,7 +213,9 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Scenario: Ask creates work item — Given an authorized user sends `/ask build release notes for Solution12`, When the `AskCommandHandler` processes it, Then a work item is created and the response includes a task ID
 - [ ] Scenario: Unknown command rejected — Given a `ParsedCommand` with `CommandName` = `foo`, When routed, Then the result has `Success=false` and a helpful error message listing valid commands
 - [ ] Scenario: Approve emits decision event — Given a pending question with `QuestionId=Q1`, When `/approve Q1` is processed, Then a `HumanDecisionEvent` is emitted with `ActionValue=approve` and the correct `CorrelationId`
-- [ ] Scenario: Handoff returns stub — Given an authorized user sends `/handoff TASK-099 @operator-2`, When `HandoffCommandHandler` processes it, Then the syntax is parsed successfully, the bot responds with "Handoff is not yet configured — awaiting policy decision (D-4)", no transfer or reassignment occurs, and an audit record is persisted with the raw command text
+- [ ] Scenario: Handoff transfers oversight — Given an authorized user sends `/handoff TASK-099 @operator-2` and both task and operator are valid, When `HandoffCommandHandler` processes it, Then the `OperatorRegistry` binding is updated, the sender receives "✅ Oversight of TASK-099 transferred to @operator-2", the receiver receives a notification, and an audit record is persisted with both operator IDs and `CorrelationId`
+- [ ] Scenario: Handoff invalid task — Given an authorized user sends `/handoff NONEXISTENT @operator-2`, When `HandoffCommandHandler` processes it, Then the bot responds with "Task NONEXISTENT not found" and no transfer occurs
+- [ ] Scenario: Handoff unknown operator — Given an authorized user sends `/handoff TASK-099 @unknown-user`, When `HandoffCommandHandler` processes it, Then the bot responds with "Operator @unknown-user is not registered" and no transfer occurs
 
 ## Stage 3.3: Callback Query Handler
 
@@ -250,9 +253,9 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ## Stage 3.5: Pending Question Store and Timeout Service
 
 ### Implementation Steps
-- [ ] Define `IPendingQuestionStore` interface in Core with methods: `StoreAsync(AgentQuestion, long telegramMessageId, CancellationToken)`, `GetAsync(string questionId, CancellationToken)`, `MarkAnsweredAsync(string questionId, CancellationToken)`, `GetExpiredAsync(CancellationToken)` returning unanswered questions past `ExpiresAt`
-- [ ] Create `PendingQuestionRecord` entity with fields: `QuestionId`, `AgentQuestion` (serialized), `TelegramChatId`, `TelegramMessageId`, `StoredAt`, `ExpiresAt`, `Status` (enum: `Pending`, `Answered`, `TimedOut`), `CorrelationId`
-- [ ] Implement `PersistentPendingQuestionStore` backed by the Persistence project (EF Core; SQLite for dev/local, PostgreSQL or SQL Server for production) with indexed lookups by `QuestionId` and `ExpiresAt`
+- [ ] Define `IPendingQuestionStore` concrete registration point — the interface is defined in Stage 1.3 Abstractions; this stage provides the EF Core implementation
+- [ ] Create `PendingQuestionRecord` entity with fields: `QuestionId`, `AgentQuestion` (serialized), `TelegramChatId`, `TelegramMessageId`, `StoredAt`, `ExpiresAt`, `DefaultActionId` (denormalized from `AgentQuestion.DefaultAction` for indexed timeout queries), `Status` (enum: `Pending`, `Answered`, `AwaitingComment`, `TimedOut`), `CorrelationId`
+- [ ] Implement `PersistentPendingQuestionStore` implementing `IPendingQuestionStore` (interface from Stage 1.3 Abstractions) backed by the Persistence project (EF Core; SQLite for dev/local, PostgreSQL or SQL Server for production) with indexed lookups by `QuestionId`, `ExpiresAt`, and `DefaultActionId`
 - [ ] Integrate store into `TelegramMessageSender.SendQuestionAsync`: after successfully sending a question to Telegram, persist the question with its Telegram message ID for later lookup by `CallbackQueryHandler`
 - [ ] Implement `RequiresComment` flow in `CallbackQueryHandler`: when the selected `HumanAction.RequiresComment` is true, set the question status to `AwaitingComment`, send a prompt ("Please reply with your comment"), and defer `HumanDecisionEvent` emission until the operator's text reply arrives via the pipeline's `TextReply` handler
 - [ ] Create `QuestionTimeoutService` as a `BackgroundService` that periodically polls `GetExpiredAsync`, and for each expired question: publishes a `HumanDecisionEvent` with `DefaultAction` value, updates the original Telegram message to indicate timeout ("⏰ Timed out — default action applied: {defaultAction}"), marks the question as `TimedOut`, and writes an audit record
@@ -275,7 +278,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Define `IOutboundQueue` interface in Core with methods: `EnqueueAsync(OutboundMessage, CancellationToken)`, `DequeueAsync(CancellationToken)`, `AcknowledgeAsync(messageId, CancellationToken)`, `NackAsync(messageId, CancellationToken)`
-- [ ] Create `OutboundMessage` record matching architecture.md's data model: `Id` (Guid), `IdempotencyKey` (string, derived from `AgentId:QuestionId:CorrelationId` to prevent duplicate sends), `ChatId`, `Payload` (serialized MessengerMessage or AgentQuestion), `Status` (enum: `Pending`, `Sending`, `Sent`, `Failed`, `DeadLettered`), `AttemptCount`, `MaxAttempts`, `NextRetryAt`, `CreatedAt`, `SentAt`, `TelegramMessageId`, `CorrelationId`, `ErrorDetail`
+- [ ] Create `OutboundMessage` record matching architecture.md's data model: `Id` (Guid), `IdempotencyKey` (string, derived per `SourceType` — see architecture.md idempotency key derivation table), `ChatId`, `Payload` (serialized MessengerMessage or AgentQuestion), `Severity` (enum: `Critical`, `High`, `Normal`, `Low` — determines priority queue ordering), `SourceType` (enum: `Question`, `Alert`, `StatusUpdate`, `CommandAck` — discriminator for origin type), `SourceId` (string, nullable — `QuestionId` for questions, alert rule ID for alerts, command correlation ID for acks; null only for fire-and-forget status broadcasts), `Status` (enum: `Pending`, `Sending`, `Sent`, `Failed`, `DeadLettered`), `AttemptCount`, `MaxAttempts`, `NextRetryAt`, `CreatedAt`, `SentAt`, `TelegramMessageId`, `CorrelationId`, `ErrorDetail`
 - [ ] Add a `UNIQUE` constraint on `IdempotencyKey` in the outbox table so that duplicate enqueue attempts for the same logical message are rejected at the database level
 - [ ] Implement `InMemoryOutboundQueue` using `Channel<OutboundMessage>` with bounded capacity and backpressure for development
 - [ ] Implement `PersistentOutboundQueue` backed by EF Core for durable persistence; use SQLite provider for dev/local environments and PostgreSQL or SQL Server for production (the specific production provider is a deployment decision, consistent with architecture.md §11.3); persist messages to an `outbox` table with status tracking; on `EnqueueAsync`, check `IdempotencyKey` uniqueness before inserting
@@ -293,7 +296,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ## Stage 4.2: Retry Policy and Dead-Letter Queue
 
 ### Implementation Steps
-- [ ] Create `RetryPolicy` configuration POCO with properties: `MaxAttempts` (default 3, aligned with architecture.md component table default of 3 and e2e-scenarios.md retry background), `InitialDelayMs` (default 1000), `BackoffMultiplier` (default 2.0), `MaxDelayMs` (default 30000)
+- [ ] Create `RetryPolicy` configuration POCO with properties: `MaxAttempts` (default 5, aligned with architecture.md §5.3 `OutboundQueue:MaxRetries` default of 5 and e2e-scenarios.md retry background specifying max 5 attempts), `InitialDelayMs` (default 2000, aligned with architecture.md `BaseRetryDelaySeconds` default of 2), `BackoffMultiplier` (default 2.0), `MaxDelayMs` (default 30000), `JitterPercent` (default 25, aligned with architecture.md ±25% jitter)
 - [ ] Implement exponential backoff with jitter in `OutboundQueueProcessor`: on transient failure, increment `Attempt`, compute next retry time, and re-enqueue
 - [ ] Define `IDeadLetterQueue` interface in Core with methods: `SendToDeadLetterAsync(OutboundMessage, FailureReason, CancellationToken)`, `ListAsync(CancellationToken)`
 - [ ] Implement `DeadLetterQueue` backed by the same persistence layer (EF Core; SQLite for dev/local, PostgreSQL or SQL Server for production) with `dead_letter_messages` table containing full failure context
@@ -305,7 +308,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Test Scenarios
 - [ ] Scenario: Retry with backoff — Given a message fails on first attempt, When retried, Then the delay before the second attempt is approximately `InitialDelayMs` (within jitter tolerance)
-- [ ] Scenario: Dead-lettered after max attempts — Given `MaxAttempts=3` and a message that always fails, When processed three times, Then the message is in the dead-letter queue and an alert is emitted
+- [ ] Scenario: Dead-lettered after max attempts — Given `MaxAttempts=5` and a message that always fails, When processed five times, Then the message is in the dead-letter queue and an alert is emitted
 - [ ] Scenario: Health check degrades — Given 10 messages in the dead-letter queue and threshold is 5, When health check is queried, Then status is `Unhealthy`
 
 ## Stage 4.3: Inbound Deduplication Service
