@@ -70,6 +70,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Create `SwarmCommand` record in Abstractions with properties: `CommandType`, `TaskId`, `OperatorId`, `Payload`, `CorrelationId`
 - [ ] Create `IOperatorRegistry` interface in Core (per architecture.md §4.3) with methods: `GetByTelegramUserAsync(long telegramUserId, long chatId, CancellationToken)` returning `OperatorBinding?`, `GetAllBindingsAsync(long telegramUserId, CancellationToken)` returning `IReadOnlyList<OperatorBinding>`, `GetByAliasAsync(string operatorAlias, CancellationToken)` returning `OperatorBinding?`, `RegisterAsync(long telegramUserId, long chatId, string tenantId, string workspaceId, CancellationToken)`, `IsAuthorizedAsync(long telegramUserId, long chatId, CancellationToken)` returning `bool` — used by Stage 3.2 (`HandoffCommandHandler` alias resolution), Stage 3.4 (concrete implementation), and Stage 5.2 (runtime authorization)
 - [ ] Create `OperatorBinding` record in Core with properties: `Id` (Guid), `TelegramUserId` (long), `TelegramChatId` (long), `ChatType` (enum: `Private`, `Group`, `Supergroup`), `OperatorAlias` (string), `TenantId`, `WorkspaceId`, `Roles` (list of string), `RegisteredAt` (DateTimeOffset), `IsActive` (bool) — per architecture.md §3.1
+- [ ] Create `IMessageSender` interface in Core with methods: `SendTextAsync(long chatId, string text, CancellationToken)`, `SendQuestionAsync(long chatId, AgentQuestion question, CancellationToken)` — the platform-agnostic outbound sending contract that `TelegramMessageSender` (Stage 2.4) implements; used by `OutboundQueueProcessor` (Stage 4.1) to send messages without depending on the Telegram project directly
 - [ ] Create `IAlertService` interface in Abstractions with method: `SendAlertAsync(string subject, string detail, CancellationToken)` — used to notify operators via a secondary channel when dead-letter events occur or critical failures are detected
 
 ### Dependencies
@@ -106,8 +107,12 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Create ASP.NET Core minimal API endpoint `POST /api/telegram/webhook` in the Worker project that receives Telegram `Update` JSON payloads
 - [ ] Implement `TelegramWebhookSecretFilter` that validates the `X-Telegram-Bot-Api-Secret-Token` header against the configured `SecretToken`; reject with 403 if mismatch
 - [ ] Deserialize the incoming `Update` using `Telegram.Bot` serialization and convert to the internal `MessengerEvent` model via a `TelegramUpdateMapper` class
-- [ ] Implement idempotency check: delegate duplicate detection to `IDeduplicationService.IsProcessedAsync(Update.Id)` (interface defined in Stage 1.3; stub implementation registered by Stage 2.5; persistent implementation replaces stub in Stage 4.3); skip duplicate updates and return 200
-- [ ] On successful processing, return HTTP 200 immediately; pass the `MessengerEvent` to `ITelegramUpdatePipeline.ProcessAsync` (interface defined in Abstractions, implementation provided via DI from Stage 2.5) for async command routing
+- [ ] Persist an `InboundUpdate` durable record (per architecture.md §3.1 lines 126-134 and §5.1 line 370) **before** returning HTTP 200: insert into the `inbound_updates` table with fields `UpdateId` (PK, Telegram's `update_id`), `RawPayload` (full serialized `Update` JSON), `ReceivedAt`, `ProcessedAt` (null initially), and `IdempotencyStatus` (set to `Received`); if the `UNIQUE` constraint on `UpdateId` fails, the update is a duplicate — return 200 immediately without further processing; this eliminates the command-loss window: if the process crashes after Telegram receives 200, the `InboundUpdate` record (with full `RawPayload`) is already persisted for recovery
+- [ ] Create `InboundUpdate` entity in Persistence with fields: `UpdateId` (long, PK), `RawPayload` (string), `ReceivedAt` (DateTimeOffset), `ProcessedAt` (DateTimeOffset?), `IdempotencyStatus` (enum: `Received`, `Processing`, `Completed`, `Failed`); add EF Core configuration with a `UNIQUE` constraint on `UpdateId`
+- [ ] Create `IInboundUpdateStore` interface in Abstractions with methods: `PersistAsync(InboundUpdate, CancellationToken)` returning `bool` (false if duplicate), `MarkProcessingAsync(long updateId, CancellationToken)`, `MarkCompletedAsync(long updateId, CancellationToken)`, `MarkFailedAsync(long updateId, CancellationToken)`, `GetUnprocessedAsync(CancellationToken)` returning `IReadOnlyList<InboundUpdate>` (records with `IdempotencyStatus = Received` or `Processing`)
+- [ ] Implement `PersistentInboundUpdateStore` in Persistence backed by EF Core (SQLite for dev, PostgreSQL or SQL Server for production), using the shared `MessagingDbContext` (see Stage 6.3 for connection configuration)
+- [ ] After persisting the `InboundUpdate` record, return HTTP 200 and pass the `MessengerEvent` to `ITelegramUpdatePipeline.ProcessAsync` (interface defined in Abstractions, implementation provided via DI from Stage 2.5) for async command routing; upon completion, transition `IdempotencyStatus` to `Completed` (or `Failed` on error)
+- [ ] Implement `InboundRecoverySweep` as a startup `IHostedService` that runs once on Worker startup: queries `IInboundUpdateStore.GetUnprocessedAsync()` for records with `IdempotencyStatus = Received` or `Processing`, deserializes each `RawPayload` back into a Telegram `Update`, maps to `MessengerEvent`, and re-feeds into `ITelegramUpdatePipeline.ProcessAsync` for idempotent re-processing; log recovered records at `Warning` level
 - [ ] Add webhook registration logic in `IHostedService` startup: call `SetWebhookAsync` with the configured URL, secret token, and allowed update types
 
 ### Dependencies
@@ -115,9 +120,10 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - phase-telegram-bot-integration/stage-inbound-update-pipeline
 
 ### Test Scenarios
-- [ ] Scenario: Valid webhook accepted — Given a well-formed Telegram Update JSON, When POSTed to `/api/telegram/webhook` with correct secret header, Then response is HTTP 200
-- [ ] Scenario: Invalid secret rejected — Given a Telegram Update JSON, When POSTed with an incorrect `X-Telegram-Bot-Api-Secret-Token`, Then response is HTTP 403
-- [ ] Scenario: Duplicate update ignored — Given the same `Update.Id` is received twice, When both are POSTed, Then only the first triggers downstream processing
+- [ ] Scenario: Valid webhook accepted — Given a well-formed Telegram Update JSON, When POSTed to `/api/telegram/webhook` with correct secret header, Then an `InboundUpdate` record is persisted with `IdempotencyStatus=Received` and `RawPayload` containing the full Update JSON, and response is HTTP 200
+- [ ] Scenario: Invalid secret rejected — Given a Telegram Update JSON, When POSTed with an incorrect `X-Telegram-Bot-Api-Secret-Token`, Then response is HTTP 403 and no `InboundUpdate` record is created
+- [ ] Scenario: Duplicate update ignored — Given the same `Update.Id` is received twice, When both are POSTed, Then only the first creates an `InboundUpdate` record and triggers downstream processing; the second returns 200 with no new record
+- [ ] Scenario: Crash recovery on restart — Given an `InboundUpdate` record exists with `IdempotencyStatus=Received` (simulating a crash after 200 was returned but before processing completed), When the Worker restarts, Then `InboundRecoverySweep` deserializes the `RawPayload`, re-feeds it into the pipeline, and the record transitions to `Completed`
 
 ## Stage 2.3: Long Polling Receiver for Development
 
@@ -138,7 +144,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ## Stage 2.4: Outbound Message Sender
 
 ### Implementation Steps
-- [ ] Create `TelegramMessageSender` implementing a `IMessageSender` interface (defined in Core) with methods: `SendTextAsync(chatId, text, parseMode, ct)`, `SendQuestionAsync(chatId, AgentQuestion, ct)`
+- [ ] Create `TelegramMessageSender` implementing `IMessageSender` (defined in Stage 1.3 Core) with methods: `SendTextAsync(chatId, text, ct)`, `SendQuestionAsync(chatId, AgentQuestion, ct)`
 - [ ] Implement `SendQuestionAsync` to render `AgentQuestion` as a rich Telegram message: include `Title`, `Body` (full context), `Severity` badge, `ExpiresAt` timeout countdown; render `AllowedActions` as Telegram `InlineKeyboardMarkup` buttons with callback data encoding `QuestionId:ActionId`; read `AgentQuestion.DefaultAction` (the shared first-class property per architecture.md §3.1 lines 167-182) and, when present, display the proposed default in the message body (e.g., "Default action if no response: Approve") and denormalize the `ActionId` into `PendingQuestionRecord.DefaultActionId` (Stage 3.5) for efficient timeout polling
 - [ ] When building the inline keyboard, write each `HumanAction` to `IDistributedCache` keyed by `QuestionId:ActionId` with expiry set to `AgentQuestion.ExpiresAt` (per architecture.md §5.2 and tech-spec D-3); this enables `CallbackQueryHandler` and `QuestionTimeoutService` to resolve the full `HumanAction` from the short `ActionId` in callback data
 - [ ] For actions with `RequiresComment = true`, append "(reply required)" to the button label so the operator knows a follow-up text reply is expected after tapping
@@ -173,7 +179,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Test Scenarios
 - [ ] Scenario: Pipeline routes command — Given a `MessengerEvent` with `EventType=Command` and text `/status`, When processed through the pipeline, Then `CommandRouter` is invoked and a response is returned
-- [ ] Scenario: Pipeline routes callback — Given a `MessengerEvent` with `EventType=CallbackResponse`, When processed, Then `CallbackQueryHandler` is invoked and a `HumanDecisionEvent` is emitted
+- [ ] Scenario: Pipeline routes callback to stub — Given a `MessengerEvent` with `EventType=CallbackResponse`, When processed, Then the injected `ICallbackHandler` mock/stub is invoked with the event (real `CallbackQueryHandler` emitting `HumanDecisionEvent` is provided by Stage 3.3; this test verifies routing only)
 - [ ] Scenario: Pipeline rejects unauthorized — Given a `MessengerEvent` from a user not in the allowlist, When processed, Then the pipeline short-circuits with a denial response and no command handler is invoked
 
 # Phase 3: Command Processing and Agent Routing
@@ -367,10 +373,10 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ## Stage 5.2: Chat and User Allowlist Enforcement
 
 ### Implementation Steps
-- [ ] Create `AllowlistOptions` POCO bound from configuration section `Telegram:AllowedUserIds` with property: `AllowedTelegramUserIds` (list of long) — per architecture.md §7.1, chat IDs are NOT independently allow-listed; a chat becomes authorized when an allowed user sends `/start` from that chat, creating an `OperatorBinding` row with both the user ID and the chat ID
-- [ ] Implement two-tier authorization per architecture.md §7.1: Tier 1 (onboarding) checks `Telegram:AllowedUserIds` at `/start` time only — if the user's Telegram ID is not in the list, `/start` is rejected and no `OperatorBinding` is created; Tier 2 (runtime) checks `OperatorBinding` records via `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)` on every inbound command — if no matching binding exists for the (userId, chatId) pair, the command is rejected
+- [ ] Normalize allowlist configuration into the existing `TelegramOptions` POCO (defined in Stage 2.1): the `AllowedUserIds` property (already present as `List<long>` on `TelegramOptions`, bound from `Telegram:AllowedUserIds`) serves as the single source of truth for the onboarding allowlist — no separate `AllowlistOptions` POCO is created; this ensures consistent binding across all stages (2.1, 5.2, 6.3) that reference `TelegramOptions.AllowedUserIds`
+- [ ] Implement two-tier authorization per architecture.md §7.1: Tier 1 (onboarding) checks `TelegramOptions.AllowedUserIds` via `IOptions<TelegramOptions>` at `/start` time only — if the user's Telegram ID is not in the list, `/start` is rejected and no `OperatorBinding` is created; Tier 2 (runtime) checks `OperatorBinding` records via `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)` on every inbound command — if no matching binding exists for the (userId, chatId) pair, the command is rejected
 - [ ] If user is not authorized, respond with a polite denial message, log the attempt at Warning level with user ID and chat ID (but no PII beyond Telegram numeric IDs), and short-circuit processing
-- [ ] Support dynamic allowlist reload without restart via `IOptionsMonitor<AllowlistOptions>`
+- [ ] Support dynamic allowlist reload without restart via `IOptionsMonitor<TelegramOptions>` — changes to `Telegram:AllowedUserIds` in configuration are reflected immediately for `/start` onboarding checks without requiring a service restart
 
 ### Dependencies
 - phase-security-and-audit/stage-secret-management-integration
@@ -378,8 +384,8 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ### Test Scenarios
 - [ ] Scenario: Allowed user passes — Given user ID `12345` has an active `OperatorBinding` for chat ID `67890`, When a command arrives from user `12345` in chat `67890`, Then processing continues normally
 - [ ] Scenario: Denied user blocked — Given user ID `99999` has no `OperatorBinding` record, When a command arrives, Then the user receives the denial message and no command handler is invoked
-- [ ] Scenario: Dynamic reload — Given user `67890` is added to `Telegram:AllowedUserIds` while the service is running, When `67890` sends `/start`, Then the `OperatorBinding` is created and subsequent commands are accepted without a restart
-- [ ] Scenario: Chat authorized through /start — Given user `12345` is in `AllowedTelegramUserIds` and sends `/start` from chat `55555`, When `12345` later sends `/status` from chat `55555`, Then the command is accepted because the `OperatorBinding` exists for that (userId, chatId) pair
+- [ ] Scenario: Dynamic reload — Given user `67890` is added to `Telegram:AllowedUserIds` while the service is running, When `67890` sends `/start`, Then the `OperatorBinding` is created and subsequent commands are accepted without a restart (verified via `IOptionsMonitor<TelegramOptions>` reload)
+- [ ] Scenario: Chat authorized through /start — Given user `12345` is in `TelegramOptions.AllowedUserIds` and sends `/start` from chat `55555`, When `12345` later sends `/status` from chat `55555`, Then the command is accepted because the `OperatorBinding` exists for that (userId, chatId) pair
 
 ## Stage 5.3: Audit Logging Persistence
 
@@ -438,8 +444,8 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Wire up `Program.cs` in the Worker project: register all services (Telegram connector, command router, all handlers, outbound queue, deduplication, audit, health checks, OpenTelemetry)
-- [ ] Create `appsettings.json` with documented configuration sections: `Telegram` (including `BotToken`, `WebhookUrl`, `UsePolling`, `AllowedUserIds`, `SecretToken`, `RateLimits`), `RetryPolicy`, `OutboundQueue`, `ConnectionStrings:AuditDb`, `KeyVault:Uri`
-- [ ] Create `appsettings.Development.json` with polling mode enabled, console OTel exporter, and in-memory queue
+- [ ] Create `appsettings.json` with documented configuration sections: `Telegram` (including `BotToken`, `WebhookUrl`, `UsePolling`, `AllowedUserIds`, `SecretToken`, `RateLimits`), `RetryPolicy`, `OutboundQueue`, `ConnectionStrings:MessagingDb` (shared connection string used by `MessagingDbContext` for all EF Core-backed stores: `InboundUpdate` dedup/recovery from Stage 2.2, outbox from Stage 4.1, dead-letter queue from Stage 4.2, `processed_events` dedup from Stage 4.3, `PendingQuestionRecord` from Stage 3.5, `OperatorBinding` from Stage 3.4, and `TaskOversight` from Stage 3.2; defaults to SQLite `Data Source=messaging.db` for dev/local, swappable to PostgreSQL or SQL Server for production via EF Core provider change), `ConnectionStrings:AuditDb` (separate connection for audit log isolation from Stage 5.3; defaults to SQLite `Data Source=audit.db` for dev/local), `KeyVault:Uri`
+- [ ] Create `appsettings.Development.json` with polling mode enabled, console OTel exporter, in-memory queue, and SQLite connection strings: `ConnectionStrings:MessagingDb` = `Data Source=messaging.db` and `ConnectionStrings:AuditDb` = `Data Source=audit.db`
 - [ ] Add `Dockerfile` for the Worker project: multi-stage build, `dotnet publish` for linux-x64, expose port 8443 for webhook, configure Kestrel to listen on port 8443 via `ASPNETCORE_URLS=http://+:8443`, health check `HEALTHCHECK CMD curl -f http://localhost:8443/healthz`
 - [ ] Add `docker-compose.yml` at repo root with the worker service and optional ngrok sidecar for local webhook testing
 
