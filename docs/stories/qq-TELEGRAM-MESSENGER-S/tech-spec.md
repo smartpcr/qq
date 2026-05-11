@@ -1,7 +1,7 @@
 # Technical Specification — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S` · 13 SP
-**Status:** Draft — Iteration 11
+**Status:** Draft — Iteration 12
 **Last updated:** 2026-05-11
 
 ---
@@ -21,7 +21,7 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 | # | Area | Detail |
 |---|------|--------|
 | S-1 | **Telegram Bot API integration** | HTTPS transport via `Telegram.Bot` NuGet package. Webhook receive in production; long-polling receive in dev/local. |
-| S-2 | **Command handling** | `/start`, `/status`, `/agents`, `/ask`, `/approve`, `/reject`, `/handoff`, `/pause`, `/resume` — parsed, validated, and dispatched to the Agent Swarm Orchestrator. `/handoff TASK-ID @operator-alias` performs a full oversight transfer: validates task existence and current oversight, resolves the target operator via `OperatorRegistry`, updates the `OperatorBinding`, notifies both operators, and persists an audit record (see D-4 §7). |
+| S-2 | **Command handling** | `/start`, `/status`, `/agents`, `/ask`, `/approve`, `/reject`, `/handoff`, `/pause`, `/resume` — parsed, validated, and dispatched to the Agent Swarm Orchestrator. `/handoff TASK-ID @operator-alias` semantics: architecture.md §5.5 (lines 480–493) specifies full oversight transfer (Decided) with validation, notification, and audit; implementation-plan.md Stage 3.2 (line 211) also implements full transfer. However, e2e-scenarios.md (lines 357–370) currently tests a **V1 stub** that validates syntax only, returns a stub ack, and does not perform any actual transfer. See D-4 and §10 for the cross-doc reconciliation note. |
 | S-3 | **Agent-to-human questions** | Render `AgentQuestion` as Telegram messages with inline keyboard buttons for each `HumanAction`. Include context, severity, timeout, and proposed default action in the message body. The shared `AgentQuestion` carries a nullable `DefaultAction` property (`string?`, a `HumanAction.ActionId`) per architecture.md §3.1 (lines 166–181). At render time the Telegram connector copies `AgentQuestion.DefaultAction` into `PendingQuestionRecord.DefaultActionId` for efficient timeout polling (see HC-3). |
 | S-4 | **Strongly typed decision events** | Button taps and text replies are converted to `HumanDecisionEvent` and published to the orchestrator. |
 | S-5 | **Operator identity mapping** | Map Telegram `chat_id` + `user_id` to an authorized operator record with tenant/workspace binding. Reject unmapped users. Applies in both 1:1 and group-chat contexts — commands in groups are attributed to the sending `user_id`, not the group `chat_id`. |

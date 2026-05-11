@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.18-draft (iteration 11)
+**Version:** v0.19-draft (iteration 12)
 
 ---
 
