@@ -225,12 +225,12 @@ Feature: Durable outbound message queue with retry and dead-letter
     And retries delivery (attempt 2)
     When the Telegram Bot API returns HTTP 200 on attempt 2
     Then the message is marked as delivered
-    And telegram.send.all_attempts_latency_ms records elapsed time from enqueue to final HTTP 200 (diagnostic metric covering all attempts per architecture.md §10.4)
-    And telegram.send.retry_latency_ms records the retry-specific latency
-    # Per architecture.md §10.4: telegram.send.latency_ms (primary) is scoped to
-    # first-attempt, non-rate-limited successes only. This retried message is NOT
-    # included in the primary metric but IS captured by the diagnostic
-    # telegram.send.all_attempts_latency_ms metric.
+    And telegram.send.latency_ms records elapsed time from enqueue to final HTTP 200 including the rate-limit wait (primary metric covering all sends per architecture.md §10.4)
+    And telegram.send.rate_limited_wait_ms records the time spent waiting during the 429 backoff
+    # Per architecture.md §10.4: telegram.send.latency_ms (primary) covers ALL
+    # messages regardless of attempt number or rate-limit holds. The rate-limit
+    # wait duration is included in this metric. A narrower diagnostic metric
+    # telegram.send.first_attempt_latency_ms isolates first-attempt successes.
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
