@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.29-draft (iteration 23)
+**Version:** v0.30-draft (iteration 24)
 
 ---
 
@@ -228,8 +228,8 @@ Feature: Durable outbound message queue with retry and dead-letter
     And retries delivery (attempt 2)
     When the Telegram Bot API returns HTTP 200 on attempt 2
     Then the message is marked as delivered
-    And telegram.send.latency_ms (primary, all-inclusive) records elapsed time from OutboundMessage.CreatedAt (enqueue) to final HTTP 200, including the rate-limit wait (per architecture.md §10.4 and tech-spec.md HC-4: all-inclusive metric covering ALL messages regardless of attempt number or rate-limit holds)
-    And telegram.send.first_attempt_latency_ms is NOT recorded for this message because it did not succeed on first attempt without rate-limiting (per tech-spec.md HC-4: this diagnostic metric covers only first-attempt, non-rate-limited successes; P95 ≤ 2s acceptance gate applies to this metric)
+    And telegram.send.latency_ms (primary, acceptance gate) is NOT recorded for this message because it did not succeed on first attempt without rate-limiting (per tech-spec.md HC-4: this metric covers only first-attempt, non-rate-limited successes; P95 ≤ 2s acceptance criterion applies to this metric)
+    And telegram.send.all_attempts_latency_ms (diagnostic, all-inclusive) records elapsed time from OutboundMessage.CreatedAt (enqueue) to final HTTP 200, including the rate-limit wait (per tech-spec.md HC-4: all-inclusive metric covering ALL messages regardless of attempt number or rate-limit holds — used for capacity planning)
     And telegram.send.rate_limited_wait_ms records the time spent waiting during the 429 backoff
 
   Scenario: Persistent failure dead-letters the message
@@ -261,24 +261,25 @@ Feature: Durable outbound message queue with retry and dead-letter
     And the original alert remains in the queue for delivery
 
   Scenario: P95 send latency under 2 seconds (normal load)
-    # Per architecture.md §10.4 and tech-spec.md HC-4: telegram.send.latency_ms
-    # (primary) = elapsed time from OutboundMessage.CreatedAt (enqueue) to
-    # Telegram API HTTP 200, measured for ALL messages regardless of attempt
-    # number or rate-limit holds (all-inclusive monitoring metric).
-    # telegram.send.first_attempt_latency_ms (diagnostic) covers only messages
-    # that succeed on first attempt without rate-limit waits — the P95 ≤ 2s
-    # acceptance gate applies to this metric (per operator answer to
-    # p95-metric-scope: first-attempt, non-rate-limited only).
+    # Per tech-spec.md HC-4: telegram.send.latency_ms (primary) = elapsed time
+    # from OutboundMessage.CreatedAt (enqueue) to Telegram API HTTP 200, measured
+    # ONLY for messages that succeed on first attempt without rate-limit waits —
+    # this is the first-attempt, non-rate-limited acceptance gate metric; the
+    # P95 ≤ 2s acceptance criterion applies to this metric.
+    # telegram.send.all_attempts_latency_ms (diagnostic) covers ALL messages
+    # regardless of attempt number or rate-limit holds — all-inclusive metric
+    # for capacity planning (per operator answer to p95-metric-scope:
+    # first-attempt, non-rate-limited only).
     Given 100 outbound messages are enqueued sequentially with mixed severities (25 Critical, 25 High, 25 Normal, 25 Low)
     And the Telegram Bot API responds HTTP 200 with ≤ 50 ms latency on every request
     And no HTTP 429 rate-limit responses occur
     When all 100 messages are dequeued and sent
     Then all 100 messages are delivered successfully on first attempt without rate-limiting
-    And telegram.send.latency_ms (primary, all-inclusive) is emitted for every send (per architecture.md §10.4 and tech-spec.md HC-4: all messages regardless of attempt number or rate-limit holds)
-    And telegram.send.first_attempt_latency_ms (diagnostic, acceptance gate) is also emitted for all 100 messages since they all succeeded on first attempt without rate-limiting
-    And P95 telegram.send.first_attempt_latency_ms across ALL 100 messages (all severities) is under 2 seconds (per operator answer to p95-metric-scope: the P95 ≤ 2s acceptance criterion applies to first-attempt, non-rate-limited sends only)
-    And P99 telegram.send.first_attempt_latency_ms across ALL 100 messages is under 3 seconds
-    And under these test conditions (no retries, no rate-limiting), telegram.send.latency_ms and telegram.send.first_attempt_latency_ms have identical values
+    And telegram.send.latency_ms (primary, acceptance gate) is emitted for every send (per tech-spec.md HC-4: first-attempt, non-rate-limited sends only)
+    And telegram.send.all_attempts_latency_ms (diagnostic, all-inclusive) is also emitted for all 100 messages (per tech-spec.md HC-4: all messages regardless of attempt number or rate-limit holds)
+    And P95 telegram.send.latency_ms across ALL 100 messages (all severities) is under 2 seconds (per operator answer to p95-metric-scope: the P95 ≤ 2s acceptance criterion applies to first-attempt, non-rate-limited sends only)
+    And P99 telegram.send.latency_ms across ALL 100 messages is under 3 seconds
+    And under these test conditions (no retries, no rate-limiting), telegram.send.latency_ms and telegram.send.all_attempts_latency_ms have identical values
 
   Scenario: Burst of 1000+ agent alerts without message loss
     Given 1000 agents each enqueue one alert message simultaneously
@@ -288,9 +289,9 @@ Feature: Durable outbound message queue with retry and dead-letter
     And zero messages are lost
     And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold)
     And the priority queuing design (architecture.md §5.2: severity-based dispatch ordering) ensures Critical/High messages are dispatched first
-    And telegram.send.latency_ms (primary, all-inclusive) is emitted for all 1000 messages regardless of attempt number or rate-limit holds (per architecture.md §10.4 and tech-spec.md HC-4)
-    And telegram.send.first_attempt_latency_ms (diagnostic, acceptance gate) is emitted for messages that succeed on first attempt without rate-limiting
-    And P95 telegram.send.first_attempt_latency_ms for the 300 Critical/High first-attempt, non-rate-limited messages is under 2 seconds (per operator answer to p95-metric-scope; under burst, priority queuing ensures Critical/High messages are dispatched first within the target)
+    And telegram.send.latency_ms (primary, acceptance gate) is emitted for messages that succeed on first attempt without rate-limiting (per tech-spec.md HC-4: first-attempt, non-rate-limited sends only)
+    And telegram.send.all_attempts_latency_ms (diagnostic, all-inclusive) is emitted for all 1000 messages regardless of attempt number or rate-limit holds (per tech-spec.md HC-4)
+    And P95 telegram.send.latency_ms for the 300 Critical/High first-attempt, non-rate-limited messages is under 2 seconds (per operator answer to p95-metric-scope; under burst, priority queuing ensures Critical/High messages are dispatched first within the target)
     And Normal/Low messages may queue-delay beyond 2 seconds due to priority ordering and Telegram rate limits but are not lost
     And time spent waiting during 429 backoff is tracked via telegram.send.rate_limited_wait_ms for operational diagnostics
 ```
@@ -351,10 +352,23 @@ Feature: Telegram bot command handling
     And the swarm orchestrator is healthy
 
   Scenario: /start registers a new user
-    Given user "new-op" (Telegram user ID "444555666") is in the allowlist but not yet registered
-    When user "new-op" sends "/start" in a private chat
-    Then the gateway registers user "new-op" and maps chat ID to tenant/workspace
-    And the bot replies with a welcome message and command help
+    # Per architecture.md §7.1 and implementation-plan.md Stage 5.2: /start uses
+    # Tier 1 onboarding allowlist (Telegram:AllowedUserIds). The tenant/workspace
+    # binding is sourced from a pre-configured user-to-tenant mapping
+    # (Telegram:UserTenantMappings in app configuration), which maps each allowed
+    # Telegram user ID to a tenant and workspace. /start creates an OperatorBinding
+    # record via IOperatorRegistry.RegisterAsync(userId, chatId, tenantId, workspaceId).
+    # If the user has multiple workspace entries in the mapping, /start creates one
+    # OperatorBinding per workspace; subsequent commands trigger workspace disambiguation
+    # via inline keyboard (per architecture.md §4.3 multi-workspace disambiguation).
+    Given user "new-op" (Telegram user ID "444555666") is in the Telegram:AllowedUserIds allowlist
+    And the app configuration maps user "444555666" to tenant "acme", workspace "factory-1" via Telegram:UserTenantMappings
+    And user "new-op" has not yet registered (no OperatorBinding exists)
+    When user "new-op" sends "/start" in a private chat with chat ID "556677"
+    Then the gateway checks Tier 1 authorization: user ID "444555666" is present in Telegram:AllowedUserIds
+    And the gateway creates an OperatorBinding record via IOperatorRegistry.RegisterAsync(userId=444555666, chatId=556677, tenantId="acme", workspaceId="factory-1")
+    And the bot replies with a welcome message listing available commands
+    And an audit record is persisted with user ID "444555666", chat ID "556677", and registration outcome
 
   Scenario: /status returns swarm summary
     When user "operator-1" sends "/status"
@@ -457,12 +471,21 @@ Feature: Security enforcement for Telegram connector
     Then the gateway rejects the message
     And an audit record is persisted with chat ID and rejection reason
 
-  Scenario: User removed from allowlist mid-session
-    Given user "operator-1" was previously authorized
-    And the allowlist is updated to remove user "operator-1"
+  Scenario: Operator deactivated mid-session via OperatorBinding
+    # Per implementation-plan.md Stage 5.2: runtime authorization (Tier 2) checks
+    # OperatorBinding records via IOperatorRegistry.IsAuthorizedAsync(userId, chatId),
+    # which queries for active bindings (IsActive=true). Removing access mid-session
+    # is modeled by setting OperatorBinding.IsActive=false, not by modifying the
+    # onboarding allowlist (which only gates /start). This ensures the operator's
+    # existing commands are rejected immediately without requiring a /start re-check.
+    Given user "operator-1" was previously authorized with an active OperatorBinding (IsActive=true)
+    And an administrator sets OperatorBinding.IsActive = false for user "operator-1"
     When user "operator-1" sends "/status"
-    Then the gateway rejects the command
+    Then the gateway calls IOperatorRegistry.IsAuthorizedAsync(userId=111222333, chatId=998877)
+    And finds no active OperatorBinding for the (user, chat) pair (IsActive=false)
+    And the gateway rejects the command
     And the bot replies with "Unauthorized – your access has been revoked"
+    And an audit record is persisted with user ID "111222333" and rejection reason "binding_deactivated"
 ```
 
 ---
@@ -546,15 +569,19 @@ Feature: Chat-to-operator-to-tenant routing
     And the bot replies with "Unauthorized – contact your administrator"
     And an audit record is persisted with user ID "999000111", group chat ID "group-777", and rejection reason
 
-  Scenario: Group-chat inline button tap is authorized by tapping user_id
-    # Per tech-spec.md S-5: button taps in groups are authorized by user_id.
+  Scenario: Group-chat inline button tap is authorized by (user, chat) OperatorBinding pair
+    # Per architecture.md §7.1 and tech-spec.md S-5: button taps in groups are
+    # authorized by the tapping user's (TelegramUserId, TelegramChatId) binding
+    # pair via IOperatorRegistry.IsAuthorizedAsync, consistent with the group-chat
+    # command scenario above. The OperatorBinding table is the runtime allowlist.
     Given an AgentQuestion "Q-7001" is displayed in group chat "group-777"
-    And user "stranger" (user ID "999000111") is NOT in the allowlist
+    And user "stranger" (user ID "999000111") does NOT have an OperatorBinding record for TelegramChatId "group-777"
     When user "stranger" taps the "Approve" inline button for question "Q-7001" in group chat "group-777"
-    Then the gateway rejects the button tap using user ID "999000111" against the allowlist
+    Then the gateway calls IOperatorRegistry.IsAuthorizedAsync(userId=999000111, chatId=group-777)
+    And finds no matching OperatorBinding for the (user, chat) pair
     And no HumanDecisionEvent is published
     And the bot sends a callback answer "Unauthorized"
-    And an audit record is persisted with user ID "999000111" and rejection reason
+    And an audit record is persisted with user ID "999000111", group chat ID "group-777", and rejection reason
 ```
 
 ---
@@ -591,8 +618,8 @@ Feature: Observability integration
     Given the outbound queue processes messages
     Then the following metrics are emitted via OpenTelemetry:
       | Metric                                   | Type      | Source                                                      |
-      | telegram.send.latency_ms                 | histogram | architecture.md §10.4 and tech-spec.md HC-4: primary all-inclusive metric (all sends regardless of attempt number or rate-limit holds — monitoring) |
-      | telegram.send.first_attempt_latency_ms   | histogram | tech-spec.md HC-4: diagnostic metric for first-attempt, non-rate-limited successes only — P95 ≤ 2s acceptance gate |
+      | telegram.send.latency_ms                 | histogram | tech-spec.md HC-4: primary acceptance gate metric (first-attempt, non-rate-limited sends only — P95 ≤ 2s) |
+      | telegram.send.all_attempts_latency_ms    | histogram | tech-spec.md HC-4: all-inclusive diagnostic metric (all sends regardless of attempt number or rate-limit holds — capacity planning) |
       | telegram.send.retry_latency_ms           | histogram | architecture.md §10.4 diagnostic (retried sends)            |
       | telegram.send.rate_limited_wait_ms       | histogram | architecture.md §10.4 rate-limit tracking                   |
       | telegram.updates.received             | counter   | §8 metrics table               |
