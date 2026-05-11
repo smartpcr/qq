@@ -61,9 +61,9 @@ Feature: Agent blocking question delivered to Telegram
     # ProposedDefaultActionId from the envelope, denormalizes it into
     # PendingQuestionRecord.DefaultActionId, displays the default in the message
     # body, and applies it on timeout.
-    # Note: tech-spec.md Section 10 alignment table still marks DefaultAction
-    # placement as UNRESOLVED; the behavioral contract tested here is identical
-    # under either model-property or envelope-sidecar approach.
+    # All sibling documents (tech-spec.md Section 10, architecture.md §3.1,
+    # implementation-plan.md Stage 1.2) mark DefaultAction placement as RESOLVED
+    # and consistently adopt the sidecar envelope model.
     Given agent "arch-agent-7" publishes an agent question with the following data:
       | Field                    | Value                                              |
       | QuestionId               | Q-1001                                             |
