@@ -166,7 +166,7 @@ The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplica
 
 #### AgentQuestion (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
-The shared `AgentQuestion` model represents a blocking question from an agent to a human operator. The shared model does **not** include a `DefaultAction` property. The story requirement for "proposed default action" is satisfied connector-side: the proposed default action is provided as metadata alongside the question (e.g., via agent/command context or sidecar payload), not as a first-class shared property. The Telegram connector determines the `DefaultActionId` at send time and stores it in `PendingQuestionRecord.DefaultActionId` for efficient timeout polling (see below). This design aligns with e2e-scenarios.md, which documents the same model choice.
+The shared `AgentQuestion` model represents a blocking question from an agent to a human operator. The shared model **includes** a nullable `DefaultAction` property (`string?`) — the `ActionId` of the proposed default action from `AllowedActions`. This is a first-class shared field, not connector-specific metadata. When the question times out, the connector applies this action automatically; when `null`, no automatic default is applied and the question expires with `ActionValue = "__timeout__"`.
 
 | Field | Type | Description |
 |---|---|---|
@@ -177,10 +177,13 @@ The shared `AgentQuestion` model represents a blocking question from an agent to
 | `Body` | `string` | Full context for the operator. |
 | `Severity` | `string` | `Critical`, `High`, `Normal`, `Low`. |
 | `AllowedActions` | `HumanAction[]` | Buttons to render. |
+| `DefaultAction` | `string?` | Nullable. The `ActionId` of the proposed default action from `AllowedActions`. When the question times out, the connector applies this action automatically. When `null`, the question expires with `ActionValue = "__timeout__"` and no automatic decision is applied. |
 | `ExpiresAt` | `DateTimeOffset` | Timeout deadline. |
 | `CorrelationId` | `string` | Trace ID. |
 
-> **Default action flow.** The proposed default action is not carried on the shared `AgentQuestion` model. Instead, it is provided as sidecar metadata in the agent/command context (e.g., a `ProposedDefaultActionId` field in the event envelope or routing metadata). When the Telegram connector renders an `AgentQuestion` as an inline-keyboard message, it reads the proposed default action from the context metadata and, when present, displays it in the message body (e.g., "Default action if no response: Approve") and stores the `ActionId` in `PendingQuestionRecord.DefaultActionId` (see below). This enables `QuestionTimeoutService` to poll for expired questions and resolve the default without re-fetching the full `AgentQuestion` or its metadata. The full `HumanAction` is resolved from `IDistributedCache` at timeout. When no proposed default action is provided in the metadata, `PendingQuestionRecord.DefaultActionId` is `null`, the question expires with a `__timeout__` action value, and no automatic decision is applied.
+> **Default action flow.** The proposed default action is carried on the shared `AgentQuestion.DefaultAction` property as a nullable `string?`. When the Telegram connector renders an `AgentQuestion` as an inline-keyboard message, it reads `AgentQuestion.DefaultAction` and, when present, displays the proposed default in the message body (e.g., "Default action if no response: Approve") and denormalizes the `ActionId` into `PendingQuestionRecord.DefaultActionId` for efficient timeout polling (see below). This enables `QuestionTimeoutService` to poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the full `AgentQuestion`. The full `HumanAction` is resolved from `IDistributedCache` at timeout. When `AgentQuestion.DefaultAction` is `null`, `PendingQuestionRecord.DefaultActionId` is also `null`, the question expires with a `__timeout__` action value, and no automatic decision is applied.
+>
+> **Cross-doc alignment:** This definition aligns with implementation-plan.md Stage 1.2 (line 36: `AgentQuestion` includes nullable `DefaultAction`), Stage 2.4 (line 142: reads `AgentQuestion.DefaultAction` at render time), Stage 3.5 (line 270: denormalizes into `PendingQuestionRecord.DefaultActionId`), e2e-scenarios.md (lines 57–61: shared model includes nullable `DefaultAction`), and tech-spec.md HC-3.
 
 #### PendingQuestionRecord (Telegram-specific — to be defined in planned `AgentSwarm.Messaging.Telegram`)
 
@@ -191,7 +194,7 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `QuestionId` | `string` | Foreign key to the `AgentQuestion.QuestionId` this record tracks. Primary key. |
 | `ChatId` | `long` | Telegram chat the question was sent to. |
 | `TelegramMessageId` | `int` | Telegram `message_id` of the sent inline-keyboard message. |
-| `DefaultActionId` | `string?` | Determined by the Telegram connector at question-send time from the agent/command context metadata's proposed default action. Stored here so that `QuestionTimeoutService` can poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the original context. When present, the timeout service resolves the full `HumanAction` and applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
+| `DefaultActionId` | `string?` | Denormalized from `AgentQuestion.DefaultAction` at question-send time. Stored here so that `QuestionTimeoutService` can poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the full `AgentQuestion`. When present, the timeout service resolves the full `HumanAction` and applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
 | `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
 | `Status` | `enum` | `Pending`, `Answered`, `TimedOut`. |
 | `CreatedAt` | `DateTimeOffset` | When the question was sent to Telegram. |
@@ -220,12 +223,27 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `Id` | `Guid` | Primary key. |
 | `MessageId` | `string` | Telegram `message_id` or internal ID. |
 | `UserId` | `string` | Telegram user ID. |
+| `OperatorBindingId` | `string` | FK to `OperatorBinding.Id`. Unambiguously identifies the operator binding (a user may have multiple bindings across workspaces). |
+| `TelegramChatId` | `long` | Telegram chat ID where the action occurred. Disambiguates multi-workspace and group-chat contexts. |
+| `WorkspaceId` | `string` | Tenant/workspace the action applies to. Derived from the `OperatorBinding`. |
 | `AgentId` | `string` | Target or source agent. |
 | `Action` | `string` | Command or decision value. |
 | `Timestamp` | `DateTimeOffset` | UTC. |
 | `CorrelationId` | `string` | Trace ID. |
 | `TenantId` | `string` | Operator's tenant. |
 | `RawPayload` | `string` | Serialized original message for forensics. |
+
+#### TaskOversight
+
+Tracks which operator currently has oversight of which task. Created/updated by the `/handoff` command handler. Also used by the orchestrator subscription filter to route agent events to the correct operator.
+
+| Field | Type | Description |
+|---|---|---|
+| `TaskId` | `string` | Primary key. The task being overseen. |
+| `OperatorBindingId` | `string` | FK to `OperatorBinding.Id`. The operator who currently has oversight. |
+| `AssignedAt` | `DateTimeOffset` | When oversight was assigned or last transferred. |
+| `AssignedBy` | `string` | The operator who initiated the handoff (their `OperatorBinding.Id`). |
+| `CorrelationId` | `string` | Trace ID for the handoff action. |
 
 ### 3.2 Entity Relationships
 
@@ -238,10 +256,12 @@ OutboundMessage        (alerts, acks, status updates have no AgentQuestion relat
 InboundUpdate   1──0..1 HumanDecisionEvent (for callback queries; linked by processing context,
                                             not a direct FK — the update triggers the event)
 PendingQuestionRecord *──1 AgentQuestion   (via PendingQuestionRecord.QuestionId = AgentQuestion.QuestionId)
-AuditRecord     *──1 OperatorBinding       (via AuditRecord.UserId = OperatorBinding.TelegramUserId;
-                                            the operator is identified by their Telegram user ID)
+AuditRecord     *──1 OperatorBinding       (via AuditRecord.OperatorBindingId = OperatorBinding.Id;
+                                            unambiguous FK — not just UserId, which can have multiple bindings)
 AuditRecord     *──0..1 AgentQuestion      (via AuditRecord.CorrelationId; joins through the
                                             correlation context, not a direct FK)
+TaskOversight   *──1 OperatorBinding       (via TaskOversight.OperatorBindingId = OperatorBinding.Id;
+                                            tracks which operator currently oversees the task)
 ```
 
 ---
@@ -402,7 +422,7 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 ```
 
 **Key invariants:**
-1. The question includes `Severity`, `ExpiresAt`, and `AllowedActions` rendered as inline keyboard buttons. The proposed default action is **not** a property of the shared `AgentQuestion` model — it is provided as sidecar metadata in the agent/command context. When the connector builds the inline keyboard, it reads the proposed default action from the context metadata and creates a `PendingQuestionRecord` with `DefaultActionId` set from the metadata for efficient timeout polling.
+1. The question includes `Severity`, `ExpiresAt`, `DefaultAction`, and `AllowedActions` rendered as inline keyboard buttons. The proposed default action is a first-class property of the shared `AgentQuestion` model (`AgentQuestion.DefaultAction`). When the connector builds the inline keyboard, it reads `AgentQuestion.DefaultAction` and creates a `PendingQuestionRecord` with `DefaultActionId` denormalized from that property for efficient timeout polling.
 2. The `callback_data` field carries `QuestionId:ActionId` (≤ 64 bytes). `ActionId` is a short key that maps to the full `HumanAction` payload stored server-side in `IDistributedCache` (see tech-spec D-3). The cache entry is written when the inline keyboard is built and expires at `AgentQuestion.ExpiresAt`.
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string.
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
@@ -427,9 +447,12 @@ OutboundQueue         TelegramSender         Telegram API         DeadLetterQueu
       │◀──markFailed(2)─────│                     │                      │                    │
       │   nextRetry=now+4s  │                     │                      │                    │
       │                     │                     │                      │                    │
-      │  ... (attempt 3 fails similarly) ...     │                      │                    │
+      │  ... (attempts 3 and 4 fail similarly) ...│                      │                    │
       │                     │                     │                      │                    │
-      │──attempt 3 fails───▶│                     │                      │                    │
+      │──dequeue msg────────▶                     │                      │                    │
+      │                     │──sendMessage────────▶│                      │                    │
+      │                     │◀──500 Server Error──│                      │                    │
+      │◀──markFailed(5)─────│                     │                      │                    │
       │──deadLetter─────────▶─────────────────────▶──────────────────────▶│                    │
       │                     │                     │                      │──alert operator────▶│
 ```
@@ -499,7 +522,7 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 > 6. Persists an audit record with handoff details (task ID, source operator, target operator, timestamp, `CorrelationId`).
 > 7. Returns error for invalid task ID, unregistered target operator, or missing arguments with usage help.
 >
-> **`TaskOversight` entity (to be created):** A lightweight entity mapping `(TaskId, OperatorBindingId)` to track which operator currently has oversight of which task. This entity is referenced by the `/handoff` handler and is also used by the orchestrator subscription filter to route agent events to the correct operator. Fields: `TaskId` (PK), `OperatorBindingId` (FK to `OperatorBinding.Id`), `AssignedAt` (DateTimeOffset), `AssignedBy` (string — the operator who initiated the handoff), `CorrelationId`.
+> **`TaskOversight` entity:** Defined in §3.1 above. A lightweight entity mapping `(TaskId, OperatorBindingId)` to track which operator currently has oversight of which task. The `/handoff` handler creates or updates this record, and the orchestrator subscription filter reads it to route agent events to the correct operator.
 >
 > **Cross-doc alignment note:** All four sibling documents are now aligned on full oversight transfer as the decided `/handoff` behavior. Implementation-plan.md Stage 3.2 specifies `HandoffCommandHandler` with full oversight transfer including validation, target resolution via `IOperatorRegistry.GetByAliasAsync`, `TaskOversight` record mutation, dual-operator notification, and audit. E2e-scenarios.md tests the full transfer flow. Tech-spec D-4 documents the decision. The `OperatorBinding.OperatorAlias` unique index supports alias resolution for the target operator lookup.
 
@@ -624,7 +647,7 @@ Both modes feed into the same `ITelegramUpdatePipeline`, so all downstream logic
 ### 10.3 Question Timeout Handling
 
 A `QuestionTimeoutService` (BackgroundService) polls for `PendingQuestionRecord` entries with `Status = Pending` past their `ExpiresAt`. When a question times out:
-1. Reads `PendingQuestionRecord.DefaultActionId`. If present, resolves the full `HumanAction` from `IDistributedCache` and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
+1. Reads `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestion.DefaultAction` at send time). If present, resolves the full `HumanAction` from `IDistributedCache` and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
 2. Updates the original Telegram message (using `PendingQuestionRecord.TelegramMessageId`) to indicate the timeout ("⏰ Timed out — default action applied: *skip*" or "⏰ Timed out — no default action").
 3. Sets `PendingQuestionRecord.Status = TimedOut`.
 4. Writes an audit record noting the timeout.
@@ -637,11 +660,13 @@ The 2-second P95 send-latency target and the 100+ agent burst requirement demand
 
 The story requires "P95 send latency under 2 seconds after event is queued." This architecture defines two complementary latency metrics:
 
-> **`telegram.send.latency_ms`** (primary) = elapsed time from `OutboundMessage.CreatedAt` (enqueue instant) to Telegram Bot API returning HTTP 200 (acceptance), measured for **all** messages regardless of attempt number or rate-limit holds. This is the metric the P95 ≤ 2s acceptance criterion applies to.
+> **`telegram.send.latency_ms`** (primary) = elapsed time from `OutboundMessage.CreatedAt` (enqueue instant) to Telegram Bot API returning HTTP 200 (acceptance), measured only for messages that **succeed on their first delivery attempt** and are **not waiting behind a 429 rate-limit hold**. This is the metric the P95 ≤ 2s acceptance criterion applies to.
 >
-> **`telegram.send.first_attempt_latency_ms`** (diagnostic) = same measurement but filtered to messages that succeed on their first delivery attempt without rate-limit waits. This diagnostic metric isolates the system's inherent latency from external factors.
+> **`telegram.send.all_attempts_latency_ms`** (diagnostic) = same measurement but including all messages regardless of attempt number or rate-limit holds. This broader metric captures overall system behavior including retries and rate-limit delays.
 
-The 2-second P95 target applies to the primary `telegram.send.latency_ms` metric, which includes all sends. This is the strictest reading of the story requirement and ensures the system is designed to meet the target under normal operating conditions — where the vast majority of sends succeed on first attempt and are not rate-limited. Under extreme burst conditions (100+ agents simultaneously), the priority queuing design ensures Critical/High messages are dispatched first and meet the 2-second target, while lower-priority messages may queue-delay beyond 2 seconds. Rate-limited wait time and retry latency are additionally tracked via `telegram.send.rate_limited_wait_ms` and `telegram.send.retry_latency_ms` for operational diagnostics.
+The 2-second P95 target applies to the primary `telegram.send.latency_ms` metric, which is scoped to first-attempt, non-rate-limited successes. Messages that are retried (attempts > 1) or rate-limited are tracked separately via `telegram.send.retry_latency_ms` and `telegram.send.rate_limited_wait_ms`. This scoping ensures the P95 target measures the system's inherent latency under normal operating conditions. Under extreme burst conditions (100+ agents simultaneously), the priority queuing design ensures Critical/High messages are dispatched first and meet the 2-second target on first attempt, while lower-priority messages may queue-delay beyond 2 seconds.
+
+> **Cross-doc alignment:** This metric scoping aligns with tech-spec.md HC-4/R-1 (first-attempt, non-rate-limited sends) and e2e-scenarios.md (lines 257–281: P95 assertion scoped to first-attempt successes).
 
 #### Queue Processor Concurrency
 
@@ -663,7 +688,7 @@ The `TelegramSender` enforces Telegram Bot API rate limits via a dual-layer toke
 1. **Global limiter** — `Telegram:RateLimits:GlobalPerSecond` (default `30`). Applies across all chats. When exhausted, workers block and wait for a token rather than issuing requests that will be 429'd.
 2. **Per-chat limiter** — `Telegram:RateLimits:PerChatPerMinute` (default `20`). Prevents flooding a single operator's chat.
 
-When the Telegram API returns `429 Too Many Requests`, the sender reads the `retry_after` header and pauses the affected worker for that duration. Rate-limited wait time is included in the primary `telegram.send.latency_ms` metric (which the P95 target applies to) and additionally tracked separately via `telegram.send.rate_limited_wait_ms` for operational diagnostics.
+When the Telegram API returns `429 Too Many Requests`, the sender reads the `retry_after` header and pauses the affected worker for that duration. Rate-limited wait time is excluded from the primary `telegram.send.latency_ms` metric (which is scoped to first-attempt, non-rate-limited sends) and tracked separately via `telegram.send.rate_limited_wait_ms` for operational diagnostics.
 
 #### Burst Scenario (100+ Agents)
 
@@ -672,7 +697,7 @@ Under a burst of 1 000+ simultaneous agent events:
 1. **Enqueue**: Events are written to the durable outbox store immediately (sub-millisecond per insert, batched where possible). Each event is tagged with its severity.
 2. **Priority drain**: The 10 concurrent processor workers dequeue by severity priority. Critical/High messages (typically < 10% of burst volume — blocking questions, approval requests) are processed first and reach the Telegram API within the 2-second window.
 3. **Multi-chat fan-out**: In production, 100+ agents typically span multiple tenants/workspaces, routing to multiple operator chats. The per-chat rate limit (20 msg/min) constrains individual operators, but the global rate limit (30 msg/s) applies across all chats. With messages distributed across N operator chats, effective throughput is `min(30, N × 20/60)` msg/s. For 10+ operator chats, the global limit of 30 msg/s is the binding constraint.
-4. **Throughput**: At 30 msg/s sustained, a burst of 1 000 messages drains in ~34 seconds. With priority queuing, the ~50 Critical/High messages in the burst are processed in the first ~2 seconds. The P95 target of 2 seconds applies to all sends (see §10.4 P95 Metric Definition): under normal conditions the vast majority succeed on first attempt and comfortably meet the target; under extreme burst, priority queuing ensures Critical/High messages are dispatched within the window. The e2e-scenarios burst test asserts zero message loss and bounded drain time.
+4. **Throughput**: At 30 msg/s sustained, a burst of 1 000 messages drains in ~34 seconds. With priority queuing, the ~50 Critical/High messages in the burst are processed in the first ~2 seconds. The P95 target of 2 seconds applies to first-attempt, non-rate-limited sends (see §10.4 P95 Metric Definition): under normal conditions the vast majority succeed on first attempt and comfortably meet the target; under extreme burst, priority queuing ensures Critical/High messages are dispatched within the window. The e2e-scenarios burst test asserts zero message loss and bounded drain time.
 5. **Backpressure**: If queue depth exceeds `MaxQueueDepth`, low-severity messages are dead-lettered immediately with reason `backpressure:queue_depth_exceeded` (see §10.4 table) and a `telegram.messages.backpressure_dlq` counter is incremented. An alert is sent to the ops channel. Critical, High, and Normal messages are always accepted.
 6. **Zero loss guarantee**: All messages are either delivered or dead-lettered with a traceable reason — zero silent loss (per e2e-scenarios burst test). Dead-lettered messages (whether from retry exhaustion or backpressure) are available for manual replay.
 
