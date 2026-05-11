@@ -98,17 +98,30 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 
 #### OperatorBinding
 
-Links a Telegram identity to the swarm's authorization model.
+Links a Telegram identity to the swarm's authorization model. Each row represents one (user, chat, workspace) binding, supporting multi-chat and multi-workspace scenarios described in e2e-scenarios (§Agent Routing and Tenant Mapping).
 
 | Field | Type | Description |
 |---|---|---|
-| `TelegramUserId` | `long` | Telegram's unique user identifier. Primary key. |
-| `TelegramChatId` | `long` | Chat/group where commands are accepted. |
+| `Id` | `Guid` | Surrogate primary key. |
+| `TelegramUserId` | `long` | Telegram's unique user identifier. |
+| `TelegramChatId` | `long` | Telegram chat ID (private chat or group). |
+| `ChatType` | `enum` | `Private`, `Group`, `Supergroup`. Used for group attribution logic: commands in groups are attributed to the sending `TelegramUserId`, not the group `TelegramChatId`. |
+| `OperatorAlias` | `string` | Human-readable alias (e.g., `@operator-1`) used in `/handoff TASK-ID @alias` lookups. |
 | `TenantId` | `string` | Swarm tenant this operator belongs to. |
-| `WorkspaceId` | `string` | Workspace within the tenant. |
+| `WorkspaceId` | `string` | Workspace within the tenant. One operator may have bindings in multiple workspaces; when a command is ambiguous, the bot presents an inline keyboard for workspace disambiguation (per e2e-scenarios). |
 | `Roles` | `string[]` | `Operator`, `Approver`, `Admin`. |
 | `RegisteredAt` | `DateTimeOffset` | When `/start` was executed. |
 | `IsActive` | `bool` | Soft-disable without deleting. |
+
+**Constraints:**
+- `UNIQUE (TelegramUserId, TelegramChatId, WorkspaceId)` — prevents duplicate bindings.
+- Composite index on `(TelegramUserId, TelegramChatId)` — used for authorization lookups (validates the chat/user pair).
+- Index on `OperatorAlias` — used for `/handoff` target resolution.
+
+**Cardinality examples:**
+- 1:1 chat, single workspace: one row per operator.
+- 1:1 chat, multiple workspaces: multiple rows with same `(UserId, ChatId)` but different `WorkspaceId`.
+- Group chat: rows for each authorized operator in the group, with `ChatType = Group`. Commands are attributed to `TelegramUserId`; unauthorized users in the same group are rejected.
 
 #### InboundUpdate (deduplication record)
 
@@ -358,8 +371,8 @@ OutboundQueue         TelegramSender         Telegram API         DeadLetterQueu
 ```
 
 **Retry policy (configurable via `OutboundQueue:MaxRetries` and `OutboundQueue:BaseRetryDelaySeconds`):**
-- Max attempts: configurable (default `3`, aligning with e2e-scenarios which test dead-letter after 3 failed attempts)
-- Back-off: exponential (`BaseRetryDelaySeconds` ^ attempt, e.g. 2s, 4s, 8s) with jitter (±25%)
+- Max attempts: configurable (default `5`, aligning with e2e-scenarios which test dead-letter after 5 failed attempts and implementation-plan `RetryPolicy.MaxAttempts` default of 5)
+- Back-off: exponential (`BaseRetryDelaySeconds` ^ attempt, e.g. 2s, 4s, 8s, 16s, 30s capped) with jitter (±25%)
 - Retryable errors: HTTP 429 (with `retry_after`), 5xx, network timeouts
 - Non-retryable: HTTP 400 (bad request), 403 (bot blocked) — dead-letter immediately
 - Dead-letter record preserves full message payload, all attempt timestamps, and error details
@@ -464,7 +477,7 @@ AgentSwarm.Messaging.sln  (to be created)
 | `Telegram:AllowedChatIds` | App configuration | Comma-separated allowlist. Evaluated by `AuthZ Service`. |
 | `Telegram:RateLimits:GlobalPerSecond` | App configuration | Default `30`. |
 | `Telegram:RateLimits:PerChatPerMinute` | App configuration | Default `20`. |
-| `OutboundQueue:MaxRetries` | App configuration | Default `3` (aligned with e2e-scenarios). |
+| `OutboundQueue:MaxRetries` | App configuration | Default `5` (aligned with e2e-scenarios and implementation-plan `RetryPolicy.MaxAttempts`). |
 | `OutboundQueue:BaseRetryDelaySeconds` | App configuration | Default `2`. |
 | `OutboundQueue:ProcessorConcurrency` | App configuration | Default `10`. Number of concurrent send workers. |
 | `OutboundQueue:MaxQueueDepth` | App configuration | Default `5000`. Backpressure threshold for low-severity shedding. |
