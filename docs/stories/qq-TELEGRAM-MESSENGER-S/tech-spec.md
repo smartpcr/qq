@@ -1,7 +1,7 @@
 # Technical Specification — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S` · 13 SP
-**Status:** Draft — Iteration 1
+**Status:** Draft — Iteration 2
 **Last updated:** 2026-05-11
 
 ---
@@ -21,10 +21,10 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 | # | Area | Detail |
 |---|------|--------|
 | S-1 | **Telegram Bot API integration** | HTTPS transport via `Telegram.Bot` NuGet package. Webhook receive in production; long-polling receive in dev/local. |
-| S-2 | **Command handling** | `/start`, `/status`, `/agents`, `/ask`, `/approve`, `/reject`, `/handoff`, `/pause`, `/resume` — parsed, validated, and dispatched to the Agent Swarm Orchestrator. |
+| S-2 | **Command handling** | `/start`, `/status`, `/agents`, `/ask`, `/approve`, `/reject`, `/handoff`, `/pause`, `/resume` — parsed, validated, and dispatched to the Agent Swarm Orchestrator. `/handoff TASK-ID @operator-alias` transfers human oversight of the specified task to the target operator. |
 | S-3 | **Agent-to-human questions** | Render `AgentQuestion` as Telegram messages with inline keyboard buttons for each `HumanAction`. Include context, severity, timeout, and proposed default action in the message body. |
 | S-4 | **Strongly typed decision events** | Button taps and text replies are converted to `HumanDecisionEvent` and published to the orchestrator. |
-| S-5 | **Operator identity mapping** | Map Telegram `chat_id` + `user_id` to an authorized operator record with tenant/workspace binding. Reject unmapped users. |
+| S-5 | **Operator identity mapping** | Map Telegram `chat_id` + `user_id` to an authorized operator record with tenant/workspace binding. Reject unmapped users. Applies in both 1:1 and group-chat contexts — commands in groups are attributed to the sending `user_id`, not the group `chat_id`. |
 | S-6 | **Durable outbound queue** | Persistent queue (outbox pattern) with retry, exponential back-off, deduplication, and dead-letter queue for Telegram API sends. |
 | S-7 | **Webhook idempotency** | Deduplicate inbound webhook deliveries by `update_id` to prevent double command execution. |
 | S-8 | **Secret management** | Bot token retrieved from Azure Key Vault (or Kubernetes secret / DPAPI in dev). Token never logged or serialized to telemetry. |
@@ -42,7 +42,7 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 | O-2 | Messenger Gateway host process | Assumed to exist as an ASP.NET Core Worker Service; this story contributes the Telegram adapter, not the host. |
 | O-3 | Agent Swarm Orchestrator internals | We consume its API surface; we do not modify it. |
 | O-4 | Bot registration / BotFather setup | Operational runbook, not code. Document the required steps in a companion ops guide. |
-| O-5 | Group-chat moderation or multi-user threads | V1 targets 1:1 bot conversations per operator. Group chat is a follow-on. |
+| O-5 | Group-chat moderation features | V1 supports basic group-chat operation (allowlist enforcement per `user_id`, command attribution to the sending operator, unauthorized-button rejection) as defined in e2e-scenarios.md. Full group-moderation features (thread management, role-based visibility, per-group notification preferences) are follow-on. |
 | O-6 | Media attachments (images, files) | Text and inline-button interactions only in V1. |
 | O-7 | Telegram Payments or inline-query mode | Not relevant to operator workflows. |
 | O-8 | Custom Telegram Bot API server (tdlib) | We use the official cloud Bot API endpoint. |
@@ -111,10 +111,10 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 
 | # | Decision | Options | Recommendation | Status |
 |---|----------|---------|----------------|--------|
-| D-1 | Durable outbox backing store | (a) Database table (EF Core), (b) Azure Service Bus, (c) In-process only | **(a) Database table** — no external queue dependency; works in dev and prod; pairs with the existing persistence project `AgentSwarm.Messaging.Persistence`. | Proposed |
+| D-1 | Durable outbox backing store | (a) Database table (EF Core), (b) Azure Service Bus, (c) In-process only | **(a) Database table** — no external queue dependency; works in dev and prod. The outbox table will be defined in the `AgentSwarm.Messaging.Persistence` project recommended by the epic solution structure (to be created as part of implementation). | Proposed |
 | D-2 | Deduplication store for `update_id` | (a) In-memory concurrent dictionary with TTL, (b) Database table, (c) Redis | **(a) In-memory** for single-instance dev, **(b) Database** for multi-instance prod. Configuration-driven. | Proposed |
 | D-3 | Callback data storage for inline buttons | (a) Server-side cache (IDistributedCache), (b) Database table | **(a) IDistributedCache** — low latency, auto-expiry, aligns with `AgentQuestion.ExpiresAt`. | Proposed |
-| D-4 | `/handoff` command semantics | (a) Transfer conversation to another operator, (b) Transfer task to a different agent | Need story-owner clarification. See open questions. | **Open** |
+| D-4 | `/handoff` command semantics | (a) Transfer human oversight of a task to another operator, (b) Transfer task to a different agent | **(a) Transfer human oversight to another operator.** Syntax: `/handoff TASK-ID @operator-alias`. The swarm reassigns the human-oversight binding for the given task to the target operator and sends confirmation messages to both parties. Aligned with the scenario defined in e2e-scenarios.md. | Decided |
 
 ---
 
@@ -143,4 +143,4 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 
 ---
 
-*Cross-references: architecture.md (component diagram), implementation-plan.md (task breakdown), e2e-scenarios.md (acceptance test scripts). These sibling documents are produced in parallel — iteration 1 may not yet exist.*
+*Cross-references: [architecture.md](architecture.md) (component diagram), [implementation-plan.md](implementation-plan.md) (task breakdown), [e2e-scenarios.md](e2e-scenarios.md) (acceptance test scripts).*
