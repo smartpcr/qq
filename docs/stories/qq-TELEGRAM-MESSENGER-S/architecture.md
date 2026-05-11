@@ -137,7 +137,7 @@ Links a Telegram identity to the swarm's authorization model. Each row represent
 | Field | Type | Description |
 |---|---|---|
 | `MessageId` | `Guid` | Internal unique identifier. Primary key. |
-| `IdempotencyKey` | `string` | Deterministic key derived from `(AgentId, QuestionId, CorrelationId)`. Prevents duplicate sends. |
+| `IdempotencyKey` | `string` | Deterministic key preventing duplicate sends. Derivation depends on message origin — see below. |
 | `ChatId` | `long` | Target Telegram chat. |
 | `Payload` | `string` | Serialized message content (MarkdownV2 text + optional inline keyboard JSON). |
 | `Severity` | `enum` | `Critical`, `High`, `Normal`, `Low`. Determines priority queue ordering. |
@@ -148,7 +148,20 @@ Links a Telegram identity to the swarm's authorization model. Each row represent
 | `SentAt` | `DateTimeOffset?` | Telegram confirmation time. |
 | `TelegramMessageId` | `int?` | Telegram's returned `message_id` on success. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
+| `SourceType` | `enum` | `Question`, `Alert`, `StatusUpdate`, `CommandAck`. Discriminator for origin type. |
+| `SourceId` | `string?` | The `QuestionId` for question messages; alert rule ID for alerts; command correlation ID for acks. Null only for fire-and-forget status broadcasts. |
 | `ErrorDetail` | `string?` | Last error message for diagnostics. |
+
+**Idempotency key derivation by `SourceType`:**
+
+| SourceType | IdempotencyKey formula | Example |
+|---|---|---|
+| `Question` | `q:{AgentId}:{QuestionId}` | `q:build-agent-3:Q-42` |
+| `Alert` | `a:{AgentId}:{CorrelationId}` | `a:monitor-1:trace-abc` |
+| `StatusUpdate` | `s:{AgentId}:{CorrelationId}` | `s:deploy-2:trace-def` |
+| `CommandAck` | `c:{CorrelationId}` | `c:trace-ghi` |
+
+The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplicate enqueue regardless of message origin. For question messages, the key includes `QuestionId` so re-delivery of the same agent question is deduplicated. For non-question messages (alerts, acks, status updates), the key is derived from the correlation context, ensuring each distinct event produces exactly one outbound message.
 
 #### AgentQuestion (shared model — defined in `AgentSwarm.Messaging.Abstractions`)
 
@@ -164,6 +177,8 @@ Links a Telegram identity to the swarm's authorization model. Each row represent
 | `ExpiresAt` | `DateTimeOffset` | Timeout; after which `DefaultAction` fires. |
 | `DefaultAction` | `string` | Action value applied on timeout. |
 | `CorrelationId` | `string` | Trace ID. |
+
+> **`DefaultAction` extension note.** The epic attachment's `AgentQuestion` record does not include `DefaultAction`. The story explicitly requires "proposed default action" on agent questions, so `DefaultAction` is an extension to the shared model added in this story's `AgentSwarm.Messaging.Abstractions` package. It is represented as a nullable `string` matching one of the `HumanAction.Value` entries in `AllowedActions`. When present, the timeout handler in `QuestionTimeoutService` applies this action automatically if the operator does not respond before `ExpiresAt`. When absent (`null`), the question expires without an automatic decision and the agent is notified of timeout via a `HumanDecisionEvent` with `ActionValue = "__timeout__"`.
 
 #### HumanDecisionEvent (shared model)
 
@@ -197,8 +212,9 @@ Links a Telegram identity to the swarm's authorization model. Each row represent
 ```text
 OperatorBinding *──* InboundUpdate     (via TelegramUserId; one operator may have multiple bindings)
 OperatorBinding *──* OutboundMessage   (via ChatId; resolved through tenant/workspace routing)
-OutboundMessage *──1 AgentQuestion     (via IdempotencyKey containing QuestionId)
-InboundUpdate   1──1 HumanDecisionEvent (for callback queries)
+OutboundMessage *──0..1 AgentQuestion   (via SourceId when SourceType = Question)
+OutboundMessage        (alerts, acks, status updates have no AgentQuestion relationship)
+InboundUpdate   1──0..1 HumanDecisionEvent (for callback queries)
 AuditRecord     *──1 OperatorBinding   (via UserId + ChatId)
 AuditRecord     *──1 AgentQuestion     (via CorrelationId)
 ```
@@ -227,12 +243,13 @@ public interface IMessengerConnector
 ```csharp
 public interface ITelegramUpdatePipeline
 {
-    /// Returns false if the update was a duplicate or unauthorized.
-    Task<bool> ProcessAsync(Update update, CancellationToken ct);
+    /// Processes a mapped MessengerEvent through dedup, allowlist, dispatch.
+    /// Returns false if the event was a duplicate or unauthorized.
+    Task<bool> ProcessAsync(MessengerEvent messengerEvent, CancellationToken ct);
 }
 ```
 
-Called by both the webhook controller and the long-poll receiver, ensuring a single processing path.
+Both the webhook controller and long-poll receiver first map the raw Telegram `Update` to a `MessengerEvent` using `TelegramUpdateMapper`, then pass the result to `ProcessAsync`. This boundary aligns with implementation-plan Stage 2.5 and keeps `ITelegramUpdatePipeline` transport-agnostic — the pipeline never sees a Telegram-specific `Update` object.
 
 ### 4.3 IOperatorRegistry
 
@@ -434,7 +451,7 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 > 4. An audit record is persisted with handoff details, both operator IDs, and `CorrelationId`.
 > 5. If `TASK-ID` is invalid: "Task NONEXISTENT not found". If `@operator-alias` is unregistered: "Operator @unknown-user is not registered".
 >
-> This aligns with e2e-scenarios §Bot Command Suite which specifies the full transfer flow. Note: tech-spec D-4 still marks this as open; that document should align in its next iteration.
+> This aligns with tech-spec D-4 (status: Decided — transfer human oversight) and e2e-scenarios §Bot Command Suite which specifies the full transfer flow including Gherkin scenarios for valid transfer, invalid task ID, and unknown operator alias.
 
 ---
 
@@ -492,7 +509,7 @@ AgentSwarm.Messaging.sln  (to be created)
 | `OutboundQueue:MaxRetries` | App configuration | Default `5` (aligned with e2e-scenarios and implementation-plan `RetryPolicy.MaxAttempts`). |
 | `OutboundQueue:BaseRetryDelaySeconds` | App configuration | Default `2`. |
 | `OutboundQueue:ProcessorConcurrency` | App configuration | Default `10`. Number of concurrent send workers. |
-| `OutboundQueue:MaxQueueDepth` | App configuration | Default `5000`. Backpressure threshold for low-severity shedding. |
+| `OutboundQueue:MaxQueueDepth` | App configuration | Default `5000`. Backpressure threshold; low-severity messages are dead-lettered when exceeded. |
 
 ---
 
@@ -564,7 +581,7 @@ The `OutboundQueueProcessor` runs as a `BackgroundService` with configurable con
 | Setting | Default | Description |
 |---|---|---|
 | `OutboundQueue:ProcessorConcurrency` | `10` | Number of concurrent dequeue-and-send workers. Each worker independently dequeues, sends via `TelegramSender`, and marks sent/failed. |
-| `OutboundQueue:MaxQueueDepth` | `5000` | Backpressure threshold. When the durable queue exceeds this depth, `EnqueueAsync` begins shedding `Low`-severity messages and emitting a `telegram.queue.backpressure` metric. `Critical` and `High` severity messages are never shed. |
+| `OutboundQueue:MaxQueueDepth` | `5000` | Backpressure threshold. When the durable queue exceeds this depth, `EnqueueAsync` applies backpressure: `Low`-severity messages are **dead-lettered immediately** (moved to the dead-letter queue with reason `backpressure:queue_depth_exceeded`) and a `telegram.queue.backpressure` metric is emitted. `Normal`, `High`, and `Critical` severity messages are always accepted. This preserves the zero-loss guarantee — no message is silently discarded; every message is either delivered or dead-lettered with a traceable reason. |
 
 #### Priority Queuing
 
@@ -587,8 +604,8 @@ Under a burst of 1 000+ simultaneous agent events:
 2. **Priority drain**: The 10 concurrent processor workers dequeue by severity priority. Critical/High messages (typically < 10% of burst volume — blocking questions, approval requests) are processed first and reach the Telegram API within the 2-second window.
 3. **Multi-chat fan-out**: In production, 100+ agents typically span multiple tenants/workspaces, routing to multiple operator chats. The per-chat rate limit (20 msg/min) constrains individual operators, but the global rate limit (30 msg/s) applies across all chats. With messages distributed across N operator chats, effective throughput is `min(30, N × 20/60)` msg/s. For 10+ operator chats, the global limit of 30 msg/s is the binding constraint.
 4. **Throughput**: At 30 msg/s sustained, a burst of 1 000 messages drains in ~34 seconds. The P95 target of 2 seconds applies to first-attempt successes: with priority queuing, the ~50 Critical/High messages in the burst are processed in the first ~2 seconds. Normal/Low messages queue-delayed beyond 2 seconds are not failures — the metric scopes to first-attempt successes, and the e2e-scenarios burst test asserts zero message loss and bounded drain time, not that all 1 000 messages complete within 2 seconds.
-5. **Backpressure**: If queue depth exceeds `MaxQueueDepth`, low-severity messages are shed with a `telegram.messages.shed` counter increment and an alert to the ops channel. Critical and High messages are never shed.
-6. **Zero loss guarantee**: All messages are either delivered or dead-lettered — zero loss (per e2e-scenarios burst test).
+5. **Backpressure**: If queue depth exceeds `MaxQueueDepth`, low-severity messages are dead-lettered immediately with reason `backpressure:queue_depth_exceeded` (see §10.4 table) and a `telegram.messages.backpressure_dlq` counter is incremented. An alert is sent to the ops channel. Critical, High, and Normal messages are always accepted.
+6. **Zero loss guarantee**: All messages are either delivered or dead-lettered with a traceable reason — zero silent loss (per e2e-scenarios burst test). Dead-lettered messages (whether from retry exhaustion or backpressure) are available for manual replay.
 
 ---
 
@@ -609,6 +626,6 @@ Under a burst of 1 000+ simultaneous agent events:
 
 1. **Single-bot deployment** — One Telegram bot per swarm instance. Multi-bot is not in scope.
 2. **No file/media handling** — The connector handles text messages and inline buttons only. Photo/document attachments from operators are out of scope for this story.
-3. **Persistence technology** — The architecture assumes a relational database (PostgreSQL or SQL Server) via EF Core for `OperatorBinding`, `InboundUpdate`, `OutboundMessage`, and `AuditRecord`. The specific provider is a deployment decision.
+3. **Persistence technology** — The architecture assumes EF Core for `OperatorBinding`, `InboundUpdate`, `OutboundMessage`, and `AuditRecord`. The implementation-plan (Stages 3.x–4.x) specifies **SQLite** as the initial provider for all persistence (outbox, dedup store, dead-letter queue, audit log), designed for swap to PostgreSQL or SQL Server via EF Core provider change for scaled deployments. This architecture aligns with that approach: SQLite is the V1 provider; production scaling to a full RDBMS is a configuration change, not a schema change.
 4. **Swarm orchestrator interface** — `ISwarmCommandBus` is assumed to exist or be defined in `AgentSwarm.Messaging.Abstractions`. Its transport (in-process, message broker, gRPC) is outside this story's scope.
 5. **Allowlist-based `/start` registration** — When a user sends `/start`, the connector checks whether their Telegram user ID is in the pre-configured allowlist. If present, the `OperatorBinding` is created or updated immediately with `IsActive = true`. If absent, the user receives a "not authorized" reply. No admin approval step is required for allowlisted users; the `IsActive` flag remains available for future soft-disable workflows.
