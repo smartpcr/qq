@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.19-draft (iteration 12)
+**Version:** v0.20-draft (iteration 13)
 
 ---
 
@@ -272,7 +272,7 @@ Feature: Durable outbound message queue with retry and dead-letter
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
-    And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold) and backpressure events via the telegram.messages.backpressure_dlq counter (per architecture.md §10.4)
+    And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold) and backpressure events via the telegram.messages.deadlettered_backpressure counter (per tech-spec.md HC-5)
     And P95 send latency remains under 2 seconds for messages that succeed on first attempt (per architecture.md §10.4 metric definition: telegram.send.latency_ms scoped to first-attempt successes, excluding rate-limited waits)
     And subsequent messages are queue-delayed by Telegram rate limits but not lost
     And time spent waiting during 429 backoff is tracked separately via telegram.send.rate_limited_wait_ms
@@ -359,10 +359,10 @@ Feature: Telegram bot command handling
 
   Scenario: /handoff transfers oversight to another operator
     # architecture.md §5.5: Full oversight transfer (Decided).
-    # implementation-plan.md Stage 3.2 (line 211): HandoffCommandHandler performs
-    # full oversight transfer — validates task existence and current oversight,
-    # resolves target operator via IOperatorRegistry, creates/updates TaskOversight
-    # record, notifies both operators, persists audit record.
+    # implementation-plan.md Stage 3.2: HandoffCommandHandler performs full oversight
+    # transfer — validates task existence and current oversight, resolves target
+    # operator via IOperatorRegistry, creates/updates TaskOversight record, notifies
+    # both operators, persists audit record.
     # tech-spec.md D-4: Decided — full transfer with validation, notification, and audit.
     Given user "operator-1" currently has oversight of task "TASK-099"
     And user "operator-2" (alias "@operator-2") is registered in the OperatorRegistry
@@ -551,7 +551,7 @@ Feature: Observability integration
       | telegram.updates.received             | counter   | §8 metrics table               |
       | telegram.messages.sent                | counter   | §8 metrics table               |
       | telegram.messages.dead_lettered       | counter   | §8 metrics table               |
-      | telegram.messages.backpressure_dlq    | counter   | §10.4 backpressure dead-letter |
+      | telegram.messages.deadlettered_backpressure | counter   | HC-5 backpressure dead-letter |
       | telegram.commands.processed           | counter   | §8 metrics table               |
       | telegram.queue.backpressure           | counter   | §10.4 backpressure threshold   |
 ```
@@ -598,10 +598,10 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 12._
-_Aligned with architecture.md (§3.1: shared AgentQuestion does NOT include DefaultAction — the proposed default action is provided as metadata alongside the question; the Telegram connector determines DefaultActionId at send time and stores it in PendingQuestionRecord for timeout polling; §5.3: configurable OutboundQueue:MaxRetries default 5 with exponential backoff and dead-letter; §5.5: /handoff performs full oversight transfer — validates task existence and current oversight, resolves target via IOperatorRegistry, creates/updates TaskOversight record, notifies both operators, persists audit; §8 metrics table; §10.4: backpressure dead-letter counted via telegram.messages.backpressure_dlq), implementation-plan.md (Stage 3.2 line 211: HandoffCommandHandler performs full oversight transfer per tech-spec D-4 and architecture.md §5.5; Stage 4.2: RetryPolicy.MaxAttempts default 5), and tech-spec.md (S-2 command handling with full /handoff transfer; HC-3 data model constraints; D-3 callback data encoding; D-4: /handoff Decided — full oversight transfer with validation, notification, and audit)._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 13._
+_Aligned with architecture.md (§3.1: shared AgentQuestion does NOT include DefaultAction — proposed default action provided as metadata, Telegram connector determines DefaultActionId at send time and stores in PendingQuestionRecord; §5.3: configurable OutboundQueue:MaxRetries default 5 with exponential backoff and dead-letter; §5.5: /handoff full oversight transfer — Decided; §8 metrics table), implementation-plan.md (Stage 3.2: HandoffCommandHandler performs full oversight transfer with validation, target resolution, TaskOversight mutation, dual notification, and audit; Stage 4.2: RetryPolicy.MaxAttempts default 5), and tech-spec.md (S-2 command handling with full /handoff transfer; HC-3 data model constraints; HC-5: backpressure dead-letter metric is `telegram.messages.deadlettered_backpressure`; D-3 callback data encoding; D-4: /handoff Decided — full oversight transfer)._
 _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively (per implementation-plan.md Stage 3.2). Inline button presses emit the HumanAction.Value from AllowedActions via CallbackQueryHandler (per implementation-plan.md Stage 3.3)._
 _Default action model: The shared `AgentQuestion` model does **not** include a `DefaultAction` property (architecture.md §3.1 line 168). The story requirement for "proposed default action" is satisfied connector-side: the proposed default action is provided as metadata alongside the question (e.g., via agent/command context or sidecar payload), and the Telegram connector determines the `DefaultActionId` at send time and stores it in `PendingQuestionRecord.DefaultActionId` for efficient timeout polling (architecture.md §3.1 lines 182–194). On timeout, `QuestionTimeoutService` reads `PendingQuestionRecord.DefaultActionId`, resolves the full `HumanAction` from `IDistributedCache`, and publishes a `HumanDecisionEvent` with that action's `Value`. If `DefaultActionId` is null, the timeout event uses `ActionValue = "__timeout__"`. Cross-doc note: tech-spec.md HC-3 says `AgentQuestion` includes `DefaultAction`; this is inconsistent with architecture.md §3.1 which explicitly excludes it. Scenarios in this document follow architecture.md §3.1 as the authoritative source for the shared data model._
 _Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are both aligned on `MaxAttempts` / `MaxRetries` default 5. Scenarios assert max 5 attempts accordingly._
-_Handoff semantics: architecture.md §5.5 specifies full oversight transfer (Decided) — the handler validates task existence and current oversight, resolves the target operator via IOperatorRegistry, creates/updates a TaskOversight record, notifies both operators, and persists an audit record. Implementation-plan.md Stage 3.2 (line 211) implements full oversight transfer per architecture.md §5.5 and tech-spec D-4. Tech-spec.md D-4 is Decided for full transfer. All three sibling docs are aligned on full /handoff semantics._
-_Metric naming: Scenarios assert `telegram.messages.backpressure_dlq` per architecture.md §10.4._
+_Handoff semantics: architecture.md §5.5 specifies full oversight transfer (Decided). Implementation-plan.md Stage 3.2 has been updated (this iteration) to implement full oversight transfer — validates task existence, resolves target via IOperatorRegistry, creates/updates TaskOversight, notifies both operators, persists audit. Tech-spec.md D-4 is Decided for full transfer. All three sibling docs and this e2e spec are now aligned on full /handoff semantics._
+_Metric naming: Scenarios assert `telegram.messages.deadlettered_backpressure` per tech-spec.md HC-5. Architecture.md §10.4 uses the name `telegram.messages.backpressure_dlq` — this e2e spec follows the tech-spec name as canonical for QA assertions; architecture.md should reconcile in a future iteration._
