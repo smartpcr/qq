@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.12-draft (iteration 6)
+**Version:** v0.13-draft (iteration 7)
 
 ---
 
@@ -63,7 +63,7 @@ Feature: Agent blocking question delivered to Telegram
       | Body            | Should we use blue-green or rolling migration?      |
       | Severity        | high                                               |
       | AllowedActions  | [{Label:"Approve", Value:"blue-green"}, {Label:"Reject", Value:"rolling"}, {Label:"Need info", Value:"need-info", RequiresComment:true}] |
-      | ProposedDefault | blue-green                                         |
+      | DefaultAction   | blue-green                                         |
       | ExpiresAt       | 2026-05-11T15:30:00Z                               |
       | CorrelationId   | corr-abc-123                                       |
     When the Messenger Gateway dequeues the question
@@ -80,7 +80,7 @@ Feature: Agent blocking question delivered to Telegram
       | Body            | Should we use blue-green or rolling migration? |
       | Severity        | critical                                       |
       | ExpiresAt       | 5 minutes from now                             |
-      | ProposedDefault | blue-green                                     |
+      | DefaultAction   | blue-green                                     |
       | AllowedActions  | [{Label:"Approve", Value:"blue-green"}, {Label:"Reject", Value:"rolling"}] |
     When the message is rendered in Telegram
     Then the message body includes the Title "Database migration strategy"
@@ -93,7 +93,7 @@ Feature: Agent blocking question delivered to Telegram
     Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
     And no human responds within 2 minutes
     When ExpiresAt is reached
-    Then the gateway publishes a HumanDecisionEvent with the proposed default ActionValue
+    Then the gateway publishes a HumanDecisionEvent with the DefaultAction value as ActionValue
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
 ```
 
