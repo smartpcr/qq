@@ -33,7 +33,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Create `MessengerMessage` record in Abstractions with properties: `MessageId`, `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, `Text`, `Severity`, `Metadata` dictionary
-- [ ] Create `AgentQuestion` record in Abstractions with properties: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `AllowedActions` (list of `HumanAction`), `ExpiresAt`, `DefaultAction` (nullable `string` matching a `HumanAction.Value` in `AllowedActions`; architecture.md §5 line 177 extends the shared model with this property), `CorrelationId` — note: when stored as a `PendingQuestionRecord` (Stage 3.5), the default is denormalized as `DefaultActionId` for indexed timeout queries
+- [ ] Create `AgentQuestion` record in Abstractions with properties: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `AllowedActions` (list of `HumanAction`), `ExpiresAt`, `CorrelationId` — note: the shared `AgentQuestion` does NOT include a `DefaultAction` property; the proposed default action is a Telegram-specific concern stored on `PendingQuestionRecord.DefaultActionId` (see Stage 3.5), consistent with architecture.md §5.2 and e2e-scenarios.md alignment notes
 - [ ] Create `HumanAction` record in Abstractions with properties: `ActionId`, `Label`, `Value`, `RequiresComment`
 - [ ] Create `HumanDecisionEvent` record in Abstractions with properties: `QuestionId`, `ActionValue`, `Comment`, `Messenger`, `ExternalUserId`, `ExternalMessageId`, `ReceivedAt`, `CorrelationId`
 - [ ] Create `MessengerEvent` record in Abstractions representing inbound events with properties: `EventId`, `EventType` enum, `RawCommand`, `UserId`, `ChatId`, `Timestamp`, `CorrelationId`, `Payload`
@@ -137,7 +137,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Create `TelegramMessageSender` implementing a `IMessageSender` interface (defined in Core) with methods: `SendTextAsync(chatId, text, parseMode, ct)`, `SendQuestionAsync(chatId, AgentQuestion, ct)`
-- [ ] Implement `SendQuestionAsync` to render `AgentQuestion` as a rich Telegram message: include `Title`, `Body` (full context), `Severity` badge, `ExpiresAt` timeout countdown, and `DefaultAction` label in the message body; render `AllowedActions` as Telegram `InlineKeyboardMarkup` buttons with callback data encoding `QuestionId:ActionId`
+- [ ] Implement `SendQuestionAsync` to render `AgentQuestion` as a rich Telegram message: include `Title`, `Body` (full context), `Severity` badge, and `ExpiresAt` timeout countdown in the message body; render `AllowedActions` as Telegram `InlineKeyboardMarkup` buttons with callback data encoding `QuestionId:ActionId`; accept an optional `defaultActionId` parameter (a `HumanAction.ActionId` string) to display the proposed default action label in the message body — this value is stored on `PendingQuestionRecord.DefaultActionId` (Stage 3.5), not on the shared `AgentQuestion` model
 - [ ] For actions with `RequiresComment = true`, append "(reply required)" to the button label so the operator knows a follow-up text reply is expected after tapping
 - [ ] Format outbound messages with Markdown V2 parse mode; include `CorrelationId` as a footer or hidden tag for traceability
 - [ ] Implement Telegram API rate-limit handling: detect `429 Too Many Requests`, extract `RetryAfter`, and back off accordingly
@@ -149,7 +149,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Test Scenarios
 - [ ] Scenario: Question renders buttons — Given an `AgentQuestion` with three `HumanAction` items, When `SendQuestionAsync` is called, Then the constructed `InlineKeyboardMarkup` contains exactly three buttons with correct labels
-- [ ] Scenario: Question body includes full context — Given an `AgentQuestion` with `Severity=Critical`, `ExpiresAt` in 30 minutes, and `DefaultAction=skip`, When `SendQuestionAsync` is called, Then the message body contains the severity badge, timeout information, default action label, and full question `Body` text
+- [ ] Scenario: Question body includes full context — Given an `AgentQuestion` with `Severity=Critical` and `ExpiresAt` in 30 minutes, and `defaultActionId=skip` passed to `SendQuestionAsync`, When `SendQuestionAsync` is called, Then the message body contains the severity badge, timeout information, default action label, and full question `Body` text
 - [ ] Scenario: Rate limit handled gracefully — Given the Telegram API returns HTTP 429 with `RetryAfter=5`, When the sender encounters it, Then it waits at least 5 seconds before retrying and does not throw
 - [ ] Scenario: CorrelationId in message — Given a `MessengerMessage` with a specific `CorrelationId`, When sent, Then the outbound message body contains the correlation ID
 - [ ] Scenario: RequiresComment action labeled — Given an `AgentQuestion` with one action having `RequiresComment=true`, When rendered, Then that button label includes a "(reply required)" indicator
@@ -204,7 +204,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Implement `AskCommandHandler` — creates a work item in the swarm orchestrator via `ISwarmCommandBus.PublishCommandAsync` from the argument text, returns confirmation with task ID and correlation ID
 - [ ] Implement `ApproveCommandHandler` and `RejectCommandHandler` — resolve a pending `AgentQuestion` by emitting a `HumanDecisionEvent` with the appropriate action value
 - [ ] Implement `PauseCommandHandler` and `ResumeCommandHandler` — send pause/resume signals to the target agent via `ISwarmCommandBus.PublishCommandAsync`
-- [ ] Implement `HandoffCommandHandler` — accepts syntax `/handoff TASK-ID @operator-alias`; validates that `TASK-ID` exists and the sending operator currently has oversight; validates that `@operator-alias` is a registered operator resolved via `OperatorRegistry`; on success, transfers oversight by updating the `OperatorRegistry` binding for the task, notifies the sender ("✅ Oversight of TASK-ID transferred to @operator-alias") and the receiver ("📋 You now have oversight of TASK-ID (transferred by @sender)") via `ISwarmCommandBus.PublishCommandAsync`; persists an audit record with handoff details, both operator IDs, and `CorrelationId`; returns error for invalid task ID ("Task NONEXISTENT not found") or unregistered operator ("Operator @unknown-user is not registered") — aligns with tech-spec.md D-4 (Decided: transfer human oversight), architecture.md §5.1 handoff semantics, and e2e-scenarios.md handoff Gherkin scenarios
+- [ ] Implement `HandoffCommandHandler` — returns a stub response: "🚧 /handoff is not yet available — oversight transfer policy is pending decision (D-4). Contact your administrator for manual handoff." Parses `/handoff TASK-ID @operator-alias` syntax to validate input format but does NOT perform any transfer, reassignment, or OperatorRegistry mutation. Logs the attempted handoff with `CorrelationId` for future audit. This aligns with e2e-scenarios.md `Scenario: /handoff returns stub response pending policy decision (D-4)` — full transfer semantics will be implemented when decision D-4 is resolved
 
 ### Dependencies
 - phase-command-processing-and-agent-routing/stage-command-parser
@@ -213,9 +213,8 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Scenario: Ask creates work item — Given an authorized user sends `/ask build release notes for Solution12`, When the `AskCommandHandler` processes it, Then a work item is created and the response includes a task ID
 - [ ] Scenario: Unknown command rejected — Given a `ParsedCommand` with `CommandName` = `foo`, When routed, Then the result has `Success=false` and a helpful error message listing valid commands
 - [ ] Scenario: Approve emits decision event — Given a pending question with `QuestionId=Q1`, When `/approve Q1` is processed, Then a `HumanDecisionEvent` is emitted with `ActionValue=approve` and the correct `CorrelationId`
-- [ ] Scenario: Handoff transfers oversight — Given an authorized user sends `/handoff TASK-099 @operator-2` and both task and operator are valid, When `HandoffCommandHandler` processes it, Then the `OperatorRegistry` binding is updated, the sender receives "✅ Oversight of TASK-099 transferred to @operator-2", the receiver receives a notification, and an audit record is persisted with both operator IDs and `CorrelationId`
-- [ ] Scenario: Handoff invalid task — Given an authorized user sends `/handoff NONEXISTENT @operator-2`, When `HandoffCommandHandler` processes it, Then the bot responds with "Task NONEXISTENT not found" and no transfer occurs
-- [ ] Scenario: Handoff unknown operator — Given an authorized user sends `/handoff TASK-099 @unknown-user`, When `HandoffCommandHandler` processes it, Then the bot responds with "Operator @unknown-user is not registered" and no transfer occurs
+- [ ] Scenario: Handoff returns stub — Given an authorized user sends `/handoff TASK-099 @operator-2`, When `HandoffCommandHandler` processes it, Then the bot responds with a stub message indicating handoff is pending policy decision (D-4), no `OperatorRegistry` mutation occurs, and no transfer or reassignment is performed
+- [ ] Scenario: Handoff with invalid syntax returns stub — Given an authorized user sends `/handoff` with no arguments, When `HandoffCommandHandler` processes it, Then the bot responds with usage help and the stub policy notice, and no audit record for a transfer is created
 
 ## Stage 3.3: Callback Query Handler
 
@@ -254,11 +253,11 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Define `IPendingQuestionStore` concrete registration point — the interface is defined in Stage 1.3 Abstractions; this stage provides the EF Core implementation
-- [ ] Create `PendingQuestionRecord` entity with fields: `QuestionId`, `AgentQuestion` (serialized), `TelegramChatId`, `TelegramMessageId`, `StoredAt`, `ExpiresAt`, `DefaultActionId` (denormalized from `AgentQuestion.DefaultAction` for indexed timeout queries), `Status` (enum: `Pending`, `Answered`, `AwaitingComment`, `TimedOut`), `CorrelationId`
+- [ ] Create `PendingQuestionRecord` entity with fields: `QuestionId`, `AgentQuestion` (serialized), `TelegramChatId`, `TelegramMessageId`, `StoredAt`, `ExpiresAt`, `DefaultActionId` (nullable `string` — the `HumanAction.ActionId` of the proposed default action to apply on timeout; this is a Telegram-specific field set at question-send time, NOT derived from the shared `AgentQuestion` model which does not include a `DefaultAction` property; aligns with architecture.md §5.2 and e2e-scenarios.md alignment notes), `Status` (enum: `Pending`, `Answered`, `AwaitingComment`, `TimedOut`), `CorrelationId`
 - [ ] Implement `PersistentPendingQuestionStore` implementing `IPendingQuestionStore` (interface from Stage 1.3 Abstractions) backed by the Persistence project (EF Core; SQLite for dev/local, PostgreSQL or SQL Server for production) with indexed lookups by `QuestionId`, `ExpiresAt`, and `DefaultActionId`
 - [ ] Integrate store into `TelegramMessageSender.SendQuestionAsync`: after successfully sending a question to Telegram, persist the question with its Telegram message ID for later lookup by `CallbackQueryHandler`
 - [ ] Implement `RequiresComment` flow in `CallbackQueryHandler`: when the selected `HumanAction.RequiresComment` is true, set the question status to `AwaitingComment`, send a prompt ("Please reply with your comment"), and defer `HumanDecisionEvent` emission until the operator's text reply arrives via the pipeline's `TextReply` handler
-- [ ] Create `QuestionTimeoutService` as a `BackgroundService` that periodically polls `GetExpiredAsync`, and for each expired question: publishes a `HumanDecisionEvent` with `DefaultAction` value, updates the original Telegram message to indicate timeout ("⏰ Timed out — default action applied: {defaultAction}"), marks the question as `TimedOut`, and writes an audit record
+- [ ] Create `QuestionTimeoutService` as a `BackgroundService` that periodically polls `GetExpiredAsync`, and for each expired question: reads `PendingQuestionRecord.DefaultActionId` — if present, resolves the full `HumanAction` from `IDistributedCache` and publishes a `HumanDecisionEvent` with that action's value; if absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"`; updates the original Telegram message (via `TelegramMessageId`) to indicate timeout ("⏰ Timed out — default action applied: {action}" or "⏰ Timed out — no default action"); marks the question as `TimedOut`; and writes an audit record
 
 ### Dependencies
 - phase-command-processing-and-agent-routing/stage-callback-query-handler
@@ -267,7 +266,8 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Scenario: Question stored on send — Given an `AgentQuestion` is sent to Telegram successfully, When `SendQuestionAsync` completes, Then a `PendingQuestionRecord` exists in the store with status `Pending` and the correct `TelegramMessageId`
 - [ ] Scenario: Callback resolves pending question — Given a pending question `Q1`, When the callback query handler processes an approve action, Then the question status is updated to `Answered` and a `HumanDecisionEvent` is emitted
 - [ ] Scenario: RequiresComment defers decision — Given a pending question with an action having `RequiresComment=true`, When the operator taps that button, Then the bot prompts for a comment and the `HumanDecisionEvent` is not emitted until the operator replies with text
-- [ ] Scenario: Timeout applies default action — Given a pending question with `ExpiresAt` in the past and `DefaultAction=skip`, When `QuestionTimeoutService` polls, Then a `HumanDecisionEvent` is emitted with `ActionValue=skip` and the Telegram message is updated with the timeout notice
+- [ ] Scenario: Timeout applies default action — Given a pending question with `ExpiresAt` in the past and `PendingQuestionRecord.DefaultActionId=skip`, When `QuestionTimeoutService` polls, Then it resolves the `HumanAction` from cache, emits a `HumanDecisionEvent` with `ActionValue=skip`, and updates the Telegram message with "⏰ Timed out — default action applied: skip"
+- [ ] Scenario: Timeout without default action — Given a pending question with `ExpiresAt` in the past and `PendingQuestionRecord.DefaultActionId` is null, When `QuestionTimeoutService` polls, Then a `HumanDecisionEvent` is emitted with `ActionValue=__timeout__` and the Telegram message is updated with "⏰ Timed out — no default action"
 
 # Phase 4: Reliability Infrastructure
 
@@ -296,7 +296,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ## Stage 4.2: Retry Policy and Dead-Letter Queue
 
 ### Implementation Steps
-- [ ] Create `RetryPolicy` configuration POCO with properties: `MaxAttempts` (default 5, aligned with architecture.md §5.3 `OutboundQueue:MaxRetries` default of 5 and e2e-scenarios.md retry background specifying max 5 attempts), `InitialDelayMs` (default 2000, aligned with architecture.md `BaseRetryDelaySeconds` default of 2), `BackoffMultiplier` (default 2.0), `MaxDelayMs` (default 30000), `JitterPercent` (default 25, aligned with architecture.md ±25% jitter)
+- [ ] Create `RetryPolicy` configuration POCO with properties: `MaxAttempts` (default 3, aligned with architecture.md §5.3 `OutboundQueue:MaxRetries` default of 3 and e2e-scenarios.md retry background specifying max 3 attempts), `InitialDelayMs` (default 2000, aligned with architecture.md `BaseRetryDelaySeconds` default of 2), `BackoffMultiplier` (default 2.0), `MaxDelayMs` (default 30000), `JitterPercent` (default 25, aligned with architecture.md ±25% jitter)
 - [ ] Implement exponential backoff with jitter in `OutboundQueueProcessor`: on transient failure, increment `Attempt`, compute next retry time, and re-enqueue
 - [ ] Define `IDeadLetterQueue` interface in Core with methods: `SendToDeadLetterAsync(OutboundMessage, FailureReason, CancellationToken)`, `ListAsync(CancellationToken)`
 - [ ] Implement `DeadLetterQueue` backed by the same persistence layer (EF Core; SQLite for dev/local, PostgreSQL or SQL Server for production) with `dead_letter_messages` table containing full failure context
@@ -308,7 +308,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Test Scenarios
 - [ ] Scenario: Retry with backoff — Given a message fails on first attempt, When retried, Then the delay before the second attempt is approximately `InitialDelayMs` (within jitter tolerance)
-- [ ] Scenario: Dead-lettered after max attempts — Given `MaxAttempts=5` and a message that always fails, When processed five times, Then the message is in the dead-letter queue and an alert is emitted
+- [ ] Scenario: Dead-lettered after max attempts — Given `MaxAttempts=3` and a message that always fails, When processed three times, Then the message is in the dead-letter queue and an alert is emitted
 - [ ] Scenario: Health check degrades — Given 10 messages in the dead-letter queue and threshold is 5, When health check is queried, Then status is `Unhealthy`
 
 ## Stage 4.3: Inbound Deduplication Service
