@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.9-draft (iteration 3)
+**Version:** v0.10-draft (iteration 4)
 
 ---
 
@@ -187,7 +187,7 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Background:
     Given the outbound message queue is operational
-    And retry policy is configured: max 5 attempts, exponential backoff (per implementation-plan.md RetryPolicy.MaxAttempts default)
+    And retry policy is configured: max 3 attempts, exponential backoff (per architecture.md §5.3 OutboundQueue:MaxRetries default)
 
   Scenario: Transient Telegram API failure triggers retry
     Given agent "test-agent-3" enqueues an outbound alert message
@@ -202,8 +202,8 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
-    When the Telegram Bot API returns HTTP 500 on attempts 1, 2, 3, 4, and 5
-    Then the message is moved to the dead-letter queue after attempt 5
+    When the Telegram Bot API returns HTTP 500 on attempts 1, 2, and 3
+    Then the message is moved to the dead-letter queue after attempt 3
     And an alert is raised to the operations channel
     And the dead-letter record includes CorrelationId, AgentId, message content, and failure reason
 
@@ -219,7 +219,9 @@ Feature: Durable outbound message queue with retry and dead-letter
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
     And the queue depth metric is observable via OpenTelemetry
-    And P95 send latency remains under 2 seconds for messages that succeed on first attempt
+    And P95 send latency remains under 2 seconds for the first ~30 messages (per architecture.md §10.4 rate-limit throughput of 30 msg/s)
+    And subsequent messages are queue-delayed by Telegram rate limits but not lost
+    And time spent waiting during 429 backoff is tracked separately via telegram.send.rate_limited_wait_ms
 ```
 
 ---
@@ -301,27 +303,13 @@ Feature: Telegram bot command handling
     When user "operator-1" sends "/reject Q-2001"
     Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
 
-  Scenario: /handoff transfers human oversight to another operator
-    # tech-spec.md D-4: /handoff TASK-ID @operator-alias transfers human oversight with confirmations
-    Given task "TASK-099" is currently overseen by user "operator-1"
-    And user "operator-2" (Telegram user ID "222333444") is in the allowlist
+  Scenario: /handoff is accepted syntactically but returns a not-yet-configured stub
+    # tech-spec.md D-4: /handoff semantics are OPEN — stub until policy is decided
     When user "operator-1" sends "/handoff TASK-099 @operator-2"
-    Then the gateway validates that "TASK-099" exists and "operator-1" has oversight
-    And the gateway validates that "@operator-2" is a registered operator
-    And oversight of "TASK-099" is transferred from "operator-1" to "operator-2"
-    And the bot sends a confirmation to "operator-1": "✅ Oversight of TASK-099 transferred to @operator-2"
-    And the bot notifies "operator-2": "📋 You now have oversight of TASK-099 (transferred by @operator-1)"
-    And an audit record is persisted with handoff details, both operator IDs, and CorrelationId
-
-  Scenario: /handoff with invalid task ID is rejected
-    When user "operator-1" sends "/handoff NONEXISTENT @operator-2"
-    Then the bot replies with "Task NONEXISTENT not found"
-    And no oversight transfer occurs
-
-  Scenario: /handoff with unregistered target operator is rejected
-    When user "operator-1" sends "/handoff TASK-099 @unknown-user"
-    Then the bot replies with "Operator @unknown-user is not registered"
-    And no oversight transfer occurs
+    Then the command handler parses the syntax "/handoff TASK-ID @operator-alias" successfully
+    And the bot replies with "Handoff is not yet configured — awaiting policy decision (D-4)"
+    And no oversight transfer, question reassignment, or agent-team transfer occurs
+    And an audit record is persisted with the raw command text, user ID, and CorrelationId
 
   Scenario: /pause and /resume control agent execution
     When user "operator-1" sends "/pause arch-agent-7"
@@ -518,5 +506,5 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 3._
-_Aligned with sibling tech-spec.md (D-4 /handoff decided), architecture.md (Messenger="Telegram", /healthz, retry exhaustion), and implementation-plan.md (MaxAttempts=5)._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 4._
+_Aligned with sibling tech-spec.md (D-4 /handoff is Open — stub until decided), architecture.md (Messenger="Telegram", /healthz, MaxRetries=3, burst P95 applies to first ~30 messages), and implementation-plan.md._
