@@ -192,7 +192,7 @@ Wraps an `AgentQuestion` with routing and context metadata. The envelope is the 
 
 > **Default action flow.** When the Telegram connector renders an `AgentQuestionEnvelope` as an inline-keyboard message, it reads `ProposedDefaultActionId` from the envelope. When present, the connector displays the proposed default in the message body (e.g., "Default action if no response: Approve") and denormalizes the `ActionId` into `PendingQuestionRecord.DefaultActionId` for efficient timeout polling (see below). This enables `QuestionTimeoutService` to poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the full envelope. When `ProposedDefaultActionId` is `null`, `PendingQuestionRecord.DefaultActionId` is `null`, the question expires with a `__timeout__` action value, and no automatic decision is applied.
 >
-> **Cross-doc alignment:** This sidecar envelope model aligns with implementation-plan.md Stage 1.2 (`AgentQuestionEnvelope` record with `ProposedDefaultActionId`) and Stage 1.3 (`IMessengerConnector.SendQuestionAsync(AgentQuestionEnvelope, CancellationToken)`). The `IMessengerConnector.SendQuestionAsync(AgentQuestionEnvelope envelope, ...)` signature (§4.1) transports the default action as part of the envelope, not the shared `AgentQuestion` model. Note: e2e-scenarios.md has an internal inconsistency — lines 57–76 describe `DefaultAction` as a first-class `AgentQuestion` field, while line 613 states the shared model does _not_ include `DefaultAction` and uses `ProposedDefaultActionId` in the envelope. This architecture follows the envelope model defined in implementation-plan.md as the authoritative contract.
+> **Cross-doc alignment:** All sibling documents are now aligned on the sidecar envelope model. Implementation-plan.md Stage 1.2 defines `AgentQuestion` without a `DefaultAction` property and creates `AgentQuestionEnvelope` with `ProposedDefaultActionId`; Stage 1.3 defines `IMessengerConnector.SendQuestionAsync(AgentQuestionEnvelope, CancellationToken)`. E2e-scenarios.md (lines 57–77) explicitly states "The shared AgentQuestion model does NOT include a DefaultAction property" and uses `AgentQuestionEnvelope.ProposedDefaultActionId` throughout its fixtures. Tech-spec.md HC-3 is updated to reflect this alignment. No divergence remains.
 
 #### PendingQuestionRecord (Telegram-specific — to be defined in planned `AgentSwarm.Messaging.Telegram`)
 
@@ -361,7 +361,7 @@ The Telegram connector publishes commands (task creation, approvals, pauses) via
 
 `SwarmEvent` is a discriminated union (or base class with subtypes) covering `AgentQuestionEvent`, `AgentAlertEvent`, and `AgentStatusUpdateEvent`. The Telegram connector's `BackgroundService` calls `SubscribeAsync` at startup for each active tenant and processes events as they arrive — rendering questions as inline-keyboard messages, alerts as priority text, and status updates as informational messages. The transport backing this subscription (in-process `Channel<T>`, message broker, gRPC stream) is outside this story's scope; the interface abstracts it.
 
-> **Cross-doc note:** The implementation plan (Stage 1.3) currently defines only the three outbound methods on `ISwarmCommandBus`. The `SubscribeAsync` method is proposed here for inclusion in the same interface during implementation; if the implementation team prefers a separate `ISwarmEventSubscription` interface, the architectural intent (single DI registration, co-located with the command bus) remains the same.
+> **Cross-doc alignment:** Implementation-plan.md Stage 1.3 now defines all four methods on `ISwarmCommandBus`: `PublishCommandAsync`, `QueryStatusAsync`, `QueryAgentsAsync`, and `SubscribeAsync(string tenantId, CancellationToken)` returning `IAsyncEnumerable<SwarmEvent>`. All sibling documents are aligned on this interface contract.
 
 ---
 
@@ -675,20 +675,20 @@ The story requires "P95 send latency under 2 seconds after event is queued." Thi
 
 The 2-second P95 target applies to the primary `telegram.send.latency_ms` metric, which covers all sends. This is the honest interpretation of the story requirement ("P95 send latency under 2 seconds after event is queued") — the acceptance criterion measures the operator's actual experience, not a cherry-picked subset. The priority queuing design (§10.4 below) ensures this target is met under normal operating conditions by dispatching Critical/High messages first and keeping queue depth manageable.
 
-**Acceptance interpretation under burst:** Under extreme burst conditions (100+ agents simultaneously), the priority queuing design ensures Critical and High severity messages are dispatched first. The P95 ≤ 2 s target applies to the all-inclusive `telegram.send.latency_ms` metric across all severities. Under normal operating conditions (queue depth < 100, no active rate-limiting), all severities comfortably meet the 2-second P95 target. Under extreme burst (1000+ simultaneous messages), queue depth and rate-limit waits may push the all-inclusive P95 above 2 seconds for the burst window — this is an expected transient condition, not a steady-state failure. The `telegram.send.first_attempt_latency_ms` diagnostic metric provides visibility into whether the system's intrinsic processing latency remains healthy even when external factors (rate limits, retries) affect the primary metric.
+**Acceptance interpretation under burst:** Under extreme burst conditions (100+ agents simultaneously), the priority queuing design ensures Critical and High severity messages are dispatched first. The following explicit severity-scoped acceptance criteria apply to the primary `telegram.send.latency_ms` metric (all sends, all-inclusive):
 
-**Severity-scoped SLO:** Under sustained burst conditions, the following severity-scoped guarantees apply to the primary `telegram.send.latency_ms` metric (all sends):
-
-| Severity | P95 SLO | Rationale |
+| Severity | P95 Acceptance | Scope |
 |---|---|---|
-| `Critical` | ≤ 2 s | Always dispatched first; blocking questions, urgent alerts. |
-| `High` | ≤ 2 s | Approval requests, important notifications. |
-| `Normal` | Best-effort ≤ 2 s | Met under normal load; may exceed during extreme burst due to queue depth. |
-| `Low` | Best-effort | Informational; may be backpressure-DLQ'd under extreme burst. |
+| `Critical` | **≤ 2 s (hard)** | Always dispatched first; blocking questions, urgent alerts. Asserted by e2e burst test. |
+| `High` | **≤ 2 s (hard)** | Approval requests, important notifications. Asserted by e2e burst test. |
+| `Normal` | **≤ 2 s under normal load; best-effort under burst** | Met when queue depth < 100 and no active rate-limiting. Under extreme burst, queue depth may push P95 transiently above 2 s. Not asserted by burst test — covered by steady-state test. |
+| `Low` | **Best-effort** | Informational; may be backpressure-DLQ'd under extreme burst (see §10.4 backpressure). Not asserted by burst test. |
 
-Under normal operating conditions (queue depth < 100, no active rate-limiting), all severities meet the 2-second P95 target. Under extreme burst (1000+ messages), priority queuing guarantees Critical/High messages are dispatched first and meet the target; Normal/Low messages are delivered without loss but may experience queue delays that push the all-inclusive metric above the target transiently.
+Under **normal operating conditions** (queue depth < 100, no active rate-limiting), all severities comfortably meet the 2-second P95 target — verified by the steady-state P95 scenario in e2e-scenarios.md (lines 265–280: 100 messages, no 429s, P95 < 2 s).
 
-> **Cross-doc alignment:** This all-inclusive metric definition aligns with e2e-scenarios.md footer (line 618: "`telegram.send.latency_ms` (primary) measures elapsed time from enqueue to Telegram API HTTP 200 for all messages regardless of attempt number or rate-limit holds") and line 617 ("`telegram.send.latency_ms` (primary, all sends) and `telegram.send.first_attempt_latency_ms` (diagnostic)"). Note: e2e-scenarios.md lines 264–279 use a narrower first-attempt definition for `telegram.send.latency_ms` in the scenario text, contradicting the footer. This architecture follows the footer's all-inclusive definition as the canonical contract, and names the narrower diagnostic metric `telegram.send.first_attempt_latency_ms` to avoid ambiguity.
+Under **extreme burst** (1000+ simultaneous messages), the burst test in e2e-scenarios.md (lines 282–290) asserts: (a) zero message loss, (b) P95 `telegram.send.latency_ms` ≤ 2 s **for Critical/High messages**, (c) Normal/Low messages are delivered without loss but may experience queue delays. The `telegram.send.first_attempt_latency_ms` diagnostic metric provides visibility into whether the system's intrinsic processing latency remains healthy even when external factors (rate limits, retries) affect the primary metric.
+
+> **Cross-doc alignment:** All sibling documents are now aligned on this all-inclusive metric definition. E2e-scenarios.md lines 265–280 define `telegram.send.latency_ms` as "elapsed time from OutboundMessage.CreatedAt (enqueue) to Telegram API HTTP 200, measured for ALL messages regardless of attempt number or rate-limit holds" and state the P95 ≤ 2 s acceptance criterion applies to this all-inclusive metric. The footer (lines 622–623) confirms the same definition. `telegram.send.first_attempt_latency_ms` is the narrower diagnostic metric covering only first-attempt, non-rate-limited successes for capacity planning. Tech-spec.md HC-4 and R-1 are updated to reflect this alignment. No divergence remains.
 
 #### Queue Processor Concurrency
 
