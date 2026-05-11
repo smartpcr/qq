@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.16-draft (iteration 9)
+**Version:** v0.17-draft (iteration 10)
 
 ---
 
@@ -140,7 +140,7 @@ Feature: Strongly typed approval/rejection events from Telegram buttons
       | Comment           | null             |
       | Messenger         | Telegram         |
       | ExternalUserId    | 111222333        |
-      | ExternalMessageId | <telegram_msg_id>|
+      | ExternalMessageId | 48291073         |
       | CorrelationId     | corr-abc-123     |
     And the original Telegram message is edited to show "✅ Approved by operator-1"
     And an audit record is persisted with all HumanDecisionEvent fields
@@ -212,12 +212,8 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Background:
     Given the outbound message queue is operational
-    And retry policy is configured with MaxAttempts from appsettings (configurable; see cross-doc note below)
+    And retry policy is configured: max 5 attempts (architecture.md §5.3 and implementation-plan.md Stage 4.2 are aligned on default 5)
     And exponential backoff with jitter is enabled
-    # Cross-doc note: architecture.md §5.3 specifies OutboundQueue:MaxRetries default 5;
-    # implementation-plan.md Stage 4.2 specifies RetryPolicy.MaxAttempts default 3.
-    # These sibling docs need reconciliation — scenarios below use the configured
-    # MaxAttempts value without asserting a specific default.
 
   Scenario: Transient Telegram API failure triggers retry
     Given agent "test-agent-3" enqueues an outbound alert message
@@ -232,8 +228,8 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
-    When the Telegram Bot API returns HTTP 500 on every attempt up to the configured MaxAttempts
-    Then the message is moved to the dead-letter queue after the final attempt
+    When the Telegram Bot API returns HTTP 500 on every attempt up to max 5 attempts
+    Then the message is moved to the dead-letter queue after attempt 5
     And an alert is raised to the operations channel
     And the dead-letter record includes CorrelationId, AgentId, message content, and failure reason
 
@@ -275,7 +271,7 @@ Feature: Durable outbound message queue with retry and dead-letter
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
-    And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold) and backpressure events via the telegram.queue.backpressure counter and telegram.messages.backpressure_dlq counter (per architecture.md §10.4)
+    And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold) and backpressure events via the telegram.queue.backpressure counter and telegram.messages.backpressure_dlq counter (per architecture.md §10.4; tech-spec.md HC-5 uses alternate name telegram.messages.deadlettered_backpressure — implementation should reconcile)
     And P95 send latency remains under 2 seconds for messages that succeed on first attempt (per architecture.md §10.4 metric definition: telegram.send.latency_ms scoped to first-attempt successes, excluding rate-limited waits)
     And subsequent messages are queue-delayed by Telegram rate limits but not lost
     And time spent waiting during 429 backoff is tracked separately via telegram.send.rate_limited_wait_ms
@@ -360,26 +356,39 @@ Feature: Telegram bot command handling
     When user "operator-1" sends "/reject Q-2001"
     Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
 
-  Scenario: /handoff returns stub response pending policy reconciliation
-    # Cross-doc note: implementation-plan.md Stage 3.2 specifies HandoffCommandHandler
-    # returns a stub response and does NOT perform transfer or OperatorRegistry mutation.
-    # architecture.md §5.5 also marks handoff as pending policy decision.
-    # tech-spec.md D-4 says full transfer is decided — these sibling docs need
-    # reconciliation. This scenario aligns with implementation-plan Stage 3.2 (stub).
+  Scenario: /handoff transfers oversight to another operator
+    # All sibling docs are aligned on full oversight transfer:
+    # - tech-spec.md D-4: Decided — full transfer with validation, notification, audit
+    # - architecture.md §5.5: full transfer with validation, notification, audit
+    # - implementation-plan.md Stage 3.2 line 207: HandoffCommandHandler performs full
+    #   transfer with validation, notification, and audit
     Given task "TASK-099" exists and user "operator-1" has oversight
     And user "operator-2" with Telegram user ID "222333444" is in the allowlist and registered
     When user "operator-1" sends "/handoff TASK-099 @operator-2"
-    Then the HandoffCommandHandler parses and validates the input syntax
-    And the bot responds with a stub message: "🚧 /handoff is not yet available — oversight transfer policy is pending reconciliation. Contact your administrator for manual handoff."
-    And no OperatorRegistry mutation occurs
-    And no transfer or reassignment is performed
-    And the attempted handoff is logged with CorrelationId for future audit
+    Then the HandoffCommandHandler validates that task "TASK-099" exists
+    And validates that user "operator-1" currently has oversight of "TASK-099"
+    And validates that "@operator-2" is registered via OperatorRegistry
+    And transfers oversight by updating the OperatorBinding for "TASK-099" to "operator-2"
+    And the bot sends "operator-1" confirmation: "✅ Oversight of TASK-099 transferred to @operator-2"
+    And the bot sends "operator-2" notification: "📋 You have been assigned oversight of TASK-099 by @operator-1"
+    And an audit record is persisted with task ID, both operator IDs, timestamp, and CorrelationId
 
-  Scenario: /handoff with invalid syntax returns stub with usage help
+  Scenario: /handoff with invalid task ID is rejected
+    When user "operator-1" sends "/handoff NONEXISTENT @operator-2"
+    Then the bot replies with "Task NONEXISTENT not found"
+    And no transfer occurs
+    And no audit record for a transfer is created
+
+  Scenario: /handoff with unregistered target operator is rejected
+    Given task "TASK-099" exists and user "operator-1" has oversight
+    When user "operator-1" sends "/handoff TASK-099 @unknown-user"
+    Then the bot replies with "Operator @unknown-user not found"
+    And no transfer occurs
+
+  Scenario: /handoff with invalid syntax returns usage help
     When user "operator-1" sends "/handoff" with no arguments
     Then the bot replies with usage help: "/handoff TASK-ID @operator-alias"
-    And the bot includes the stub policy notice
-    And no audit record for a transfer is created
+    And no transfer or audit record is created
 
   Scenario: /pause and /resume control agent execution
     When user "operator-1" sends "/pause arch-agent-7"
@@ -534,7 +543,7 @@ Feature: Observability integration
       | telegram.updates.received             | counter   | §8 metrics table               |
       | telegram.messages.sent                | counter   | §8 metrics table               |
       | telegram.messages.dead_lettered       | counter   | §8 metrics table               |
-      | telegram.messages.backpressure_dlq    | counter   | §10.4 backpressure dead-letter |
+      | telegram.messages.backpressure_dlq    | counter   | §10.4 backpressure dead-letter (note: tech-spec.md HC-5 uses alternate name telegram.messages.deadlettered_backpressure — QA should assert whichever name the implementation adopts and file a reconciliation issue for the other) |
       | telegram.commands.processed           | counter   | §8 metrics table               |
       | telegram.queue.backpressure           | counter   | §10.4 backpressure threshold   |
 ```
@@ -581,9 +590,10 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 9._
-_Aligned with sibling tech-spec.md (HC-3: shared AgentQuestion model is unchanged — no DefaultAction property; proposed default action stored Telegram-side in PendingQuestionRecord.DefaultActionId; S-2 command handling), implementation-plan.md (Stage 3.2: HandoffCommandHandler returns stub response pending policy reconciliation, no OperatorRegistry mutation; Stage 3.5: PendingQuestionRecord.DefaultActionId is Telegram-specific, not derived from a shared AgentQuestion.DefaultAction property; Stage 4.2: RetryPolicy.MaxAttempts is configurable), and architecture.md (§3.1 PendingQuestionRecord data model; §5.3 configurable OutboundQueue:MaxRetries with exponential backoff and dead-letter; §10.4 P95 under 2s for first-attempt successes via telegram.send.latency_ms; §8 metrics table)._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 10._
+_Aligned with sibling tech-spec.md (HC-3: shared AgentQuestion model is unchanged — no DefaultAction property; proposed default action stored Telegram-side in PendingQuestionRecord.DefaultActionId; S-2 command handling; D-4: /handoff performs full oversight transfer), implementation-plan.md (Stage 3.2: HandoffCommandHandler performs full oversight transfer with validation, notification, and audit — aligned with tech-spec D-4 and architecture.md §5.5; Stage 3.5: PendingQuestionRecord.DefaultActionId is denormalized from AgentQuestion.DefaultAction at question-send time per implementation-plan.md line 258; Stage 4.2: RetryPolicy.MaxAttempts default 5, aligned with architecture.md §5.3), and architecture.md (§3.1 PendingQuestionRecord data model; §5.3 configurable OutboundQueue:MaxRetries default 5 with exponential backoff and dead-letter; §5.5 /handoff full transfer aligned with all sibling docs; §10.4 P95 under 2s for first-attempt successes via telegram.send.latency_ms; §8 metrics table)._
 _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively (per implementation-plan.md Stage 3.2). Inline button presses emit the HumanAction.Value from AllowedActions via CallbackQueryHandler (per implementation-plan.md Stage 3.3)._
-_Default action model: The shared `AgentQuestion` record does NOT include a `DefaultAction` property (per tech-spec.md HC-3 and the epic attachment lines 831–841). The story requirement for "proposed default action" is handled Telegram-side: when the Telegram connector renders an `AgentQuestion`, it stores the proposed default action's `HumanAction.ActionId` in `PendingQuestionRecord.DefaultActionId` (architecture.md §3.1, implementation-plan.md Stage 3.5). On timeout, `QuestionTimeoutService` reads `PendingQuestionRecord.DefaultActionId`, resolves the full `HumanAction` from `IDistributedCache`, and publishes a `HumanDecisionEvent` with that action's `Value`. If `DefaultActionId` is null, the timeout event uses `ActionValue = "__timeout__"`. Note: architecture.md §3.1 line 177 and implementation-plan.md Stage 1.2 add `DefaultAction` directly to the shared `AgentQuestion` model, which contradicts the epic attachment — those docs should reconcile in future iterations._
-_Retry count: architecture.md §5.3 specifies `OutboundQueue:MaxRetries` default 5; implementation-plan.md Stage 4.2 specifies `RetryPolicy.MaxAttempts` default 3. These sibling docs are inconsistent — scenarios in this document use the configured `MaxAttempts` value without asserting a specific default, so QA tests should parameterize accordingly._
-_Handoff semantics: implementation-plan.md Stage 3.2 specifies `HandoffCommandHandler` returns a stub response and does not mutate `OperatorRegistry`; architecture.md §5.5 also notes handoff as pending policy decision. tech-spec.md D-4 marks full transfer as decided. These sibling docs are inconsistent — scenarios in this document align with implementation-plan.md Stage 3.2 (stub), since that is the implementation-level specification. When the docs reconcile, update these scenarios accordingly._
+_Default action model: The shared `AgentQuestion` record does NOT include a `DefaultAction` property (per tech-spec.md HC-3 and the epic attachment lines 831–841). The story requirement for "proposed default action" is handled Telegram-side: when the Telegram connector renders an `AgentQuestion`, it stores the proposed default action's `HumanAction.ActionId` in `PendingQuestionRecord.DefaultActionId` (architecture.md §3.1, implementation-plan.md Stage 3.5). Implementation-plan.md Stage 3.5 line 258 describes `DefaultActionId` as "denormalized from `AgentQuestion.DefaultAction` at question-send time"; tech-spec.md HC-3 says the shared `AgentQuestion` does NOT include `DefaultAction` as a first-class property. This is a known cross-doc tension: implementation-plan.md Stage 1.2 lists `DefaultAction` on the shared model, while tech-spec.md HC-3 and the epic attachment say otherwise. Scenarios in this document follow the tech-spec/epic position (DefaultAction not on shared model) with the `PendingQuestionRecord.DefaultActionId` denormalization described in implementation-plan.md Stage 3.5. On timeout, `QuestionTimeoutService` reads `PendingQuestionRecord.DefaultActionId`, resolves the full `HumanAction` from `IDistributedCache`, and publishes a `HumanDecisionEvent` with that action's `Value`. If `DefaultActionId` is null, the timeout event uses `ActionValue = "__timeout__"`._
+_Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are both aligned on `MaxAttempts` / `MaxRetries` default 5. Scenarios assert max 5 attempts accordingly._
+_Handoff semantics: All sibling docs are aligned on full oversight transfer for `/handoff`. tech-spec.md D-4 (Decided: full transfer), architecture.md §5.5 (full transfer with validation, notification, audit), and implementation-plan.md Stage 3.2 line 207 (HandoffCommandHandler performs full transfer) all describe the same behavior. Scenarios in this document implement full transfer accordingly._
+_Metric naming note: architecture.md §10.4 uses `telegram.messages.backpressure_dlq` for backpressure dead-letter counting; tech-spec.md HC-5 uses `telegram.messages.deadlettered_backpressure`. QA should assert whichever name the implementation adopts and file a reconciliation issue for the alternate name._
