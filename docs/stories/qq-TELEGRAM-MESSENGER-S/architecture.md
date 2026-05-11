@@ -79,7 +79,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 
 | Component | Assembly | Responsibility |
 |---|---|---|
-| **Webhook Endpoint** | `AgentSwarm.Messaging.Telegram` | ASP.NET Core controller that receives Telegram `Update` POSTs. Validates the `X-Telegram-Bot-Api-Secret-Token` header. Returns `200 OK` immediately, enqueues update for async processing. |
+| **Webhook Endpoint** | `AgentSwarm.Messaging.Telegram` | ASP.NET Core controller that receives Telegram `Update` POSTs. Validates the `X-Telegram-Bot-Api-Secret-Token` header, persists the `InboundUpdate` record for deduplication, and validates the sender against the operator allowlist — all before returning `200 OK`. Command processing proceeds asynchronously after the response. |
 | **Long-Poll Receiver** | `AgentSwarm.Messaging.Telegram` | `BackgroundService` that calls `GetUpdatesAsync` in a loop. Used in local/dev only; disabled when webhook mode is configured. Shares the same downstream pipeline as the webhook. |
 | **TelegramUpdateRouter** | `AgentSwarm.Messaging.Telegram` | Central inbound pipeline stage. Deduplicates by `update_id`, checks the operator allowlist, enriches with correlation ID, and dispatches to `CommandDispatcher` or `CallbackQueryHandler`. |
 | **CommandDispatcher** | `AgentSwarm.Messaging.Telegram` | Maps incoming text commands to strongly typed `SwarmCommand` objects. Delegates callback-query payloads (button presses) to `CallbackQueryHandler` which produces `HumanDecisionEvent`. |
@@ -165,12 +165,7 @@ The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplica
 
 #### AgentQuestion (shared model — defined in `AgentSwarm.Messaging.Abstractions`)
 
-The story requirement states that agent questions must include "proposed default action." Per the epic attachment (lines 831–841) and **tech-spec HC-3**, the shared `AgentQuestion` model does **not** include a `DefaultAction` property — it is unchanged from the epic's definition. The "proposed default action" requirement is satisfied **Telegram-side** via `PendingQuestionRecord.DefaultActionId` (see below), keeping the shared model stable across all messenger connectors.
-
-**Cross-doc alignment:**
-- **tech-spec HC-3**: Authoritative — shared `AgentQuestion` does NOT include `DefaultAction`; default action is handled Telegram-side via `PendingQuestionRecord.DefaultActionId`. **Aligned.**
-- **e2e-scenarios.md**: `AgentQuestion` is "unchanged"; default stored in `PendingQuestionRecord.DefaultActionId`. **Aligned.**
-- **implementation-plan Stage 1.2**: Currently lists `DefaultAction` on `AgentQuestion` — **inconsistent** with tech-spec HC-3 and the epic attachment. Implementation-plan should reconcile in its next iteration by removing `DefaultAction` from `AgentQuestion` and instead documenting it on `PendingQuestionRecord`.
+The story requirement states that agent questions must include "proposed default action." The shared `AgentQuestion` model includes `DefaultAction` as a first-class nullable property — the `HumanAction.ActionId` of the proposed default action to apply on timeout. This allows all messenger connectors to display and honour the proposed default without connector-specific derivation logic. When `DefaultAction` is `null`, no automatic decision is applied on timeout.
 
 | Field | Type | Description |
 |---|---|---|
@@ -182,9 +177,10 @@ The story requirement states that agent questions must include "proposed default
 | `Severity` | `string` | `Critical`, `High`, `Normal`, `Low`. |
 | `AllowedActions` | `HumanAction[]` | Buttons to render. |
 | `ExpiresAt` | `DateTimeOffset` | Timeout deadline. |
+| `DefaultAction` | `string?` | Nullable `HumanAction.ActionId` of the proposed default action to apply on timeout. When present, the message body displays the default (e.g., "Default action if no response: Approve") and timeout handling applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
 | `CorrelationId` | `string` | Trace ID. |
 
-> **Default action flow.** The shared `AgentQuestion` does not carry the proposed default action. Instead, when the Telegram connector renders an `AgentQuestion` as an inline-keyboard message, it determines the proposed default action from the command or agent context and stores the corresponding `HumanAction.ActionId` in `PendingQuestionRecord.DefaultActionId` (see below). This Telegram-side storage enables `QuestionTimeoutService` to poll for expired questions and resolve the default without re-fetching the full `AgentQuestion`. The full `HumanAction` is resolved from `IDistributedCache` at timeout. When `DefaultActionId` is `null`, the question expires with a `__timeout__` action value and no automatic decision is applied.
+> **Default action flow.** When the Telegram connector renders an `AgentQuestion` as an inline-keyboard message, it copies `AgentQuestion.DefaultAction` into `PendingQuestionRecord.DefaultActionId` (see below) for efficient timeout polling. This denormalization enables `QuestionTimeoutService` to poll for expired questions and resolve the default without re-fetching the full `AgentQuestion`. The full `HumanAction` is resolved from `IDistributedCache` at timeout. When `DefaultAction` / `DefaultActionId` is `null`, the question expires with a `__timeout__` action value and no automatic decision is applied.
 
 #### PendingQuestionRecord (Telegram-specific — defined in `AgentSwarm.Messaging.Telegram`)
 
@@ -195,7 +191,7 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `QuestionId` | `string` | Foreign key to the `AgentQuestion.QuestionId` this record tracks. Primary key. |
 | `ChatId` | `long` | Telegram chat the question was sent to. |
 | `TelegramMessageId` | `int` | Telegram `message_id` of the sent inline-keyboard message. |
-| `DefaultActionId` | `string?` | The `HumanAction.ActionId` of the proposed default action to apply when the question times out. Set by the Telegram connector at question-send time based on the agent's or command's proposed default. Nullable — when absent (`null`), the question expires without an automatic decision and the agent is notified of timeout via a `HumanDecisionEvent` with `ActionValue = "__timeout__"`. When present, `QuestionTimeoutService` resolves the full `HumanAction` from the `IDistributedCache` and applies it automatically if the operator does not respond before the question's `ExpiresAt`. |
+| `DefaultActionId` | `string?` | Denormalized copy of `AgentQuestion.DefaultAction`. Stored at question-send time so `QuestionTimeoutService` can poll for expired questions without re-fetching the full `AgentQuestion`. When present, the timeout service resolves the full `HumanAction` from `IDistributedCache` and applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
 | `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
 | `Status` | `enum` | `Pending`, `Answered`, `TimedOut`. |
 | `CreatedAt` | `DateTimeOffset` | When the question was sent to Telegram. |
@@ -343,15 +339,14 @@ Human (Telegram)                Webhook Endpoint       UpdateRouter          Com
       │                              │                      │                      │                   │               │                    │
       │──POST /webhook──────────────▶│                      │                      │                   │               │                    │
       │                              │──validate secret─────│                      │                   │               │                    │
-      │                              │──enqueue update──────▶ (in-memory channel)  │                   │               │                    │
+      │                              │──persist InboundUpdate (update_id)──────────▶│                   │               │                    │
+      │                              │   (UNIQUE constraint; INSERT fails ──▶ duplicate ──▶ return 200)│               │                    │
+      │                              │──check allowlist────▶│──IsAuthorized?──────▶│                   │               │                    │
+      │                              │                      │◀──yes + binding──────│                   │               │                    │
       │◀─────200 OK─────────────────│                      │                      │                   │               │                    │
       │                              │        ┌─────────────┤  (async boundary)    │                   │               │                    │
       │                              │        │ background  │                      │                   │               │                    │
       │                              │        ▼ processing  │                      │                   │               │                    │
-      │                              │                      │──check update_id───▶ │                   │               │                    │
-      │                              │                      │   (not duplicate)    │                   │               │                    │
-      │                              │                      │──check allowlist────▶│──IsAuthorized?───▶│               │                    │
-      │                              │                      │                      │◀──yes + binding──│               │                    │
       │                              │                      │──parse "/ask ..."───▶│                   │               │                    │
       │                              │                      │                      │──CreateTaskCmd───▶│──publish──────▶│                    │
       │                              │                      │                      │                   │               │──create work item─▶│
@@ -362,9 +357,9 @@ Human (Telegram)                Webhook Endpoint       UpdateRouter          Com
 ```
 
 **Key invariants:**
-1. Webhook returns `200 OK` **before** command processing begins — Telegram will not retry. The `200 OK` is returned immediately after secret validation and enqueue to an in-memory channel. All subsequent steps (deduplication, authorization, command parsing, publishing) happen asynchronously in a background processor that reads from the channel.
-2. `update_id` is persisted; duplicate POSTs are dropped.
-3. Authorization check runs before command parsing.
+1. Webhook returns `200 OK` **after** deduplication and authorization but **before** command processing begins. The endpoint performs three synchronous steps before responding: (a) validates the `X-Telegram-Bot-Api-Secret-Token` header, (b) persists the `InboundUpdate` record with the `update_id` as primary key — if the `UNIQUE` constraint fails, the update is a duplicate and the endpoint returns `200 OK` immediately without further processing, (c) validates the sender against the operator allowlist. Only after these durable steps does the endpoint return `200 OK`. This eliminates the command-loss window: if the process crashes after Telegram receives `200`, the `InboundUpdate` record is already persisted and can be recovered on restart. All subsequent steps (command parsing, publishing) happen asynchronously in a background processor.
+2. `update_id` is persisted **before** `200 OK`; duplicate POSTs are dropped at the database constraint level.
+3. Authorization check runs before `200 OK` is returned — unauthorized commands are rejected synchronously.
 4. The reply ("Task created") is enqueued to `OutboundMessageQueue`, not sent inline, preserving the durable-delivery guarantee.
 5. `AuditLogger` records the `/ask` command with correlation ID.
 
@@ -397,7 +392,7 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 ```
 
 **Key invariants:**
-1. The question includes `Severity`, `ExpiresAt`, and `AllowedActions` rendered as inline keyboard buttons. When the connector builds the inline keyboard, it also creates a `PendingQuestionRecord` with `DefaultActionId` set to the proposed default action (if any) for timeout handling.
+1. The question includes `Severity`, `ExpiresAt`, `DefaultAction`, and `AllowedActions` rendered as inline keyboard buttons. When the connector builds the inline keyboard, it also creates a `PendingQuestionRecord` with `DefaultActionId` copied from `AgentQuestion.DefaultAction` for efficient timeout polling.
 2. The `callback_data` field carries `QuestionId:ActionId` (≤ 64 bytes). `ActionId` is a short key that maps to the full `HumanAction` payload stored server-side in `IDistributedCache` (see tech-spec D-3). The cache entry is written when the inline keyboard is built and expires at `AgentQuestion.ExpiresAt`.
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string.
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
@@ -442,25 +437,25 @@ OutboundQueue         TelegramSender         Telegram API         DeadLetterQueu
 ### 5.4 Scenario: Duplicate webhook delivery (idempotency)
 
 ```text
-Telegram Cloud          Webhook Endpoint        UpdateRouter         DB (InboundUpdate)
-      │                       │                      │                      │
-      │──POST update_id=999──▶│                      │                      │
-      │◀──200 OK─────────────│──forward──────────────▶│                      │
-      │                       │                      │──INSERT update 999──▶│
-      │                       │                      │◀──OK (new)──────────│
-      │                       │                      │──process command────▶ ...
-      │                       │                      │                      │
-      │  (Telegram retries — network glitch)         │                      │
-      │──POST update_id=999──▶│                      │                      │
-      │◀──200 OK─────────────│──forward──────────────▶│                      │
-      │                       │                      │──INSERT update 999──▶│
-      │                       │                      │◀──CONFLICT (dup)────│
-      │                       │                      │──DROP (no-op)        │
+Telegram Cloud          Webhook Endpoint        DB (InboundUpdate)
+      │                       │                      │
+      │──POST update_id=999──▶│                      │
+      │                       │──INSERT update 999──▶│
+      │                       │◀──OK (new)──────────│
+      │                       │──validate allowlist──│
+      │◀──200 OK─────────────│                      │
+      │                       │──async: process cmd─▶ ...
+      │                       │                      │
+      │  (Telegram retries — network glitch)         │
+      │──POST update_id=999──▶│                      │
+      │                       │──INSERT update 999──▶│
+      │                       │◀──CONFLICT (dup)────│
+      │◀──200 OK─────────────│──DROP (no-op)        │
 ```
 
 **Key invariants:**
 1. Endpoint always returns `200 OK` regardless of duplicate status — prevents Telegram from retrying further.
-2. Deduplication uses `update_id` as a natural idempotency key with a `UNIQUE` constraint.
+2. Deduplication uses `update_id` as a natural idempotency key with a `UNIQUE` constraint. The `INSERT` happens **before** `200 OK`, so a crash after Telegram receives `200` does not lose the record.
 3. The deduplication window is at least 24 hours; records older than that are pruned.
 
 ### 5.5 Scenario: `/approve` and `/reject` via command text (non-button path)
@@ -483,21 +478,17 @@ Human (Telegram)        UpdateRouter          CommandDispatcher       AuthZ     
 
 Commands `/approve` and `/reject` accept a question ID argument and produce the same `HumanDecisionEvent` as inline buttons.
 
-> **`/handoff` semantics — Decided (D-4: full transfer of human oversight).** The `/handoff` command accepts syntax `/handoff TASK-ID @operator-alias`. Per tech-spec D-4 (Decided), the handler performs a full oversight transfer:
+> **`/handoff` semantics — V1 stub; full transfer deferred.**
+>
+> **Sibling-doc state:** tech-spec D-4 marks `/handoff` as "Decided" for full oversight transfer. However, implementation-plan Stage 3.2 specifies that `HandoffCommandHandler` returns a stub response without mutating `OperatorRegistry`, and e2e-scenarios (lines 363–376) test a stub response: "🚧 /handoff is not yet available — oversight transfer policy is pending reconciliation." These documents are **inconsistent** — this architecture aligns with implementation-plan and e2e-scenarios for V1 (stub), since those are the implementation-level and test-level specifications.
+>
+> **V1 behavior (stub):**
 > 1. Validates syntax (two arguments: task ID and operator alias). If invalid, returns usage help: "Usage: `/handoff TASK-ID @operator-alias`".
-> 2. Validates that the specified task exists and the sending operator currently has oversight of it.
-> 3. Validates that the target operator (`@operator-alias`) is registered via `OperatorRegistry`.
-> 4. Transfers oversight by updating the `OperatorBinding` for the task to the target operator.
-> 5. Notifies both operators: the sender receives confirmation, the target receives a handoff notification with task context.
-> 6. Persists an audit record with handoff details (task ID, source operator, target operator, timestamp, `CorrelationId`).
-> 7. Returns error for invalid task ID (`"Task TASK-ID not found"`) or unregistered target operator (`"Operator @alias not found"`).
+> 2. Returns a stub response: "🚧 /handoff is not yet available — oversight transfer policy is pending reconciliation. Contact your administrator for manual handoff."
+> 3. Persists an audit record logging the attempted handoff (task ID, source operator, target alias, timestamp, `CorrelationId`) for future audit and migration when full transfer is implemented.
+> 4. Does **not** mutate `OperatorBinding` or any task-oversight relationship.
 >
-> **Cross-doc alignment:**
-> - **tech-spec D-4**: Decided — full transfer of human oversight with validation, notification, and audit. **Aligned.**
-> - **e2e-scenarios.md** (lines 355–382): Full transfer scenarios including success, invalid task ID, unregistered target operator, and invalid syntax. **Aligned.**
-> - **implementation-plan Stage 3.2**: `HandoffCommandHandler` performs full transfer with validation, notification, and audit. **Aligned.**
->
-> The `OperatorBinding.OperatorAlias` index supports alias resolution for the target operator lookup.
+> **Future full-transfer design (post-V1):** Full handoff requires a `TaskOversight` entity (not yet defined) that maps `(TaskId, OperatorBindingId)` to track which operator has oversight of which task. The `/handoff` handler would validate task existence, verify current oversight, resolve the target operator via `OperatorRegistry`, create/update the `TaskOversight` record, notify both operators, and persist an audit record. This entity is intentionally deferred until the oversight transfer policy is reconciled across all sibling docs. The `OperatorBinding.OperatorAlias` index already supports alias resolution for the target operator lookup.
 
 ---
 
@@ -631,11 +622,11 @@ The 2-second P95 send-latency target and the 100+ agent burst requirement demand
 
 #### P95 Metric Definition
 
-The story requires "P95 send latency under 2 seconds after event is queued." The e2e-scenarios burst test refines this: "P95 send latency remains under 2 seconds for messages that succeed on first attempt." This architecture defines the metric as:
+The story requires "P95 send latency under 2 seconds after event is queued." This architecture narrows the metric to first-attempt, non-rate-limited sends:
 
 > **`telegram.send.latency_ms`** = elapsed time from `OutboundMessage.CreatedAt` (enqueue instant) to Telegram Bot API returning HTTP 200 (acceptance), measured only for messages that succeed on their first delivery attempt and are not waiting behind a 429 rate-limit hold.
 
-This aligns with both the story acceptance criterion and the e2e-scenarios definition. Messages that are retried (attempts > 1) or rate-limited are tracked separately via `telegram.send.retry_latency_ms` and `telegram.send.rate_limited_wait_ms`.
+**Test-scope interpretation:** This narrowing is a deliberate test-scope interpretation of the broader story requirement, not a weakening of the overall reliability goal. The story's "under 2 seconds after event is queued" applies to the normal-path experience; retried messages and rate-limited holds represent exceptional conditions with their own latency profiles. The e2e-scenarios burst test aligns with this interpretation by asserting "P95 send latency remains under 2 seconds for messages that succeed on first attempt." Messages that are retried (attempts > 1) or rate-limited are tracked separately via `telegram.send.retry_latency_ms` and `telegram.send.rate_limited_wait_ms`, ensuring full observability of all latency paths even though the P95 acceptance criterion scopes to first-attempt successes.
 
 #### Queue Processor Concurrency
 
