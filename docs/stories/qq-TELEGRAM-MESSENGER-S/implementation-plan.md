@@ -33,13 +33,13 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Create `MessengerMessage` record in Abstractions with properties: `MessageId`, `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, `Text`, `Severity`, `Metadata` dictionary
-- [ ] Create `AgentQuestion` record in Abstractions with properties: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `AllowedActions` (list of `HumanAction`), `ExpiresAt`, `CorrelationId` — the shared model does **not** include a `DefaultAction` property; per e2e-scenarios.md (lines 57–62), the proposed default action is provided as sidecar metadata via `ProposedDefaultActionId` in the agent/command context envelope (see `AgentQuestionEnvelope` below), enabling connectors to handle defaults without coupling the shared model to timeout behavior
+- [ ] Create `AgentQuestion` record in Abstractions with properties: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `AllowedActions` (list of `HumanAction`), `ExpiresAt`, `CorrelationId` — the shared model does **not** include a `DefaultAction` property; the proposed default action is carried as sidecar metadata via `ProposedDefaultActionId` in `AgentQuestionEnvelope` (see below); this follows architecture.md §3.1 (lines 167–184) which defines `AgentQuestion` without `DefaultAction` and `AgentQuestionEnvelope` with `ProposedDefaultActionId`; **cross-doc note:** e2e-scenarios.md is internally inconsistent — lines 57–62 and 64–77 use the envelope/sidecar model (matching this plan), while the footer (line 617) claims `AgentQuestion` includes a nullable `DefaultAction` as a first-class field; this plan treats the e2e fixture (lines 57–77) and architecture.md §3.1 as authoritative; the e2e footer should be corrected to match
 - [ ] Create `AgentQuestionEnvelope` record in Abstractions with properties: `Question` (`AgentQuestion`), `ProposedDefaultActionId` (nullable `string` — the `ActionId` of the proposed default action from `AllowedActions`; carried as routing/context metadata alongside the `AgentQuestion`; when the question times out, the connector reads this from `PendingQuestionRecord.DefaultActionId` and applies the action automatically; when `null`, the question expires with `ActionValue = "__timeout__"`), `RoutingMetadata` (dictionary of string key-value pairs for extensible context)
 - [ ] Create `HumanAction` record in Abstractions with properties: `ActionId`, `Label`, `Value`, `RequiresComment`
 - [ ] Create `HumanDecisionEvent` record in Abstractions with properties: `QuestionId`, `ActionValue`, `Comment`, `Messenger`, `ExternalUserId`, `ExternalMessageId`, `ReceivedAt`, `CorrelationId`
 - [ ] Create `MessengerEvent` record in Abstractions representing inbound events with properties: `EventId`, `EventType` enum, `RawCommand`, `UserId`, `ChatId`, `Timestamp`, `CorrelationId`, `Payload`
 - [ ] Create `EventType` enum in Abstractions: `Command`, `CallbackResponse`, `TextReply`, `Unknown`
-- [ ] Create `MessageSeverity` enum in Abstractions: `Info`, `Warning`, `Error`, `Critical`
+- [ ] Create `MessageSeverity` enum in Abstractions: `Critical`, `High`, `Normal`, `Low` — canonical severity vocabulary used consistently across all stages (1.2, 4.1), architecture.md §3.1 (`OutboundMessage.Severity`), and e2e-scenarios.md fixtures
 
 ### Dependencies
 - phase-messaging-abstractions-and-solution-scaffold/stage-solution-and-project-structure
@@ -67,8 +67,9 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Create `ParsedCommand` record in Abstractions with properties: `CommandName`, `Arguments`, `RawText`, `IsValid`, `ValidationError`
 - [ ] Create `ICallbackHandler` interface in Abstractions with method: `HandleAsync(MessengerEvent, CancellationToken)` returning `CommandResult` — abstracts callback query processing for inline button presses
 - [ ] Create `IDeduplicationService` interface in Abstractions with methods: `IsProcessedAsync(string eventId, CancellationToken)` returning bool, and `MarkProcessedAsync(string eventId, CancellationToken)` — abstracts inbound event deduplication
-- [ ] Create `ISwarmCommandBus` interface in Abstractions with methods: `PublishCommandAsync(SwarmCommand, CancellationToken)`, `QueryStatusAsync(CancellationToken)`, `QueryAgentsAsync(CancellationToken)` — port to the agent swarm orchestrator (transport is out of scope for this story, per architecture.md)
+- [ ] Create `ISwarmCommandBus` interface in Abstractions with methods: `PublishCommandAsync(SwarmCommand, CancellationToken)`, `QueryStatusAsync(CancellationToken)`, `QueryAgentsAsync(CancellationToken)`, `SubscribeAsync(string tenantId, CancellationToken)` returning `IAsyncEnumerable<SwarmEvent>` — port to the agent swarm orchestrator (transport is out of scope for this story, per architecture.md §4.6); `SubscribeAsync` enables the connector to receive agent-originated questions, alerts, and status updates for rendering in Telegram
 - [ ] Create `SwarmCommand` record in Abstractions with properties: `CommandType`, `TaskId`, `OperatorId`, `Payload`, `CorrelationId`
+- [ ] Create `SwarmEvent` abstract record in Abstractions as a discriminated union base with subtypes: `AgentQuestionEvent` (wraps `AgentQuestionEnvelope`), `AgentAlertEvent` (properties: `AgentId`, `AlertId`, `Title`, `Body`, `Severity`, `CorrelationId`), `AgentStatusUpdateEvent` (properties: `AgentId`, `TaskId`, `StatusText`, `CorrelationId`) — per architecture.md §4.6, these cover all agent-originated events that the Telegram connector must render
 - [ ] Create `IOperatorRegistry` interface in Core (per architecture.md §4.3) with methods: `GetByTelegramUserAsync(long telegramUserId, long chatId, CancellationToken)` returning `OperatorBinding?`, `GetAllBindingsAsync(long telegramUserId, CancellationToken)` returning `IReadOnlyList<OperatorBinding>`, `GetByAliasAsync(string operatorAlias, CancellationToken)` returning `OperatorBinding?`, `RegisterAsync(long telegramUserId, long chatId, string tenantId, string workspaceId, CancellationToken)`, `IsAuthorizedAsync(long telegramUserId, long chatId, CancellationToken)` returning `bool` — used by Stage 3.2 (`HandoffCommandHandler` alias resolution), Stage 3.4 (concrete implementation), and Stage 5.2 (runtime authorization)
 - [ ] Create `OperatorBinding` record in Core with properties: `Id` (Guid), `TelegramUserId` (long), `TelegramChatId` (long), `ChatType` (enum: `Private`, `Group`, `Supergroup`), `OperatorAlias` (string), `TenantId`, `WorkspaceId`, `Roles` (list of string), `RegisteredAt` (DateTimeOffset), `IsActive` (bool) — per architecture.md §3.1
 
@@ -85,6 +86,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ### Implementation Steps
 - [ ] Create `IMessageSender` interface in Core with methods: `SendTextAsync(long chatId, string text, CancellationToken)`, `SendQuestionAsync(long chatId, AgentQuestionEnvelope envelope, CancellationToken)` — the platform-agnostic outbound sending contract that `TelegramMessageSender` (Stage 2.3) implements; uses `AgentQuestionEnvelope` so the sender can read `ProposedDefaultActionId` from sidecar metadata and denormalize it into `PendingQuestionRecord.DefaultActionId`; used by `OutboundQueueProcessor` (Stage 4.1) to send messages without depending on the Telegram project directly
 - [ ] Create `IAlertService` interface in Abstractions with method: `SendAlertAsync(string subject, string detail, CancellationToken)` — used to notify operators via a secondary channel when dead-letter events occur or critical failures are detected
+- [ ] Create `IOutboundQueue` interface in Abstractions with methods: `EnqueueAsync(OutboundMessage, CancellationToken)`, `DequeueAsync(CancellationToken)` returning the highest-severity pending message, `MarkSentAsync(Guid messageId, int telegramMessageId, CancellationToken)`, `MarkFailedAsync(Guid messageId, string error, CancellationToken)`, `DeadLetterAsync(Guid messageId, CancellationToken)` — per architecture.md §4.4; defined here so `TelegramMessengerConnector` (Stage 2.6) can delegate sends without depending on the concrete implementation (Stage 4.1)
 
 ### Dependencies
 - phase-messaging-abstractions-and-solution-scaffold/stage-connector-interface-and-service-contracts
@@ -92,6 +94,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ### Test Scenarios
 - [ ] Scenario: IMessageSender accepts envelope — Given a Moq mock of `IMessageSender`, When `SendQuestionAsync` is invoked with an `AgentQuestionEnvelope` containing `ProposedDefaultActionId`, Then the mock records the call and envelope properties are accessible
 - [ ] Scenario: IAlertService mockable — Given a Moq mock of `IAlertService`, When `SendAlertAsync` is invoked with a subject and detail, Then the mock records the call without error
+- [ ] Scenario: IOutboundQueue mockable — Given a Moq mock of `IOutboundQueue`, When `EnqueueAsync` is invoked with an `OutboundMessage`, Then the mock records the call without error
 
 # Phase 2: Telegram Bot Integration
 
@@ -193,6 +196,43 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ### Test Scenarios
 - [ ] Scenario: Polling receives updates — Given polling mode is enabled and the bot has pending updates, When the polling loop executes, Then updates are mapped and enqueued
 - [ ] Scenario: Mutual exclusion enforced — Given both `UsePolling=true` and `WebhookUrl` is set, When the host starts, Then startup fails with a configuration error explaining the conflict
+
+## Stage 2.6: Telegram Messenger Connector
+
+### Implementation Steps
+- [ ] Create `TelegramMessengerConnector` class in the Telegram project implementing `IMessengerConnector` (defined in Stage 1.3 Abstractions) — per architecture.md §4.1, this is the concrete Telegram implementation of the shared gateway interface
+- [ ] Implement `SendMessageAsync(MessengerMessage, CancellationToken)`: convert the `MessengerMessage` to an `OutboundMessage` with appropriate `SourceType` (e.g., `Alert`, `StatusUpdate`, `CommandAck`), derive `IdempotencyKey` per architecture.md §3.1 idempotency key derivation table, set `Severity` from the message, and delegate to `IOutboundQueue.EnqueueAsync` (interface defined in Stage 1.4)
+- [ ] Implement `SendQuestionAsync(AgentQuestionEnvelope, CancellationToken)`: convert the envelope to an `OutboundMessage` with `SourceType=Question`, `SourceId=QuestionId`, `IdempotencyKey=q:{AgentId}:{QuestionId}`, read `RoutingMetadata["TelegramChatId"]` for the target chat, and delegate to `IOutboundQueue.EnqueueAsync`
+- [ ] Implement `ReceiveAsync(CancellationToken)`: drain processed inbound `MessengerEvent`s from an internal `Channel<MessengerEvent>` that the `TelegramUpdatePipeline` (Stage 2.2) feeds after processing each update; return as `IReadOnlyList<MessengerEvent>`
+- [ ] Register `TelegramMessengerConnector` as `IMessengerConnector` in the DI container via `TelegramServiceCollectionExtensions`
+
+### Dependencies
+- phase-telegram-bot-integration/stage-inbound-update-pipeline
+- phase-telegram-bot-integration/stage-outbound-message-sender
+
+### Test Scenarios
+- [ ] Scenario: SendMessageAsync delegates to outbound queue — Given a `MessengerMessage` with `Severity=High`, When `SendMessageAsync` is called on `TelegramMessengerConnector`, Then an `OutboundMessage` is enqueued with matching severity, correct `IdempotencyKey`, and `SourceType=StatusUpdate`
+- [ ] Scenario: SendQuestionAsync uses envelope metadata — Given an `AgentQuestionEnvelope` with `RoutingMetadata["TelegramChatId"]="12345"` and `ProposedDefaultActionId="act-1"`, When `SendQuestionAsync` is called, Then the enqueued `OutboundMessage` has `ChatId=12345`, `SourceType=Question`, and `IdempotencyKey=q:{AgentId}:{QuestionId}`
+- [ ] Scenario: ReceiveAsync drains processed events — Given two `MessengerEvent`s have been fed into the connector's internal channel by the pipeline, When `ReceiveAsync` is called, Then both events are returned
+
+## Stage 2.7: Swarm Event Ingress Service
+
+### Implementation Steps
+- [ ] Create `SwarmEventSubscriptionService` as a `BackgroundService` in the Telegram project that subscribes to agent-originated events via `ISwarmCommandBus.SubscribeAsync(tenantId, CancellationToken)` (defined in Stage 1.3, per architecture.md §4.6)
+- [ ] On startup, resolve active tenant IDs from `IOperatorRegistry` and call `SubscribeAsync` for each tenant; process the `IAsyncEnumerable<SwarmEvent>` stream as events arrive
+- [ ] Route `AgentQuestionEvent` events: extract the `AgentQuestionEnvelope`, resolve the target operator's `TelegramChatId` via `IOperatorRegistry` (or from `RoutingMetadata`), and call `IMessengerConnector.SendQuestionAsync` to deliver the question with inline buttons
+- [ ] Route `AgentAlertEvent` events: convert to a `MessengerMessage` with the alert's severity, resolve the target chat via task oversight or broadcast to all active operators, and call `IMessengerConnector.SendMessageAsync`
+- [ ] Route `AgentStatusUpdateEvent` events: convert to a `MessengerMessage` with `Severity=Normal`, resolve the oversighting operator via `ITaskOversightRepository` (Stage 3.2), and call `IMessengerConnector.SendMessageAsync`
+- [ ] Handle subscription errors with exponential backoff and reconnection; log disconnections at `Warning` level and reconnections at `Information` level
+- [ ] Provide a stub/no-op `ISwarmCommandBus` implementation for development that yields no events from `SubscribeAsync` (concrete transport is out of scope for this story)
+
+### Dependencies
+- phase-telegram-bot-integration/stage-telegram-messenger-connector
+
+### Test Scenarios
+- [ ] Scenario: Question event routed to Telegram — Given agent "build-agent-1" publishes an `AgentQuestionEvent` with a blocking question, When `SwarmEventSubscriptionService` processes it, Then `IMessengerConnector.SendQuestionAsync` is called with the correct `AgentQuestionEnvelope`
+- [ ] Scenario: Alert event broadcast — Given agent "monitor-1" publishes an `AgentAlertEvent` with `Severity=Critical`, When processed, Then `IMessengerConnector.SendMessageAsync` is called with a `MessengerMessage` containing the alert title and `Severity=Critical`
+- [ ] Scenario: Subscription reconnects on error — Given the `SubscribeAsync` stream throws a transient exception, When the error occurs, Then the service logs a warning and re-subscribes with backoff
 
 # Phase 3: Command Processing and Agent Routing
 
@@ -310,8 +350,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ## Stage 4.1: Durable Outbound Message Queue
 
 ### Implementation Steps
-- [ ] Define `IOutboundQueue` interface in Core (per architecture.md §4.4) with methods: `EnqueueAsync(OutboundMessage, CancellationToken)`, `DequeueAsync(CancellationToken)` returning the highest-severity pending message (severity-priority order: `Critical` > `High` > `Normal` > `Low`), `MarkSentAsync(Guid messageId, int telegramMessageId, CancellationToken)`, `MarkFailedAsync(Guid messageId, string error, CancellationToken)`, `DeadLetterAsync(Guid messageId, CancellationToken)`
-- [ ] Create `OutboundMessage` record matching architecture.md's data model: `Id` (Guid), `IdempotencyKey` (string, derived per `SourceType` — see architecture.md idempotency key derivation table), `ChatId`, `Payload` (serialized MessengerMessage or AgentQuestion), `Severity` (enum: `Critical`, `High`, `Normal`, `Low` — determines priority queue ordering), `SourceType` (enum: `Question`, `Alert`, `StatusUpdate`, `CommandAck` — discriminator for origin type), `SourceId` (string, nullable — `QuestionId` for questions, alert rule ID for alerts, command correlation ID for acks; null only for fire-and-forget status broadcasts), `Status` (enum: `Pending`, `Sending`, `Sent`, `Failed`, `DeadLettered`), `AttemptCount`, `MaxAttempts`, `NextRetryAt`, `CreatedAt`, `SentAt`, `TelegramMessageId`, `CorrelationId`, `ErrorDetail`
+- [ ] Implement concrete `OutboundMessage` record in Core matching architecture.md's data model: `Id` (Guid), `IdempotencyKey` (string, derived per `SourceType` — see architecture.md idempotency key derivation table), `ChatId`, `Payload` (serialized MessengerMessage or AgentQuestion), `Severity` (enum: `Critical`, `High`, `Normal`, `Low` — determines priority queue ordering), `SourceType` (enum: `Question`, `Alert`, `StatusUpdate`, `CommandAck` — discriminator for origin type), `SourceId` (string, nullable — `QuestionId` for questions, alert rule ID for alerts, command correlation ID for acks; null only for fire-and-forget status broadcasts), `Status` (enum: `Pending`, `Sending`, `Sent`, `Failed`, `DeadLettered`), `AttemptCount`, `MaxAttempts`, `NextRetryAt`, `CreatedAt`, `SentAt`, `TelegramMessageId`, `CorrelationId`, `ErrorDetail`
 - [ ] Add a `UNIQUE` constraint on `IdempotencyKey` in the outbox table so that duplicate enqueue attempts for the same logical message are rejected at the database level
 - [ ] Implement `InMemoryOutboundQueue` using a priority-ordered `Channel<OutboundMessage>` (severity-priority dequeue: `Critical` > `High` > `Normal` > `Low`) with bounded capacity for development
 - [ ] Implement `PersistentOutboundQueue` backed by EF Core for durable persistence; use SQLite provider for dev/local environments and PostgreSQL or SQL Server for production (the specific production provider is a deployment decision, consistent with architecture.md §11.3); persist messages to an `outbox` table with status tracking; `DequeueAsync` queries `WHERE Status=Pending ORDER BY Severity ASC, CreatedAt ASC` to enforce severity-priority ordering; on `EnqueueAsync`, check `IdempotencyKey` uniqueness before inserting; when queue depth exceeds `OutboundQueue:MaxQueueDepth` (default 5000, per architecture.md §10.4), dead-letter `Low`-severity messages immediately with reason `backpressure:queue_depth_exceeded` and emit a `telegram.queue.backpressure` metric — `Normal`, `High`, and `Critical` messages are always accepted
@@ -508,14 +547,3 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Scenario: All acceptance tests pass — Given the full integration test suite, When `dotnet test` is run, Then all eight AC and PERF tests pass
 - [ ] Scenario: Tests are deterministic — Given the integration tests, When run three times consecutively, Then all pass every time with no flaky failures
 - [ ] Scenario: P95 latency measured accurately — Given the PERF001 test, When 100 messages are sent through the outbound pipeline, Then a P95 histogram is computed using the `telegram.send.latency_ms` all-inclusive metric (per architecture.md §10.4) and the assertion threshold is 2000ms
-
----
-
-## Cross-Document Alignment Notes
-
-| Topic | This document's position | Sibling document status |
-|-------|-------------------------|------------------------|
-| **DefaultAction model** | Stage 1.2 defines `AgentQuestion` **without** a `DefaultAction` property. The proposed default action is carried as sidecar metadata via `ProposedDefaultActionId` in `AgentQuestionEnvelope` (Stage 1.2). This aligns with architecture.md §3.1 (lines 167–184) and e2e-scenarios.md (lines 57–63, 613). The connector reads `ProposedDefaultActionId` from the envelope, denormalizes it into `PendingQuestionRecord.DefaultActionId` (Stage 3.5), and applies it on timeout. | **tech-spec.md** Section 10 alignment table (line 160) incorrectly states that this plan's Stage 1.2 "defines `AgentQuestion` with `DefaultAction` as a first-class property." This is a stale cross-reference — this plan has used the sidecar-metadata approach since iteration 12. tech-spec.md should update its alignment table column for implementation-plan.md to reflect the sidecar approach. **architecture.md** has an internal inconsistency: §3.1 specifies sidecar-metadata (no `DefaultAction` on `AgentQuestion`), while §5.3 (line 424) describes `DefaultAction` as a first-class property. This plan follows §3.1 as authoritative. |
-| **Data-flow for default actions** | `IMessengerConnector.SendQuestionAsync` accepts `AgentQuestionEnvelope` (not bare `AgentQuestion`) so the connector has access to `ProposedDefaultActionId` and `RoutingMetadata`. `IPendingQuestionStore.StoreAsync` accepts `AgentQuestionEnvelope`, `telegramChatId`, and `telegramMessageId` so the store can denormalize `ProposedDefaultActionId` into `PendingQuestionRecord.DefaultActionId` and persist `TelegramChatId` for timeout message edits. This closes the data-flow gap between Stage 1.2 (envelope definition), Stage 1.3 (interface contracts), Stage 2.3 (outbound sender), and Stage 3.5 (pending question store/timeout). | Consistent with e2e-scenarios.md lines 64–77 (envelope fixture) and architecture.md §3.1. |
-| **P95 latency scope** | The P95 ≤ 2s acceptance criterion applies to `telegram.send.latency_ms`, the all-inclusive metric measuring elapsed time from `OutboundMessage.CreatedAt` (enqueue instant) to Telegram API HTTP 200, for all messages regardless of attempt number or rate-limit holds, per architecture.md §10.4 (lines 662–666). No provisional scoping remains. | Consistent with architecture.md §10.4 and e2e-scenarios.md line 618. tech-spec.md HC-4 previously noted the scope as pending confirmation; this plan adopts the architecture.md definition as decided. |
-| **Stage ordering** | Phase 2 stages are ordered: 2.1 Bot Client Wrapper → 2.2 Inbound Update Pipeline → 2.3 Outbound Message Sender → 2.4 Webhook Receiver → 2.5 Long Polling Receiver. The pipeline (2.2) appears before both receivers (2.4, 2.5), so all dependency references point to upstream stage anchors. | No cross-doc impact; stage ordering is internal to implementation-plan.md. |
