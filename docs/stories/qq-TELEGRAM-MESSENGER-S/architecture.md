@@ -351,22 +351,13 @@ public interface ISwarmCommandBus
     Task PublishCommandAsync(SwarmCommand command, CancellationToken ct);
     Task<SwarmStatusSummary> QueryStatusAsync(CancellationToken ct);
     Task<IReadOnlyList<AgentInfo>> QueryAgentsAsync(CancellationToken ct);
-}
-```
-
-The Telegram connector publishes commands (task creation, approvals, pauses) via `PublishCommandAsync` and queries swarm state via `QueryStatusAsync` and `QueryAgentsAsync`. These three methods align with implementation-plan.md Stage 1.3.
-
-**Event ingress (agent → connector):** The connector must also receive inbound events from the swarm (agent questions, status updates, alerts) to render them in Telegram. Rather than introducing a separate subscription interface not present in the implementation plan, event ingress is handled via an additional `SubscribeAsync` method on `ISwarmCommandBus`. This keeps a single swarm integration surface consistent with implementation-plan.md Stage 1.3, which defines `ISwarmCommandBus` as the sole port to the agent swarm orchestrator:
-
-```csharp
-public interface ISwarmCommandBus
-{
-    Task PublishCommandAsync(SwarmCommand command, CancellationToken ct);
-    Task<SwarmStatusSummary> QueryStatusAsync(CancellationToken ct);
-    Task<IReadOnlyList<AgentInfo>> QueryAgentsAsync(CancellationToken ct);
     IAsyncEnumerable<SwarmEvent> SubscribeAsync(string tenantId, CancellationToken ct);
 }
 ```
+
+The Telegram connector publishes commands (task creation, approvals, pauses) via `PublishCommandAsync` and queries swarm state via `QueryStatusAsync` and `QueryAgentsAsync`. These three outbound methods align with implementation-plan.md Stage 1.3.
+
+**Event ingress (agent → connector):** The connector must also receive inbound events from the swarm (agent questions, status updates, alerts) to render them in Telegram. Event ingress is handled via `SubscribeAsync` on the same `ISwarmCommandBus` interface, keeping a single swarm integration surface consistent with implementation-plan.md Stage 1.3, which defines `ISwarmCommandBus` as the sole port to the agent swarm orchestrator.
 
 `SwarmEvent` is a discriminated union (or base class with subtypes) covering `AgentQuestionEvent`, `AgentAlertEvent`, and `AgentStatusUpdateEvent`. The Telegram connector's `BackgroundService` calls `SubscribeAsync` at startup for each active tenant and processes events as they arrive — rendering questions as inline-keyboard messages, alerts as priority text, and status updates as informational messages. The transport backing this subscription (in-process `Channel<T>`, message broker, gRPC stream) is outside this story's scope; the interface abstracts it.
 
