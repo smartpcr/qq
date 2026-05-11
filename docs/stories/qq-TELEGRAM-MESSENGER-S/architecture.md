@@ -86,7 +86,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 | **AuthZ Service** | `AgentSwarm.Messaging.Core` | Validates that the Telegram user ID + chat ID pair is in the authorized operator registry. Returns tenant/workspace binding or rejects the request. |
 | **Operator Registry** | `AgentSwarm.Messaging.Core` | Persistent map of `TelegramUserId → OperatorIdentity(TenantId, WorkspaceId, Roles)`. Populated via `/start` registration flow and admin configuration. |
 | **Swarm Command Bus** | `AgentSwarm.Messaging.Core` | Publishes validated, strongly typed commands to the agent swarm orchestrator. Consumes agent-originated events (questions, alerts, status) and routes them to the correct outbound connector. |
-| **OutboundMessageQueue** | `AgentSwarm.Messaging.Core` | Durable queue for outbound messages. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 3 attempts), and dead-letter after exhaustion. |
+| **OutboundMessageQueue** | `AgentSwarm.Messaging.Core` | Durable queue for outbound messages. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 5 attempts), and dead-letter after exhaustion. |
 | **TelegramSender** | `AgentSwarm.Messaging.Telegram` | Wraps `ITelegramBotClient` from the `Telegram.Bot` library. Formats messages with MarkdownV2, builds `InlineKeyboardMarkup` for agent questions, enforces Telegram rate limits. |
 | **AuditLogger** | `AgentSwarm.Messaging.Persistence` | Writes an immutable audit record for every human response. Includes message ID, user ID, agent ID, timestamp, and correlation ID. Backed by append-only store. |
 
@@ -165,6 +165,14 @@ The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplica
 
 #### AgentQuestion (shared model — defined in `AgentSwarm.Messaging.Abstractions`)
 
+The story requirement states that agent questions must include "proposed default action." `DefaultAction` is modelled as a **first-class shared property** on `AgentQuestion` — not a Telegram-specific extension. This decision is aligned across three sibling documents:
+
+- **tech-spec HC-3**: defines `AgentQuestion.DefaultAction` as a shared property on the `AgentSwarm.Messaging.Abstractions` model.
+- **implementation-plan Stage 1.2**: creates `AgentQuestion` with `DefaultAction` (nullable `string` matching a `HumanAction.Value` in `AllowedActions`).
+- **e2e-scenarios**: uses `DefaultAction` as a Gherkin table field directly on `AgentQuestion`.
+
+The epic attachment's `AgentQuestion` record does not include `DefaultAction`; this is a **deliberate extension** of the shared model to satisfy the story's "proposed default action" requirement, documented here and in tech-spec HC-3.
+
 | Field | Type | Description |
 |---|---|---|
 | `QuestionId` | `string` | Unique question identifier. |
@@ -174,10 +182,11 @@ The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplica
 | `Body` | `string` | Full context for the operator. |
 | `Severity` | `string` | `Critical`, `High`, `Normal`, `Low`. |
 | `AllowedActions` | `HumanAction[]` | Buttons to render. |
+| `DefaultAction` | `string?` | `HumanAction.ActionId` of the proposed default action to apply on timeout. Nullable — when absent, the question expires without an automatic decision. This is a first-class shared property (not Telegram-specific) so that all messenger connectors can display and honour the default action consistently. |
 | `ExpiresAt` | `DateTimeOffset` | Timeout deadline. |
 | `CorrelationId` | `string` | Trace ID. |
 
-> **Default action handling.** The epic attachment's shared `AgentQuestion` record does not include a `DefaultAction` property, and this architecture preserves that shared contract unchanged. The story's "proposed default action" requirement is fulfilled via a **Telegram-specific** `PendingQuestionRecord` (see below) whose `DefaultActionId` field stores the `HumanAction.ActionId` to apply on timeout. This aligns with tech-spec HC-3, which specifies that the proposed default belongs on `PendingQuestionRecord.DefaultActionId`, not the shared model. The approach keeps `AgentQuestion` stable across all messenger connectors while allowing each connector to implement connector-specific timeout behaviour.
+> **Default action flow.** When the Telegram connector renders an `AgentQuestion` as an inline-keyboard message, it copies `AgentQuestion.DefaultAction` into `PendingQuestionRecord.DefaultActionId` (see below). This denormalization enables `QuestionTimeoutService` to poll for expired questions and resolve the default without re-fetching the full `AgentQuestion`. The value is the `HumanAction.ActionId` string; the full `HumanAction` is resolved from `IDistributedCache` at timeout. When `DefaultAction` is `null`, the question expires with a `__timeout__` action value and no automatic decision is applied.
 
 #### PendingQuestionRecord (Telegram-specific — defined in `AgentSwarm.Messaging.Telegram`)
 
@@ -188,7 +197,7 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `QuestionId` | `string` | Foreign key to the `AgentQuestion.QuestionId` this record tracks. Primary key. |
 | `ChatId` | `long` | Telegram chat the question was sent to. |
 | `TelegramMessageId` | `int` | Telegram `message_id` of the sent inline-keyboard message. |
-| `DefaultActionId` | `string?` | The `HumanAction.ActionId` to apply when the question times out. Nullable — when absent (`null`), the question expires without an automatic decision and the agent is notified of timeout via a `HumanDecisionEvent` with `ActionValue = "__timeout__"`. When present, `QuestionTimeoutService` resolves the full `HumanAction` from the `IDistributedCache` and applies it automatically if the operator does not respond before the question's `ExpiresAt`. |
+| `DefaultActionId` | `string?` | Copied from `AgentQuestion.DefaultAction` at question-send time. The `HumanAction.ActionId` to apply when the question times out. Nullable — when absent (`null`), the question expires without an automatic decision and the agent is notified of timeout via a `HumanDecisionEvent` with `ActionValue = "__timeout__"`. When present, `QuestionTimeoutService` resolves the full `HumanAction` from the `IDistributedCache` and applies it automatically if the operator does not respond before the question's `ExpiresAt`. |
 | `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
 | `Status` | `enum` | `Pending`, `Answered`, `TimedOut`. |
 | `CreatedAt` | `DateTimeOffset` | When the question was sent to Telegram. |
@@ -419,12 +428,14 @@ OutboundQueue         TelegramSender         Telegram API         DeadLetterQueu
 ```
 
 **Retry policy (configurable via `OutboundQueue:MaxRetries` and `OutboundQueue:BaseRetryDelaySeconds`):**
-- Max attempts: configurable (default `3`, aligning with implementation-plan Stage 4.2 `RetryPolicy.MaxAttempts` default of `3`)
+- Max attempts: configurable (default `5`, aligned with implementation-plan Stage 4.2 `RetryPolicy.MaxAttempts` default of `5`)
 - Back-off: exponential (`BaseRetryDelaySeconds` ^ attempt, e.g. 2s, 4s, 8s capped) with jitter (±25%)
 - Retryable errors: HTTP 429 (with `retry_after`), 5xx, network timeouts
 - Non-retryable: HTTP 400 (bad request), 403 (bot blocked) — dead-letter immediately
 - Dead-letter record preserves full message payload, all attempt timestamps, and error details
 - Alert is sent to a secondary notification channel (ops Telegram group or fallback messenger)
+
+> **Cross-doc retry default reconciliation:** This architecture and implementation-plan.md both use `MaxRetries = 5` (implementation-plan Stage 4.2: `RetryPolicy.MaxAttempts` default `5`, test scenario: "Given `MaxAttempts=5`"). **E2e-scenarios.md is inconsistent** — its Background block (line 211) says "max 3 attempts" and its dead-letter scenario (line 227) says "dead-letter after attempt 3"; these should be updated to `5` to match. The alignment footer in e2e-scenarios (line 583) also references "OutboundQueue:MaxRetries default 3" from an earlier iteration of this architecture — that reference is now stale and should be corrected to `5`.
 
 ### 5.4 Scenario: Duplicate webhook delivery (idempotency)
 
@@ -470,18 +481,17 @@ Human (Telegram)        UpdateRouter          CommandDispatcher       AuthZ     
 
 Commands `/approve` and `/reject` accept a question ID argument and produce the same `HumanDecisionEvent` as inline buttons.
 
-> **`/handoff` semantics — decided.** The `/handoff` command transfers human oversight of a specified task to another operator. Syntax: `/handoff TASK-ID @operator-alias`. The handler:
-> 1. Validates that `TASK-ID` exists and the sending operator currently has oversight.
-> 2. Validates that `@operator-alias` is a registered operator (resolved via `OperatorBinding.OperatorAlias`).
-> 3. Transfers oversight by updating the `OperatorBinding` records and notifying both parties:
->    - Sender receives: "✅ Oversight of TASK-099 transferred to @operator-2"
->    - Receiver receives: "📋 You now have oversight of TASK-099 (transferred by @operator-1)"
-> 4. An audit record is persisted with handoff details, both operator IDs, and `CorrelationId`.
-> 5. If `TASK-ID` is invalid: "Task NONEXISTENT not found". If `@operator-alias` is unregistered: "Operator @unknown-user is not registered".
+> **`/handoff` semantics — V1 stub (pending policy decision D-4).** The `/handoff` command accepts syntax `/handoff TASK-ID @operator-alias`. In V1, the handler:
+> 1. Validates that the syntax is correct (two arguments: task ID and operator alias). If invalid, returns usage help: "Usage: `/handoff TASK-ID @operator-alias`".
+> 2. Returns a stub acknowledgement: "Handoff is not yet configured — awaiting policy decision (D-4)." No transfer, question reassignment, or agent-team change occurs.
+> 3. An audit record is persisted for the attempt (including both arguments, sending operator ID, and `CorrelationId`) so that handoff requests can be replayed once the policy is decided.
 >
-> This aligns with tech-spec D-4 (status: Decided — transfer human oversight) and e2e-scenarios §Bot Command Suite which specifies the full transfer flow including Gherkin scenarios for valid transfer, invalid task ID, and unknown operator alias.
+> **Cross-doc alignment status:**
+> - **tech-spec D-4**: Aligned — defines `/handoff` as Open / stub for V1, with no transfer occurring.
+> - **e2e-scenarios.md**: **Inconsistent** — the Gherkin scenario at line 354 ("Scenario: /handoff transfers oversight to another operator") describes a full transfer flow (validates task, transfers oversight, notifies both operators). This contradicts the stub behavior. The e2e-scenarios Gherkin should be updated to test stub behavior: syntax validation, stub acknowledgement response, and audit persistence — with no transfer step.
+> - **implementation-plan.md**: **Internally inconsistent** — Stage 3.2 body text describes a full `HandoffCommandHandler` transfer flow, but the alignment footer (line 553) says "returns stub pending D-4." The body text should be reconciled to match the stub behavior.
 >
-> **Sibling-doc divergence note:** implementation-plan Stage 3.2 still implements `HandoffCommandHandler` as a not-yet-configured stub (returning a placeholder response and logging for future replay). That implementation-plan predates the D-4 decision closure and needs to be updated in its next iteration to implement the full transfer flow described here and in e2e-scenarios.
+> This architecture aligns with tech-spec D-4 (the authoritative design decision) and implements only the stub. The `OperatorBinding.OperatorAlias` index is retained so that alias resolution is ready when the full transfer semantic is implemented post-D-4.
 
 ---
 
@@ -535,13 +545,27 @@ AgentSwarm.Messaging.sln  (to be created)
 | `Telegram:BotToken` | Azure Key Vault / K8s secret | Never logged. Loaded at startup via `ISecretClient`. |
 | `Telegram:WebhookUrl` | App configuration | Public HTTPS URL; set to empty to enable long-poll mode. |
 | `Telegram:SecretToken` | Key Vault | Header value Telegram sends with each webhook POST; validated by `WebhookController`. |
-| `Telegram:AllowedChatIds` | App configuration | Comma-separated allowlist. Evaluated by `AuthZ Service`. |
+| `Telegram:AllowedUserIds` | App configuration | Comma-separated allowlist of Telegram **user IDs** authorized to register via `/start`. See "Allowlist Authorization Model" below for how user IDs, chat IDs, and tenant/workspace bindings interact. |
 | `Telegram:RateLimits:GlobalPerSecond` | App configuration | Default `30`. |
 | `Telegram:RateLimits:PerChatPerMinute` | App configuration | Default `20`. |
-| `OutboundQueue:MaxRetries` | App configuration | Default `3` (aligned with implementation-plan Stage 4.2 `RetryPolicy.MaxAttempts`). |
+| `OutboundQueue:MaxRetries` | App configuration | Default `5` (aligned with implementation-plan Stage 4.2 `RetryPolicy.MaxAttempts` default of `5`; **note:** e2e-scenarios.md currently references an older default of `3` — see §5.3 reconciliation note). |
 | `OutboundQueue:BaseRetryDelaySeconds` | App configuration | Default `2`. |
 | `OutboundQueue:ProcessorConcurrency` | App configuration | Default `10`. Number of concurrent send workers. |
 | `OutboundQueue:MaxQueueDepth` | App configuration | Default `5000`. Backpressure threshold; low-severity messages are dead-lettered when exceeded. |
+
+### 7.1 Allowlist Authorization Model
+
+Authorization uses a **two-tier model**: a static configuration-time allowlist gates onboarding, and dynamic runtime bindings gate command execution.
+
+| Tier | What is checked | Where it lives | When it is checked |
+|---|---|---|---|
+| **Tier 1: Onboarding allowlist** | `Telegram:AllowedUserIds` — a static list of Telegram **user IDs** (not chat IDs). | App configuration (environment variable, appsettings, or config provider). | At `/start` time only. If the user's Telegram user ID is not in this list, `/start` is rejected and no `OperatorBinding` is created. |
+| **Tier 2: Runtime bindings** | `OperatorBinding` records — each row contains **both** `TelegramUserId` and `TelegramChatId`, plus `TenantId`, `WorkspaceId`, and `Roles`. | Persistence store (database). | On every inbound command (after deduplication). The `AuthZ Service` calls `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)` which queries the `OperatorBinding` table for an active row matching both the user ID and the chat ID. If no matching binding exists, the command is rejected. |
+
+**Key design decisions:**
+- **Chat IDs are not independently allow-listed in configuration.** A chat ID becomes implicitly authorized when an allowed user sends `/start` from that chat, which creates an `OperatorBinding` row with the chat's ID. This avoids maintaining a separate `AllowedChatIds` config list and ensures that authorization is always tied to a specific (user, chat, workspace) triple.
+- **Group chat attribution:** In group chats, commands are attributed to the sending `TelegramUserId` (the `from.id` field on the Telegram `Update`), not the group's `TelegramChatId`. This means each group member must have their own `OperatorBinding` — an unauthorized user in an authorized group is rejected (per tech-spec S-5).
+- **Multi-workspace:** An operator may have `OperatorBinding` rows in multiple workspaces. When a command is ambiguous (the user has bindings in multiple workspaces for the same chat), the bot presents an inline keyboard for workspace disambiguation (per e2e-scenarios).
 
 ---
 

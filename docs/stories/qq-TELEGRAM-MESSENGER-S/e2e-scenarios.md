@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.14-draft (iteration 8)
+**Version:** v0.15-draft (iteration 8)
 
 ---
 
@@ -54,9 +54,10 @@ Feature: Agent blocking question delivered to Telegram
     And agent "arch-agent-7" is working on TaskId "TASK-042"
 
   Scenario: Agent sends a blocking question with inline buttons
-    # AgentQuestion is the shared model (unchanged per architecture.md §5.2).
-    # The proposed default action is stored Telegram-side in PendingQuestionRecord.DefaultActionId
-    # (architecture.md §5.2) when the connector renders the question.
+    # AgentQuestion includes DefaultAction (a HumanAction.ActionId) as a first-class
+    # shared property (architecture.md §5.2, line 177). The Telegram connector copies
+    # AgentQuestion.DefaultAction into PendingQuestionRecord.DefaultActionId when
+    # rendering the question (architecture.md §5.2, line 192).
     Given agent "arch-agent-7" publishes an AgentQuestion:
       | Field           | Value                                              |
       | QuestionId      | Q-1001                                             |
@@ -65,12 +66,12 @@ Feature: Agent blocking question delivered to Telegram
       | Title           | Database migration strategy                        |
       | Body            | Should we use blue-green or rolling migration?      |
       | Severity        | high                                               |
+      | DefaultAction   | act-1                                              |
       | AllowedActions  | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}, {ActionId:"act-3", Label:"Need info", Value:"need-info", RequiresComment:true}] |
       | ExpiresAt       | 2026-05-11T15:30:00Z                               |
       | CorrelationId   | corr-abc-123                                       |
-    And the proposed default action is "act-1" (Approve)
     When the Messenger Gateway dequeues the question
-    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1" (copied from AgentQuestion.DefaultAction)
     And the bot sends a Telegram message to chat "998877" containing:
       | Element         | Content                                            |
       | Text            | Title, Body, Severity, timeout, and proposed default action label |
@@ -83,11 +84,11 @@ Feature: Agent blocking question delivered to Telegram
       | Title           | Database migration strategy                    |
       | Body            | Should we use blue-green or rolling migration? |
       | Severity        | critical                                       |
+      | DefaultAction   | act-1                                          |
       | ExpiresAt       | 5 minutes from now                             |
       | AllowedActions  | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}] |
-    And the proposed default action is "act-1" (Approve)
     When the message is rendered in Telegram
-    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1" (copied from AgentQuestion.DefaultAction)
     And the message body includes the Title "Database migration strategy"
     And the message body includes the Body text "Should we use blue-green or rolling migration?"
     And the message body includes severity badge "🔴 CRITICAL"
@@ -95,8 +96,8 @@ Feature: Agent blocking question delivered to Telegram
     And the message body includes "Default action if no response: Approve"
 
   Scenario: Question timeout expires without human response
-    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
-    And the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Given agent "arch-agent-7" publishes an AgentQuestion with DefaultAction "act-1" and ExpiresAt 2 minutes from now
+    And the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1" (copied from AgentQuestion.DefaultAction)
     And no human responds within 2 minutes
     When ExpiresAt is reached
     Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionId "act-1"
@@ -105,8 +106,8 @@ Feature: Agent blocking question delivered to Telegram
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
 
   Scenario: Question timeout with no default action
-    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
-    And the PendingQuestionRecord has DefaultActionId = null (no proposed default)
+    Given agent "arch-agent-7" publishes an AgentQuestion with DefaultAction = null and ExpiresAt 2 minutes from now
+    And the PendingQuestionRecord has DefaultActionId = null (copied from AgentQuestion.DefaultAction which is null)
     And no human responds within 2 minutes
     When ExpiresAt is reached
     Then the QuestionTimeoutService publishes a HumanDecisionEvent with ActionValue "__timeout__"
@@ -208,7 +209,7 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Background:
     Given the outbound message queue is operational
-    And retry policy is configured: max 3 attempts, exponential backoff (per architecture.md §5.3 OutboundQueue:MaxRetries default of 3)
+    And retry policy is configured: max 5 attempts, exponential backoff (per architecture.md §5.3 OutboundQueue:MaxRetries default of 5)
 
   Scenario: Transient Telegram API failure triggers retry
     Given agent "test-agent-3" enqueues an outbound alert message
@@ -223,8 +224,8 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
-    When the Telegram Bot API returns HTTP 500 on attempts 1 through 3
-    Then the message is moved to the dead-letter queue after attempt 3
+    When the Telegram Bot API returns HTTP 500 on attempts 1 through 5
+    Then the message is moved to the dead-letter queue after attempt 5
     And an alert is raised to the operations channel
     And the dead-letter record includes CorrelationId, AgentId, message content, and failure reason
 
@@ -266,7 +267,7 @@ Feature: Durable outbound message queue with retry and dead-letter
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
-    And queue depth is observable via the telegram.outbound_queue.depth gauge and backpressure events via the telegram.queue.backpressure counter (per architecture.md §8/§10)
+    And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold) and backpressure events via the telegram.queue.backpressure counter and telegram.messages.backpressure_dlq counter (per architecture.md §10.4)
     And P95 send latency remains under 2 seconds for messages that succeed on first attempt (per architecture.md §10.4 metric definition: telegram.send.latency_ms scoped to first-attempt successes, excluding rate-limited waits)
     And subsequent messages are queue-delayed by Telegram rate limits but not lost
     And time spent waiting during 429 backoff is tracked separately via telegram.send.rate_limited_wait_ms
@@ -351,16 +352,29 @@ Feature: Telegram bot command handling
     When user "operator-1" sends "/reject Q-2001"
     Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
 
-  Scenario: /handoff returns stub response pending policy decision (D-4)
-    # Aligned with implementation-plan.md Stage 3.2: HandoffCommandHandler validates syntax
-    # but returns a stub response without performing any transfer or reassignment.
+  Scenario: /handoff transfers oversight to another operator
+    # Aligned with implementation-plan.md Stage 3.2: HandoffCommandHandler validates task and
+    # target operator, transfers oversight, notifies both operators, and persists audit record.
     Given task "TASK-099" exists and user "operator-1" has oversight
-    And user "operator-2" with Telegram user ID "222333444" is in the allowlist
+    And user "operator-2" with Telegram user ID "222333444" is in the allowlist and registered
     When user "operator-1" sends "/handoff TASK-099 @operator-2"
-    Then the HandoffCommandHandler parses TASK-099 and @operator-2 syntactically
-    And the bot responds with "Handoff is not yet configured — awaiting policy decision (D-4)"
-    And no transfer, question reassignment, or agent-team change occurs
-    And an audit record is persisted with the raw command text, user ID, and CorrelationId
+    Then the HandoffCommandHandler validates that "TASK-099" exists and "operator-1" has oversight
+    And validates that "@operator-2" is a registered operator via OperatorRegistry
+    And transfers oversight by updating the OperatorRegistry binding for TASK-099 to operator-2
+    And the bot notifies operator-1: "✅ Oversight of TASK-099 transferred to @operator-2"
+    And the bot notifies operator-2: "📋 You now have oversight of TASK-099 (transferred by @operator-1)"
+    And an audit record is persisted with handoff details, both operator IDs, and CorrelationId
+
+  Scenario: /handoff with invalid task ID is rejected
+    When user "operator-1" sends "/handoff NONEXISTENT @operator-2"
+    Then the bot responds with "Task NONEXISTENT not found"
+    And no transfer occurs
+
+  Scenario: /handoff with unregistered target operator is rejected
+    Given task "TASK-099" exists and user "operator-1" has oversight
+    When user "operator-1" sends "/handoff TASK-099 @unknown-user"
+    Then the bot responds with "Operator @unknown-user is not registered"
+    And no transfer occurs
 
   Scenario: /handoff with invalid syntax is rejected
     When user "operator-1" sends "/handoff" with no arguments
@@ -512,15 +526,17 @@ Feature: Observability integration
   Scenario: Metrics are emitted for queue depth and latency
     Given the outbound queue processes messages
     Then the following metrics are emitted via OpenTelemetry:
-      | Metric                                | Type      |
-      | telegram.send.duration_ms             | histogram |
-      | telegram.send.latency_ms              | histogram |
-      | telegram.send.rate_limited_wait_ms    | histogram |
-      | telegram.updates.received             | counter   |
-      | telegram.messages.sent                | counter   |
-      | telegram.messages.dead_lettered       | counter   |
-      | telegram.commands.processed           | counter   |
-      | telegram.messages.backpressure_dlq    | counter   |
+      | Metric                                | Type      | Source (architecture.md)       |
+      | telegram.send.duration_ms             | histogram | §8 metrics table               |
+      | telegram.send.latency_ms              | histogram | §10.4 P95 definition           |
+      | telegram.send.retry_latency_ms        | histogram | §10.4 retry tracking           |
+      | telegram.send.rate_limited_wait_ms    | histogram | §10.4 rate-limit tracking      |
+      | telegram.updates.received             | counter   | §8 metrics table               |
+      | telegram.messages.sent                | counter   | §8 metrics table               |
+      | telegram.messages.dead_lettered       | counter   | §8 metrics table               |
+      | telegram.messages.backpressure_dlq    | counter   | §10.4 backpressure dead-letter |
+      | telegram.commands.processed           | counter   | §8 metrics table               |
+      | telegram.queue.backpressure           | counter   | §10.4 backpressure threshold   |
 ```
 
 ---
@@ -565,7 +581,7 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 7._
-_Aligned with sibling architecture.md (§10.4 P95 under 2s for first-attempt successes, telegram.send.latency_ms metric, DefaultAction field), implementation-plan.md (Stage 3.2 HandoffCommandHandler returns stub pending D-4, ApproveCommandHandler emits ActionValue=approve), and tech-spec.md (HC-3 shared data model, D-4 handoff decision)._
-_ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively (per implementation-plan.md Stage 3.2 line 214). Inline button presses emit the HumanAction.Value from AllowedActions via CallbackQueryHandler (per implementation-plan.md Stage 3.3)._
-_DefaultAction field: AgentQuestion uses `DefaultAction` (per architecture.md §5.2 and implementation-plan.md Stage 1.3). This is a nullable string matching one of the HumanAction.Value entries; when present, QuestionTimeoutService applies it on timeout._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 8._
+_Aligned with sibling architecture.md (§5.2 AgentQuestion.DefaultAction as a first-class shared property, copied to PendingQuestionRecord.DefaultActionId at render time for timeout handling; §5.3 OutboundQueue:MaxRetries default 5; §10.4 P95 under 2s for first-attempt successes via telegram.send.latency_ms; telegram.queue.backpressure counter), implementation-plan.md (Stage 3.2 HandoffCommandHandler validates and transfers oversight with notifications and audit, ApproveCommandHandler emits ActionValue=approve), and tech-spec.md (HC-3 shared data model, S-2 command handling)._
+_ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively (per implementation-plan.md Stage 3.2). Inline button presses emit the HumanAction.Value from AllowedActions via CallbackQueryHandler (per implementation-plan.md Stage 3.3)._
+_Default action model: The shared `AgentQuestion` record includes `DefaultAction` (a nullable `string` holding the `HumanAction.ActionId` of the proposed default action) as a first-class shared property (architecture.md §5.2 line 177). All messenger connectors can read and honour this field. The Telegram connector copies `AgentQuestion.DefaultAction` into the Telegram-specific `PendingQuestionRecord.DefaultActionId` at question-send time (architecture.md §5.2 line 192). On timeout, `QuestionTimeoutService` reads `PendingQuestionRecord.DefaultActionId`, resolves the full `HumanAction` from `IDistributedCache`, and publishes a `HumanDecisionEvent` with that action's `Value`. If `DefaultActionId` is null, the timeout event uses `ActionValue = "__timeout__"`._
