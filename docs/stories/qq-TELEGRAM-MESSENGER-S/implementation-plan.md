@@ -93,7 +93,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Implement `TelegramWebhookSecretFilter` that validates the `X-Telegram-Bot-Api-Secret-Token` header against the configured `SecretToken`; reject with 403 if mismatch
 - [ ] Deserialize the incoming `Update` using `Telegram.Bot` serialization and convert to the internal `MessengerEvent` model via a `TelegramUpdateMapper` class
 - [ ] Implement idempotency check: store processed `Update.Id` values in a time-bounded concurrent dictionary (or persistence layer); skip duplicate updates and return 200
-- [ ] On successful processing, return HTTP 200 immediately; enqueue the `MessengerEvent` for async processing via `IMessageQueue` (defined in Core)
+- [ ] On successful processing, return HTTP 200 immediately; pass the `MessengerEvent` to `ITelegramUpdatePipeline.ProcessAsync` (defined in Stage 2.5) for async command routing
 - [ ] Add webhook registration logic in `IHostedService` startup: call `SetWebhookAsync` with the configured URL, secret token, and allowed update types
 
 ### Dependencies
@@ -108,7 +108,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Create `TelegramPollingService` as a `BackgroundService` in the Telegram project that calls `GetUpdatesAsync` in a loop when `TelegramOptions.UsePolling` is `true`
-- [ ] Map each received `Update` to `MessengerEvent` using the shared `TelegramUpdateMapper` and enqueue via `IMessageQueue`
+- [ ] Map each received `Update` to `MessengerEvent` using the shared `TelegramUpdateMapper` and pass to `ITelegramUpdatePipeline.ProcessAsync` (defined in Stage 2.5)
 - [ ] Implement graceful shutdown: respect `CancellationToken`, log final offset, and cleanly stop polling
 - [ ] Ensure polling and webhook modes are mutually exclusive at startup via a guard in the DI registration
 
@@ -123,7 +123,8 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Create `TelegramMessageSender` implementing a `IMessageSender` interface (defined in Core) with methods: `SendTextAsync(chatId, text, parseMode, ct)`, `SendQuestionAsync(chatId, AgentQuestion, ct)`
-- [ ] Implement `SendQuestionAsync` to render `AgentQuestion.AllowedActions` as Telegram `InlineKeyboardMarkup` buttons with callback data encoding `QuestionId:ActionId`
+- [ ] Implement `SendQuestionAsync` to render `AgentQuestion` as a rich Telegram message: include `Title`, `Body` (full context), `Severity` badge, `ExpiresAt` timeout countdown, and `DefaultAction` label in the message body; render `AllowedActions` as Telegram `InlineKeyboardMarkup` buttons with callback data encoding `QuestionId:ActionId`
+- [ ] For actions with `RequiresComment = true`, append "(reply required)" to the button label so the operator knows a follow-up text reply is expected after tapping
 - [ ] Format outbound messages with Markdown V2 parse mode; include `CorrelationId` as a footer or hidden tag for traceability
 - [ ] Implement Telegram API rate-limit handling: detect `429 Too Many Requests`, extract `RetryAfter`, and back off accordingly
 - [ ] Add message-ID tracking: after successful send, persist the Telegram message ID mapped to `CorrelationId` for reply correlation
@@ -133,8 +134,27 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Test Scenarios
 - [ ] Scenario: Question renders buttons — Given an `AgentQuestion` with three `HumanAction` items, When `SendQuestionAsync` is called, Then the constructed `InlineKeyboardMarkup` contains exactly three buttons with correct labels
+- [ ] Scenario: Question body includes full context — Given an `AgentQuestion` with `Severity=Critical`, `ExpiresAt` in 30 minutes, and `DefaultAction=skip`, When `SendQuestionAsync` is called, Then the message body contains the severity badge, timeout information, default action label, and full question `Body` text
 - [ ] Scenario: Rate limit handled gracefully — Given the Telegram API returns HTTP 429 with `RetryAfter=5`, When the sender encounters it, Then it waits at least 5 seconds before retrying and does not throw
 - [ ] Scenario: CorrelationId in message — Given a `MessengerMessage` with a specific `CorrelationId`, When sent, Then the outbound message body contains the correlation ID
+- [ ] Scenario: RequiresComment action labeled — Given an `AgentQuestion` with one action having `RequiresComment=true`, When rendered, Then that button label includes a "(reply required)" indicator
+
+## Stage 2.5: Inbound Update Pipeline
+
+### Implementation Steps
+- [ ] Define `ITelegramUpdatePipeline` interface in Core with method `ProcessAsync(MessengerEvent, CancellationToken)` that orchestrates the full inbound processing chain: deduplication check → allowlist gate → command parsing → command routing / callback handling
+- [ ] Implement `TelegramUpdatePipeline` in the Telegram project that composes `IDeduplicationService`, `IUserAuthorizationService`, `TelegramCommandParser`, `ICommandRouter`, and `CallbackQueryHandler` into a single sequential pipeline
+- [ ] Route `MessengerEvent` by `EventType`: `Command` events go to `CommandRouter`, `CallbackResponse` events go to `CallbackQueryHandler`, `TextReply` events check for pending `RequiresComment` prompts (via `IPendingQuestionStore`) before falling through to default handling
+- [ ] Emit structured log entries at each pipeline stage with `CorrelationId`, `EventId`, and stage name for end-to-end traceability
+- [ ] Return a `PipelineResult` record with `Handled` (bool), `ResponseText`, and `CorrelationId` to callers (webhook endpoint and polling service)
+
+### Dependencies
+- phase-telegram-bot-integration/stage-outbound-message-sender
+
+### Test Scenarios
+- [ ] Scenario: Pipeline routes command — Given a `MessengerEvent` with `EventType=Command` and text `/status`, When processed through the pipeline, Then `CommandRouter` is invoked and a response is returned
+- [ ] Scenario: Pipeline routes callback — Given a `MessengerEvent` with `EventType=CallbackResponse`, When processed, Then `CallbackQueryHandler` is invoked and a `HumanDecisionEvent` is emitted
+- [ ] Scenario: Pipeline rejects unauthorized — Given a `MessengerEvent` from a user not in the allowlist, When processed, Then the pipeline short-circuits with a denial response and no command handler is invoked
 
 # Phase 3: Command Processing and Agent Routing
 
@@ -169,7 +189,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Implement `AskCommandHandler` — creates a work item in the swarm orchestrator from the argument text, returns confirmation with task ID and correlation ID
 - [ ] Implement `ApproveCommandHandler` and `RejectCommandHandler` — resolve a pending `AgentQuestion` by emitting a `HumanDecisionEvent` with the appropriate action value
 - [ ] Implement `PauseCommandHandler` and `ResumeCommandHandler` — send pause/resume signals to the target agent
-- [ ] Implement `HandoffCommandHandler` — initiates agent handoff to another operator or team
+- [ ] Implement `HandoffCommandHandler` — accepts syntax `/handoff TASK-ID @operator-alias`, validates both arguments, and transfers human oversight of the specified task to the target operator by updating the `OperatorRegistry` binding and notifying both parties; aligns with tech-spec.md D-4 (decided: transfer human oversight to another operator) while noting that e2e-scenarios.md marks the full handoff flow as pending clarification — the handler logs the command for future replay if the downstream orchestrator handoff API is not yet available
 
 ### Dependencies
 - phase-command-processing-and-agent-routing/stage-command-parser
@@ -212,6 +232,25 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Scenario: Authorized user mapped — Given Telegram user `12345` is in the allowlist mapped to operator `op-1` in tenant `t-1`, When `/start` is received, Then `AuthorizationResult.IsAuthorized` is true and `OperatorId` is `op-1`
 - [ ] Scenario: Unauthorized user rejected — Given Telegram user `99999` is not in the allowlist, When any command is received, Then `AuthorizationResult.IsAuthorized` is false and `DenialReason` is populated
 
+## Stage 3.5: Pending Question Store and Timeout Service
+
+### Implementation Steps
+- [ ] Define `IPendingQuestionStore` interface in Core with methods: `StoreAsync(AgentQuestion, long telegramMessageId, CancellationToken)`, `GetAsync(string questionId, CancellationToken)`, `MarkAnsweredAsync(string questionId, CancellationToken)`, `GetExpiredAsync(CancellationToken)` returning unanswered questions past `ExpiresAt`
+- [ ] Create `PendingQuestionRecord` entity with fields: `QuestionId`, `AgentQuestion` (serialized), `TelegramChatId`, `TelegramMessageId`, `StoredAt`, `ExpiresAt`, `Status` (enum: `Pending`, `Answered`, `TimedOut`), `CorrelationId`
+- [ ] Implement `PersistentPendingQuestionStore` backed by the Persistence project (SQLite via EF Core) with indexed lookups by `QuestionId` and `ExpiresAt`
+- [ ] Integrate store into `TelegramMessageSender.SendQuestionAsync`: after successfully sending a question to Telegram, persist the question with its Telegram message ID for later lookup by `CallbackQueryHandler`
+- [ ] Implement `RequiresComment` flow in `CallbackQueryHandler`: when the selected `HumanAction.RequiresComment` is true, set the question status to `AwaitingComment`, send a prompt ("Please reply with your comment"), and defer `HumanDecisionEvent` emission until the operator's text reply arrives via the pipeline's `TextReply` handler
+- [ ] Create `QuestionTimeoutService` as a `BackgroundService` that periodically polls `GetExpiredAsync`, and for each expired question: publishes a `HumanDecisionEvent` with `DefaultAction` value, updates the original Telegram message to indicate timeout ("⏰ Timed out — default action applied: {defaultAction}"), marks the question as `TimedOut`, and writes an audit record
+
+### Dependencies
+- phase-command-processing-and-agent-routing/stage-callback-query-handler
+
+### Test Scenarios
+- [ ] Scenario: Question stored on send — Given an `AgentQuestion` is sent to Telegram successfully, When `SendQuestionAsync` completes, Then a `PendingQuestionRecord` exists in the store with status `Pending` and the correct `TelegramMessageId`
+- [ ] Scenario: Callback resolves pending question — Given a pending question `Q1`, When the callback query handler processes an approve action, Then the question status is updated to `Answered` and a `HumanDecisionEvent` is emitted
+- [ ] Scenario: RequiresComment defers decision — Given a pending question with an action having `RequiresComment=true`, When the operator taps that button, Then the bot prompts for a comment and the `HumanDecisionEvent` is not emitted until the operator replies with text
+- [ ] Scenario: Timeout applies default action — Given a pending question with `ExpiresAt` in the past and `DefaultAction=skip`, When `QuestionTimeoutService` polls, Then a `HumanDecisionEvent` is emitted with `ActionValue=skip` and the Telegram message is updated with the timeout notice
+
 # Phase 4: Reliability Infrastructure
 
 ## Dependencies
@@ -221,10 +260,11 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 
 ### Implementation Steps
 - [ ] Define `IOutboundQueue` interface in Core with methods: `EnqueueAsync(OutboundMessage, CancellationToken)`, `DequeueAsync(CancellationToken)`, `AcknowledgeAsync(messageId, CancellationToken)`, `NackAsync(messageId, CancellationToken)`
-- [ ] Create `OutboundMessage` record with properties: `Id`, `ChatId`, `Payload` (MessengerMessage or AgentQuestion), `Attempt`, `MaxAttempts`, `NextRetryAt`, `CreatedAt`, `CorrelationId`
+- [ ] Create `OutboundMessage` record matching architecture.md's data model: `Id` (Guid), `IdempotencyKey` (string, derived from `AgentId:QuestionId:CorrelationId` to prevent duplicate sends), `ChatId`, `Payload` (serialized MessengerMessage or AgentQuestion), `Status` (enum: `Pending`, `Sending`, `Sent`, `Failed`, `DeadLettered`), `AttemptCount`, `MaxAttempts`, `NextRetryAt`, `CreatedAt`, `SentAt`, `TelegramMessageId`, `CorrelationId`, `ErrorDetail`
+- [ ] Add a `UNIQUE` constraint on `IdempotencyKey` in the outbox table so that duplicate enqueue attempts for the same logical message are rejected at the database level
 - [ ] Implement `InMemoryOutboundQueue` using `Channel<OutboundMessage>` with bounded capacity and backpressure for development
-- [ ] Implement `PersistentOutboundQueue` backed by SQLite (via EF Core) for production durability; persist messages to an `outbox` table with status tracking
-- [ ] Create `OutboundQueueProcessor` as a `BackgroundService` that dequeues messages, sends via `TelegramMessageSender`, and acknowledges or nacks based on result
+- [ ] Implement `PersistentOutboundQueue` backed by SQLite (via EF Core) for production durability; persist messages to an `outbox` table with status tracking; on `EnqueueAsync`, check `IdempotencyKey` uniqueness before inserting
+- [ ] Create `OutboundQueueProcessor` as a `BackgroundService` that dequeues messages with `Status=Pending`, transitions to `Sending`, sends via `TelegramMessageSender`, and transitions to `Sent` on success or `Failed` on error
 
 ### Dependencies
 - _none — start stage_
@@ -233,6 +273,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Scenario: Enqueue and dequeue — Given a message is enqueued, When dequeued, Then the message content matches and the queue size decreases by one
 - [ ] Scenario: Persistence survives restart — Given a message is enqueued to the persistent queue, When the process restarts, Then the message is still available for dequeue
 - [ ] Scenario: Backpressure applied — Given the in-memory queue is at capacity, When another message is enqueued, Then the call blocks until space is available (does not drop)
+- [ ] Scenario: Outbound deduplication by idempotency key — Given a message with `IdempotencyKey=agent1:Q1:corr-1` is already enqueued, When a second message with the same `IdempotencyKey` is enqueued, Then the duplicate is rejected and the original message is returned without creating a second outbox entry
 
 ## Stage 4.2: Retry Policy and Dead-Letter Queue
 
@@ -279,7 +320,7 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 ### Implementation Steps
 - [ ] Add Azure Key Vault integration to the Worker project: install `Azure.Extensions.AspNetCore.Configuration.Secrets` NuGet package and configure in `Program.cs` to load secrets when a Key Vault URI is configured
 - [ ] Map Key Vault secret `TelegramBotToken` to `Telegram:BotToken` configuration path
-- [ ] For local development, support .NET User Secrets as the token source; document setup in a `docs/stories/qq-TELEGRAM-MESSENGER-S/dev-setup.md` stub
+- [ ] For local development, support .NET User Secrets as the token source; document the setup procedure in `docs/stories/qq-TELEGRAM-MESSENGER-S/dev-setup.md` with step-by-step instructions for configuring User Secrets and environment variables
 - [ ] Add startup validation that logs (at Warning level) if neither Key Vault nor User Secrets provides the token, then fails with a clear error
 
 ### Dependencies
@@ -404,10 +445,13 @@ storyId: "qq-TELEGRAM-MESSENGER-S"
 - [ ] Write test `AC004_DuplicateWebhookIdempotent`: send the same `Update.Id` twice via webhook, verify command handler is invoked exactly once
 - [ ] Write test `AC005_FailedSendRetriesAndDeadLetters`: configure WireMock to return 500 for `sendMessage`, enqueue a message, verify retry attempts occur and message is eventually dead-lettered
 - [ ] Write test `AC006_AllMessagesHaveCorrelationId`: process multiple commands and questions, inspect all emitted events and outbound messages to verify every one carries a non-null `CorrelationId`
+- [ ] Write test `PERF001_P95SendLatencyUnder2Seconds`: enqueue 100 outbound messages, configure WireMock to respond with 200 in under 50ms, measure the elapsed time from enqueue to send-completion for each message, and assert that the 95th percentile is under 2 seconds
+- [ ] Write test `PERF002_BurstFrom100PlusAgents`: simulate 100+ agents each enqueuing one alert message concurrently (1000+ total messages), process all through the outbound queue, and assert that every message reaches either `Sent` or `DeadLettered` status (zero messages lost) and the queue drains completely within a bounded time
 
 ### Dependencies
 - phase-integration-testing-and-acceptance-validation/stage-integration-test-infrastructure
 
 ### Test Scenarios
-- [ ] Scenario: All acceptance tests pass — Given the full integration test suite, When `dotnet test` is run, Then all six AC tests pass
+- [ ] Scenario: All acceptance tests pass — Given the full integration test suite, When `dotnet test` is run, Then all eight AC and PERF tests pass
 - [ ] Scenario: Tests are deterministic — Given the integration tests, When run three times consecutively, Then all pass every time with no flaky failures
+- [ ] Scenario: P95 latency measured accurately — Given the PERF001 test, When 100 messages are sent through the outbound pipeline, Then a P95 histogram is computed and the assertion threshold is 2000ms
