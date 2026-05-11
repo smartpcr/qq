@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.7-draft
+**Version:** v0.8-draft (iteration 2)
 
 ---
 
@@ -63,6 +63,7 @@ Feature: Agent blocking question delivered to Telegram
       | Body            | Should we use blue-green or rolling migration?      |
       | Severity        | high                                               |
       | AllowedActions  | [Approve:blue-green, Reject:rolling, NeedInfo:info] |
+      | ProposedDefault | blue-green                                         |
       | ExpiresAt       | 2026-05-11T15:30:00Z                               |
       | CorrelationId   | corr-abc-123                                       |
     When the Messenger Gateway dequeues the question
@@ -73,11 +74,16 @@ Feature: Agent blocking question delivered to Telegram
     And the outbound message is logged with CorrelationId "corr-abc-123"
 
   Scenario: Question includes context, severity, timeout, and proposed default
-    Given agent "arch-agent-7" publishes an AgentQuestion with Severity "critical" and ExpiresAt in 5 minutes
+    Given agent "arch-agent-7" publishes an AgentQuestion with:
+      | Field           | Value                                         |
+      | Severity        | critical                                       |
+      | ExpiresAt       | 5 minutes from now                             |
+      | ProposedDefault | blue-green                                     |
+      | AllowedActions  | [Approve:blue-green, Reject:rolling]           |
     When the message is rendered in Telegram
     Then the message body includes severity badge "🔴 CRITICAL"
     And the message body includes "Timeout: 5 min"
-    And the message body includes "Default action if no response: <proposed default>"
+    And the message body includes "Default action if no response: blue-green"
 
   Scenario: Question timeout expires without human response
     Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
@@ -126,9 +132,9 @@ Feature: Strongly typed approval/rejection events from Telegram buttons
     And when user "operator-1" replies with "What is the rollback plan?"
     Then a HumanDecisionEvent is published with ActionValue "info" and Comment "What is the rollback plan?"
 
-  Scenario: Button tap from unauthorized user in group chat
+  Scenario: Button tap from unauthorized user is rejected
     Given user "intruder" (Telegram user ID "666777888") is NOT in the allowlist
-    When user "intruder" taps the "Approve" inline button for question "Q-1001"
+    When user "intruder" taps the "Approve" inline button for question "Q-1001" in a 1:1 chat with the bot
     Then no HumanDecisionEvent is published
     And the bot sends a callback answer "Unauthorized"
     And an audit record is persisted with user ID "666777888" and rejection reason
@@ -191,7 +197,7 @@ Feature: Durable outbound message queue with retry and dead-letter
     And retries delivery (attempt 2)
     When the Telegram Bot API returns HTTP 200 on attempt 2
     Then the message is marked as delivered
-    And P95 send latency from enqueue to delivery is under 2 seconds (excluding backoff waits)
+    And P95 send latency from enqueue to delivery is under 2 seconds
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
@@ -206,12 +212,13 @@ Feature: Durable outbound message queue with retry and dead-letter
     Then the message is re-enqueued for delivery
     And the retry counter is reset
 
-  Scenario: Burst of 100+ agent alerts without message loss
-    Given 150 agents each enqueue one alert message simultaneously
-    When all 150 messages are processed through the outbound queue
-    Then all 150 messages are eventually delivered or dead-lettered
+  Scenario: Burst of 1000+ agent alerts without message loss
+    Given 1000 agents each enqueue one alert message simultaneously
+    When all 1000 messages are processed through the outbound queue
+    Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
     And the queue depth metric is observable via OpenTelemetry
+    And P95 send latency remains under 2 seconds for messages that succeed on first attempt
 ```
 
 ---
@@ -235,8 +242,9 @@ Feature: End-to-end correlation and traceability
   Scenario: Outbound agent message preserves original correlation ID
     Given agent "arch-agent-7" sends a question with CorrelationId "corr-abc-123"
     When the gateway delivers the message to Telegram
-    Then the delivered Telegram message metadata includes "corr-abc-123"
-    And the audit record for the outbound message includes "corr-abc-123"
+    Then the delivered Telegram message body includes "corr-abc-123" as a reference tag
+    And the outbox record for the outbound message includes CorrelationId "corr-abc-123"
+    And the audit record for the outbound message includes CorrelationId "corr-abc-123"
 
   Scenario: Human response back-links to the original question's correlation ID
     Given AgentQuestion "Q-1001" was delivered with CorrelationId "corr-abc-123"
@@ -292,11 +300,12 @@ Feature: Telegram bot command handling
     When user "operator-1" sends "/reject Q-2001"
     Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
 
-  Scenario: /handoff transfers task to another operator
-    Given task "TASK-099" is assigned to agent "deploy-agent-9"
+  Scenario: /handoff command is acknowledged but semantics are pending clarification
+    # tech-spec.md D-4: /handoff semantics are an open decision requiring story-owner input
     When user "operator-1" sends "/handoff TASK-099 @operator-2"
-    Then the swarm reassigns human oversight of "TASK-099" to "operator-2"
-    And both operators receive confirmation messages
+    Then the gateway validates the command syntax
+    And the bot replies with "Handoff is not yet configured — awaiting policy decision"
+    And an audit record is persisted with the raw command for future replay
 
   Scenario: /pause and /resume control agent execution
     When user "operator-1" sends "/pause arch-agent-7"
@@ -408,12 +417,6 @@ Feature: Chat-to-operator-to-tenant routing
     When user "operator-1" sends "/agents" without specifying a workspace
     Then the bot replies with an inline keyboard to select a workspace
     And the selected workspace is used for the query
-
-  Scenario: Group chat with multiple authorized operators
-    Given chat "776655" is a group containing operators "operator-1" and "operator-2"
-    When user "operator-1" sends "/approve Q-3001" in the group
-    Then the command is attributed to "operator-1" (not the group)
-    And the HumanDecisionEvent.ExternalUserId is "111222333" (operator-1)
 ```
 
 ---
@@ -499,5 +502,5 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 1._
-_Sibling docs (tech-spec, architecture, implementation-plan) were not yet available._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 2._
+_Aligned with sibling tech-spec.md (constraints HC-1–HC-11, out-of-scope O-5, open decision D-4)._
