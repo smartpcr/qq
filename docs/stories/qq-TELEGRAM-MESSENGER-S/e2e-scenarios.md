@@ -54,14 +54,14 @@ Feature: Agent blocking question delivered to Telegram
     And agent "arch-agent-7" is working on TaskId "TASK-042"
 
   Scenario: Agent sends a blocking question with inline buttons
-    # The shared AgentQuestion model includes a nullable DefaultAction property
-    # (architecture.md §3.1) — the ActionId of the proposed default action from
-    # AllowedActions. This is a first-class shared field, not connector-specific
-    # metadata. When the question times out, the connector reads
-    # PendingQuestionRecord.DefaultActionId (denormalized from
-    # AgentQuestion.DefaultAction at send time) and applies the action
-    # automatically. When null, the question expires with ActionValue = "__timeout__".
-    Given agent "arch-agent-7" publishes an AgentQuestion:
+    # The shared AgentQuestion model does NOT include a DefaultAction property
+    # (architecture.md §3.1, tech-spec.md HC-3/S-3). The proposed default action
+    # is carried as sidecar metadata via ProposedDefaultActionId on the
+    # AgentQuestionEnvelope. The Telegram connector reads ProposedDefaultActionId
+    # from the envelope at render time and denormalizes the ActionId into
+    # PendingQuestionRecord.DefaultActionId for efficient timeout polling.
+    # When null, the question expires with ActionValue = "__timeout__".
+    Given agent "arch-agent-7" publishes an AgentQuestionEnvelope:
       | Field                    | Value                                              |
       | QuestionId               | Q-1001                                             |
       | AgentId                  | arch-agent-7                                       |
@@ -72,9 +72,9 @@ Feature: Agent blocking question delivered to Telegram
       | AllowedActions           | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}, {ActionId:"act-3", Label:"Need info", Value:"need-info", RequiresComment:true}] |
       | ExpiresAt                | 2026-05-11T15:30:00Z                               |
       | CorrelationId            | corr-abc-123                                       |
-      | DefaultAction            | act-1                                              |
+      | ProposedDefaultActionId  | act-1                                              |
     When the Messenger Gateway dequeues the question
-    Then the Telegram connector reads DefaultAction "act-1" from the AgentQuestion model and creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Then the Telegram connector reads ProposedDefaultActionId "act-1" from the AgentQuestionEnvelope and creates a PendingQuestionRecord with DefaultActionId "act-1"
     And the bot sends a Telegram message to chat "998877" containing:
       | Element         | Content                                            |
       | Text            | Title, Body, Severity, timeout, and proposed default action label |
@@ -82,16 +82,16 @@ Feature: Agent blocking question delivered to Telegram
     And the outbound message is logged with CorrelationId "corr-abc-123"
 
   Scenario: Question includes context, severity, timeout, and proposed default
-    Given agent "arch-agent-7" publishes an AgentQuestion with:
+    Given agent "arch-agent-7" publishes an AgentQuestionEnvelope with:
       | Field                    | Value                                         |
       | Title                    | Database migration strategy                    |
       | Body                     | Should we use blue-green or rolling migration? |
       | Severity                 | critical                                       |
       | ExpiresAt                | 5 minutes from now                             |
       | AllowedActions           | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}] |
-      | DefaultAction            | act-1                                          |
+      | ProposedDefaultActionId  | act-1                                          |
     When the message is rendered in Telegram
-    Then the Telegram connector reads DefaultAction "act-1" from the AgentQuestion model and creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Then the Telegram connector reads ProposedDefaultActionId "act-1" from the AgentQuestionEnvelope and creates a PendingQuestionRecord with DefaultActionId "act-1"
     And the message body includes the Title "Database migration strategy"
     And the message body includes the Body text "Should we use blue-green or rolling migration?"
     And the message body includes severity badge "🔴 CRITICAL"
@@ -99,9 +99,9 @@ Feature: Agent blocking question delivered to Telegram
     And the message body includes "Default action if no response: Approve"
 
   Scenario: Question timeout expires without human response
-    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
-    And the question has DefaultAction "act-1"
-    And the Telegram connector reads DefaultAction "act-1" from the AgentQuestion model and creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Given agent "arch-agent-7" publishes an AgentQuestionEnvelope with ExpiresAt 2 minutes from now
+    And the envelope has ProposedDefaultActionId "act-1"
+    And the Telegram connector reads ProposedDefaultActionId "act-1" from the envelope and creates a PendingQuestionRecord with DefaultActionId "act-1"
     And no human responds within 2 minutes
     When ExpiresAt is reached
     Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionId "act-1"
@@ -110,8 +110,8 @@ Feature: Agent blocking question delivered to Telegram
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
 
   Scenario: Question timeout with no default action
-    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
-    And the question has DefaultAction = null
+    Given agent "arch-agent-7" publishes an AgentQuestionEnvelope with ExpiresAt 2 minutes from now
+    And the envelope has ProposedDefaultActionId = null
     And the Telegram connector creates a PendingQuestionRecord with DefaultActionId = null
     And no human responds within 2 minutes
     When ExpiresAt is reached
@@ -225,13 +225,14 @@ Feature: Durable outbound message queue with retry and dead-letter
     And retries delivery (attempt 2)
     When the Telegram Bot API returns HTTP 200 on attempt 2
     Then the message is marked as delivered
-    And telegram.send.all_attempts_latency_ms records elapsed time from enqueue to final HTTP 200 including the rate-limit wait (diagnostic metric covering all sends per architecture.md §10.4)
+    And telegram.send.latency_ms records elapsed time from enqueue to final HTTP 200 including the rate-limit wait (primary metric covering all sends per tech-spec.md HC-4 and architecture.md §10.4)
     And telegram.send.rate_limited_wait_ms records the time spent waiting during the 429 backoff
-    And this message is excluded from the primary telegram.send.latency_ms metric because it was rate-limited (per architecture.md §10.4: primary metric covers only first-attempt, non-rate-limited successes)
-    # Per architecture.md §10.4: telegram.send.latency_ms (primary) covers ONLY
-    # first-attempt, non-rate-limited successes. Messages that are retried or
-    # rate-limited are excluded and tracked via telegram.send.all_attempts_latency_ms
-    # (diagnostic, all sends) and telegram.send.retry_latency_ms (retried sends).
+    And telegram.send.first_attempt_latency_ms is NOT recorded for this message because it did not succeed on first attempt (per architecture.md §10.4: diagnostic metric covering only first-attempt, non-rate-limited successes)
+    # Per tech-spec.md HC-4 and architecture.md §10.4: telegram.send.latency_ms (primary) covers
+    # ALL messages regardless of attempt number or rate-limit holds. This all-inclusive
+    # metric is the one the P95 ≤ 2s acceptance criterion applies to.
+    # telegram.send.first_attempt_latency_ms (diagnostic) covers only first-attempt,
+    # non-rate-limited successes for capacity planning.
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
@@ -262,21 +263,21 @@ Feature: Durable outbound message queue with retry and dead-letter
     And the original alert remains in the queue for delivery
 
   Scenario: P95 send latency under 2 seconds
-    # Per architecture.md §10.4: telegram.send.latency_ms (primary) = elapsed
-    # time from OutboundMessage.CreatedAt (enqueue) to Telegram API HTTP 200,
-    # measured ONLY for messages that succeed on first attempt and are NOT
-    # waiting behind a 429 rate-limit hold. The P95 ≤ 2s acceptance criterion
-    # applies to this first-attempt, non-rate-limited metric. Messages that
-    # are retried or rate-limited are excluded and tracked via
-    # telegram.send.all_attempts_latency_ms (diagnostic, all sends).
+    # Per tech-spec.md HC-4 and architecture.md §10.4: telegram.send.latency_ms
+    # (primary) = elapsed time from OutboundMessage.CreatedAt (enqueue) to
+    # Telegram API HTTP 200, measured for ALL messages regardless of attempt
+    # number or rate-limit holds. This all-inclusive metric is the one the
+    # P95 ≤ 2s acceptance criterion applies to. telegram.send.first_attempt_latency_ms
+    # (diagnostic) covers only first-attempt, non-rate-limited successes
+    # for capacity planning.
     Given 100 outbound messages are enqueued sequentially
     And the Telegram Bot API responds HTTP 200 with ≤ 50 ms latency on every request
     And no HTTP 429 rate-limit responses occur
     When all 100 messages are dequeued and sent
     Then P95 telegram.send.latency_ms is under 2 seconds
     And P99 telegram.send.latency_ms is under 3 seconds
-    And latency is reported via the telegram.send.latency_ms histogram covering only first-attempt, non-rate-limited successes (per architecture.md §10.4)
-    And a separate telegram.send.all_attempts_latency_ms diagnostic histogram is also emitted covering all sends regardless of attempt number or rate-limit holds
+    And latency is reported via the telegram.send.latency_ms histogram covering all sends regardless of attempt number or rate-limit holds (per tech-spec.md HC-4 and architecture.md §10.4)
+    And a separate telegram.send.first_attempt_latency_ms diagnostic histogram is also emitted covering only first-attempt, non-rate-limited successes for capacity planning
 
   Scenario: Burst of 1000+ agent alerts without message loss
     Given 1000 agents each enqueue one alert message simultaneously
@@ -284,9 +285,9 @@ Feature: Durable outbound message queue with retry and dead-letter
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
     And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold)
-    And P95 telegram.send.latency_ms remains under 2 seconds for Critical/High messages that succeed on first attempt without rate-limiting (per architecture.md §10.4: primary metric covers only first-attempt, non-rate-limited successes; priority queuing ensures Critical/High are dispatched first)
+    And P95 telegram.send.latency_ms remains under 2 seconds for Critical/High messages (per tech-spec.md HC-4 and architecture.md §10.4: primary metric is all-inclusive, covering all sends; priority queuing ensures Critical/High are dispatched first and meet the target even under burst)
     And subsequent messages are queue-delayed by Telegram rate limits but not lost
-    And time spent waiting during 429 backoff is excluded from the primary telegram.send.latency_ms metric and tracked separately via telegram.send.rate_limited_wait_ms (per architecture.md §10.4); the broader telegram.send.all_attempts_latency_ms diagnostic metric includes rate-limit waits
+    And time spent waiting during 429 backoff is included in the primary telegram.send.latency_ms metric (per tech-spec.md HC-4: all-inclusive) and also tracked separately via telegram.send.rate_limited_wait_ms for operational diagnostics; the telegram.send.first_attempt_latency_ms diagnostic metric excludes rate-limited and retried sends
 ```
 
 ---
