@@ -86,7 +86,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 | **AuthZ Service** | `AgentSwarm.Messaging.Core` | Validates that the Telegram user ID + chat ID pair is in the authorized operator registry. Returns tenant/workspace binding or rejects the request. |
 | **Operator Registry** | `AgentSwarm.Messaging.Core` | Persistent map of `TelegramUserId → OperatorIdentity(TenantId, WorkspaceId, Roles)`. Populated via `/start` registration flow and admin configuration. |
 | **Swarm Command Bus** | `AgentSwarm.Messaging.Core` | Publishes validated, strongly typed commands to the agent swarm orchestrator. Consumes agent-originated events (questions, alerts, status) and routes them to the correct outbound connector. |
-| **OutboundMessageQueue** | `AgentSwarm.Messaging.Core` | Durable queue for outbound messages. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 5 attempts), and dead-letter after exhaustion. |
+| **OutboundMessageQueue** | `AgentSwarm.Messaging.Core` | Durable queue for outbound messages. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 3 attempts), and dead-letter after exhaustion. |
 | **TelegramSender** | `AgentSwarm.Messaging.Telegram` | Wraps `ITelegramBotClient` from the `Telegram.Bot` library. Formats messages with MarkdownV2, builds `InlineKeyboardMarkup` for agent questions, enforces Telegram rate limits. |
 | **AuditLogger** | `AgentSwarm.Messaging.Persistence` | Writes an immutable audit record for every human response. Includes message ID, user ID, agent ID, timestamp, and correlation ID. Backed by append-only store. |
 
@@ -174,11 +174,28 @@ The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplica
 | `Body` | `string` | Full context for the operator. |
 | `Severity` | `string` | `Critical`, `High`, `Normal`, `Low`. |
 | `AllowedActions` | `HumanAction[]` | Buttons to render. |
-| `ExpiresAt` | `DateTimeOffset` | Timeout; after which `DefaultAction` fires. |
-| `DefaultAction` | `string` | Action value applied on timeout. |
+| `ExpiresAt` | `DateTimeOffset` | Timeout deadline. |
 | `CorrelationId` | `string` | Trace ID. |
 
-> **`DefaultAction` extension note.** The epic attachment's `AgentQuestion` record does not include `DefaultAction`. The story explicitly requires "proposed default action" on agent questions, so `DefaultAction` is an extension to the shared model added in this story's `AgentSwarm.Messaging.Abstractions` package. It is represented as a nullable `string` matching one of the `HumanAction.Value` entries in `AllowedActions`. When present, the timeout handler in `QuestionTimeoutService` applies this action automatically if the operator does not respond before `ExpiresAt`. When absent (`null`), the question expires without an automatic decision and the agent is notified of timeout via a `HumanDecisionEvent` with `ActionValue = "__timeout__"`.
+> **Default action handling.** The epic attachment's shared `AgentQuestion` record does not include a `DefaultAction` property, and this architecture preserves that shared contract unchanged. The story's "proposed default action" requirement is fulfilled via a **Telegram-specific** `PendingQuestionRecord` (see below) whose `DefaultActionId` field stores the `HumanAction.ActionId` to apply on timeout. This aligns with tech-spec HC-3, which specifies that the proposed default belongs on `PendingQuestionRecord.DefaultActionId`, not the shared model. The approach keeps `AgentQuestion` stable across all messenger connectors while allowing each connector to implement connector-specific timeout behaviour.
+
+#### PendingQuestionRecord (Telegram-specific — defined in `AgentSwarm.Messaging.Telegram`)
+
+Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a response. Created when the Telegram connector renders an `AgentQuestion` as an inline-keyboard message.
+
+| Field | Type | Description |
+|---|---|---|
+| `QuestionId` | `string` | Foreign key to the `AgentQuestion.QuestionId` this record tracks. Primary key. |
+| `ChatId` | `long` | Telegram chat the question was sent to. |
+| `TelegramMessageId` | `int` | Telegram `message_id` of the sent inline-keyboard message. |
+| `DefaultActionId` | `string?` | The `HumanAction.ActionId` to apply when the question times out. Nullable — when absent (`null`), the question expires without an automatic decision and the agent is notified of timeout via a `HumanDecisionEvent` with `ActionValue = "__timeout__"`. When present, `QuestionTimeoutService` resolves the full `HumanAction` from the `IDistributedCache` and applies it automatically if the operator does not respond before the question's `ExpiresAt`. |
+| `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
+| `Status` | `enum` | `Pending`, `Answered`, `TimedOut`. |
+| `CreatedAt` | `DateTimeOffset` | When the question was sent to Telegram. |
+
+**Constraints:**
+- `UNIQUE (QuestionId)` — one pending record per question.
+- Index on `(Status, ExpiresAt)` — used by `QuestionTimeoutService` to poll for expired questions.
 
 #### HumanDecisionEvent (shared model)
 
@@ -210,13 +227,18 @@ The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplica
 ### 3.2 Entity Relationships
 
 ```text
-OperatorBinding *──* InboundUpdate     (via TelegramUserId; one operator may have multiple bindings)
-OperatorBinding *──* OutboundMessage   (via ChatId; resolved through tenant/workspace routing)
-OutboundMessage *──0..1 AgentQuestion   (via SourceId when SourceType = Question)
+OperatorBinding *──* OutboundMessage       (via OperatorBinding.TelegramChatId = OutboundMessage.ChatId;
+                                            resolved through tenant/workspace routing)
+OutboundMessage *──0..1 AgentQuestion      (via OutboundMessage.SourceId = AgentQuestion.QuestionId
+                                            when OutboundMessage.SourceType = Question)
 OutboundMessage        (alerts, acks, status updates have no AgentQuestion relationship)
-InboundUpdate   1──0..1 HumanDecisionEvent (for callback queries)
-AuditRecord     *──1 OperatorBinding   (via UserId + ChatId)
-AuditRecord     *──1 AgentQuestion     (via CorrelationId)
+InboundUpdate   1──0..1 HumanDecisionEvent (for callback queries; linked by processing context,
+                                            not a direct FK — the update triggers the event)
+PendingQuestionRecord *──1 AgentQuestion   (via PendingQuestionRecord.QuestionId = AgentQuestion.QuestionId)
+AuditRecord     *──1 OperatorBinding       (via AuditRecord.UserId = OperatorBinding.TelegramUserId;
+                                            the operator is identified by their Telegram user ID)
+AuditRecord     *──0..1 AgentQuestion      (via AuditRecord.CorrelationId; joins through the
+                                            correlation context, not a direct FK)
 ```
 
 ---
@@ -244,12 +266,15 @@ public interface IMessengerConnector
 public interface ITelegramUpdatePipeline
 {
     /// Processes a mapped MessengerEvent through dedup, allowlist, dispatch.
-    /// Returns false if the event was a duplicate or unauthorized.
-    Task<bool> ProcessAsync(MessengerEvent messengerEvent, CancellationToken ct);
+    /// Returns a PipelineResult indicating whether the event was handled,
+    /// an optional response text, and the CorrelationId.
+    Task<PipelineResult> ProcessAsync(MessengerEvent messengerEvent, CancellationToken ct);
 }
+
+public sealed record PipelineResult(bool Handled, string? ResponseText, string CorrelationId);
 ```
 
-Both the webhook controller and long-poll receiver first map the raw Telegram `Update` to a `MessengerEvent` using `TelegramUpdateMapper`, then pass the result to `ProcessAsync`. This boundary aligns with implementation-plan Stage 2.5 and keeps `ITelegramUpdatePipeline` transport-agnostic — the pipeline never sees a Telegram-specific `Update` object.
+Both the webhook controller and long-poll receiver first map the raw Telegram `Update` to a `MessengerEvent` using `TelegramUpdateMapper`, then pass the result to `ProcessAsync`. The `PipelineResult` return type (defined in `AgentSwarm.Messaging.Abstractions`, per implementation-plan Stage 1.3) provides structured outcome information: `Handled = false` for duplicates or unauthorized events, `ResponseText` for any reply to send back to the user, and `CorrelationId` for tracing. This boundary aligns with implementation-plan Stage 2.5 and keeps `ITelegramUpdatePipeline` transport-agnostic — the pipeline never sees a Telegram-specific `Update` object.
 
 ### 4.3 IOperatorRegistry
 
@@ -292,11 +317,13 @@ public interface IAuditLog
 public interface ISwarmCommandBus
 {
     Task PublishCommandAsync(SwarmCommand command, CancellationToken ct);
+    Task<SwarmStatusSummary> QueryStatusAsync(CancellationToken ct);
+    Task<IReadOnlyList<AgentInfo>> QueryAgentsAsync(CancellationToken ct);
     IAsyncEnumerable<SwarmEvent> SubscribeAsync(string tenantId, CancellationToken ct);
 }
 ```
 
-The Telegram connector publishes commands (task creation, approvals, pauses) and subscribes to events (agent questions, status updates, alerts) for the operator's tenant.
+The Telegram connector publishes commands (task creation, approvals, pauses) and subscribes to events (agent questions, status updates, alerts) for the operator's tenant. `QueryStatusAsync` is consumed by the `/status` command handler and `QueryAgentsAsync` by the `/agents` command handler (per implementation-plan Stage 3.2). The transport backing `ISwarmCommandBus` (in-process, message broker, gRPC) is outside this story's scope.
 
 ---
 
@@ -337,9 +364,10 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
       │                    │                     │                   │                  │                   │
       │──AgentQuestion────▶│                     │                   │                  │                   │
       │  (severity=High,   │──deliver event─────▶│                   │                  │                   │
-      │   timeout=30min,   │                     │──build message────▶                  │                   │
-      │   defaultAction=   │                     │  + InlineKeyboard │                  │                   │
-      │   "skip")          │                     │──enqueue──────────▶│                  │                   │
+      │   timeout=30min)   │                     │──build message────▶                  │                   │
+      │                    │                     │  + InlineKeyboard │                  │                   │
+      │                    │                     │  + PendingQuestion│                  │                   │
+      │                    │                     │──enqueue──────────▶│                  │                   │
       │                    │                     │                   │──dequeue────────▶│                   │
       │                    │                     │                   │                  │──sendMessage──────▶│
       │                    │                     │                   │                  │  [Approve][Reject] │
@@ -358,12 +386,12 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 ```
 
 **Key invariants:**
-1. The question includes `Severity`, `ExpiresAt`, `DefaultAction`, and `AllowedActions` rendered as inline keyboard buttons.
+1. The question includes `Severity`, `ExpiresAt`, and `AllowedActions` rendered as inline keyboard buttons. When the connector builds the inline keyboard, it also creates a `PendingQuestionRecord` with `DefaultActionId` set to the proposed default action (if any) for timeout handling.
 2. The `callback_data` field carries `QuestionId:ActionId` (≤ 64 bytes). `ActionId` is a short key that maps to the full `HumanAction` payload stored server-side in `IDistributedCache` (see tech-spec D-3). The cache entry is written when the inline keyboard is built and expires at `AgentQuestion.ExpiresAt`.
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string.
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
 5. Audit record is written with `MessageId`, `UserId`, `AgentId`, timestamp, and `CorrelationId`.
-6. If no operator responds before `ExpiresAt`, a timeout handler fires `DefaultAction` and updates the Telegram message to reflect the timeout.
+6. If no operator responds before `ExpiresAt`, a timeout handler reads `PendingQuestionRecord.DefaultActionId`, resolves the corresponding `HumanAction`, fires a `HumanDecisionEvent` with that action, and updates the Telegram message to reflect the timeout.
 
 ### 5.3 Scenario: Outbound send failure with retry and dead-letter
 
@@ -383,16 +411,16 @@ OutboundQueue         TelegramSender         Telegram API         DeadLetterQueu
       │◀──markFailed(2)─────│                     │                      │                    │
       │   nextRetry=now+4s  │                     │                      │                    │
       │                     │                     │                      │                    │
-      │  ... (attempts 3 and 4 fail similarly) ... │                      │                    │
+      │  ... (attempt 3 fails similarly) ...     │                      │                    │
       │                     │                     │                      │                    │
-      │──attempt 5 fails───▶│                     │                      │                    │
+      │──attempt 3 fails───▶│                     │                      │                    │
       │──deadLetter─────────▶─────────────────────▶──────────────────────▶│                    │
       │                     │                     │                      │──alert operator────▶│
 ```
 
 **Retry policy (configurable via `OutboundQueue:MaxRetries` and `OutboundQueue:BaseRetryDelaySeconds`):**
-- Max attempts: configurable (default `5`, aligning with e2e-scenarios which test dead-letter after 5 failed attempts and implementation-plan `RetryPolicy.MaxAttempts` default of 5)
-- Back-off: exponential (`BaseRetryDelaySeconds` ^ attempt, e.g. 2s, 4s, 8s, 16s, 30s capped) with jitter (±25%)
+- Max attempts: configurable (default `3`, aligning with implementation-plan Stage 4.2 `RetryPolicy.MaxAttempts` default of `3`)
+- Back-off: exponential (`BaseRetryDelaySeconds` ^ attempt, e.g. 2s, 4s, 8s capped) with jitter (±25%)
 - Retryable errors: HTTP 429 (with `retry_after`), 5xx, network timeouts
 - Non-retryable: HTTP 400 (bad request), 403 (bot blocked) — dead-letter immediately
 - Dead-letter record preserves full message payload, all attempt timestamps, and error details
@@ -452,6 +480,8 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 > 5. If `TASK-ID` is invalid: "Task NONEXISTENT not found". If `@operator-alias` is unregistered: "Operator @unknown-user is not registered".
 >
 > This aligns with tech-spec D-4 (status: Decided — transfer human oversight) and e2e-scenarios §Bot Command Suite which specifies the full transfer flow including Gherkin scenarios for valid transfer, invalid task ID, and unknown operator alias.
+>
+> **Sibling-doc divergence note:** implementation-plan Stage 3.2 still implements `HandoffCommandHandler` as a not-yet-configured stub (returning a placeholder response and logging for future replay). That implementation-plan predates the D-4 decision closure and needs to be updated in its next iteration to implement the full transfer flow described here and in e2e-scenarios.
 
 ---
 
@@ -479,6 +509,8 @@ AgentSwarm.Messaging.sln  (to be created)
 │                                            TelegramSender,
 │                                            WebhookController,
 │                                            LongPollReceiver,
+│                                            PendingQuestionRecord,
+│                                            QuestionTimeoutService,
 │                                            TelegramOptions (config POCO)
 │
 ├── AgentSwarm.Messaging.Persistence      ← AuditLogger, OutboundQueueStore,
@@ -506,7 +538,7 @@ AgentSwarm.Messaging.sln  (to be created)
 | `Telegram:AllowedChatIds` | App configuration | Comma-separated allowlist. Evaluated by `AuthZ Service`. |
 | `Telegram:RateLimits:GlobalPerSecond` | App configuration | Default `30`. |
 | `Telegram:RateLimits:PerChatPerMinute` | App configuration | Default `20`. |
-| `OutboundQueue:MaxRetries` | App configuration | Default `5` (aligned with e2e-scenarios and implementation-plan `RetryPolicy.MaxAttempts`). |
+| `OutboundQueue:MaxRetries` | App configuration | Default `3` (aligned with implementation-plan Stage 4.2 `RetryPolicy.MaxAttempts`). |
 | `OutboundQueue:BaseRetryDelaySeconds` | App configuration | Default `2`. |
 | `OutboundQueue:ProcessorConcurrency` | App configuration | Default `10`. Number of concurrent send workers. |
 | `OutboundQueue:MaxQueueDepth` | App configuration | Default `5000`. Backpressure threshold; low-severity messages are dead-lettered when exceeded. |
@@ -557,10 +589,11 @@ Both modes feed into the same `ITelegramUpdatePipeline`, so all downstream logic
 
 ### 10.3 Question Timeout Handling
 
-A `QuestionTimeoutService` (BackgroundService) polls for open questions past their `ExpiresAt`. When a question times out:
-1. Publishes a `HumanDecisionEvent` with the `DefaultAction` value.
-2. Updates the original Telegram message to indicate the timeout ("⏰ Timed out — default action applied: *skip*").
-3. Writes an audit record noting the timeout.
+A `QuestionTimeoutService` (BackgroundService) polls for `PendingQuestionRecord` entries with `Status = Pending` past their `ExpiresAt`. When a question times out:
+1. Reads `PendingQuestionRecord.DefaultActionId`. If present, resolves the full `HumanAction` from `IDistributedCache` and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
+2. Updates the original Telegram message (using `PendingQuestionRecord.TelegramMessageId`) to indicate the timeout ("⏰ Timed out — default action applied: *skip*" or "⏰ Timed out — no default action").
+3. Sets `PendingQuestionRecord.Status = TimedOut`.
+4. Writes an audit record noting the timeout.
 
 ### 10.4 Performance: Concurrency, Backpressure, and Rate Limiting
 
