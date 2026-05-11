@@ -1,7 +1,7 @@
 # Technical Specification — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S` · 13 SP
-**Status:** Draft — Iteration 2
+**Status:** Draft — Iteration 3
 **Last updated:** 2026-05-11
 
 ---
@@ -21,7 +21,7 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 | # | Area | Detail |
 |---|------|--------|
 | S-1 | **Telegram Bot API integration** | HTTPS transport via `Telegram.Bot` NuGet package. Webhook receive in production; long-polling receive in dev/local. |
-| S-2 | **Command handling** | `/start`, `/status`, `/agents`, `/ask`, `/approve`, `/reject`, `/handoff`, `/pause`, `/resume` — parsed, validated, and dispatched to the Agent Swarm Orchestrator. `/handoff TASK-ID @operator-alias` transfers human oversight of the specified task to the target operator. |
+| S-2 | **Command handling** | `/start`, `/status`, `/agents`, `/ask`, `/approve`, `/reject`, `/handoff`, `/pause`, `/resume` — parsed, validated, and dispatched to the Agent Swarm Orchestrator. `/handoff` semantics are an open decision (see D-4); the command handler will accept the syntax `/handoff TASK-ID @operator-alias` but reply with a "not yet configured" message until the policy is finalized. |
 | S-3 | **Agent-to-human questions** | Render `AgentQuestion` as Telegram messages with inline keyboard buttons for each `HumanAction`. Include context, severity, timeout, and proposed default action in the message body. |
 | S-4 | **Strongly typed decision events** | Button taps and text replies are converted to `HumanDecisionEvent` and published to the orchestrator. |
 | S-5 | **Operator identity mapping** | Map Telegram `chat_id` + `user_id` to an authorized operator record with tenant/workspace binding. Reject unmapped users. Applies in both 1:1 and group-chat contexts — commands in groups are attributed to the sending `user_id`, not the group `chat_id`. |
@@ -82,9 +82,9 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|-----------|--------|------------|
-| R-1 | **Telegram Bot API rate limits** — `sendMessage` is limited to ~30 msg/sec per bot in a single chat, ~20 msg/sec to different chats in bursts. Under 100-agent burst, we may hit 429 errors. | High | High | Implement per-chat token-bucket rate limiter in the outbound queue. Back-off on 429 with `retry_after`. Spread alerts across operator chats when possible. |
+| R-1 | **Telegram Bot API rate limits** — `sendMessage` is limited to ~30 msg/s globally per bot and ~20 msg/min per individual chat (per architecture.md's rate-limiter design). Under 100-agent burst, we may hit 429 errors. | High | High | Implement a dual token-bucket rate limiter in the outbound queue: one global bucket (30 msg/s) and per-chat buckets (20 msg/min). Back-off on 429 with `retry_after`. Spread alerts across operator chats when possible. |
 | R-2 | **Webhook endpoint availability** — If the ASP.NET host is behind a load balancer restart or deployment, Telegram may fail to deliver updates and retry for a limited window. | Medium | Medium | Register webhook with `max_connections` tuned to replica count. Implement `/setWebhook` on startup with `drop_pending_updates=false`. For blue/green deploys, keep old pod alive until new webhook is confirmed. |
-| R-3 | **Inline keyboard callback data limit** — Telegram limits `callback_data` to 64 bytes. Complex `HumanAction` payloads won't fit. | High | Medium | Store action payload in a server-side lookup keyed by a short GUID. Embed only the GUID in `callback_data`. Expire entries after `AgentQuestion.ExpiresAt`. |
+| R-3 | **Inline keyboard callback data limit** — Telegram limits `callback_data` to 64 bytes. Complex `HumanAction` payloads won't fit. | High | Medium | Primary approach (aligned with architecture.md): encode `QuestionId:ActionValue` directly in `callback_data` — this fits within 64 bytes for typical short IDs and action labels. If a specific question's payload exceeds 64 bytes, fall back to a server-side lookup keyed by a short GUID stored in `IDistributedCache`, with entries expiring at `AgentQuestion.ExpiresAt`. The implementation should try direct encoding first and only use the fallback when the encoded string exceeds the limit. |
 | R-4 | **Long-polling ↔ webhook mode switching** — Telegram does not allow both simultaneously; switching requires calling `deleteWebhook` first. | Low | Low | Configuration-driven mode selection at startup. Guard with a startup check that calls `deleteWebhook` before starting long-polling and `setWebhook` before starting webhook mode. |
 | R-5 | **Secret rotation** — If the Key Vault token is rotated while the connector is running, the bot loses API access until restart. | Medium | High | Use Key Vault SDK's `SecretClient` with `CacheControl` / periodic refresh (e.g., every 5 minutes via `IOptionsMonitor<T>` reload). |
 | R-6 | **Outbox queue durability** — If the outbox is in-process only (e.g., `Channel<T>`), a process crash loses queued messages. | Medium | High | Use a durable store (database outbox table or external queue like Azure Service Bus) for the outbound queue. In-process channel serves only as a hot buffer in front of the durable store. |
@@ -111,10 +111,10 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 
 | # | Decision | Options | Recommendation | Status |
 |---|----------|---------|----------------|--------|
-| D-1 | Durable outbox backing store | (a) Database table (EF Core), (b) Azure Service Bus, (c) In-process only | **(a) Database table** — no external queue dependency; works in dev and prod. The outbox table will be defined in the `AgentSwarm.Messaging.Persistence` project recommended by the epic solution structure (to be created as part of implementation). | Proposed |
+| D-1 | Durable outbox backing store | (a) Database table (EF Core), (b) Azure Service Bus, (c) In-process only | **(a) Database table via EF Core** — no external queue dependency. SQLite for dev/local environments; PostgreSQL or SQL Server for production (the specific provider is a deployment decision, consistent with architecture.md). The outbox table will be defined in the `AgentSwarm.Messaging.Persistence` project recommended by the epic solution structure (to be created as part of implementation). | Proposed |
 | D-2 | Deduplication store for `update_id` | (a) In-memory concurrent dictionary with TTL, (b) Database table, (c) Redis | **(a) In-memory** for single-instance dev, **(b) Database** for multi-instance prod. Configuration-driven. | Proposed |
-| D-3 | Callback data storage for inline buttons | (a) Server-side cache (IDistributedCache), (b) Database table | **(a) IDistributedCache** — low latency, auto-expiry, aligns with `AgentQuestion.ExpiresAt`. | Proposed |
-| D-4 | `/handoff` command semantics | (a) Transfer human oversight of a task to another operator, (b) Transfer task to a different agent | **(a) Transfer human oversight to another operator.** Syntax: `/handoff TASK-ID @operator-alias`. The swarm reassigns the human-oversight binding for the given task to the target operator and sends confirmation messages to both parties. Aligned with the scenario defined in e2e-scenarios.md. | Decided |
+| D-3 | Callback data encoding for inline buttons | (a) Direct `QuestionId:ActionValue` in `callback_data`, (b) Server-side cache lookup via GUID | **(a) Direct encoding** as the primary approach — `QuestionId:ActionValue` fits within Telegram's 64-byte limit for typical payloads (aligned with architecture.md). Fall back to **(b) `IDistributedCache` lookup** only when the encoded string would exceed 64 bytes. | Proposed |
+| D-4 | `/handoff` command semantics | (a) Transfer human oversight of a task to another operator, (b) Reassign the question to another operator, (c) Transfer task to a different agent team | **Open — requires story-owner clarification.** Sibling docs diverge: architecture.md says "reassigns the question to another operator," implementation-plan.md says "initiates agent handoff to another operator or team," and e2e-scenarios.md explicitly marks this as pending. The command handler will parse `/handoff TASK-ID @operator-alias` but respond with a "not yet configured" stub until the policy is decided. See open questions below. | Open |
 
 ---
 
@@ -144,3 +144,16 @@ The system must handle bursty traffic from 100+ concurrent agents without messag
 ---
 
 *Cross-references: [architecture.md](architecture.md) (component diagram), [implementation-plan.md](implementation-plan.md) (task breakdown), [e2e-scenarios.md](e2e-scenarios.md) (acceptance test scripts).*
+
+---
+
+## 10  Sibling Document Alignment Notes
+
+The following items were identified as inconsistencies across sibling documents during iteration 3 review. This tech-spec has been updated to align or explicitly defer to the authoritative sibling:
+
+| Item | This spec | architecture.md | implementation-plan.md | e2e-scenarios.md | Resolution |
+|------|-----------|-----------------|----------------------|-----------------|------------|
+| `/handoff` semantics (D-4) | Open — stub until decided | "reassigns the question to another operator" | "initiates agent handoff to another operator or team" | "pending clarification" | All docs should treat as **open**. This spec defers; e2e-scenarios already stubs. architecture.md and implementation-plan.md should align in their next iteration. |
+| Rate-limit model (R-1) | 30 msg/s global, 20 msg/min per chat | 30 msg/s global, 20 msg/min per chat | Not specified numerically | N/A | **Aligned** with architecture.md. |
+| Callback data format (R-3, D-3) | Direct `QuestionId:ActionValue`; GUID fallback for overflow | `QuestionId:ActionValue`, no DB lookup | `QuestionId:ActionId` | N/A | **Aligned** with architecture.md primary approach. `ActionId` vs `ActionValue` is a naming difference; implementation-plan.md should clarify. |
+| Persistence provider (D-1) | EF Core; SQLite for dev, PostgreSQL/SQL Server for prod | PostgreSQL or SQL Server via EF Core (deployment decision) | SQLite for production | N/A | **Aligned** with architecture.md: SQLite is dev/local only. implementation-plan.md should clarify that SQLite is not the production provider. |
