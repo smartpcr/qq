@@ -54,11 +54,12 @@ Feature: Agent blocking question delivered to Telegram
     And agent "arch-agent-7" is working on TaskId "TASK-042"
 
   Scenario: Agent sends a blocking question with inline buttons
-    # The shared AgentQuestion model includes DefaultAction as a first-class nullable
-    # property (architecture.md §3.1 line 180). When the Telegram connector renders
-    # the question, it copies AgentQuestion.DefaultAction into
-    # PendingQuestionRecord.DefaultActionId for efficient timeout polling
-    # (architecture.md §3.1 line 194, §5.2 line 183).
+    # The shared AgentQuestion model does NOT include a DefaultAction property
+    # (architecture.md §3.1 line 168). The proposed default action is provided
+    # as metadata alongside the question (e.g., agent/command context or sidecar
+    # payload). The Telegram connector determines DefaultActionId at send time
+    # and stores it in PendingQuestionRecord for timeout polling
+    # (architecture.md §3.1 lines 182–194).
     Given agent "arch-agent-7" publishes an AgentQuestion:
       | Field           | Value                                              |
       | QuestionId      | Q-1001                                             |
@@ -69,10 +70,10 @@ Feature: Agent blocking question delivered to Telegram
       | Severity        | high                                               |
       | AllowedActions  | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}, {ActionId:"act-3", Label:"Need info", Value:"need-info", RequiresComment:true}] |
       | ExpiresAt       | 2026-05-11T15:30:00Z                               |
-      | DefaultAction   | act-1                                              |
       | CorrelationId   | corr-abc-123                                       |
+    And the agent/command context metadata specifies proposed default action "act-1"
     When the Messenger Gateway dequeues the question
-    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1" (denormalized from AgentQuestion.DefaultAction per architecture.md §3.1)
+    Then the Telegram connector determines DefaultActionId "act-1" from the context metadata and creates a PendingQuestionRecord
     And the bot sends a Telegram message to chat "998877" containing:
       | Element         | Content                                            |
       | Text            | Title, Body, Severity, timeout, and proposed default action label |
@@ -87,9 +88,9 @@ Feature: Agent blocking question delivered to Telegram
       | Severity        | critical                                       |
       | ExpiresAt       | 5 minutes from now                             |
       | AllowedActions  | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}] |
-      | DefaultAction   | act-1                                         |
+    And the agent/command context metadata specifies proposed default action "act-1"
     When the message is rendered in Telegram
-    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1" (denormalized from AgentQuestion.DefaultAction per architecture.md §3.1)
+    Then the Telegram connector determines DefaultActionId "act-1" from the context metadata and creates a PendingQuestionRecord
     And the message body includes the Title "Database migration strategy"
     And the message body includes the Body text "Should we use blue-green or rolling migration?"
     And the message body includes severity badge "🔴 CRITICAL"
@@ -97,8 +98,9 @@ Feature: Agent blocking question delivered to Telegram
     And the message body includes "Default action if no response: Approve"
 
   Scenario: Question timeout expires without human response
-    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now and DefaultAction "act-1"
-    And the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1" (denormalized from AgentQuestion.DefaultAction per architecture.md §3.1)
+    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
+    And the agent/command context metadata specifies proposed default action "act-1"
+    And the Telegram connector determines DefaultActionId "act-1" from the context metadata and creates a PendingQuestionRecord
     And no human responds within 2 minutes
     When ExpiresAt is reached
     Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionId "act-1"
@@ -107,8 +109,9 @@ Feature: Agent blocking question delivered to Telegram
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
 
   Scenario: Question timeout with no default action
-    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now and DefaultAction = null
-    And the Telegram connector creates a PendingQuestionRecord with DefaultActionId = null (reflecting the null AgentQuestion.DefaultAction)
+    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
+    And the agent/command context metadata does not specify a proposed default action
+    And the Telegram connector creates a PendingQuestionRecord with DefaultActionId = null
     And no human responds within 2 minutes
     When ExpiresAt is reached
     Then the QuestionTimeoutService publishes a HumanDecisionEvent with ActionValue "__timeout__"
@@ -354,20 +357,37 @@ Feature: Telegram bot command handling
     When user "operator-1" sends "/reject Q-2001"
     Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
 
-  Scenario: /handoff returns V1 stub acknowledgement
-    # architecture.md §5.5 (line 481): "V1 stub; full transfer deferred."
-    # implementation-plan.md Stage 3.2 (line 211): HandoffCommandHandler is a V1 stub
-    # that validates syntax only, returns a stub ack, and persists an audit record.
-    # It does NOT validate task existence, resolve the target operator, mutate
-    # OperatorBinding, or notify the target operator.
-    # Full transfer requires a TaskOversight entity not yet defined (architecture.md §5.5 line 491).
+  Scenario: /handoff transfers oversight to another operator
+    # architecture.md §5.5: Full oversight transfer (Decided).
+    # implementation-plan.md Stage 3.2 (line 211): HandoffCommandHandler performs
+    # full oversight transfer — validates task existence and current oversight,
+    # resolves target operator via IOperatorRegistry, creates/updates TaskOversight
+    # record, notifies both operators, persists audit record.
+    # tech-spec.md D-4: Decided — full transfer with validation, notification, and audit.
+    Given user "operator-1" currently has oversight of task "TASK-099"
+    And user "operator-2" (alias "@operator-2") is registered in the OperatorRegistry
     When user "operator-1" sends "/handoff TASK-099 @operator-2"
     Then the HandoffCommandHandler validates the syntax (two arguments: task ID and operator alias)
-    And the bot replies with "🔜 Handoff for TASK-099 to @operator-2 noted — full transfer will be implemented in a future iteration"
-    And an audit record is persisted with task ID "TASK-099", target alias "@operator-2", requesting operator "operator-1", timestamp, and CorrelationId
-    And no OperatorBinding records are created, updated, or deleted
+    And the handler validates that task "TASK-099" exists and "operator-1" currently has oversight
+    And the handler resolves "@operator-2" via IOperatorRegistry.GetByAliasAsync
+    And a TaskOversight record is created or updated mapping "TASK-099" to "operator-2"
+    And "operator-1" receives confirmation "✅ Oversight of TASK-099 transferred to @operator-2"
+    And "operator-2" receives a handoff notification with task context for "TASK-099"
+    And an audit record is persisted with task ID "TASK-099", source operator "operator-1", target operator "operator-2", timestamp, and CorrelationId
+
+  Scenario: /handoff with nonexistent task is rejected
+    Given task "NONEXISTENT" does not exist
+    When user "operator-1" sends "/handoff NONEXISTENT @operator-2"
+    Then the bot replies with "❌ Task NONEXISTENT not found"
+    And no TaskOversight record is created or updated
     And no notification is sent to operator-2
-    And no task existence validation occurs
+
+  Scenario: /handoff with unregistered target operator is rejected
+    Given user "operator-1" currently has oversight of task "TASK-099"
+    And alias "@unknown-user" is not registered in the OperatorRegistry
+    When user "operator-1" sends "/handoff TASK-099 @unknown-user"
+    Then the bot replies with "❌ Operator @unknown-user is not registered"
+    And no TaskOversight record is created or updated
 
   Scenario: /handoff with invalid syntax returns usage help
     When user "operator-1" sends "/handoff" with no arguments
@@ -578,10 +598,10 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 11._
-_Aligned with architecture.md (§3.1: AgentQuestion includes DefaultAction as a first-class nullable property; PendingQuestionRecord.DefaultActionId is denormalized from AgentQuestion.DefaultAction at question-send time per §3.1 line 183-194; §5.3: configurable OutboundQueue:MaxRetries default 5 with exponential backoff and dead-letter; §5.5: /handoff is a V1 stub — syntax validation and stub ack only, full transfer deferred pending TaskOversight entity; §8 metrics table; §10.4: P95 under 2s for first-attempt successes via telegram.send.latency_ms, backpressure dead-letter counted via telegram.messages.backpressure_dlq), implementation-plan.md (Stage 3.2 line 211: HandoffCommandHandler is a V1 stub — validates syntax, returns stub ack, persists audit, does NOT validate task existence, resolve target, mutate OperatorBinding, or notify target; Stage 4.2: RetryPolicy.MaxAttempts default 5), and tech-spec.md (S-2 command handling; HC-3 data model constraints; D-3 callback data encoding)._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 12._
+_Aligned with architecture.md (§3.1: shared AgentQuestion does NOT include DefaultAction — the proposed default action is provided as metadata alongside the question; the Telegram connector determines DefaultActionId at send time and stores it in PendingQuestionRecord for timeout polling; §5.3: configurable OutboundQueue:MaxRetries default 5 with exponential backoff and dead-letter; §5.5: /handoff performs full oversight transfer — validates task existence and current oversight, resolves target via IOperatorRegistry, creates/updates TaskOversight record, notifies both operators, persists audit; §8 metrics table; §10.4: backpressure dead-letter counted via telegram.messages.backpressure_dlq), implementation-plan.md (Stage 3.2 line 211: HandoffCommandHandler performs full oversight transfer per tech-spec D-4 and architecture.md §5.5; Stage 4.2: RetryPolicy.MaxAttempts default 5), and tech-spec.md (S-2 command handling with full /handoff transfer; HC-3 data model constraints; D-3 callback data encoding; D-4: /handoff Decided — full oversight transfer with validation, notification, and audit)._
 _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively (per implementation-plan.md Stage 3.2). Inline button presses emit the HumanAction.Value from AllowedActions via CallbackQueryHandler (per implementation-plan.md Stage 3.3)._
-_Default action model: The shared `AgentQuestion` model includes `DefaultAction` as a first-class nullable property — the `HumanAction.ActionId` of the proposed default action to apply on timeout (architecture.md §3.1 line 168-180). When the Telegram connector renders an `AgentQuestion`, it copies `AgentQuestion.DefaultAction` into `PendingQuestionRecord.DefaultActionId` for efficient timeout polling (architecture.md §3.1 line 183-194). On timeout, `QuestionTimeoutService` reads `PendingQuestionRecord.DefaultActionId`, resolves the full `HumanAction` from `IDistributedCache`, and publishes a `HumanDecisionEvent` with that action's `Value`. If `DefaultActionId` is null, the timeout event uses `ActionValue = "__timeout__"`. Cross-doc note: tech-spec.md HC-3 says the shared `AgentQuestion` does NOT include `DefaultAction`; this is inconsistent with architecture.md §3.1 which explicitly includes it. Scenarios in this document follow architecture.md §3.1 as the authoritative source for the shared data model._
+_Default action model: The shared `AgentQuestion` model does **not** include a `DefaultAction` property (architecture.md §3.1 line 168). The story requirement for "proposed default action" is satisfied connector-side: the proposed default action is provided as metadata alongside the question (e.g., via agent/command context or sidecar payload), and the Telegram connector determines the `DefaultActionId` at send time and stores it in `PendingQuestionRecord.DefaultActionId` for efficient timeout polling (architecture.md §3.1 lines 182–194). On timeout, `QuestionTimeoutService` reads `PendingQuestionRecord.DefaultActionId`, resolves the full `HumanAction` from `IDistributedCache`, and publishes a `HumanDecisionEvent` with that action's `Value`. If `DefaultActionId` is null, the timeout event uses `ActionValue = "__timeout__"`. Cross-doc note: tech-spec.md HC-3 says `AgentQuestion` includes `DefaultAction`; this is inconsistent with architecture.md §3.1 which explicitly excludes it. Scenarios in this document follow architecture.md §3.1 as the authoritative source for the shared data model._
 _Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are both aligned on `MaxAttempts` / `MaxRetries` default 5. Scenarios assert max 5 attempts accordingly._
-_Handoff semantics: architecture.md §5.5 (line 481) says "/handoff — V1 stub; full transfer deferred" and implementation-plan.md Stage 3.2 (line 211) specifies HandoffCommandHandler as a V1 stub that validates syntax, returns a stub ack, persists an audit record, and does NOT validate task existence, resolve target, mutate OperatorBinding, or notify target. Full transfer requires a `TaskOversight` entity not yet defined (architecture.md §5.5 line 491). Cross-doc note: tech-spec.md D-4 marks `/handoff` as "Decided" for full oversight transfer — this is inconsistent with architecture.md §5.5 and implementation-plan.md Stage 3.2. Scenarios in this document follow architecture.md and implementation-plan.md as the implementation-level specifications._
-_Metric naming: Scenarios assert `telegram.messages.backpressure_dlq` per architecture.md §10.4 (line 661). Cross-doc note: tech-spec.md HC-5 uses `telegram.messages.deadlettered_backpressure` for the same concept; tech-spec.md should reconcile with architecture.md in a future iteration._
+_Handoff semantics: architecture.md §5.5 specifies full oversight transfer (Decided) — the handler validates task existence and current oversight, resolves the target operator via IOperatorRegistry, creates/updates a TaskOversight record, notifies both operators, and persists an audit record. Implementation-plan.md Stage 3.2 (line 211) implements full oversight transfer per architecture.md §5.5 and tech-spec D-4. Tech-spec.md D-4 is Decided for full transfer. All three sibling docs are aligned on full /handoff semantics._
+_Metric naming: Scenarios assert `telegram.messages.backpressure_dlq` per architecture.md §10.4._
