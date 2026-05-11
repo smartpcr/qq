@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.13-draft (iteration 7)
+**Version:** v0.14-draft (iteration 8)
 
 ---
 
@@ -54,6 +54,9 @@ Feature: Agent blocking question delivered to Telegram
     And agent "arch-agent-7" is working on TaskId "TASK-042"
 
   Scenario: Agent sends a blocking question with inline buttons
+    # AgentQuestion is the shared model (unchanged per architecture.md §5.2).
+    # The proposed default action is stored Telegram-side in PendingQuestionRecord.DefaultActionId
+    # (architecture.md §5.2) when the connector renders the question.
     Given agent "arch-agent-7" publishes an AgentQuestion:
       | Field           | Value                                              |
       | QuestionId      | Q-1001                                             |
@@ -62,14 +65,15 @@ Feature: Agent blocking question delivered to Telegram
       | Title           | Database migration strategy                        |
       | Body            | Should we use blue-green or rolling migration?      |
       | Severity        | high                                               |
-      | AllowedActions  | [{Label:"Approve", Value:"approve"}, {Label:"Reject", Value:"reject"}, {Label:"Need info", Value:"need-info", RequiresComment:true}] |
-      | DefaultAction   | approve                                            |
+      | AllowedActions  | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}, {ActionId:"act-3", Label:"Need info", Value:"need-info", RequiresComment:true}] |
       | ExpiresAt       | 2026-05-11T15:30:00Z                               |
       | CorrelationId   | corr-abc-123                                       |
+    And the proposed default action is "act-1" (Approve)
     When the Messenger Gateway dequeues the question
-    Then the bot sends a Telegram message to chat "998877" containing:
+    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1"
+    And the bot sends a Telegram message to chat "998877" containing:
       | Element         | Content                                            |
-      | Text            | Title, Body, Severity, timeout, and default action |
+      | Text            | Title, Body, Severity, timeout, and proposed default action label |
       | InlineKeyboard  | Three buttons: "Approve", "Reject", "Need info"  |
     And the outbound message is logged with CorrelationId "corr-abc-123"
 
@@ -80,21 +84,33 @@ Feature: Agent blocking question delivered to Telegram
       | Body            | Should we use blue-green or rolling migration? |
       | Severity        | critical                                       |
       | ExpiresAt       | 5 minutes from now                             |
-      | DefaultAction   | approve                                    |
-      | AllowedActions  | [{Label:"Approve", Value:"approve"}, {Label:"Reject", Value:"reject"}] |
+      | AllowedActions  | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}] |
+    And the proposed default action is "act-1" (Approve)
     When the message is rendered in Telegram
-    Then the message body includes the Title "Database migration strategy"
+    Then the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1"
+    And the message body includes the Title "Database migration strategy"
     And the message body includes the Body text "Should we use blue-green or rolling migration?"
     And the message body includes severity badge "🔴 CRITICAL"
     And the message body includes "Timeout: 5 min"
-    And the message body includes "Default action if no response: approve"
+    And the message body includes "Default action if no response: Approve"
 
   Scenario: Question timeout expires without human response
     Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
+    And the Telegram connector creates a PendingQuestionRecord with DefaultActionId "act-1"
     And no human responds within 2 minutes
     When ExpiresAt is reached
-    Then the gateway publishes a HumanDecisionEvent with the DefaultAction value as ActionValue
+    Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionId "act-1"
+    And resolves the corresponding HumanAction from the cache
+    And publishes a HumanDecisionEvent with that HumanAction.Value as ActionValue
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
+
+  Scenario: Question timeout with no default action
+    Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
+    And the PendingQuestionRecord has DefaultActionId = null (no proposed default)
+    And no human responds within 2 minutes
+    When ExpiresAt is reached
+    Then the QuestionTimeoutService publishes a HumanDecisionEvent with ActionValue "__timeout__"
+    And the Telegram message is updated to show "⏰ Timed out — no default action"
 ```
 
 ---
@@ -192,7 +208,7 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Background:
     Given the outbound message queue is operational
-    And retry policy is configured: max 5 attempts, exponential backoff (per architecture.md §5.3 OutboundQueue:MaxRetries default of 5)
+    And retry policy is configured: max 3 attempts, exponential backoff (per architecture.md §5.3 OutboundQueue:MaxRetries default of 3)
 
   Scenario: Transient Telegram API failure triggers retry
     Given agent "test-agent-3" enqueues an outbound alert message
@@ -207,8 +223,8 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Scenario: Persistent failure dead-letters the message
     Given agent "deploy-agent-9" enqueues an urgent alert message
-    When the Telegram Bot API returns HTTP 500 on attempts 1 through 5
-    Then the message is moved to the dead-letter queue after attempt 5
+    When the Telegram Bot API returns HTTP 500 on attempts 1 through 3
+    Then the message is moved to the dead-letter queue after attempt 3
     And an alert is raised to the operations channel
     And the dead-letter record includes CorrelationId, AgentId, message content, and failure reason
 
@@ -250,7 +266,7 @@ Feature: Durable outbound message queue with retry and dead-letter
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
-    And the queue depth metric is observable via OpenTelemetry (telegram.send.duration_ms histogram)
+    And queue depth is observable via the telegram.outbound_queue.depth gauge and backpressure events via the telegram.queue.backpressure counter (per architecture.md §8/§10)
     And P95 send latency remains under 2 seconds for messages that succeed on first attempt (per architecture.md §10.4 metric definition: telegram.send.latency_ms scoped to first-attempt successes, excluding rate-limited waits)
     And subsequent messages are queue-delayed by Telegram rate limits but not lost
     And time spent waiting during 429 backoff is tracked separately via telegram.send.rate_limited_wait_ms

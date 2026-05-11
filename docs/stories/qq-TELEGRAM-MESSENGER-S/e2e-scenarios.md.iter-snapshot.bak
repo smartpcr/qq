@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.12-draft (iteration 6)
+**Version:** v0.13-draft (iteration 7)
 
 ---
 
@@ -62,15 +62,15 @@ Feature: Agent blocking question delivered to Telegram
       | Title           | Database migration strategy                        |
       | Body            | Should we use blue-green or rolling migration?      |
       | Severity        | high                                               |
-      | AllowedActions  | [{Label:"Approve", Value:"blue-green"}, {Label:"Reject", Value:"rolling"}, {Label:"Need info", Value:"need-info", RequiresComment:true}] |
-      | ProposedDefault | blue-green                                         |
+      | AllowedActions  | [{Label:"Approve", Value:"approve"}, {Label:"Reject", Value:"reject"}, {Label:"Need info", Value:"need-info", RequiresComment:true}] |
+      | DefaultAction   | approve                                            |
       | ExpiresAt       | 2026-05-11T15:30:00Z                               |
       | CorrelationId   | corr-abc-123                                       |
     When the Messenger Gateway dequeues the question
     Then the bot sends a Telegram message to chat "998877" containing:
       | Element         | Content                                            |
       | Text            | Title, Body, Severity, timeout, and default action |
-      | InlineKeyboard  | Three buttons: "Blue-green", "Rolling", "Need info"|
+      | InlineKeyboard  | Three buttons: "Approve", "Reject", "Need info"  |
     And the outbound message is logged with CorrelationId "corr-abc-123"
 
   Scenario: Question includes context, severity, timeout, and proposed default
@@ -80,20 +80,20 @@ Feature: Agent blocking question delivered to Telegram
       | Body            | Should we use blue-green or rolling migration? |
       | Severity        | critical                                       |
       | ExpiresAt       | 5 minutes from now                             |
-      | ProposedDefault | blue-green                                     |
-      | AllowedActions  | [{Label:"Approve", Value:"blue-green"}, {Label:"Reject", Value:"rolling"}] |
+      | DefaultAction   | approve                                    |
+      | AllowedActions  | [{Label:"Approve", Value:"approve"}, {Label:"Reject", Value:"reject"}] |
     When the message is rendered in Telegram
     Then the message body includes the Title "Database migration strategy"
     And the message body includes the Body text "Should we use blue-green or rolling migration?"
     And the message body includes severity badge "🔴 CRITICAL"
     And the message body includes "Timeout: 5 min"
-    And the message body includes "Default action if no response: blue-green"
+    And the message body includes "Default action if no response: approve"
 
   Scenario: Question timeout expires without human response
     Given agent "arch-agent-7" publishes an AgentQuestion with ExpiresAt 2 minutes from now
     And no human responds within 2 minutes
     When ExpiresAt is reached
-    Then the gateway publishes a HumanDecisionEvent with the proposed default ActionValue
+    Then the gateway publishes a HumanDecisionEvent with the DefaultAction value as ActionValue
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
 ```
 
@@ -111,24 +111,24 @@ Feature: Strongly typed approval/rejection events from Telegram buttons
     And an AgentQuestion "Q-1001" is displayed in chat "998877" with inline buttons
 
   Scenario: Human approves via inline button
-    # ActionValue carries the domain value from HumanAction.Value, not the verb
+    # ActionValue carries the HumanAction.Value from AllowedActions (per implementation-plan.md Stage 3.3)
     When user "operator-1" taps the "Approve" inline button for question "Q-1001"
     Then a HumanDecisionEvent is published:
       | Field             | Value            |
       | QuestionId        | Q-1001           |
-      | ActionValue       | blue-green       |
+      | ActionValue       | approve          |
       | Comment           | null             |
       | Messenger         | Telegram         |
       | ExternalUserId    | 111222333        |
       | ExternalMessageId | <telegram_msg_id>|
       | CorrelationId     | corr-abc-123     |
-    And the original Telegram message is edited to show "✅ Approved by operator-1 (blue-green)"
+    And the original Telegram message is edited to show "✅ Approved by operator-1"
     And an audit record is persisted with all HumanDecisionEvent fields
 
   Scenario: Human rejects via inline button
     When user "operator-1" taps the "Reject" inline button for question "Q-1001"
-    Then a HumanDecisionEvent is published with ActionValue "rolling"
-    And the original Telegram message is edited to show "❌ Rejected by operator-1 (rolling)"
+    Then a HumanDecisionEvent is published with ActionValue "reject"
+    And the original Telegram message is edited to show "❌ Rejected by operator-1"
 
   Scenario: Human selects "Need more info" which requires a comment
     Given the "Need info" action has RequiresComment = true
@@ -233,23 +233,25 @@ Feature: Durable outbound message queue with retry and dead-letter
     Then the duplicate is suppressed
     And the original alert remains in the queue for delivery
 
-  Scenario: P95 send latency under 2 seconds for non-rate-limited delivery
-    # Standalone deterministic latency test aligned with architecture.md §10.4
+  Scenario: P95 send latency under 2 seconds for first-attempt successes
+    # Per architecture.md §10.4: telegram.send.latency_ms = elapsed time from
+    # OutboundMessage.CreatedAt (enqueue) to Telegram API HTTP 200, measured ONLY
+    # for messages that succeed on first attempt and are not waiting behind a 429 hold.
     Given 100 outbound messages are enqueued sequentially
     And the Telegram Bot API responds HTTP 200 with ≤ 50 ms latency on every request
     And no HTTP 429 rate-limit responses occur
     When all 100 messages are dequeued and sent
-    Then P95 send latency (measured from enqueue to Telegram API 200 response) is under 2 seconds
-    And P99 send latency is under 3 seconds
-    And latency is reported via the messenger.outbound.send_latency_ms histogram
+    Then P95 telegram.send.latency_ms (first-attempt successes only, per architecture.md §10.4) is under 2 seconds
+    And P99 telegram.send.latency_ms is under 3 seconds
+    And latency is reported via the telegram.send.latency_ms histogram (per architecture.md §10.4)
 
   Scenario: Burst of 1000+ agent alerts without message loss
     Given 1000 agents each enqueue one alert message simultaneously
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
-    And the queue depth metric is observable via OpenTelemetry
-    And P95 send latency remains under 2 seconds for the first ~30 messages (per architecture.md §10.4 rate-limit throughput of 30 msg/s)
+    And the queue depth metric is observable via OpenTelemetry (telegram.send.duration_ms histogram)
+    And P95 send latency remains under 2 seconds for messages that succeed on first attempt (per architecture.md §10.4 metric definition: telegram.send.latency_ms scoped to first-attempt successes, excluding rate-limited waits)
     And subsequent messages are queue-delayed by Telegram rate limits but not lost
     And time spent waiting during 429 backoff is tracked separately via telegram.send.rate_limited_wait_ms
 ```
@@ -324,38 +326,30 @@ Feature: Telegram bot command handling
     Then the bot replies with a formatted list of active agents and their current tasks
 
   Scenario: /approve with question ID
-    Given an open AgentQuestion "Q-2001" exists with AllowedActions [{Label:"Approve", Value:"proceed"}]
+    Given an open AgentQuestion "Q-2001" exists with AllowedActions [{Label:"Approve", Value:"approve"}]
     When user "operator-1" sends "/approve Q-2001"
-    Then a HumanDecisionEvent with ActionValue "proceed" is published for "Q-2001"
+    Then a HumanDecisionEvent with ActionValue "approve" is published for "Q-2001"
 
   Scenario: /reject with question ID
-    Given an open AgentQuestion "Q-2001" exists with AllowedActions [{Label:"Reject", Value:"abort"}]
+    Given an open AgentQuestion "Q-2001" exists with AllowedActions [{Label:"Reject", Value:"reject"}]
     When user "operator-1" sends "/reject Q-2001"
-    Then a HumanDecisionEvent with ActionValue "abort" is published for "Q-2001"
+    Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
 
-  Scenario: /handoff transfers human oversight of a task to another operator
-    # Fully specified per tech-spec.md D-4 (Decided): /handoff = transfer human oversight
-    # NOTE: implementation-plan.md Stage 3.2 references "pending clarification" — that clause
-    # is stale; this scenario is the authoritative definition of the handoff flow.
+  Scenario: /handoff returns stub response pending policy decision (D-4)
+    # Aligned with implementation-plan.md Stage 3.2: HandoffCommandHandler validates syntax
+    # but returns a stub response without performing any transfer or reassignment.
     Given task "TASK-099" exists and user "operator-1" has oversight
     And user "operator-2" with Telegram user ID "222333444" is in the allowlist
     When user "operator-1" sends "/handoff TASK-099 @operator-2"
-    Then the HandoffCommandHandler validates TASK-099 exists and @operator-2 is a known operator
-    And oversight of TASK-099 is transferred from "operator-1" to "operator-2" in the OperatorRegistry
-    And the bot notifies "operator-1": "✅ Oversight of TASK-099 transferred to @operator-2"
-    And the bot notifies "operator-2": "📋 You now have oversight of TASK-099 (transferred by @operator-1)"
+    Then the HandoffCommandHandler parses TASK-099 and @operator-2 syntactically
+    And the bot responds with "Handoff is not yet configured — awaiting policy decision (D-4)"
+    And no transfer, question reassignment, or agent-team change occurs
     And an audit record is persisted with the raw command text, user ID, and CorrelationId
 
-  Scenario: /handoff with invalid task ID is rejected
-    When user "operator-1" sends "/handoff NONEXISTENT-TASK @operator-2"
-    Then the bot replies with "Task NONEXISTENT-TASK not found"
-    And no oversight transfer occurs
-
-  Scenario: /handoff with unknown operator alias is rejected
-    Given task "TASK-099" exists and user "operator-1" has oversight
-    When user "operator-1" sends "/handoff TASK-099 @unknown-user"
-    Then the bot replies with "Operator @unknown-user not found in the allowlist"
-    And no oversight transfer occurs
+  Scenario: /handoff with invalid syntax is rejected
+    When user "operator-1" sends "/handoff" with no arguments
+    Then the bot replies with usage help: "/handoff TASK-ID @operator-alias"
+    And no audit record for handoff transfer is created
 
   Scenario: /pause and /resume control agent execution
     When user "operator-1" sends "/pause arch-agent-7"
@@ -502,12 +496,15 @@ Feature: Observability integration
   Scenario: Metrics are emitted for queue depth and latency
     Given the outbound queue processes messages
     Then the following metrics are emitted via OpenTelemetry:
-      | Metric                              | Type      |
-      | messenger.outbound.queue_depth      | gauge     |
-      | messenger.outbound.send_latency_ms  | histogram |
-      | messenger.inbound.commands_total    | counter   |
-      | messenger.outbound.retries_total    | counter   |
-      | messenger.outbound.deadletters_total| counter   |
+      | Metric                                | Type      |
+      | telegram.send.duration_ms             | histogram |
+      | telegram.send.latency_ms              | histogram |
+      | telegram.send.rate_limited_wait_ms    | histogram |
+      | telegram.updates.received             | counter   |
+      | telegram.messages.sent                | counter   |
+      | telegram.messages.dead_lettered       | counter   |
+      | telegram.commands.processed           | counter   |
+      | telegram.messages.backpressure_dlq    | counter   |
 ```
 
 ---
@@ -552,6 +549,7 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 6._
-_Aligned with sibling tech-spec.md (D-4 /handoff Decided — transfer human oversight to another operator), architecture.md (Messenger="Telegram", /healthz, MaxRetries=5, §10.4 P95 under 2s for non-rate-limited delivery), and implementation-plan.md (Stage 3.2 "pending clarification" on handoff is stale — this document fully specifies the handoff flow)._
-_ActionValue semantics: HumanDecisionEvent.ActionValue carries the domain value from HumanAction.Value (e.g., "blue-green", "rolling"), not the approval verb._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 7._
+_Aligned with sibling architecture.md (§10.4 P95 under 2s for first-attempt successes, telegram.send.latency_ms metric, DefaultAction field), implementation-plan.md (Stage 3.2 HandoffCommandHandler returns stub pending D-4, ApproveCommandHandler emits ActionValue=approve), and tech-spec.md (HC-3 shared data model, D-4 handoff decision)._
+_ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively (per implementation-plan.md Stage 3.2 line 214). Inline button presses emit the HumanAction.Value from AllowedActions via CallbackQueryHandler (per implementation-plan.md Stage 3.3)._
+_DefaultAction field: AgentQuestion uses `DefaultAction` (per architecture.md §5.2 and implementation-plan.md Stage 1.3). This is a nullable string matching one of the HumanAction.Value entries; when present, QuestionTimeoutService applies it on timeout._
