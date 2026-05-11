@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.24-draft (iteration 18)
+**Version:** v0.25-draft (iteration 19)
 
 ---
 
@@ -404,11 +404,12 @@ Feature: Telegram bot command handling
   Scenario: /handoff with invalid syntax returns usage help
     When user "operator-1" sends "/handoff" with no arguments
     Then the bot replies with usage help: "Usage: /handoff TASK-ID @operator-alias"
-    And no audit record for a handoff attempt is created
+    And an audit record is persisted for the inbound command with user ID, timestamp, command "/handoff", and outcome "invalid_syntax" (per implementation-plan.md Stage 5.3: every inbound command is logged)
 
   Scenario: /handoff with one argument returns usage help
     When user "operator-1" sends "/handoff TASK-099"
     Then the bot replies with usage help: "Usage: /handoff TASK-ID @operator-alias"
+    And an audit record is persisted for the inbound command with user ID, timestamp, command "/handoff TASK-099", and outcome "invalid_syntax"
 
   Scenario: /pause and /resume control agent execution
     When user "operator-1" sends "/pause arch-agent-7"
@@ -556,14 +557,17 @@ Feature: Observability integration
     Given the outbound queue processes messages
     Then the following metrics are emitted via OpenTelemetry:
       | Metric                                   | Type      | Source (architecture.md)                             |
-      | telegram.send.latency_ms                 | histogram | §10.4 primary (first-attempt, non-rate-limited)      |
-      | telegram.send.all_attempts_latency_ms    | histogram | §10.4 diagnostic (all sends)                         |
-      | telegram.send.retry_latency_ms           | histogram | §10.4 diagnostic (retried sends)                     |
+      | telegram.send.latency_ms                 | histogram | §10.4 primary (all sends, all-inclusive — P95 ≤ 2s target) |
+      | telegram.send.first_attempt_latency_ms   | histogram | §10.4 diagnostic (first-attempt, non-rate-limited only)    |
+      | telegram.send.retry_latency_ms           | histogram | §10.4 diagnostic (retried sends)                         |
       | telegram.send.rate_limited_wait_ms       | histogram | §10.4 rate-limit tracking                            |
       | telegram.updates.received             | counter   | §8 metrics table               |
       | telegram.messages.sent                | counter   | §8 metrics table               |
       | telegram.messages.dead_lettered       | counter   | §8 metrics table               |
-      | telegram.messages.backpressure_dlq    | counter   | §10.4 backpressure dead-letter |
+      | telegram.messages.deadlettered_backpressure | counter | tech-spec.md HC-5 backpressure dead-letter |
+      | telegram.queue.depth                  | gauge     | implementation-plan.md Stage 6.1           |
+      | telegram.dlq.depth                    | gauge     | implementation-plan.md Stage 6.1           |
+      | telegram.errors                       | counter   | implementation-plan.md Stage 6.1           |
       | telegram.commands.processed           | counter   | §8 metrics table               |
       | telegram.queue.backpressure           | counter   | §10.4 backpressure threshold   |
 ```
@@ -610,10 +614,11 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 18._
-_Aligned with architecture.md §3.1: the shared `AgentQuestion` model **includes** a nullable `DefaultAction` property (`string?`) — the `ActionId` of the proposed default action from `AllowedActions`. This is a first-class shared field, not connector-specific metadata. Agents set `DefaultAction` when publishing a question; connectors read it directly from the model. The Telegram connector reads `DefaultAction` from the `AgentQuestion` at render time, displays the proposed default in the message body, and denormalizes the `ActionId` into `PendingQuestionRecord.DefaultActionId` for efficient timeout polling. When the question times out, `QuestionTimeoutService` reads `DefaultActionId` and applies the action automatically; when `null`, the question expires with `ActionValue = "__timeout__"`. No envelope or sidecar parameter is required._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 19._
+_Aligned with tech-spec.md HC-3/S-3 and architecture.md §3.1: the shared `AgentQuestion` model does **not** include a `DefaultAction` property. The proposed default action is carried as sidecar metadata via `ProposedDefaultActionId` on the `AgentQuestionEnvelope`. The Telegram connector reads `ProposedDefaultActionId` from the envelope at render time, displays the proposed default in the message body, and denormalizes the `ActionId` into `PendingQuestionRecord.DefaultActionId` for efficient timeout polling. When the question times out, `QuestionTimeoutService` reads `DefaultActionId` and applies the action automatically; when `null`, the question expires with `ActionValue = "__timeout__"`._
 _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively (per implementation-plan.md Stage 3.2). Inline button presses emit the HumanAction.Value from AllowedActions via CallbackQueryHandler (per implementation-plan.md Stage 3.3)._
 _Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are both aligned on `MaxAttempts` / `MaxRetries` default 5. Scenarios assert max 5 attempts accordingly._
 _Handoff semantics: architecture.md §5.5 specifies full oversight transfer (Decided). Tech-spec.md D-4 is Decided for full transfer. Implementation-plan.md Stage 3.2 specifies full oversight transfer. Scenarios test the complete flow: task validation, operator resolution via IOperatorRegistry, TaskOversight mutation, dual notification, and audit._
-_Metric naming: architecture.md §8 lists histograms `telegram.send.latency_ms` (primary; first-attempt, non-rate-limited successes) and `telegram.send.all_attempts_latency_ms` (diagnostic; all sends). §10.4 additionally defines `telegram.send.retry_latency_ms` (diagnostic; retried sends) and `telegram.send.rate_limited_wait_ms` (diagnostic; 429 backoff duration). This document uses those canonical names._
-_P95 metric scope: Per architecture.md §10.4, `telegram.send.latency_ms` (primary) measures elapsed time from enqueue to Telegram API HTTP 200 **only** for messages that succeed on their first delivery attempt and are **not** waiting behind a 429 rate-limit hold. The P95 ≤ 2s acceptance criterion applies to this first-attempt, non-rate-limited metric. Messages that are retried or rate-limited are excluded from this metric and tracked via `telegram.send.all_attempts_latency_ms` (diagnostic, all sends), `telegram.send.retry_latency_ms`, and `telegram.send.rate_limited_wait_ms`._
+_Metric naming: Per tech-spec.md HC-4 and architecture.md §8/§10.4, `telegram.send.latency_ms` (primary) is all-inclusive — it measures elapsed time from enqueue to HTTP 200 for **all** messages regardless of attempt number or rate-limit holds. The P95 ≤ 2s acceptance criterion applies to this all-inclusive metric. `telegram.send.first_attempt_latency_ms` (diagnostic) covers only first-attempt, non-rate-limited successes for capacity planning. Additional diagnostics: `telegram.send.retry_latency_ms` (retried sends) and `telegram.send.rate_limited_wait_ms` (429 backoff duration). Backpressure dead-letter counter: `telegram.messages.deadlettered_backpressure` (per tech-spec.md HC-5). Queue depth and error counters: `telegram.queue.depth`, `telegram.dlq.depth`, `telegram.errors` (per implementation-plan.md Stage 6.1)._
+_P95 metric scope: Per tech-spec.md HC-4 and architecture.md §10.4, `telegram.send.latency_ms` (primary) measures elapsed time from `OutboundMessage.CreatedAt` (enqueue) to Telegram API HTTP 200 for **all** messages regardless of attempt number or rate-limit holds. This all-inclusive metric is the one the P95 ≤ 2s acceptance criterion applies to. Under normal operating conditions, the vast majority of sends comfortably meet the 2-second target. Under extreme burst (100+ agents), priority queuing ensures Critical/High messages are dispatched first and meet the target; Normal/Low messages may queue-delay beyond 2 seconds transiently._
+_Audit policy: Per implementation-plan.md Stage 5.3, every inbound command is logged regardless of outcome (success, invalid syntax, unauthorized, etc.). This includes commands like `/handoff` with invalid syntax — an audit record is persisted with the command text, outcome, user ID, and timestamp._
