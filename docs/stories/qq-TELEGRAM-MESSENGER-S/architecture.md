@@ -206,7 +206,7 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `TelegramMessageId` | `long` | Telegram `message_id` of the sent inline-keyboard message. Typed as `long` to match implementation-plan.md Stage 1.3 `PendingQuestion.TelegramMessageId` and Stage 3.5 `PendingQuestionRecord.TelegramMessageId`. |
 | `DefaultActionId` | `string?` | Denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at question-send time. Stored here so that `QuestionTimeoutService` can poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the full envelope. When present, the timeout service resolves the full `HumanAction` and applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
 | `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
-| `Status` | `enum` | `Pending`, `AwaitingComment`, `Answered`, `TimedOut`. `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). **Canonical status name:** This document uses `TimedOut` as the single canonical status name for timed-out questions across the abstraction DTO (`PendingQuestion.Status`), the persistence entity (`PendingQuestionRecord.Status`), and the timeout flow (`QuestionTimeoutService`). This aligns with implementation-plan.md Stage 3.5 which defines `PendingQuestionRecord.Status` as `Pending`, `Answered`, `AwaitingComment`, `TimedOut` and where `QuestionTimeoutService` marks the question as `TimedOut`. Implementation-plan.md Stage 1.3 currently defines the abstraction DTO with `Expired`; Stage 1.3 should be updated to `TimedOut` to match the persistence entity and this architecture. |
+| `Status` | `enum` | `Pending`, `AwaitingComment`, `Answered`, `TimedOut`. `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). **Canonical status values:** `TimedOut` is the canonical status name for timed-out questions across the abstraction DTO (`PendingQuestion.Status`), the persistence entity (`PendingQuestionRecord.Status`), and the timeout flow (`QuestionTimeoutService`). Implementation-plan.md Stage 1.3 defines the abstraction DTO with `Expired` as a synonym; both names refer to the same terminal state. The canonical enum value used in code is `TimedOut`, matching implementation-plan.md Stage 3.5's persistence entity and `QuestionTimeoutService` logic. |
 | `StoredAt` | `DateTimeOffset` | When the record was persisted (after successful Telegram send). |
 | `CorrelationId` | `string` | Trace/correlation ID for end-to-end observability. |
 
@@ -297,7 +297,7 @@ public interface IMessengerConnector
 
 `TelegramMessengerConnector : IMessengerConnector` delegates `SendMessageAsync` and `SendQuestionAsync` to the `OutboundMessageQueue` and implements `ReceiveAsync` by draining processed inbound events. `SendQuestionAsync` accepts the full `AgentQuestionEnvelope` so the connector can read `ProposedDefaultActionId` and `RoutingMetadata` (e.g., `TelegramChatId`) from the envelope sidecar. This signature aligns with implementation-plan.md Stage 1.3.
 
-### 4.2 ITelegramUpdatePipeline (internal)
+### 4.2 ITelegramUpdatePipeline (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
 ```csharp
 public interface ITelegramUpdatePipeline
@@ -433,7 +433,7 @@ public interface IInboundUpdateStore
 
 `TryInsertAsync` returns `false` if the `update_id` already exists (the `UNIQUE` constraint on `UpdateId` is the canonical deduplication mechanism for webhook delivery — see §5.4). `GetStuckAsync` returns updates in `Processing` status older than the threshold, used by `InboundRecoverySweep` to detect and retry crashed processing attempts. Status transitions follow the `InboundUpdate.IdempotencyStatus` enum: `Received → Processing → Completed|Failed`.
 
-### 4.9 IDeduplicationService (to be defined in planned `AgentSwarm.Messaging.Core`)
+### 4.9 IDeduplicationService (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
 Provides fast in-pipeline deduplication as a supplementary layer above `IInboundUpdateStore`.
 
@@ -529,7 +529,7 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 
 **Key invariants:**
 1. The question includes `Severity`, `ExpiresAt`, `AllowedActions` rendered as inline keyboard buttons, and the proposed default action (if any). The default action is carried as sidecar metadata in `AgentQuestionEnvelope.ProposedDefaultActionId` (see §3.1). When the connector builds the inline keyboard, it reads `ProposedDefaultActionId` from the envelope and prepares a `PendingQuestionRecord` with `DefaultActionId` denormalized from that field. The `PendingQuestionRecord` is **persisted after the Telegram send succeeds** (once `TelegramMessageId` is available from the API response), not before — because `PendingQuestionRecord.TelegramMessageId` is required for timeout-driven message edits and cannot be known until the send completes.
-2. The `callback_data` field carries the format `QuestionId:ActionId` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both `QuestionId` and `ActionId` are constrained to a maximum of 30 characters each, ensuring the combined `callback_data` (including the `:` separator) fits within Telegram's 64-byte limit (max 61 bytes). The server stores the full `HumanAction` payload in `IDistributedCache` keyed by `QuestionId:ActionId`, written when the inline keyboard is built and expiring at `AgentQuestion.ExpiresAt` (aligned with tech-spec.md §7 D-3 and §10). The `QuestionTimeoutService` polls for expired questions slightly before `ExpiresAt` (implementation detail — configurable poll interval ensures the timeout service reads the cache entry before it expires, avoiding the race condition where the cache entry is evicted before the timeout service processes it). On callback, the handler parses `QuestionId:ActionId` from the callback data, looks up the full `HumanAction` from cache, retrieves the original `AgentQuestion` from the pending-questions store, and resolves the chosen action.
+2. The `callback_data` field carries the format `QuestionId:ActionId` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both `QuestionId` and `ActionId` are constrained to a maximum of 30 characters each, ensuring the combined `callback_data` (including the `:` separator) fits within Telegram's 64-byte limit (max 61 bytes). The server stores the full `HumanAction` payload in `IDistributedCache` keyed by `QuestionId:ActionId`, written when the inline keyboard is built and expiring at `AgentQuestion.ExpiresAt + 5 minutes` (the 5-minute grace window ensures `QuestionTimeoutService` can still resolve the cached `HumanAction` after the timeout fires, avoiding the race condition where the cache entry is evicted simultaneously with or before the timeout poll; aligned with implementation-plan.md Stage 2.3). On callback, the handler parses `QuestionId:ActionId` from the callback data, looks up the full `HumanAction` from cache, retrieves the original `AgentQuestion` from the pending-questions store, and resolves the chosen action.
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string. **However**, when the selected `HumanAction.RequiresComment` is `true` (e.g., the "Need info" action in e2e-scenarios.md), the `HumanDecisionEvent` is **deferred**: the `CallbackQueryHandler` sets `PendingQuestionRecord.Status = AwaitingComment`, sends a prompt to the operator ("Please reply with your comment"), and returns without emitting the event. When the operator's text reply arrives via the inbound pipeline's text-reply handler, it is matched to the `AwaitingComment` record by chat ID, the `HumanDecisionEvent` is then published with both the `ActionValue` (e.g., `"need-info"`) and the `Comment` (the operator's text), and the record transitions to `Answered`. This two-step flow is tested by e2e-scenarios.md "RequiresComment defers decision" and implementation-plan.md Stage 3.5 "RequiresComment flow."
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
 5. Audit record is written with `MessageId`, `UserId`, `AgentId`, timestamp, and `CorrelationId`.
@@ -644,12 +644,15 @@ AgentSwarm.Messaging.sln  (to be created)
 ├── AgentSwarm.Messaging.Abstractions     ← IMessengerConnector, AgentQuestion,
 │                                            HumanDecisionEvent, HumanAction,
 │                                            MessengerMessage, MessengerEvent,
-│                                            ISwarmCommandBus
+│                                            ISwarmCommandBus, IAuditLogger (interface),
+│                                            AuditEntry, ITelegramUpdatePipeline,
+│                                            PipelineResult, IDeduplicationService,
+│                                            IPendingQuestionStore, PendingQuestion
 │
 ├── AgentSwarm.Messaging.Core             ← IOutboundQueue, IOperatorRegistry,
-│                                            IAuditLogger, AuthZ service,
+│                                            AuthZ service,
 │                                            CommandDispatcher base,
-│                                            RetryPolicy, DeduplicationService
+│                                            RetryPolicy
 │
 ├── AgentSwarm.Messaging.Telegram         ← TelegramMessengerConnector,
 │                                            TelegramUpdateRouter,
@@ -661,10 +664,13 @@ AgentSwarm.Messaging.sln  (to be created)
 │                                            QuestionTimeoutService,
 │                                            TelegramOptions (config POCO)
 │
-├── AgentSwarm.Messaging.Persistence      ← AuditLogger, OutboundQueueStore,
+├── AgentSwarm.Messaging.Persistence      ← PersistentAuditLogger (impl of IAuditLogger),
+│                                            OutboundQueueStore,
 │                                            InboundUpdateStore,
 │                                            OperatorBindingStore,
 │                                            PendingQuestionRecord,
+│                                            PersistentPendingQuestionStore,
+│                                            DeduplicationService (impl of IDeduplicationService),
 │                                            EF Core DbContext + migrations
 │
 ├── AgentSwarm.Messaging.Worker           ← ASP.NET Core host,
@@ -769,7 +775,7 @@ Both modes feed into the same `ITelegramUpdatePipeline`, so all downstream logic
 ### 10.3 Question Timeout Handling
 
 A `QuestionTimeoutService` (BackgroundService) polls for `PendingQuestionRecord` entries with `Status = Pending` past their `ExpiresAt`. When a question times out:
-1. Reads `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at send time). If present, resolves the full `HumanAction` from `IDistributedCache` (the cache entry expires at `AgentQuestion.ExpiresAt`, aligned with tech-spec.md §7 D-3; the timeout service's poll interval is configured to process expired questions before the cache entry is evicted) and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
+1. Reads `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at send time). If present, resolves the full `HumanAction` from `IDistributedCache` (the cache entry expires at `AgentQuestion.ExpiresAt + 5 minutes`, providing a grace window that ensures the timeout service can still resolve the cached action after `ExpiresAt`; aligned with implementation-plan.md Stage 2.3) and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
 2. Updates the original Telegram message (using `PendingQuestionRecord.TelegramMessageId`) to indicate the timeout ("⏰ Timed out — default action applied: *skip*" or "⏰ Timed out — no default action").
 3. Sets `PendingQuestionRecord.Status = TimedOut`.
 4. Writes an audit record noting the timeout.
@@ -860,7 +866,7 @@ Under a burst of 1 000+ simultaneous agent events:
 | **`update_id` as the deduplication key** | Telegram guarantees `update_id` is unique and monotonically increasing per bot. Using it directly avoids the cost of hashing message content. |
 | **Webhook secret token validation** | Telegram supports a `secret_token` parameter on `setWebhook` (added in Bot API 6.0). This is cheaper and simpler than IP-allowlisting Telegram's data-center ranges. |
 | **Single `ITelegramUpdatePipeline`** | Forces webhook and long-poll modes through identical logic, eliminating a class of "works in dev, breaks in prod" bugs. |
-| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Encodes `QuestionId:ActionId` directly in `callback_data` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both IDs are constrained to ≤ 30 characters, keeping the combined payload within Telegram's 64-byte `callback_data` limit. The full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, written at inline-keyboard build time with expiry at `AgentQuestion.ExpiresAt` (aligned with tech-spec.md §7 D-3 and §10). On callback, the handler parses the key, looks up the full `HumanAction` from cache, and resolves the chosen action. |
+| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Encodes `QuestionId:ActionId` directly in `callback_data` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both IDs are constrained to ≤ 30 characters, keeping the combined payload within Telegram's 64-byte `callback_data` limit. The full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, written at inline-keyboard build time with expiry at `AgentQuestion.ExpiresAt + 5 minutes` (grace window per implementation-plan.md Stage 2.3, ensuring `QuestionTimeoutService` can resolve the cached action after `ExpiresAt`). On callback, the handler parses the key, looks up the full `HumanAction` from cache, and resolves the chosen action. |
 
 ---
 
