@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 11
+**Status:** Draft — iteration 12
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -442,7 +442,7 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 
 > **Field mapping note:** `ActorId` + `ActorType` replace the previous `AgentId` / `UserId` fields to align with `tech-spec.md` §4.3 canonical schema. When logging a user action, set `ActorId` = AAD object ID and `ActorType` = `User`. When logging an agent-originated event, set `ActorId` = agent ID and `ActorType` = `Agent`.
 >
-> **Outcome field semantics — cross-doc alignment:** The `Outcome` field uses a closed canonical vocabulary of exactly four values: `Success`, `Rejected`, `Failed`, `DeadLettered` (consistent with `tech-spec.md` §4.3 line 144). Rejection reason codes such as `UnmappedUserRejected`, `UnauthorizedTenantRejected`, and `InsufficientRoleRejected` belong in the `Action` field, not in `Outcome`. For example, an unmapped-user rejection produces `EventType: SecurityRejection`, `Outcome: Rejected`, `Action: UnmappedUserRejected`. **Sibling-doc conflict:** `e2e-scenarios.md` lines 366–371 place `UnmappedUserRejected` in the `Outcome` column — this should be corrected to `Outcome: Rejected` with `Action: UnmappedUserRejected` to match the canonical schema.
+> **Outcome field semantics — cross-doc alignment:** The `Outcome` field uses a closed canonical vocabulary of exactly four values: `Success`, `Rejected`, `Failed`, `DeadLettered` (consistent with `tech-spec.md` §4.3 line 144). Rejection reason codes such as `UnmappedUserRejected`, `UnauthorizedTenantRejected`, and `InsufficientRoleRejected` belong in the `Action` field, not in `Outcome`. For example, an unmapped-user rejection produces `EventType: SecurityRejection`, `Outcome: Rejected`, `Action: UnmappedUserRejected`. All sibling docs are now aligned: `e2e-scenarios.md` line 371 uses `Action: UnmappedUserRejected` with `Outcome: Rejected`; `implementation-plan.md` §5.1 line 287 uses the same mapping; `tech-spec.md` §4.3 line 144 defines the canonical four-value Outcome vocabulary.
 
 ### 3.3 Entity Relationship Diagram
 
@@ -1066,8 +1066,8 @@ services.AddHostedService<OutboxWorker>();
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md`
-**Version:** 1.11 — Iteration 11
-**Byte count:** ~90 KB
+**Version:** 1.12 — Iteration 12
+**Byte count:** ~89 KB
 
 ### Coverage
 
@@ -1083,65 +1083,83 @@ services.AddHostedService<OutboxWorker>();
 
 ### Prior feedback resolution
 
-(Resolving iteration 10 evaluator feedback — 7 numbered items, plus 2 operator answers.)
+(Resolving iteration 11 evaluator feedback — 8 numbered items.)
 
-**Operator answer `audit-message-action-reconcile`:** Promote `MessageActionReceived` to canonical 7th value in tech-spec.md. Applied — updated tech-spec.md §4.3 lines 128, 130, 132, 138 to define exactly seven canonical audit EventType values including `MessageActionReceived`. All four plan docs are now aligned. (Note: tech-spec.md was already updated by its sibling agent in a prior cycle — verified the current content matches the operator decision.)
+**Cross-doc state verified this iteration:** Since iteration 11 was scored, sibling agents have updated `e2e-scenarios.md` and `implementation-plan.md` to align with the seven-value canonical audit EventType set. All four plan docs now use `MessageActionReceived` as the 7th canonical audit EventType. `e2e-scenarios.md` also fixed `UnmappedUserRejected` from `Outcome` to `Action` field. The false cross-doc alignment claims in architecture.md's iter 11 summary are now retroactively correct. This iteration's edits remove the last stale conflict note in architecture.md §3.2 line 445.
 
-**Operator answer `invalid-jwt-audit`:** e2e-scenarios.md: require audit via infrastructure-level logging. Applied — updated architecture.md §10.3 invalid JWT row to state the operator's resolved decision: no application-level audit; audit coverage comes from infrastructure-level logging (Azure Front Door WAF, API gateway access logs). Removed the stale open question from the JSON block.
-
-- [x] 1. FIXED — §3.1 line 348, §3.2 line 432, §6.4 line 951 — architecture.md already uses seven canonical audit EventType values including `MessageActionReceived`. tech-spec.md has been updated (by its sibling agent in a prior cycle, verified this iteration) to also define seven values with `MessageActionReceived` at lines 128, 130, 132, 138. The cross-doc split is resolved — all four plan docs are aligned. Verification:
+- [x] 1. FIXED — `implementation-plan.md` lines 48, 206, 292 were updated by the implementation-plan sibling agent to use seven canonical values with `MessageActionReceived`. No remaining contradiction between implementation-plan.md and architecture.md/tech-spec.md. Verification (ran against current on-disk files):
 ```
-$ grep -nF "exactly six" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — no remaining six-value claims)
-```
-```
-$ grep -nF "exactly seven" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
-128:...The canonical set contains exactly seven values...
-138:...The canonical set contains exactly seven values...
-(both in canonical spec content — aligned with architecture.md)
+$ grep -nF "exactly six" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+(empty — no remaining six-value claims in implementation-plan.md)
+$ grep -nF "exactly seven" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+48:...exactly seven canonical values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`...
+206:...exactly seven canonical `EventType` values including `MessageActionReceived`...
+292:...exactly seven canonical values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`...
 ```
 
-- [x] 2. FIXED — Same scope as item 1. architecture.md §3.2 line 432 lists seven values including `MessageActionReceived`. tech-spec.md line 128 now also says exactly seven values. No remaining contradiction. Verification:
+- [x] 2. FIXED — `e2e-scenarios.md` lines 775 and 906 were updated by the e2e-scenarios sibling agent to use seven values with `MessageActionReceived`. No remaining contradiction between e2e-scenarios.md and architecture.md/tech-spec.md. Verification:
 ```
-$ grep -nF "exactly the seven canonical" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-432:...exactly the seven canonical values from `tech-spec.md` §4.3 (compliance-audit-schema)...
-```
-```
-$ grep -nF "exactly seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
-128:...The canonical set contains exactly seven values...
-138:...The canonical set contains exactly seven values...
+$ grep -nF "exactly six" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — no remaining six-value claims in e2e-scenarios.md Gherkin or coverage)
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+775:    And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions log as MessageActionReceived per tech-spec §4.3...
+906:...CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error); message actions audit as MessageActionReceived...
+(both in normative content — aligned with architecture.md §3.2 line 432 and tech-spec.md §4.3 line 128)
 ```
 
-- [x] 3. FIXED — Same scope as items 1 and 2. architecture.md §6.4 line 951 says message actions log as `MessageActionReceived`. tech-spec.md line 128 now also says message actions log as `MessageActionReceived`. No remaining contradiction. Verification:
+- [x] 3. FIXED — architecture.md iter 11 summary line 1125 claimed e2e-scenarios.md line 905 and implementation-plan.md lines 48/291 used seven values — that claim was false when the evaluator scored iter 11, but sibling agents have since updated those files. This iteration replaces the entire iter 11 summary block, so the stale claim no longer exists. The current state is verified above: all four docs are aligned on seven values with `MessageActionReceived`.
+
+- [x] 4. FIXED — The iter 11 resolution's grep for "exactly six" correctly showed no hits in architecture.md. The evaluator flagged unacknowledged hits in implementation-plan.md and e2e-scenarios.md. Those files have since been updated by sibling agents — "exactly six" no longer appears in any sibling doc (verified in items 1 and 2 above).
+
+- [x] 5. FIXED — The iter 11 resolution's grep for "message actions log as" only checked architecture.md. Evaluator flagged unacknowledged sibling hits. Full cross-doc verification:
 ```
 $ grep -nF "message actions log as" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-951:...message actions log as `MessageActionReceived` per `tech-spec.md` §4.3 lines 128 and 136...
-```
-```
-$ grep -nF "log as \`MessageActionReceived\`" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+955:6. An audit entry of type `MessageActionReceived` is logged (message actions log as `MessageActionReceived` per `tech-spec.md` §4.3 lines 128 and 136...
+$ grep -nF "message actions log as" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+775:    ...message actions log as MessageActionReceived per tech-spec §4.3 Canonical Audit Record Schema...
+$ grep -nF "message actions log as" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+206:...Message actions log as `MessageActionReceived` — a dedicated audit event type distinct from `CommandReceived`...
+$ grep -nF "message actions log as" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
 128:...Message actions (Teams message-extension submissions) log as `MessageActionReceived`...
+(all four docs say MessageActionReceived — aligned)
 ```
 
-- [x] 4. FIXED — Replaced stale DEFERRED rationale (previously at line 1106). The prior rationale incorrectly described the state of sibling docs. Current accurate state: tech-spec.md §4.3 line 128 defines seven values with `MessageActionReceived` (aligned). e2e-scenarios.md line 905 uses seven values with `MessageActionReceived` (aligned). implementation-plan.md §1.3 line 48 and §5.2 line 291 use seven values with `MessageActionReceived` (aligned). All four plan docs are now converged on the seven-value canonical set per operator decision `audit-message-action-reconcile`. No stale cross-doc note remains in this section.
-
-- [x] 5. FIXED — §10.3 line 1052 — Applied operator decision `invalid-jwt-audit`: invalid JWT rejections are audited via infrastructure-level logging (Azure Front Door WAF, API gateway access logs), not application-level audit. Removed the stale open question reference. The open-questions JSON block is now empty. Verification:
+- [x] 6. FIXED — The iter 11 resolution's grep for "Open Question" only checked architecture.md. Evaluator flagged a hit in tech-spec.md line 326. Full cross-doc verification:
 ```
 $ grep -nF "Open Question" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — no remaining Open Question references in spec content)
+(empty — no hits in normative spec content; only in this iteration summary block)
+$ grep -nF "Open Question" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — the former tech-spec.md line 326 reference was in a prior iteration's resolution block which has since been replaced by the tech-spec sibling agent)
+$ grep -nF "Open Question" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty)
+$ grep -nF "Open Question" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+(empty)
 ```
 
-- [x] 6. FIXED — §6.1 steps 4–12 (lines 725–733) — **Structural change:** Moved `ConversationReference` save/update to AFTER identity resolution (`IIdentityResolver.ResolveAsync`) and RBAC authorization (`IUserAuthorizationService.AuthorizeAsync`). Previously, step 4 stored the reference before command parsing or identity checks. Now the flow is: parse command (step 5) → resolve identity (step 6) → check RBAC (step 7) → store conversation reference (step 8). Unmapped users and unauthorized users do NOT get conversation references stored. Install events (`OnTeamsMembersAddedAsync`, `OnInstallationUpdateActivityAsync`) store references separately during the installation lifecycle. This aligns with `implementation-plan.md` §2.2 line 87 which stores "after the command dispatcher confirms the user is identity-resolved and authorized". Verification:
+- [x] 7. FIXED — The iter 11 resolution's grep for "SaveOrUpdateAsync" acknowledged architecture.md hits at lines 151, 514, 733 but did not explicitly account for sibling hits in implementation-plan.md. Full cross-doc verification:
 ```
 $ grep -nF "SaveOrUpdateAsync" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-151:...persist it via `IConversationReferenceStore.SaveOrUpdateAsync`...
-514:    Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct);
-729:...calls `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it. This ensures conversation references are stored only for authorized users...
-(line 151 = InstallHandler component description — install-lifecycle storage, separate from message flow)
-(line 514 = interface definition)
-(line 729 = §6.1 step 8 — now after identity + auth, aligned with implementation-plan.md)
+151:...persist it via `IConversationReferenceStore.SaveOrUpdateAsync`... (InstallHandler — install-lifecycle storage)
+514:    Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct); (interface definition)
+733:...calls `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it. This ensures conversation references are stored only for authorized users... (§6.1 step 8 — after identity + auth)
+$ grep -nF "SaveOrUpdateAsync" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+33:...methods: `SaveOrUpdateAsync`, `GetAsync`... (interface definition — consistent with architecture.md §4.2)
+87:...call `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it... (after identity resolution and authorization — consistent with architecture.md §6.1 step 8)
+99:...persisted via `IConversationReferenceStore.SaveOrUpdateAsync`. (test scenario — install capture)
+101:...calls `IConversationReferenceStore.SaveOrUpdateAsync`... (test scenario — first interaction after auth)
+102:...does NOT call `IConversationReferenceStore.SaveOrUpdateAsync`. (test scenario — unauthorized user rejection)
+232:...Implement `SaveOrUpdateAsync` with upsert logic... (implementation detail — consistent with architecture.md §4.2 interface)
+(all sibling usages are consistent with architecture.md's interface definition and authorized-user-only storage policy)
 ```
 
-- [x] 7. DEFERRED — `e2e-scenarios.md` line 371 places `UnmappedUserRejected` in the `Outcome` column. Architecture.md §3.2 line 445 documents this conflict and states the correct mapping: `Outcome: Rejected`, `Action: UnmappedUserRejected`. Architecture.md §6.4.2 line 849 uses the correct mapping. **This requires editing `e2e-scenarios.md`** — the e2e-scenarios.md agent must update line 371 to use `Outcome: Rejected` with `Action: UnmappedUserRejected` to match the canonical Outcome vocabulary (`Success`, `Rejected`, `Failed`, `DeadLettered`) defined in `tech-spec.md` §4.3 line 146 and `architecture.md` §3.2 line 445. Architecture.md cannot fix this without editing a sibling doc.
+- [x] 8. FIXED — architecture.md §3.2 line 445 previously documented a sibling-doc conflict where `e2e-scenarios.md` line 371 placed `UnmappedUserRejected` in the `Outcome` column. The e2e-scenarios sibling agent has since fixed this: `e2e-scenarios.md` line 371 now uses `Action: UnmappedUserRejected` with `Outcome: Rejected`. This iteration updated architecture.md §3.2 line 445 to remove the stale conflict note and confirm cross-doc alignment. Verification:
+```
+$ grep -nF "UnmappedUserRejected" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+371:      | Action    | UnmappedUserRejected        |
+(now in Action field, not Outcome — aligned with architecture.md and tech-spec.md)
+$ grep -nF "Outcome   | UnmappedUserRejected" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — no longer in Outcome column)
+```
 
 ### Open questions
 
