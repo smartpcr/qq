@@ -127,7 +127,7 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 
 > The canonical **audit** `EventType` values defined by this spec are: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. The canonical set contains exactly seven values. Message actions (Teams message-extension submissions) log as `MessageActionReceived` — a dedicated audit event type distinct from `CommandReceived` — because message-action submissions arrive through the `composeExtension/submitAction` invoke mechanism rather than direct text commands, and distinguishing them in the audit trail supports compliance filtering and forensic analysis. The `Source` field on the domain `MessengerEvent` additionally marks the origination (`Source = MessageAction`) for downstream processing.
 >
-> **Cross-doc alignment status:** All sibling docs (`architecture.md` §3.2 line 432, `implementation-plan.md` §1.3 line 48 / §3.4 line 206 / §5.2 line 291, `e2e-scenarios.md` line 773 and line 905) define exactly seven canonical audit `EventType` values including `MessageActionReceived`. All four plan docs are now aligned on this seven-value canonical set.
+> **Cross-doc alignment status:** All sibling docs (`architecture.md` §3.2 line 432, `implementation-plan.md` §1.3 line 50 / §3.4 line 208 / §5.2 line 294, `e2e-scenarios.md` line 781 and line 912) define exactly seven canonical audit `EventType` values including `MessageActionReceived`. All four plan docs are now aligned on this seven-value canonical set.
 >
 > **Important distinction:** The `EventType` field in the canonical **audit record** schema (this table) is a different concept from the `EventType` discriminator on the `MessengerEvent` domain model. The audit `EventType` categorizes audit log entries (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`). The `MessengerEvent.EventType` discriminator identifies the domain event subtype (`AgentTaskRequest`, `Command`, `Escalation`, `PauseAgent`, `ResumeAgent`, `Decision`, `Text`, `InstallUpdate`, `Reaction`) as defined in `architecture.md` §3.1 and `e2e-scenarios.md` §Audit Trail compliance scenarios. These are intentionally separate enumerations serving different purposes — audit categorization vs. domain event polymorphism — and are not expected to share values.
 
@@ -285,13 +285,6 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 *Sibling plan documents in this story folder (`docs/stories/qq-MICROSOFT-TEAMS-MESS/`): `architecture.md`, `implementation-plan.md`, `e2e-scenarios.md`.*
 
 ---
-
-## Iteration Summary
-
-**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md`
-**Covers:** Problem statement (§1), in/out-of-scope (§2), non-goals (§3), hard constraints (§4 — security, performance, compliance with canonical seven-value audit schema), identified risks (§5), dependencies (§6), assumptions (§7), success metrics (§8), glossary (§9). All sections anchored to story description details: Bot Framework, Entra ID, Teams scopes, Adaptive Cards, proactive messaging, commands, P95 delivery, audit trail.
-
-### Prior feedback resolution
 
 Iteration 14 — resolving all 6 numbered items from iteration 13 evaluator feedback. All 6 items are "UNVERIFIED CLAIM" issues where the iter 13 prior-feedback block listed incomplete grep results. **Structural fix this iteration:** the old prior-feedback block has been entirely removed and replaced. Each item below runs grep across ALL FOUR sibling docs and lists EVERY hit comprehensively. No normative content changes were needed — the canonical audit model across all docs was already correct and aligned.
 

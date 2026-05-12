@@ -148,7 +148,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Lifecycle` |
-| **Responsibility** | Handle `installationUpdate` and `conversationUpdate` activities. On install/member-add: validate tenant ID against allowlist, extract `ConversationReference`, persist it via `IConversationReferenceStore.SaveOrUpdateAsync`, and send a welcome Adaptive Card. On uninstall: call `IConversationReferenceStore.MarkInactiveAsync` to mark the conversation reference as inactive. |
+| **Responsibility** | Handle `installationUpdate` and `conversationUpdate` activities. On install/member-add: validate tenant ID against allowlist, extract `ConversationReference`, persist it via `IConversationReferenceStore.SaveOrUpdateAsync` with `IsActive = true`, and send a welcome Adaptive Card. These **installation-captured references** are gated by Teams app installation policy (admin-managed in Entra ID) and tenant allowlist validation — identity resolution and RBAC authorization are NOT applied at install time because the install event carries no user command to authorize. The stored reference proves the app is installed and enables future proactive messaging; command-level authorization is enforced at command time (§6.1 steps 6–7, §6.4). On uninstall: call `IConversationReferenceStore.MarkInactiveAsync` to mark the conversation reference as inactive. |
 
 ### 2.8 ConversationReferenceStore
 
@@ -279,12 +279,16 @@ Blocking question from an agent requiring human response. Defined in `AgentSwarm
 | `QuestionId` | `string` | Unique question identifier. |
 | `AgentId` | `string` | Asking agent. |
 | `TaskId` | `string` | Associated task. |
+| `TargetUserId` | `string?` | Internal user ID of the intended recipient. The orchestrator sets this when the question targets a specific user (e.g., `alice@contoso.com`'s internal ID). `TeamsMessengerConnector` resolves this to a `TeamsConversationReference` via `IConversationReferenceStore.GetByUserIdAsync(tenantId, targetUserId)`. Null when the question should be broadcast to a channel (in which case `TargetChannelId` must be set). |
+| `TargetChannelId` | `string?` | Teams channel ID for channel-scoped questions. Mutually exclusive with `TargetUserId` — exactly one must be non-null. |
 | `Title` | `string` | Short title for the card header. |
 | `Body` | `string` | Detailed question text. |
 | `Severity` | `string` | `Info`, `Warning`, `Error`, `Critical`. |
 | `AllowedActions` | `IReadOnlyList<HumanAction>` | Buttons the human can press. |
 | `ExpiresAt` | `DateTimeOffset` | Expiration deadline. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
+
+> **Routing derivation:** When the orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`, `TeamsMessengerConnector` builds an `OutboxEntry` with `Destination` derived from `TargetUserId` or `TargetChannelId`: `teams://{tenantId}/{targetUserId}` for personal delivery, `teams://{tenantId}/channel/{targetChannelId}` for channel delivery. The `ProactiveNotifier` then resolves this destination to a stored `ConversationReference` via `IConversationReferenceStore`. The `TargetUserId` is the orchestrator's internal user ID (the same value stored in `TeamsConversationReference.UserId`); the orchestrator is responsible for determining which user should receive each question based on task assignment, escalation policy, or explicit addressing. The e2e scenario at `e2e-scenarios.md` lines 81–96 (agent sends a blocking question to `alice@contoso.com`) exercises this path: the orchestrator sets `TargetUserId` to Alice's internal ID, `TeamsMessengerConnector` resolves it to her stored `ConversationReference`, and `ProactiveNotifier` delivers via `ContinueConversationAsync`.
 
 #### HumanAction
 
@@ -732,7 +736,10 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmAc
 5. `CommandParser` recognizes `agent ask` prefix, extracts payload, generates `CorrelationId`.
 6. Handler invokes `IIdentityResolver.ResolveAsync` with `Activity.From.AadObjectId` to map the Entra identity to an internal user. If the user is unmapped, the flow diverts to §6.4.2 (unmapped-user rejection) — no conversation reference is stored.
 7. Handler invokes `IUserAuthorizationService.AuthorizeAsync` to check RBAC permissions. If insufficient, the flow diverts to §6.4.3 (RBAC rejection) — no conversation reference is stored.
-8. After successful identity resolution and authorization, handler extracts the `ConversationReference` from the activity via `Activity.GetConversationReference()` and calls `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it. This ensures conversation references are stored only for authorized users (aligned with `implementation-plan.md` §2.2 line 87 which stores only after identity resolution and authorization, and `e2e-scenarios.md` §Conversation Reference Persistence). Install events (`OnTeamsMembersAddedAsync`, `OnInstallationUpdateActivityAsync`) store references separately during the installation lifecycle — see §2 InstallHandler component.
+8. After successful identity resolution and authorization, handler extracts the `ConversationReference` from the activity via `Activity.GetConversationReference()` and calls `IConversationReferenceStore.SaveOrUpdateAsync` to refresh it. This **message-path refresh** updates the `ServiceUrl` and `ConversationId` on the existing reference (which was originally created by the install event — see §2.7 `InstallHandler`). Two distinct paths store/update conversation references:
+   - **Install path (§2.7):** `InstallHandler` persists a new reference on `installationUpdate`/`conversationUpdate` after tenant validation only. This is gated by Teams app installation policy (admin-managed). No identity resolution or RBAC is applied because install events carry no user command. The reference proves the app is installed.
+   - **Message path (this step):** `TeamsSwarmActivityHandler` refreshes the reference after full identity resolution + RBAC authorization. This keeps the `ServiceUrl` current (Bot Framework rotates service URLs) and confirms the user is still authorized.
+   Both paths require tenant validation. Proactive messaging (§6.2) uses whichever reference is most recently updated. Command authorization is always enforced at command time (§6.4), regardless of which path stored the reference.
 9. An acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}") is sent back to the user.
 10. `TeamsMessengerConnector` publishes a `CommandEvent` (a `MessengerEvent` subtype with `EventType = AgentTaskRequest`) to the inbound buffer.
 11. The orchestrator consumes the event and dispatches work to agents.
