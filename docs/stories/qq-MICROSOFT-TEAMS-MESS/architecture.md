@@ -100,7 +100,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Type** | `CloudAdapter` (from `Microsoft.Bot.Builder.Integration.AspNet.Core`) |
 | **Middleware** | `TelemetryMiddleware` → `TenantValidationMiddleware` → `RateLimitMiddleware` |
-| **Responsibility** | Deserialize Bot Framework `Activity` objects, run middleware pipeline, route to `TeamsActivityHandler`. Handles authentication of inbound requests via Bot Framework JWT validation. |
+| **Responsibility** | Deserialize Bot Framework `Activity` objects, run middleware pipeline, route to `TeamsSwarmActivityHandler`. Handles authentication of inbound requests via Bot Framework JWT validation. |
 | **Error handling** | `OnTurnError` logs the exception, sends a user-facing error card, and publishes a dead-letter event to the outbox. |
 
 ### 2.4 TeamsSwarmActivityHandler
@@ -498,7 +498,7 @@ public interface IAdaptiveCardRenderer
 
 Components communicate through two internal channels:
 
-1. **Inbound queue** — `TeamsActivityHandler` → domain handlers → `TeamsMessengerConnector.ReceiveAsync()` buffer. The orchestrator polls `ReceiveAsync` or subscribes to a push-based `IObservable<MessengerEvent>` variant.
+1. **Inbound queue** — `TeamsSwarmActivityHandler` → domain handlers → `TeamsMessengerConnector.ReceiveAsync()` buffer. The orchestrator polls `ReceiveAsync` or subscribes to a push-based `IObservable<MessengerEvent>` variant.
 2. **Outbound queue** — Orchestrator calls `SendMessageAsync` / `SendQuestionAsync` → `OutboxRetryEngine` enqueues → background worker dequeues → `ProactiveNotifier` delivers via Bot Framework.
 
 ---
@@ -542,7 +542,7 @@ Outbound requests to the Bot Connector service use OAuth 2.0 client credentials 
 ### 6.1 Scenario: Human sends `agent ask create e2e test scenarios for update service`
 
 ```text
-Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsActivityHandler    CommandParser    TeamsMessengerConnector    Orchestrator
+Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    CommandParser    TeamsMessengerConnector    Orchestrator
      │                        │                       │                    │                     │                    │                      │
      │── message ────────────>│                       │                    │                     │                    │                      │
      │                        │── POST /api/messages─>│                    │                     │                    │                      │
@@ -561,7 +561,7 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsActivit
 1. Human types `agent ask create e2e test scenarios for update service` in Teams.
 2. Bot Framework delivers the activity to `POST /api/messages`.
 3. `TeamsBotAdapter` runs middleware: tenant validation passes, rate limit check passes.
-4. `TeamsActivityHandler.OnMessageActivityAsync` delegates to `CommandParser`.
+4. `TeamsSwarmActivityHandler.OnMessageActivityAsync` delegates to `CommandParser`.
 5. `CommandParser` recognizes `agent ask` prefix, extracts payload, generates `CorrelationId`.
 6. An acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}") is sent back to the user.
 7. `TeamsMessengerConnector` publishes a `MessengerEvent` of type `Command` to the inbound buffer.
@@ -601,7 +601,7 @@ Orchestrator    TeamsMessengerConnector    OutboxRetryEngine    ProactiveNotifie
 ### 6.3 Scenario: Human approves via Adaptive Card action
 
 ```text
-Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsActivityHandler    CardActionHandler    CardStateStore    TeamsMessengerConnector    Orchestrator
+Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    CardActionHandler    CardStateStore    TeamsMessengerConnector    Orchestrator
      │                  │                       │                    │                      │                   │                    │                      │
      │── tap Approve ──>│                       │                    │                      │                   │                    │                      │
      │                  │── invoke activity ───>│                    │                      │                   │                    │                      │
@@ -621,7 +621,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsActivityHandl
 
 1. Human taps "Approve" on the Adaptive Card in Teams.
 2. Teams sends an `invoke` activity with `type: "adaptiveCard/action"` to the bot.
-3. `TeamsActivityHandler.OnAdaptiveCardInvokeAsync` delegates to `CardActionHandler`.
+3. `TeamsSwarmActivityHandler.OnAdaptiveCardInvokeAsync` delegates to `CardActionHandler`.
 4. `CardActionHandler` extracts `QuestionId` and `ActionId` from `Activity.Value`.
 5. Idempotency check: if this `(QuestionId, UserId)` pair was already processed, return the previous result.
 6. `CardActionHandler` builds a `HumanDecisionEvent` with the user's AAD object ID, action value, and optional comment.
@@ -744,7 +744,7 @@ All components emit traces and metrics through `System.Diagnostics.Activity` and
 
 | Signal | Source | Key attributes |
 |---|---|---|
-| Trace span | `TeamsActivityHandler` | `messaging.system=teams`, `correlation_id`, `command_type` |
+| Trace span | `TeamsSwarmActivityHandler` | `messaging.system=teams`, `correlation_id`, `command_type` |
 | Trace span | `ProactiveNotifier` | `messaging.operation=send`, `destination`, `card_type` |
 | Trace span | `OutboxRetryEngine` | `outbox.status`, `outbox.attempt` |
 | Metric (counter) | `CommandParser` | `teams.commands.received` by `command_type` |
