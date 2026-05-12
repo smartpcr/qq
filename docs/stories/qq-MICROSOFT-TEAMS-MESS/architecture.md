@@ -200,7 +200,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Persistence` |
 | **Namespace** | `AgentSwarm.Messaging.Persistence.Audit` |
-| **Responsibility** | Append-only, immutable audit trail. Logs every inbound command, outbound message, card action, proactive notification, security rejection, and error. Each entry carries `CorrelationId`, `Timestamp`, `ActorId`, `TenantId`, `EventType`, and a JSON payload. Suitable for enterprise compliance review. |
+| **Responsibility** | Append-only, immutable audit trail. Logs every inbound command, outbound message, card action, proactive notification, security rejection, and error. Each entry carries all canonical fields from `tech-spec.md` §4.3: `CorrelationId`, `Timestamp`, `ActorId`, `ActorType`, `TenantId`, `EventType`, `Action`, `Outcome`, and `PayloadJson`. Suitable for enterprise compliance review. |
 | **Storage** | Write-once store — Azure Table Storage (append-only), SQL Server with row-level immutability triggers, or a dedicated audit log service. |
 
 ### 2.14 Agent Swarm Orchestrator (external boundary)
@@ -607,7 +607,7 @@ Orchestrator    TeamsMessengerConnector    OutboxRetryEngine    ProactiveNotifie
 7. Teams returns the `activityId` of the sent message.
 8. `CardStateStore.SaveAsync` persists the `TeamsCardState` with the `activityId` (needed for future update/delete).
 9. `OutboxRetryEngine` marks the entry as `Delivered`.
-10. If delivery fails with a transient error (HTTP 429, 502, 503), the engine schedules a retry with exponential backoff.
+10. If delivery fails with a transient error (HTTP 429, 500, 502, 503, 504), the engine schedules a retry per `tech-spec.md` §4.4 (exponential backoff with ±25% jitter; `Retry-After` override for 429).
 
 ### 6.3 Scenario: Human approves via Adaptive Card action
 
@@ -738,8 +738,9 @@ Orchestrator    TeamsMessengerConnector    CardStateStore    ProactiveNotifier  
 2. `TeamsMessengerConnector` retrieves the `TeamsCardState` to obtain the `activityId` and `conversationId`.
 3. A new Adaptive Card is rendered showing the updated status (e.g., "This approval has expired").
 4. `ProactiveNotifier` calls `TurnContext.UpdateActivityAsync` (via `ConnectorClient.Conversations.UpdateActivityAsync`) with the stored `activityId`.
-5. For deletion, `DeleteActivityAsync` is called instead, removing the card from the conversation.
-6. `CardStateStore` is updated with the new status.
+5. If `UpdateActivityAsync` fails because the activity ID is no longer valid (e.g., message too old, deleted by user), `ProactiveNotifier` sends a **new replacement card** to the user showing the updated status instead. The outbound retry policy does not infinitely retry the stale update (aligned with `e2e-scenarios.md` §Update/Delete — "bot sends a new replacement card and avoids infinite retry").
+6. For deletion, `DeleteActivityAsync` is called instead, removing the card from the conversation.
+7. `CardStateStore` is updated with the new status.
 
 ### 6.6 Scenario: Conversation reference reuse after service restart
 
