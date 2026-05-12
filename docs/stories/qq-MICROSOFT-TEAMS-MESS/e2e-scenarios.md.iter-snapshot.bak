@@ -384,9 +384,9 @@ Feature: Security — Tenant and User Validation
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
     And the Authorization header contains an invalid JWT token
     When the Bot Framework authentication middleware processes the request
-    Then the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline
-    And no application code or middleware runs
-    And no audit entry is emitted (the request never reaches the bot handler — per tech-spec §4.2 line 108)
+    Then the request is rejected with HTTP 401
+    And no processing occurs
+    And the attempt is logged in the security audit trail
 
   Scenario: Multi-tenant isolation — one tenant cannot see another's data
     Given user "alice@contoso.com" in tenant "contoso-tenant-id" has active tasks
