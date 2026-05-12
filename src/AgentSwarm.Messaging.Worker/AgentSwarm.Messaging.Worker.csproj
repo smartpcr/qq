@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-AgentSwarm.Messaging.Worker-34563548-df1c-4e74-ac47-502173f264b5</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.*">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj" />
+    <ProjectReference Include="..\AgentSwarm.Messaging.Telegram\AgentSwarm.Messaging.Telegram.csproj" />
+    <ProjectReference Include="..\AgentSwarm.Messaging.Persistence\AgentSwarm.Messaging.Persistence.csproj" />
+  </ItemGroup>
+</Project>
