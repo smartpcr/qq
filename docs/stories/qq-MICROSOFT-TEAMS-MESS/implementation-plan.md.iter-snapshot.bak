@@ -45,7 +45,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Implementation Steps
 - [ ] Create project `AgentSwarm.Messaging.Persistence` targeting .NET 8.
-- [ ] Define `IAuditLogger` interface with method `LogAsync(AuditEntry, CancellationToken)` where `AuditEntry` includes all canonical fields from `tech-spec.md` §4.3: `Timestamp` (DateTimeOffset), `CorrelationId` (string), `EventType` (string — values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`), `ActorId` (string — AAD object ID for users, agent ID for agents), `ActorType` (string — `User` or `Agent`), `TenantId` (string), `TaskId` (string, optional), `ConversationId` (string, optional), `Action` (string), `PayloadJson` (string — sanitized JSON payload), `Outcome` (string — `Success`, `Rejected`, `Failed`, `DeadLettered`).
+- [ ] Define `IAuditLogger` interface with method `LogAsync(AuditEntry, CancellationToken)` where `AuditEntry` includes all canonical fields from `tech-spec.md` §4.3: `Timestamp` (DateTimeOffset), `CorrelationId` (string), `EventType` (string — values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`), `ActorId` (string — AAD object ID for users, agent ID for agents), `ActorType` (string — `User` or `Agent`), `TenantId` (string), `TaskId` (string, optional), `ConversationId` (string, optional), `Action` (string), `PayloadJson` (string — sanitized JSON payload), `Outcome` (string — `Success`, `Rejected`, `Failed`, `DeadLettered`).
 - [ ] Define `IMessageStore` interface for persisting inbound/outbound messages with methods: `SaveInboundAsync`, `SaveOutboundAsync`, `GetByCorrelationIdAsync`.
 - [ ] Implement `AuditEntry` as an immutable record with all canonical fields listed above plus an implementation-specific `Checksum` field (SHA-256 of row content for tamper detection).
 
@@ -92,10 +92,10 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `OnTurnAsync` to add `CorrelationId` (from activity or new GUID) to the turn context for distributed tracing.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
 
 ### Test Scenarios
-- [ ] Scenario: Command routing— Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
+- [ ] Scenario: Command routing — Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
 - [ ] Scenario: Bot install captures reference — Given a `MembersAdded` activity where the bot is added, When processed, Then the conversation reference is persisted via `IConversationReferenceStore.SaveOrUpdateAsync`.
 - [ ] Scenario: Correlation ID propagation — Given an incoming activity without a `CorrelationId` header, When `OnTurnAsync` runs, Then a new GUID-based `CorrelationId` is attached to the turn context.
 - [ ] Scenario: First interaction saves reference — Given user `dave@contoso.com` has never interacted with the bot before, When `dave` sends `agent status` in personal chat, Then `OnMessageActivityAsync` extracts the conversation reference from the activity and calls `IConversationReferenceStore.SaveOrUpdateAsync`, persisting the reference keyed by `(AadObjectId, TenantId)` before dispatching the command.
@@ -127,10 +127,10 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create `manifest.zip` packaging script that bundles `manifest.json`, `color.png` (192×192), and `outline.png` (32×32) icons for sideloading or admin deployment.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
 
 ### Test Scenarios
-- [ ] Scenario: Manifest schema validation— Given the generated `manifest.json`, When validated against the Teams manifest schema v1.16, Then no schema errors are reported.
+- [ ] Scenario: Manifest schema validation — Given the generated `manifest.json`, When validated against the Teams manifest schema v1.16, Then no schema errors are reported.
 - [ ] Scenario: Required scopes present — Given the manifest, When the `bots[0].scopes` field is inspected, Then it contains both `personal` and `team`.
 - [ ] Scenario: Message extension stub present — Given the manifest, When the `composeExtensions` field is inspected, Then it contains at least one action command entry.
 
@@ -200,7 +200,6 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Override `OnTeamsMessagingExtensionSubmitActionAsync` in `TeamsSwarmActivityHandler` to delegate to `MessageExtensionHandler`, passing the `MessagingExtensionAction` data.
 - [ ] Implement message content extraction: parse the `MessagingExtensionAction.MessagePayload` to retrieve the forwarded message text, sender, and timestamp.
 - [ ] Delegate extracted text to `CommandParser` to parse the forwarded message as an agent command and publish a `MessengerEvent` of type `AgentTaskRequest` with `Source = MessageAction` to the inbound buffer (aligned with `architecture.md` §2.15 and `e2e-scenarios.md` §Message Actions).
-- [ ] After extracting and dispatching the message-action payload, log an audit entry with `EventType = "MessageActionReceived"` via `IAuditLogger.LogAsync`, recording the acting user's AAD object ID, tenant ID, the source message text, and the resulting correlation/task ID. This satisfies the `tech-spec.md` §4.3 requirement that message actions log under the canonical `MessageActionReceived` audit event type (distinct from `CommandReceived`).
 - [ ] Return a task-submitted confirmation card to the user via `MessagingExtensionActionResponse` containing a success message and the created task/correlation ID.
 - [ ] Update the Teams app manifest `composeExtensions` entry to set `fetchTask: false` (direct submit) and configure the `commands` array with the action command definition including `id`, `title`, `description`, and `type: "action"`.
 
@@ -211,7 +210,6 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Message action forwarding — Given a user right-clicks a message and selects "Forward to Agent", When the message extension submit action is received, Then `MessageExtensionHandler` extracts the message text and publishes an `AgentTaskRequest` event with `Source = MessageAction`.
 - [ ] Scenario: Confirmation card returned — Given a successful message-extension submit, When `OnTeamsMessagingExtensionSubmitActionAsync` completes, Then a `MessagingExtensionActionResponse` with a confirmation Adaptive Card is returned to the user.
 - [ ] Scenario: Empty message payload — Given a message action invoke with no message payload (e.g., triggered from command box), When `MessageExtensionHandler` processes it, Then a descriptive error card is returned asking the user to select a message first.
-- [ ] Scenario: Message action audit entry — Given a user submits a message action forwarding a message to an agent, When `MessageExtensionHandler` completes dispatch, Then an `AuditLog` entry exists with `EventType = "MessageActionReceived"`, `ActorId` set to the user's AAD object ID, `TenantId` matching the user's tenant, and `PayloadJson` containing the forwarded message text.
 
 # Phase 4: Proactive Messaging and Conversation Reference Management
 
@@ -281,7 +279,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 5.2: Audit Logging Implementation
 
 ### Implementation Steps
-- [ ] Implement `SqlAuditLogger : IAuditLogger` writing to an append-only `AuditLog` table with columns matching the canonical schema from `tech-spec.md` §4.3: `Id` (surrogate PK), `Timestamp` (DateTimeOffset), `CorrelationId` (string), `EventType` (string — `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`), `ActorId` (string — AAD object ID or agent ID), `ActorType` (string — `User` or `Agent`), `TenantId` (string), `TaskId` (string, nullable), `ConversationId` (string, nullable), `Action` (string), `PayloadJson` (string — sanitized JSON), `Outcome` (string — `Success`, `Rejected`, `Failed`, `DeadLettered`), `Checksum` (SHA-256 of row content for tamper detection).
+- [ ] Implement `SqlAuditLogger : IAuditLogger` writing to an append-only `AuditLog` table with columns matching the canonical schema from `tech-spec.md` §4.3: `Id` (surrogate PK), `Timestamp` (DateTimeOffset), `CorrelationId` (string), `EventType` (string — `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`), `ActorId` (string — AAD object ID or agent ID), `ActorType` (string — `User` or `Agent`), `TenantId` (string), `TaskId` (string, nullable), `ConversationId` (string, nullable), `Action` (string), `PayloadJson` (string — sanitized JSON), `Outcome` (string — `Success`, `Rejected`, `Failed`, `DeadLettered`), `Checksum` (SHA-256 of row content for tamper detection).
 - [ ] Create EF Core migration for the `AuditLog` table with a clustered index on `Timestamp` and non-clustered index on `CorrelationId`.
 - [ ] Instrument all command handlers to emit audit entries: log the command, user identity, tenant, timestamp, and outcome.
 - [ ] Instrument proactive message sends to emit audit entries: log the target user, message type, correlation ID, and delivery status.

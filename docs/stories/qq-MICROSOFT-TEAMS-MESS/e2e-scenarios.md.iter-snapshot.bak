@@ -770,7 +770,7 @@ Feature: Teams Message Actions (Message Extensions)
       | Body           | The deployment pipeline for service-xyz is failing with timeout errors on stage 3. |
       | Source         | MessageAction                                                                     |
     And the bot replies in the channel thread confirming the task was created
-    And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions use a dedicated audit EventType distinct from CommandReceived, per tech-spec §4.3 line 136)
+    And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism per tech-spec §4.3)
 
   Scenario: Message action presents a task form for user input
     Given user "alice@contoso.com" selects a message and invokes the "Forward to Agent" action
@@ -900,7 +900,7 @@ Feature: Edge Cases and Error Handling
 - Security: tenant validation, unmapped Entra identity rejection, RBAC, bot installation checks, Bot Framework token validation
 - Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, idempotency
 - Performance: P95 < 3s card delivery
-- Compliance: immutable audit trail with canonical EventType values; message actions audit as MessageActionReceived (per tech-spec §4.3 line 136)
+- Compliance: immutable audit trail with canonical EventType values; message actions audit as CommandReceived
 - Observability: distributed tracing with CorrelationId
 - Message actions (message extensions)
 - Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes
