@@ -620,8 +620,9 @@ public interface IActivityIdStore
 ### 4.9 IIdentityResolver (user identity mapping)
 
 ```csharp
-// Assembly: AgentSwarm.Messaging.Teams
-// Aligned with implementation-plan.md §5.1
+// Assembly: AgentSwarm.Messaging.Abstractions (interface)
+// Implementations: AgentSwarm.Messaging.Teams
+// Aligned with implementation-plan.md §1.2 (interface in Abstractions) and §5.1 (implementation in Teams)
 public interface IIdentityResolver
 {
     /// <summary>
@@ -643,8 +644,9 @@ public sealed record UserIdentity(
 ### 4.10 IUserAuthorizationService (RBAC enforcement)
 
 ```csharp
-// Assembly: AgentSwarm.Messaging.Teams
-// Aligned with implementation-plan.md §5.1
+// Assembly: AgentSwarm.Messaging.Abstractions (interface)
+// Implementations: AgentSwarm.Messaging.Teams
+// Aligned with implementation-plan.md §1.2 (interface in Abstractions) and §5.1 (implementation in Teams)
 public interface IUserAuthorizationService
 {
     /// <summary>
@@ -965,10 +967,10 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 
 | Assembly | Layer | Responsibility |
 |---|---|---|
-| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`) |
+| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`), `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult` |
 | `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IMessageOutbox`, retry policies, deduplication, rate limiting |
 | `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), storage implementations (SQL, Azure Table) |
-| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore`, `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult` |
+| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore`, `EntraIdentityResolver` (impl of `IIdentityResolver`), `RbacAuthorizationService` (impl of `IUserAuthorizationService`) |
 | `AgentSwarm.Messaging.Worker` | Host | ASP.NET Core worker service hosting the Teams connector, DI registration, health checks, OpenTelemetry configuration |
 | `AgentSwarm.Messaging.Tests` | Test | Unit and integration tests for all assemblies |
 
