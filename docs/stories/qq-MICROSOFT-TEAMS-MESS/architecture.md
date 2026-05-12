@@ -782,20 +782,21 @@ User (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityH
 ### 6.5 Scenario: Message update/delete for already-sent approval card
 
 ```text
-Orchestrator    TeamsMessengerConnector    CardStateStore    ProactiveNotifier    Teams
-     │                    │                     │                  │                │
-     │── update card ────>│                     │                  │                │
-     │  (expired/cancel)  │── lookup state ────>│                  │                │
-     │                    │<── TeamsCardState ──│                  │                │
-     │                    │── render new card ──│                  │                │
-     │                    │── UpdateActivity ──────────────────────>│                │
-     │                    │                     │                  │── HTTP PUT ────>│
-     │                    │                     │                  │<── 200 OK ─────│
-     │                    │── update status ───>│                  │                │
-     │                    │  (Expired/Deleted)   │                  │                │
+Orchestrator    IMessengerConnector           TeamsMessengerConnector    CardStateStore    ProactiveNotifier    Teams
+     │                    │                          │                     │                  │                │
+     │── UpdateCardAsync ─>│ (or DeleteCardAsync)    │                     │                  │                │
+     │   (questionId,      │── delegate ────────────>│                     │                  │                │
+     │    MarkExpired)     │                          │── lookup state ────>│                  │                │
+     │                    │                          │<── TeamsCardState ──│                  │                │
+     │                    │                          │── render new card ──│                  │                │
+     │                    │                          │── UpdateActivity ──────────────────────>│                │
+     │                    │                          │                     │                  │── HTTP PUT ────>│
+     │                    │                          │                     │                  │<── 200 OK ─────│
+     │                    │                          │── update status ───>│                  │                │
+     │                    │                          │  (Expired/Deleted)   │                  │                │
 ```
 
-1. The orchestrator signals that an approval card should be updated (e.g., question expired, or the task was cancelled).
+1. The orchestrator calls `IMessengerConnector.UpdateCardAsync(questionId, CardUpdateAction.MarkExpired)` (or `DeleteCardAsync` for deletion). This is the public contract surface through which the orchestrator triggers card updates without knowledge of Teams-specific types.
 2. `TeamsMessengerConnector` retrieves the `TeamsCardState` to obtain the `activityId` and `conversationId`.
 3. A new Adaptive Card is rendered showing the updated status (e.g., "This approval has expired").
 4. `ProactiveNotifier` calls `TurnContext.UpdateActivityAsync` (via `ConnectorClient.Conversations.UpdateActivityAsync`) with the stored `activityId`.
@@ -863,10 +864,10 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 
 | Assembly | Layer | Responsibility |
 |---|---|---|
-| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` |
+| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `CardUpdateAction`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`) |
 | `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IOutboxStore`, retry policies, deduplication, rate limiting |
 | `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), storage implementations (SQL, Azure Table) |
-| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore` |
+| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore` |
 | `AgentSwarm.Messaging.Worker` | Host | ASP.NET Core worker service hosting the Teams connector, DI registration, health checks, OpenTelemetry configuration |
 | `AgentSwarm.Messaging.Tests` | Test | Unit and integration tests for all assemblies |
 
@@ -886,6 +887,7 @@ All components emit traces and metrics through `System.Diagnostics.Activity` and
 | Metric (counter) | `CommandParser` | `teams.commands.received` by `command_type` |
 | Metric (histogram) | `ProactiveNotifier` | `teams.card.delivery_latency_ms` |
 | Metric (counter) | `TenantValidationMiddleware` | `teams.security.rejections` by `tenant_id` |
+| Metric (counter) | `ActivityDeduplicationMiddleware` | `teams.webhook.duplicates_suppressed` |
 | Metric (gauge) | `OutboxRetryEngine` | `teams.outbox.pending_count` |
 | Health check | `TeamsMessengerConnector` | Bot Framework connectivity, outbox queue depth |
 
@@ -933,6 +935,7 @@ Teams connector configuration is bound from `appsettings.json` / environment var
 services.AddSingleton<IMessengerConnector, TeamsMessengerConnector>();
 services.AddSingleton<IConversationReferenceStore, SqlConversationReferenceStore>();
 services.AddSingleton<ICardStateStore, SqlCardStateStore>();
+services.AddSingleton<IActivityIdStore, InMemoryActivityIdStore>();
 services.AddSingleton<IAdaptiveCardRenderer, AdaptiveCardRenderer>();
 services.AddSingleton<ProactiveNotifier>();
 services.AddSingleton<CommandParser>();
