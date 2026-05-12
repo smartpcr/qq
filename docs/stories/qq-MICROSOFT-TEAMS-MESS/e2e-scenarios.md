@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.10 — Iteration 10
+**Version:** 1.11 — Iteration 11
 
 ---
 
@@ -771,7 +771,7 @@ Feature: Teams Message Actions (Message Extensions)
       | Body           | The deployment pipeline for service-xyz is failing with timeout errors on stage 3. |
       | Source         | MessageAction                                                                     |
     And the bot replies in the channel thread confirming the task was created
-    And an immutable audit record is persisted with EventType "CommandReceived" (message actions log as CommandReceived per tech-spec §4.3 line 128 — the canonical audit set contains exactly six values; the Source field on the domain MessengerEvent distinguishes message-action-originated commands via Source = MessageAction)
+    And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions log as MessageActionReceived per tech-spec §4.3 Canonical Audit Record Schema — the canonical audit set contains exactly seven values; MessageActionReceived is a dedicated audit event type distinct from CommandReceived because message-action submissions arrive through the composeExtension/submitAction invoke mechanism rather than direct text commands)
 
   Scenario: Message action presents a task form for user input
     Given user "alice@contoso.com" selects a message and invokes the "Forward to Agent" action
@@ -902,7 +902,7 @@ Feature: Edge Cases and Error Handling
 - Security: tenant validation, unmapped Entra identity rejection, RBAC, bot installation checks, Bot Framework token validation
 - Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, idempotency
 - Performance: P95 < 3s card delivery
-- Compliance: immutable audit trail with canonical EventType values (six values per tech-spec §4.3 line 128: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, Error); message actions audit as CommandReceived (the Source field on the domain MessengerEvent distinguishes message-action-originated commands via Source = MessageAction — per tech-spec §4.3 line 128)
+- Compliance: immutable audit trail with canonical EventType values (seven values per tech-spec §4.3 Canonical Audit Record Schema: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error); message actions audit as MessageActionReceived — a dedicated audit event type distinct from CommandReceived because message-action submissions arrive through the composeExtension/submitAction invoke mechanism rather than direct text commands
 - Observability:distributed tracing with CorrelationId
 - Message actions (message extensions)
 - Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes, deterministic max message length with audit trail
