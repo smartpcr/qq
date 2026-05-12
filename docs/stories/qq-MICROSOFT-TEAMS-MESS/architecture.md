@@ -226,7 +226,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 | **Type** | Bot Framework middleware (`IMiddleware`) |
 | **Position in pipeline** | After `TenantValidationMiddleware`, before `RateLimitMiddleware` (see §2.3). |
 | **Responsibility** | Suppress duplicate inbound webhook deliveries. Teams and the Bot Connector service may retry an HTTP POST if the initial response times out, resulting in the same logical activity being delivered more than once. This middleware deduplicates by `Activity.Id` (or `Activity.ReplyToId` for invoke activities) per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. |
-| **Store** | `IActivityIdStore` — a lightweight store (in-memory + durable backing) that tracks recently-seen activity IDs with a configurable TTL (default: 24 hours, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
+| **Store** | `IActivityIdStore` — a lightweight store (in-memory + durable backing) that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
 | **Distinction from §2.6 idempotency** | This middleware operates at the **transport level** on raw `Activity.Id`, catching retried HTTP POSTs before any handler runs. The `CardActionHandler` idempotency set (§2.6) operates at the **domain level** on `(QuestionId, UserId)`, catching semantically duplicate card actions that may arrive as distinct activities. Both layers are necessary. |
 
 ### 2.17 IdentityResolver
@@ -345,7 +345,7 @@ The base record carries the common envelope fields. Each subtype adds a typed pa
 | *(base)* | `InstallUpdate` | `InstallEventPayload` | Bot installed/uninstalled from personal scope or team. |
 | *(base)* | `Reaction` | `ReactionPayload` | User adds/removes a reaction to a bot message. |
 
-> **Cross-doc alignment — domain `MessengerEvent.EventType` vocabulary:** The canonical domain `MessengerEvent.EventType` discriminator values are: `AgentTaskRequest`, `Command`, `Escalation`, `PauseAgent`, `ResumeAgent`, `Decision`, `Text`, `InstallUpdate`, `Reaction`. This is the authoritative set. `e2e-scenarios.md` §Tracing line 680 defines this same domain constraint set. (Note: `e2e-scenarios.md` lines 669–673 contain an **audit trail** table with audit `EventType` values `CommandReceived`, `ProactiveNotification`, `CardActionReceived`, `MessageSent` — these are audit values, not domain values.) `tech-spec.md` §4.3 line 131 lists a subset (`Command`, `Decision`, `Reaction`, `InstallUpdate`, `AgentTaskRequest`) and omits `Escalation`, `PauseAgent`, `ResumeAgent`, and `Text` — tech-spec.md should be updated to include the full set in its next iteration. Note: these domain `EventType` values are intentionally distinct from the **audit** `EventType` values (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`) defined in §3.2 `AuditEntry` — the two enumerations serve different purposes (domain event polymorphism vs. audit categorization).
+> **Cross-doc alignment — domain `MessengerEvent.EventType` vocabulary:** The canonical domain `MessengerEvent.EventType` discriminator values are: `AgentTaskRequest`, `Command`, `Escalation`, `PauseAgent`, `ResumeAgent`, `Decision`, `Text`, `InstallUpdate`, `Reaction`. This is the authoritative set. `e2e-scenarios.md` §Tracing line 680 defines this same domain constraint set. (Note: `e2e-scenarios.md` lines 669–673 contain an **audit trail** table with audit `EventType` values `CommandReceived`, `ProactiveNotification`, `CardActionReceived`, `MessageSent` — these are audit values, not domain values.) `tech-spec.md` §4.3 line 130 lists the full domain discriminator set including `Escalation`, `PauseAgent`, `ResumeAgent`, and `Text` — all sibling docs are now aligned on this vocabulary. Note: these domain `EventType` values are intentionally distinct from the **audit** `EventType` values (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`) defined in §3.2 `AuditEntry` — the two enumerations serve different purposes (domain event polymorphism vs. audit categorization).
 >
 > `implementation-plan.md` §1.1 line 19 defines `MessengerEvent` as a base record with subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`. This architecture adopts that subtype structure. The `CommandEvent` subtype uses variable `EventType` discriminator values depending on the parsed command — `AgentTaskRequest` for `agent ask`, `Command` for general commands, `Escalation`/`PauseAgent`/`ResumeAgent` for lifecycle commands — aligning with `e2e-scenarios.md` which expects these as distinct event types (lines 543, 551, 560, 680). The `CommandParser` sets the `EventType` based on the recognized command pattern.
 
@@ -429,7 +429,7 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 | `AuditEntryId` | `string` | Yes | Primary key (GUID) — implementation-specific surrogate key. |
 | `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
 | `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
-| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error` — exactly the six canonical values from `tech-spec.md` §4.3. Message-action-forwarded commands log as `CommandReceived` (not a separate event type) because the action is a command submission mechanism, consistent with `tech-spec.md` §4.3 line 136. |
+| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error` — exactly the seven canonical values from `tech-spec.md` §4.3. Message actions (Teams message-extension submissions) log as `MessageActionReceived` — a dedicated audit event type that distinguishes the message-action submission mechanism from direct command input (`CommandReceived`), consistent with `tech-spec.md` §4.3 line 136. |
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users (`ActorType = User`), agent ID for agent-originated events (`ActorType = Agent`). |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
@@ -509,14 +509,17 @@ public enum CardUpdateAction
 // Aligned with implementation-plan.md §1.2 / §4.1 contract
 public interface IConversationReferenceStore
 {
-    Task SaveAsync(TeamsConversationReference reference, CancellationToken ct);
+    Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct);
 
     // Generic get by primary key (aligned with implementation-plan.md §1.2 GetAsync)
     Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct);
 
     Task<TeamsConversationReference?> GetByUserIdAsync(string tenantId, string userId, CancellationToken ct);
     Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct);
-    Task<IReadOnlyList<TeamsConversationReference>> GetAllAsync(string tenantId, CancellationToken ct);
+    Task<IReadOnlyList<TeamsConversationReference>> GetAllActiveAsync(string tenantId, CancellationToken ct);
+
+    // Check whether a reference is active (not uninstalled/stale)
+    Task<bool> IsActiveAsync(string tenantId, string userId, CancellationToken ct);
 
     // Personal-scope overloads (keyed by userId)
     Task MarkInactiveAsync(string tenantId, string userId, CancellationToken ct);
@@ -610,7 +613,7 @@ public interface IActivityIdStore
 }
 ```
 
-`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 24 hours, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
+`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
 
 ### 4.9 IIdentityResolver (user identity mapping)
 
@@ -940,7 +943,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 3. `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to `MessageExtensionHandler`.
 4. `MessageExtensionHandler` extracts the source message text and metadata, delegates to `CommandParser` to parse the forwarded content (aligned with `e2e-scenarios.md` §Message Actions which expects delegation to `CommandParser`).
 5. A `MessengerEvent` of type `AgentTaskRequest` is built with `Source = MessageAction` (aligned with `e2e-scenarios.md` which expects `MessengerEvent` type `AgentTaskRequest` with `Source = MessageAction`, not `MessageAction` type).
-6. An audit entry of type `CommandReceived` is logged (message actions are a command submission mechanism and use the canonical audit `EventType = CommandReceived` per `tech-spec.md` §4.3 line 136, not a separate event type).
+6. An audit entry of type `MessageActionReceived` is logged (message actions use the dedicated canonical audit `EventType = MessageActionReceived` per `tech-spec.md` §4.3 line 136, distinguishing the message-action submission mechanism from direct command input which uses `CommandReceived`).
 7. A confirmation card is returned to the user ("Message forwarded to agent — tracking ID: {CorrelationId}").
 8. `TeamsMessengerConnector` publishes the `MessengerEvent` to the inbound buffer.
 9. The orchestrator consumes the event and routes the forwarded context to the appropriate agent.
