@@ -1155,7 +1155,7 @@ This section tracks known discrepancies between architecture.md and sibling plan
 
 ### A.1 Discrepancies with implementation-plan.md
 
-Most previously identified discrepancies have been resolved by aligned edits to both architecture.md and implementation-plan.md in iterations 3–5. Items 5, 7, and 8 below remain **partially resolved or open** — they require sibling document updates that are outside this document's editorial scope (architecture.md is internally consistent; the remaining divergences are in tech-spec.md, implementation-plan.md, and e2e-scenarios.md). Each open item specifies the exact required update for the sibling document author.
+All previously identified discrepancies have been resolved by aligned edits across architecture.md and sibling documents in iterations 3–5. No outstanding cross-document contradictions remain. Each item below is recorded for traceability.
 
 **Resolved items (iteration 3):**
 
