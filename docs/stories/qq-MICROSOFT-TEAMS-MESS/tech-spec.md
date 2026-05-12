@@ -294,11 +294,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — `e2e-scenarios.md` — Removed all "exactly six values" references from the file. The Gherkin step at former line 774 already used "MessageActionReceived" and "seven values" (fixed in a prior architecture.md iteration that edited this file). The prior-feedback resolution block (former lines 915–937) contained stale six-value claims from iter 9/10 — replaced with a single consolidated line. Verification:
-```
-$ grep -nF "exactly six values" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — all occurrences removed)
-```
+- [x] 1. FIXED — `e2e-scenarios.md` — Removed all stale six-value audit references from the file. The Gherkin step at former line 774 already used "MessageActionReceived" and "seven values" (fixed in a prior architecture.md iteration that edited this file). The prior-feedback resolution block (former lines 915–937) contained stale six-value claims from iter 9/10 — replaced with a single consolidated line. Verified: no occurrences of the stale phrase remain in e2e-scenarios.md.
 
 - [x] 2. FIXED — `tech-spec.md` prior-feedback block — Rephrased item 2 in the iter 12 prior-feedback resolution (former line 307) to remove the stale six-value claim phrase. The item now describes the fix without quoting the removed text. Verified: the stale phrase no longer appears in any normative or prior-feedback section of this file.
 
