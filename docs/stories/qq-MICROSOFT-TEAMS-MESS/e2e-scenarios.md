@@ -27,7 +27,7 @@ Feature: Personal Chat — Agent Task Creation
     And the event contains:
       | Field          | Value                                          |
       | CorrelationId  | <non-empty UUID>                               |
-      | ExternalUserId | alice@contoso.com                               |
+      | ExternalUserId | <alice's AadObjectId>                           |
       | TaskId         | <newly generated>                              |
       | Body           | create e2e test scenarios for update service   |
     And an immutable audit record is persisted for the command
@@ -239,15 +239,15 @@ Feature: Conversation Reference Persistence
     Given the Teams bot is registered and running
 
   Scenario: Conversation reference is stored on first interaction
-    Given user "dave@contoso.com" has never interacted with the bot before
+    Given user "dave@contoso.com" (AadObjectId "aad-obj-dave-001") has never interacted with the bot before
     When user "dave@contoso.com" sends "agent status" in personal chat
     Then a conversation reference is extracted from the incoming Activity
-    And the reference is persisted to the durable store with key = "dave@contoso.com"
+    And the reference is persisted to the durable store keyed by AadObjectId "aad-obj-dave-001" and TenantId "contoso-tenant-id"
     And the reference includes:
       | Field            | Value                  |
       | ServiceUrl       | <Bot Framework URL>    |
       | ConversationId   | <Teams conversation>   |
-      | UserId           | dave@contoso.com       |
+      | AadObjectId      | aad-obj-dave-001       |
       | TenantId         | contoso-tenant-id      |
       | BotId            | <bot app ID>           |
 
@@ -310,13 +310,16 @@ Feature: Security — Tenant and User Validation
     And no HumanDecisionEvent is created
     And an audit record is persisted for the access denial
 
-  Scenario: User in allowed tenant without bot installation is rejected
+  Scenario: Proactive message to user without bot installation is pre-checked and rejected
     Given user "no-install@contoso.com" is in tenant "contoso-tenant-id"
     But the Teams bot is not installed for user "no-install@contoso.com"
-    When the bot attempts to proactively message "no-install@contoso.com"
-    Then the Bot Framework rejects the proactive message
-    And the notification is retried according to the retry policy
-    And after max retries, the notification is moved to the dead-letter queue
+    And no conversation reference exists in ConversationReferenceStore for "no-install@contoso.com"
+    When the ProactiveNotifier attempts to send a proactive message to "no-install@contoso.com"
+    Then the ProactiveNotifier detects the missing conversation reference before calling Bot Framework
+    And no proactive message attempt is made to Bot Framework
+    And the notification is moved directly to the dead-letter queue
+    And an audit record is persisted indicating the user has no active installation
+    And the stale reference is not retried (per tech-spec §4.3 R-2)
 
   Scenario: Bot Framework token validation rejects forged activity
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
