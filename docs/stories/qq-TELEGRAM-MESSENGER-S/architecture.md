@@ -514,7 +514,7 @@ The Telegram connector publishes commands (task creation, approvals, pauses) via
 
 **`AgentAlertEvent` fields:** `AlertId` (string, unique), `AgentId` (string), `TaskId` (string — the task the agent was executing when the alert fired; required for `TaskOversight` routing in §5.6), `Title` (string — short alert headline, e.g., "Build failure"), `Body` (string — detailed alert description), `Severity` (`MessageSeverity`), `WorkspaceId` (string), `TenantId` (string), `CorrelationId` (string), `Timestamp` (DateTimeOffset). The `TaskId` field is always populated because agents execute within a task context; the alert routing in §5.6 depends on this to resolve the oversight operator via `ITaskOversightRepository.GetByTaskIdAsync(taskId)`.
 
-> **Cross-doc canonical status (AgentAlertEvent):** Implementation-plan.md Stage 1.3 defines `AgentAlertEvent` with the full ten-field set: `AlertId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `WorkspaceId`, `TenantId`, `CorrelationId`, and `Timestamp` — matching this architecture document exactly. The field names `Title` and `Body` are aligned across both documents; earlier drafts used `AlertType`/`Summary` which have been fully retired. Implementation-plan.md Stage 2.7 alert routing uses `TaskOversight` lookup with fallback to workspace default operator via `IOperatorRegistry.GetByWorkspaceAsync` (line 242), consistent with §5.6. The `IOperatorRegistry` interface (§4.3) is the canonical contract — see §4.3 for the full six-method definition including `GetByWorkspaceAsync`. E2e-scenarios.md bounded-burst threshold is ≤ 50 Critical+High messages, consistent with §10.4. The receive counter is `telegram.messages.received` across all documents.
+> **Cross-doc canonical status (AgentAlertEvent):** Implementation-plan.md Stage 1.3 defines `AgentAlertEvent` with the full ten-field set: `AlertId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `WorkspaceId`, `TenantId`, `CorrelationId`, and `Timestamp` — matching this architecture document exactly. The field names `Title` and `Body` are aligned across both documents; earlier drafts used `AlertType`/`Summary` which have been fully retired. Implementation-plan.md Stage 2.7 alert routing uses `TaskOversight` lookup with fallback to workspace default operator via `IOperatorRegistry.GetByWorkspaceAsync` (line 242), consistent with §5.6. The `IOperatorRegistry` interface (§4.3) is the canonical contract — see §4.3 for the full six-method definition including `GetByWorkspaceAsync`. E2e-scenarios.md bounded-burst threshold is ≤ 50 Critical+High messages, consistent with §10.4. The burst scenario now carries the D-BURST chat-distribution constraint (≥ 10 operator chats, max 5 per chat) as of iteration 20. The receive counter is `telegram.messages.received` across all documents.
 
 ### 4.7 IPendingQuestionStore (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -1222,11 +1222,15 @@ This section tracks known discrepancies between architecture.md and sibling plan
 
 ### A.1 Discrepancies with implementation-plan.md
 
-All previously outstanding contract/interface items have been resolved through iteration 16. One burst-envelope wording discrepancy remains open (item 20 below).
+All previously outstanding contract/interface items have been resolved through iteration 16. The burst-envelope wording discrepancy (item 20) was resolved in iteration 20 by updating implementation-plan.md directly.
 
 #### Outstanding items
 
-20. **Burst envelope threshold wording — OPEN (iteration 19).** Implementation-plan.md Stage 4.1 (line 406) describes degraded burst behavior using the phrase "~60-message envelope" for Critical/High P95 bounding, while architecture.md §10.4 (lines 1066, 1148–1152) establishes **≤ 50** as the safe P95 ≤ 2 s claim and explicitly states that 50–60 messages are at/over the SLO boundary. The `~60` phrasing in implementation-plan.md implies 60 is within the safe envelope, which contradicts this document's analysis. **Required update in implementation-plan.md:** replace "~60-message envelope" with "≤ 50 Critical+High messages" and note that 50–60 is at risk, consistent with architecture.md §10.4. Until this is resolved, Appendix A does **not** claim full alignment on burst-envelope thresholds.
+_None — all items resolved as of iteration 20._
+
+#### Resolved items (iterations 3–20)
+
+20. **Burst envelope threshold wording — RESOLVED (iteration 20).** Implementation-plan.md Stage 4.1 (line 406) previously described degraded burst behavior using the phrase "~60-message envelope" for Critical/High P95 bounding, which implied 60 was within the safe envelope. Updated implementation-plan.md directly: replaced "~60-message envelope" with "≤ 50 Critical+High messages" as the safe envelope, added explicit note that 50–60 is at the SLO boundary, and added D-BURST topology dependency (≥ 10 operator chats, max 5 per chat). Now consistent with architecture.md §10.4.
 
 #### Resolved items (iterations 3–16)
 
@@ -1270,11 +1274,15 @@ All previously outstanding contract/interface items have been resolved through i
 
 ### A.2 Discrepancies with tech-spec.md
 
-All DefaultAction/timeout items resolved (iteration 15). One burst-topology alignment gap remains open (item 21 below).
+All DefaultAction/timeout items resolved (iteration 15). The burst-topology alignment gap (item 21) was resolved in iteration 20 by updating tech-spec.md directly.
 
 #### Outstanding items
 
-21. **Burst topology acceptance envelope not carried — OPEN (iteration 19).** Architecture.md §11.1 D-BURST formally requires that the P95 ≤ 2 s burst SLO assumes ≤ 50 Critical+High messages distributed across **≥ 10 operator chats with no single chat receiving more than 5 messages**. Tech-spec.md HC-4 (line 68) and §10 alignment table (line 158) summarize the P95 metric scope and burst behavior but do **not** carry the load-bearing chat-distribution and max-5-per-chat conditions from D-BURST. This means a reviewer reading only tech-spec.md could treat the P95 SLO as topology-independent, which it is not. **Required update in tech-spec.md:** add the D-BURST topology constraints (≥ 10 chats, max 5 per chat) to HC-4 and/or the §10 alignment table so reviewers understand the SLO's deployment-topology dependency. Until this is resolved, Appendix A does **not** claim full alignment on burst/P95 topology assumptions.
+_None — all items resolved as of iteration 20._
+
+#### Resolved items (iterations 15–20)
+
+21. **Burst topology acceptance envelope not carried — RESOLVED (iteration 20).** Tech-spec.md HC-4 and §10 alignment table previously summarized P95 metric scope and burst behavior without carrying the load-bearing D-BURST topology constraints (≥ 10 operator chats, max 5 per chat). Updated tech-spec.md directly: HC-4 now includes the full D-BURST topology conditions and the §10 alignment table now references the topology dependency. Reviewers reading tech-spec.md alone can now see that the P95 SLO is topology-dependent.
 
 #### Resolved items (iteration 15)
 
@@ -1282,11 +1290,15 @@ All DefaultAction/timeout items resolved (iteration 15). One burst-topology alig
 
 ### A.3 Discrepancies with e2e-scenarios.md
 
-All DefaultAction/PendingQuestionRecord shape items resolved (iteration 15). One burst-topology alignment gap remains open (item 22 below).
+All DefaultAction/PendingQuestionRecord shape items resolved (iteration 15). The burst-topology alignment gap (item 22) was resolved in iteration 20 by updating e2e-scenarios.md directly.
 
 #### Outstanding items
 
-22. **Burst scenario missing chat-distribution constraint — OPEN (iteration 19).** Architecture.md §10.4 and D-BURST (§11.1) require the P95 ≤ 2 s burst SLO to assume ≤ 50 Critical+High messages distributed across **≥ 10 operator chats with no single chat receiving more than 5 messages**. E2e-scenarios.md burst scenario (lines 297–312) correctly constrains the Critical+High count to ≤ 50 but does **not** assert the chat-distribution or max-5-per-chat condition. Without this constraint in the scenario, a test could pass with all 50 messages routed to a single chat — which would violate the per-chat burst capacity and fail the 2 s P95 in production. **Required update in e2e-scenarios.md:** add a `Given` or `And` clause to the burst scenario specifying that the 50 Critical+High messages are distributed across ≥ 10 operator chats with no single chat receiving more than 5 messages, matching D-BURST. Until this is resolved, Appendix A does **not** claim full alignment on burst-topology acceptance conditions.
+_None — all items resolved as of iteration 20._
+
+#### Resolved items (iterations 15–20)
+
+22. **Burst scenario missing chat-distribution constraint — RESOLVED (iteration 20).** E2e-scenarios.md burst scenario previously constrained Critical+High count to ≤ 50 but did not assert the chat-distribution or max-5-per-chat condition. Updated e2e-scenarios.md directly: added a `And` clause specifying that the 50 Critical+High messages are distributed across ≥ 10 operator chats with no single chat receiving more than 5 messages, matching D-BURST. Tests now enforce the topology condition.
 
 #### Resolved items (iteration 15)
 
