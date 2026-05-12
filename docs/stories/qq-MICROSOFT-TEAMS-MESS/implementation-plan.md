@@ -98,7 +98,9 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Command routing— Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
 - [ ] Scenario: Bot install captures reference — Given a `MembersAdded` activity where the bot is added, When processed, Then the conversation reference is persisted via `IConversationReferenceStore.SaveOrUpdateAsync`.
 - [ ] Scenario: Correlation ID propagation — Given an incoming activity without a `CorrelationId` header, When `OnTurnAsync` runs, Then a new GUID-based `CorrelationId` is attached to the turn context.
-- [ ] Scenario: First interaction saves reference — Given user `dave@contoso.com` has never interacted with the bot before, When `dave` sends `agent status` in personal chat, Then `OnMessageActivityAsync` extracts the conversation reference from the activity and calls `IConversationReferenceStore.SaveOrUpdateAsync`, persisting the reference keyed by `(AadObjectId, TenantId)` before dispatching the command.
+- [ ] Scenario: First interaction saves reference after auth — Given user `dave@contoso.com` has never interacted with the bot before and is identity-resolved and authorized, When `dave` sends `agent status` in personal chat, Then `OnMessageActivityAsync` extracts the conversation reference from the activity and calls `IConversationReferenceStore.SaveOrUpdateAsync`, persisting the reference keyed by `(AadObjectId, TenantId)` after confirming authorization.
+- [ ] Scenario: Unauthorized user reference not persisted — Given user `eve@external.com` is not identity-mapped, When `eve` sends `agent ask something` in personal chat, Then `OnMessageActivityAsync` rejects the request with an access-denied card and does NOT call `IConversationReferenceStore.SaveOrUpdateAsync`.
+- [ ] Scenario: @mention stripped in channel — Given a team channel message with text `<at>AgentBot</at> agent ask plan migration`, When `OnMessageActivityAsync` processes the activity, Then the `@AgentBot` mention markup is stripped and `CommandDispatcher` receives `agent ask plan migration`.
 
 ## Stage 2.3: Teams Messenger Connector
 
@@ -239,8 +241,8 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 4.2: Proactive Notification Service
 
 ### Implementation Steps
-- [ ] Create `IProactiveNotifier` interface with `SendProactiveAsync(string userId, MessengerMessage message, CancellationToken ct)` and `SendProactiveQuestionAsync(string userId, AgentQuestion question, CancellationToken ct)`.
-- [ ] Implement `TeamsProactiveNotifier : IProactiveNotifier` using `CloudAdapter.ContinueConversationAsync` with stored conversation references.
+- [ ] Create `IProactiveNotifier` interface with methods: `SendProactiveAsync(string userId, MessengerMessage message, CancellationToken ct)`, `SendProactiveQuestionAsync(string userId, AgentQuestion question, CancellationToken ct)`, `SendToChannelAsync(string channelId, string tenantId, MessengerMessage message, CancellationToken ct)`, and `SendQuestionToChannelAsync(string channelId, string tenantId, AgentQuestion question, CancellationToken ct)`. The channel-targeted methods route to a team channel using the channel's stored `ConversationReference` (retrieved via `IConversationReferenceStore.GetByChannelIdAsync`), supporting the story requirement to send proactive notifications to both personal chat and team channels.
+- [ ] Implement `TeamsProactiveNotifier : IProactiveNotifier` using `CloudAdapter.ContinueConversationAsync` with stored conversation references. For user-targeted sends, look up by `(UserId, TenantId)`; for channel-targeted sends, look up by `(ChannelId, TenantId)`.
 - [ ] Implement conversation reference rehydration: deserialize stored `ConversationReference` JSON and invoke `ContinueConversationAsync` with the app credentials.
 - [ ] Add proactive message delivery via direct `ContinueConversationAsync` calls; durable outbox queuing is layered on top in Phase 6 Stage 6.1 when `OutboxRetryEngine` becomes available.
 - [ ] Implement notification routing: determine whether to send to personal chat or team channel based on message priority and user preferences.
