@@ -771,7 +771,7 @@ Orchestrator    TeamsMessengerConnector    OutboxRetryEngine    ProactiveNotifie
 1. Orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`.
 2. `TeamsMessengerConnector` creates an `OutboxEntry` and persists it via `IMessageOutbox.EnqueueAsync`.
 3. The outbox background worker dequeues the entry and delegates to `ProactiveNotifier`.
-4. `ProactiveNotifier` looks up the `ConversationReference` for the target user from `ConversationReferenceStore`.
+4. `ProactiveNotifier` resolves the target from the `OutboxEntry.Destination` field (which was derived from `AgentQuestion.TargetUserId` or `AgentQuestion.TargetChannelId` — see §3.1 routing derivation note). It looks up the `ConversationReference` for the target user via `IConversationReferenceStore.GetByUserIdAsync(tenantId, targetUserId)` (or `GetByChannelIdAsync` for channel-scoped questions).
 5. **Inactive-installation pre-check:** If the reference is not found, or if `IsActive == false` (indicating the user uninstalled the bot), `ProactiveNotifier` skips the Bot Framework call entirely, moves the outbox entry to the dead-letter queue via `IMessageOutbox.DeadLetterAsync`, and logs an audit entry (`EventType: Error`, `Outcome: Failed`, reason: inactive/missing reference). This pre-check avoids unnecessary Bot Framework calls for known-uninstalled users (aligned with `implementation-plan.md` §5.1 `InstallationStateGate` and `e2e-scenarios.md` §Proactive Messaging lines 121–129).
 6. `AdaptiveCardRenderer.RenderQuestionCard` builds the Adaptive Card with action buttons.
 7. `ProactiveNotifier` calls `CloudAdapter.ContinueConversationAsync` with the conversation reference, sending the card as an `Activity`.
