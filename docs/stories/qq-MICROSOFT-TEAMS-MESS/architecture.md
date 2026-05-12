@@ -508,7 +508,7 @@ public interface IConversationReferenceStore
 }
 ```
 
-> **Design note:** The channel-scoped `MarkInactiveByChannelAsync` and `DeleteByChannelAsync` methods mirror the personal-scope variants to ensure symmetry with `GetByChannelIdAsync`. When a bot is uninstalled from a team, `MarkInactiveByChannelAsync` is called for each channel in that team; when audit retention permits, `DeleteByChannelAsync` performs hard removal.
+> **Design note:** The channel-scoped `MarkInactiveByChannelAsync` and `DeleteByChannelAsync` methods mirror the personal-scope variants to ensure symmetry with `GetByChannelIdAsync`. When a bot is uninstalled from a team, `MarkInactiveByChannelAsync` is called for each channel in that team — references are **retained as inactive for audit** rather than deleted (aligned with `implementation-plan.md` §2.2 which specifies "mark conversation references inactive rather than removing them" on uninstall). `DeleteByChannelAsync` exists for **administrative cleanup only** — it may be used by an operator-initiated maintenance task after the enterprise audit retention period has elapsed, not as part of the automated uninstall flow.
 
 ### 4.3 ICardStateStore
 
@@ -590,7 +590,7 @@ public interface IActivityIdStore
 }
 ```
 
-`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 24 hours, aligned with `implementation-plan.md` §6.2 `ProcessedMessages` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
+`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
 
 ---
 
