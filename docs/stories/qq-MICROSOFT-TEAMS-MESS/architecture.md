@@ -235,7 +235,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Security` |
-| **Interface** | `IIdentityResolver` (defined in `AgentSwarm.Messaging.Teams`) |
+| **Interface** | `IIdentityResolver` (defined in `AgentSwarm.Messaging.Abstractions`; implementations in `AgentSwarm.Messaging.Teams`) |
 | **Responsibility** | Map the Teams `Activity.From.AadObjectId` (Entra AAD object ID) to an internal user identity record. Returns `null` when the AAD object ID is not mapped, triggering the unmapped-user rejection flow (§6.4.2). Aligned with `implementation-plan.md` §5.1 which defines `IIdentityResolver` with method `ResolveAsync(string aadObjectId)`. |
 | **Invoked by** | `TeamsSwarmActivityHandler` after tenant validation passes. |
 
@@ -245,7 +245,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Security` |
-| **Interface** | `IUserAuthorizationService` (defined in `AgentSwarm.Messaging.Teams`) |
+| **Interface** | `IUserAuthorizationService` (defined in `AgentSwarm.Messaging.Abstractions`; implementations in `AgentSwarm.Messaging.Teams`) |
 | **Responsibility** | Enforce RBAC permissions for user commands. Given a tenant ID, user ID, and command, determines whether the user's assigned role permits the command. Role definitions are configured via `RbacOptions` (§5.2). Returns an authorization result indicating success or the specific role required. Aligned with `implementation-plan.md` §5.1 which defines `IUserAuthorizationService` with method `AuthorizeAsync(string tenantId, string userId, string command)`. |
 | **Invoked by** | `TeamsSwarmActivityHandler` after identity resolution succeeds (§6.4.3). |
 
