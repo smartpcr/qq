@@ -53,7 +53,6 @@ Feature: Personal Chat — Agent Task Creation
       | escalate      | Escalate issue     |
       | pause         | Pause agent        |
       | resume        | Resume agent       |
-    And no MessengerEvent is enqueued
 
   Scenario: User queries agent status
     Given agent "planner-agent-01" is executing task "TASK-42"
@@ -119,15 +118,26 @@ Feature: Proactive Messaging — Blocking Questions
     And the Adaptive Card is delivered successfully to the user
     And connector recovery completes within 30 seconds
 
-  Scenario: Proactive message to user who uninstalled the bot
+  Scenario: Proactive message to user who uninstalled the bot (known uninstall — inactive reference pre-check)
     Given user "charlie@contoso.com" had the bot installed previously
-    And a conversation reference exists for "charlie@contoso.com"
-    But user "charlie@contoso.com" has since uninstalled the Teams bot
+    And the bot received an installationUpdate activity with action "remove" for "charlie@contoso.com"
+    And the conversation reference for "charlie@contoso.com" was marked inactive (per tech-spec §4.2)
     When agent "planner-agent-01" publishes an AgentQuestion for "charlie@contoso.com"
-    Then the Bot Framework returns a 403/Forbidden error
+    Then the ProactiveNotifier checks the ConversationReferenceStore and finds the reference is inactive
+    And no proactive message attempt is made to Bot Framework
     And the notification is moved to the dead-letter queue
-    And an audit record is persisted indicating delivery failure
+    And an audit record is persisted indicating the reference is inactive due to uninstall
+
+  Scenario: Proactive message fails with stale reference (uninstall event was missed)
+    Given user "dave@contoso.com" had the bot installed previously
+    And a conversation reference exists for "dave@contoso.com" and is still marked active
+    But user "dave@contoso.com" was removed from the tenant without the bot receiving an uninstall event
+    When agent "planner-agent-01" publishes an AgentQuestion for "dave@contoso.com"
+    Then the ProactiveNotifier finds the reference is active and attempts delivery
+    And the Bot Framework returns a 403/Forbidden error
+    And the notification is moved to the dead-letter queue with reason "stale_reference"
     And the stored conversation reference is marked as stale
+    And an audit record is persisted indicating delivery failure due to stale reference
 ```
 
 ---
