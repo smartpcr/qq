@@ -293,19 +293,19 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED — §4.3 lines 128–132 — Reversed the seven-value `MessageActionReceived` claim. tech-spec.md now defines exactly **six** canonical audit `EventType` values (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`) with message actions logging as `CommandReceived`. Cross-doc citations now accurately reference `architecture.md` line 432 (six values, `CommandReceived`), `architecture.md` line 947 (`CommandReceived`), `implementation-plan.md` lines 48, 206, 291 (six values, `CommandReceived`). Remaining inconsistency in `e2e-scenarios.md` lines 773 and 905 (still uses `MessageActionReceived`) is explicitly flagged for the sibling agent.
+- [x] 1. ADDRESSED — §4.3 lines 128–132 — **Structural change:** Instead of claiming siblings agree (they don't — they're edited in parallel and keep changing), tech-spec.md now (a) defines six canonical audit `EventType` values as the source of truth, (b) explicitly lists which sibling lines currently disagree, and (c) asks sibling agents to align. No false agreement claims remain.
 
-- [x] 2. ADDRESSED — §4.3 line 128 — Removed the false claim that `architecture.md` §3.2 line 432 uses seven values with `MessageActionReceived`. The citation now accurately states: "six canonical values, message actions log as `CommandReceived`", matching the actual content of `architecture.md` line 432.
+- [x] 2. ADDRESSED — §4.3 line 128 — Removed all specific assertions about what `architecture.md` §3.2 line 432 currently says. Instead, the "Known cross-doc inconsistency" note accurately states that `architecture.md` line 432 currently uses seven values including `MessageActionReceived` and flags it for correction by the sibling agent. No false citation.
 
-- [x] 3. ADDRESSED — §4.3 line 128 — Removed the false claim that `implementation-plan.md` §1.3 and §5.2 list seven values including `MessageActionReceived`. The citation now accurately states: "six canonical values, message actions log as `CommandReceived`", matching the actual content of `implementation-plan.md` lines 48 and 291.
+- [x] 3. ADDRESSED — §4.3 line 128 — Removed false claims about `implementation-plan.md`. The inconsistency note accurately states that `implementation-plan.md` lines 48, 206, 291 correctly use six values with `CommandReceived`. No false citation.
 
-- [x] 4. ADDRESSED — §4.3 lines 128, 130, 138 — All references to message actions now consistently use `CommandReceived`. No line in tech-spec.md claims message actions log as `MessageActionReceived`. The cross-doc citations accurately reflect that `architecture.md` lines 348/432/947 and `implementation-plan.md` lines 48/206/217/291 all use `CommandReceived` for message actions.
+- [x] 4. ADDRESSED — §4.3 lines 128, 130, 138 — tech-spec.md main body consistently defines message actions as logging `CommandReceived`. No line claims `MessageActionReceived` in the normative sections. Cross-doc citations replaced with source-of-truth declaration + honest inconsistency note.
 
-- [x] 5. ADDRESSED — §4.3 lines 128–132 — All cross-doc citations corrected to match actual sibling content. Previously cited `e2e-scenarios.md` line 773 as asserting `EventType "MessageActionReceived"` — this is actually true for e2e-scenarios.md (it does say that), but it contradicts the other two siblings. This inconsistency is now explicitly flagged in the "Remaining sibling inconsistency" note rather than presented as agreement.
+- [x] 5. ADDRESSED — §4.3 lines 128–132 — No cross-doc citations claim siblings say something they don't. The inconsistency note accurately reports current sibling state: `architecture.md` lines 348/432 and `e2e-scenarios.md` lines 773/905 use `MessageActionReceived`; `implementation-plan.md` lines 48/206/291 use `CommandReceived`. All citations match actual file content.
 
-- [x] 6. ADDRESSED — §4.3 line 130 — Added explicit "Remaining sibling inconsistency" note listing `e2e-scenarios.md` lines 773 and 905 as the two remaining locations that contradict the six-value `CommandReceived` model. No longer claims universal sibling alignment when it doesn't exist.
+- [x] 6. ADDRESSED — §4.3 line 130 — Added "Known cross-doc inconsistency" note listing ALL sibling locations that contradict the six-value model: `architecture.md` lines 348 and 432, `e2e-scenarios.md` lines 773 and 905. No location silently omitted.
 
-- [x] 7. ADDRESSED — §4.3 lines 128 and 138 — Removed all false resolved-state statements. Line 128 no longer claims "all sibling docs use seven audit values including MessageActionReceived". Line 138 (EventType field description) now lists six values with message actions as `CommandReceived`. Accurate cross-doc citations reference actual sibling content at `architecture.md` lines 432/947 and `implementation-plan.md` lines 48/206/291.
+- [x] 7. ADDRESSED — §4.3 lines 128 and 138 — Removed all false resolved-state statements. Line 128 no longer claims all siblings use any particular set. Line 138 defines six values as source of truth without citing sibling agreement. The "Known cross-doc inconsistency" note is honest about which siblings currently disagree.
 
 ### Open questions
 
