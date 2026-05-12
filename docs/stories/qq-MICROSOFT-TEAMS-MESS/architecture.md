@@ -693,6 +693,32 @@ Service (restart)    ConvRefStore    ProactiveNotifier    Teams
 2. References survive restarts because they are stored in durable storage, not in-memory.
 3. When a proactive notification is needed, `ProactiveNotifier` retrieves the reference by `(tenantId, userId)` and sends the message without requiring the user to re-initiate a conversation.
 
+### 6.7 Scenario: Message action — user forwards a message to an agent
+
+```text
+Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    MessageExtensionHandler    TeamsMessengerConnector    Orchestrator
+     │                  │                       │                    │                           │                          │                      │
+     │── msg action ───>│                       │                    │                           │                          │                      │
+     │  (right-click    │── invoke activity ───>│                    │                           │                          │                      │
+     │   "Forward to    │   composeExtension/   │── middleware ─────>│                           │                          │                      │
+     │    Agent")       │   submitAction        │                    │── ext dispatch ──────────>│                          │                      │
+     │                  │                       │                    │                           │── extract source msg     │                      │
+     │                  │                       │                    │                           │── build MessageAction    │                      │
+     │                  │                       │                    │                           │    Request               │                      │
+     │                  │                       │                    │                           │── audit log              │                      │
+     │                  │                       │                    │<── confirmation card ─────│                          │                      │
+     │<── "Forwarded" ──│<──────────────────────│<───────────────────│                           │── MessengerEvent ───────>│                      │
+     │                  │                       │                    │                           │  {MessageAction}         │── MessengerEvent ───>│
+```
+
+1. Human right-clicks a message in Teams and selects the "Forward to Agent" message action (defined as a `composeExtension` command in the app manifest).
+2. Teams sends an `invoke` activity with `name: "composeExtension/submitAction"` containing the source message content.
+3. `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to `MessageExtensionHandler`.
+4. `MessageExtensionHandler` extracts the source message text and metadata, builds a `MessageActionRequest`, and logs an audit entry of type `MessageActionReceived`.
+5. A confirmation card is returned to the user ("Message forwarded to agent — tracking ID: {CorrelationId}").
+6. `TeamsMessengerConnector` publishes a `MessengerEvent` of type `MessageAction` with the `MessageActionRequest` payload to the inbound buffer.
+7. The orchestrator consumes the event and routes the forwarded context to the appropriate agent.
+
 ---
 
 ## 7. Assembly / Project Mapping

@@ -39,7 +39,7 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 | **Teams app manifest** | Manifest v1.16+ defining bot capabilities, personal scope, team scope, and message extension stubs. |
 | **Interaction scopes** | Personal (1:1) chat and team channel conversations. |
 | **Message actions** | Teams message-extension action commands to forward context to agents. |
-| **Reliability** | Durable outbound notification queue. Retry transient Bot Connector failures (HTTP 429, 500, 502, 503, 504) with exponential backoff + jitter. Dead-letter after exhausting retries. Connector restart recovery using persisted conversation references. |
+| **Reliability** | Durable outbound notification queue. Retry transient Bot Connector failures (HTTP 429, 500, 502, 503, 504) per the canonical retry policy (§4.4). Dead-letter after exhausting retries. Connector restart recovery using persisted conversation references. |
 | **Performance** | P95 Adaptive Card delivery < 3 seconds after queue pickup. Connector recovery < 30 seconds. Support 1000+ concurrent users. |
 | **Compliance** | Immutable audit trail for all inbound commands and outbound notifications. Include `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, user identity, and action taken. |
 | **Observability** | OpenTelemetry traces and metrics. Structured logging. Health-check endpoint. Latency histograms for card delivery. |
