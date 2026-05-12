@@ -734,6 +734,10 @@ Orchestrator    TeamsMessengerConnector    OutboxRetryEngine    ProactiveNotifie
      │                    │                      │── dequeue ─────────>│                  │                  │                    │              │
      │                    │                      │                     │── lookup ref ───>│                  │                    │              │
      │                    │                      │                     │<── ConvRef ──────│                  │                    │              │
+     │                    │                      │                     │── check IsActive │                  │                    │              │
+     │                    │                      │                     │   (if inactive:  │                  │                    │              │
+     │                    │                      │                     │    dead-letter,  │                  │                    │              │
+     │                    │                      │                     │    audit, STOP)  │                  │                    │              │
      │                    │                      │                     │── render card ──────────────────────>│                    │              │
      │                    │                      │                     │<── Attachment ──────────────────────│                    │              │
      │                    │                      │                     │── ContinueConversationAsync ───────────────────────────────────────────>│
@@ -1037,7 +1041,10 @@ services.AddHostedService<OutboxWorker>();
 | Error class | Handling |
 |---|---|
 | Transient (HTTP 429, 500, 502, 503, 504) | Exponential backoff retry via outbox engine per `tech-spec.md` §4.4: base 2 s, 2× multiplier, max 60 s, 5 total attempts, ±25% jitter, `Retry-After` header override for HTTP 429. |
-| Authentication failure | Log `SecurityRejection` audit entry; return 403. |
+| Invalid Bot Framework JWT (pre-application) | Handled automatically by Bot Framework `CloudAdapter` authentication pipeline — returns HTTP 401 before any application code or middleware runs. No `SecurityRejection` audit entry is emitted because the request never reaches the bot handler (per `tech-spec.md` §4.2 rejection matrix row 1). |
+| Tenant not in allow-list | `TenantValidationMiddleware` rejects with HTTP 403; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 2). |
+| Unmapped user identity | `IIdentityResolver` returns null; handler responds with HTTP 200 + access-denial Adaptive Card; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 3). |
+| Insufficient RBAC role | `IUserAuthorizationService` rejects; handler responds with HTTP 200 + insufficient-permissions Adaptive Card; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 4). |
 | Card update conflict (activity not found) | Log warning; mark card state as `Deleted`; send a **new replacement card** to the user with the updated status (aligned with `e2e-scenarios.md` §Update/Delete — "bot sends a new replacement card"); do not infinitely retry the stale update. |
 | Serialization error | Log error; move to dead-letter queue. |
 | Unhandled exception | `OnTurnError` handler logs, sends error card to user, publishes dead-letter event. |
