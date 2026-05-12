@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.8 — Iteration 8
+**Version:** 1.9 — Iteration 9
 
 ---
 
@@ -770,7 +770,7 @@ Feature: Teams Message Actions (Message Extensions)
       | Body           | The deployment pipeline for service-xyz is failing with timeout errors on stage 3. |
       | Source         | MessageAction                                                                     |
     And the bot replies in the channel thread confirming the task was created
-    And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism and log as CommandReceived per tech-spec §4.3 line 136, not a separate event type)
+    And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions use a dedicated audit event type distinct from CommandReceived — per tech-spec §4.3 lines 128 and 136, the canonical set contains exactly seven values including MessageActionReceived)
 
   Scenario: Message action presents a task form for user input
     Given user "alice@contoso.com" selects a message and invokes the "Forward to Agent" action
@@ -888,7 +888,7 @@ Feature: Edge Cases and Error Handling
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Version:** 1.8 — Iteration 8
+**Version:** 1.9 — Iteration 9
 **Byte count:** ~53,700
 
 ### Coverage
@@ -902,8 +902,8 @@ Feature: Edge Cases and Error Handling
 - Security: tenant validation, unmapped Entra identity rejection, RBAC, bot installation checks, Bot Framework token validation
 - Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, idempotency
 - Performance: P95 < 3s card delivery
-- Compliance: immutable audit trail with canonical EventType values; message actions audit as CommandReceived (per tech-spec §4.3 line 136 — message actions are a command submission mechanism, not a separate event type; the canonical set contains exactly six values)
-- Observability: distributed tracing with CorrelationId
+- Compliance: immutable audit trail with canonical EventType values (seven values per tech-spec §4.3: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error); message actions audit as MessageActionReceived (distinct from CommandReceived — per tech-spec §4.3 lines 128 and 136)
+- Observability:distributed tracing with CorrelationId
 - Message actions (message extensions)
 - Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes, deterministic max message length with audit trail
 - Uninstall handling: both known-uninstall (inactive pre-check) and missed-uninstall (stale reference 403)
