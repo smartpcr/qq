@@ -762,8 +762,7 @@ Feature: Teams Message Actions (Message Extensions)
     When user "alice@contoso.com" right-clicks (or long-presses) the message and selects "Forward to Agent" from the message actions menu
     Then the bot receives an invoke activity of type "composeExtension/submitAction"
     And the activity payload includes the selected message text as context
-    And the custom TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync delegates to MessageExtensionHandler
-    And MessageExtensionHandler extracts the source message context and dispatches to CommandParser with the forwarded content
+    And the TeamsActivityHandler delegates to the CommandParser with the forwarded content
     And a MessengerEvent of type "AgentTaskRequest" is enqueued with:
       | Field          | Value                                                                             |
       | CorrelationId  | <non-empty UUID>                                                                  |
