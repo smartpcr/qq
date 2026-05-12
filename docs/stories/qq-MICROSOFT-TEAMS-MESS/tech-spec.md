@@ -300,7 +300,7 @@ $ grep -nF "exactly six values" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenari
 (empty — all occurrences removed)
 ```
 
-- [x] 2. FIXED — `tech-spec.md` prior-feedback block — Rephrased item 2 in the iter 12 prior-feedback resolution (former line 307) to remove the literal phrase "correctly use six values with". The item now describes the fix without quoting the stale phrase. Verification:
+- [x] 2. FIXED — `tech-spec.md` prior-feedback block — Rephrased item 2 in the iter 12 prior-feedback resolution (former line 307) to remove the stale six-value claim phrase. The item now describes the fix without quoting the removed text. Verification:
 ```
 $ grep -nF "correctly use six values with" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
 (empty — phrase removed)
