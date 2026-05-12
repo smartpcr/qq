@@ -17,7 +17,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 │                    Messenger Gateway (Worker Service)           │
 │                                                                 │
 │  ┌──────────────────┐   ┌────────────────────┐                  │
-│  │ Webhook Endpoint │   │ Long-Poll Receiver  │                 │
+│  │ Webhook Endpoint │   │ TelegramPollingService │                 │
 │  │ (ASP.NET Core)   │   │ (BackgroundService) │                 │
 │  │ - Secret-token   │   │                     │                 │
 │  │   validation     │   │                     │                 │
@@ -83,7 +83,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 | Component | Planned Assembly | Responsibility |
 |---|---|---|
 | **Webhook Endpoint** | `AgentSwarm.Messaging.Telegram` (to be created) | ASP.NET Core controller that receives Telegram `Update` POSTs. Validates the `X-Telegram-Bot-Api-Secret-Token` header, persists the `InboundUpdate` record (including the full raw `Update` JSON payload) for deduplication and crash recovery, and returns `200 OK`. Authorization, command parsing, and all further processing happen asynchronously inside `ITelegramUpdatePipeline.ProcessAsync` (see §5.1, implementation-plan.md Stage 2.2/2.4). This boundary ensures Telegram receives a fast acknowledgement while authorization failures are handled as pipeline-level rejections with an outbound reply, not as HTTP error codes. |
-| **Long-Poll Receiver** | `AgentSwarm.Messaging.Telegram` (to be created) | `BackgroundService` that calls `GetUpdatesAsync` in a loop. Used in local/dev only; disabled when webhook mode is configured. Shares the same downstream pipeline as the webhook. |
+| **TelegramPollingService** | `AgentSwarm.Messaging.Telegram` (to be created) | `BackgroundService` that calls `GetUpdatesAsync` in a loop. Enabled when `TelegramOptions.UsePolling = true`; used in local/dev only. Mutually exclusive with webhook mode — startup fails if both `UsePolling = true` and `WebhookUrl` is set (per implementation-plan.md Stage 2.5). Shares the same downstream pipeline as the webhook. |
 | **TelegramUpdateRouter** | `AgentSwarm.Messaging.Telegram` (to be created) | Central inbound pipeline stage (inside `ITelegramUpdatePipeline`). Deduplicates by `update_id`, performs authorization via `IUserAuthorizationService` (operator allowlist and binding checks), enriches with correlation ID, and dispatches to `CommandDispatcher` or `CallbackQueryHandler`. Unauthorized commands receive a rejection reply via the outbound queue. |
 | **CommandDispatcher** | `AgentSwarm.Messaging.Telegram` (to be created) | Maps incoming text commands to strongly typed `SwarmCommand` objects. Delegates callback-query payloads (button presses) to `CallbackQueryHandler` which produces `HumanDecisionEvent`. |
 | **AuthZ Service** | `AgentSwarm.Messaging.Core` (to be created) | Validates that the Telegram user ID + chat ID pair is in the authorized operator registry. Returns tenant/workspace binding or rejects the request. |
@@ -421,7 +421,7 @@ public interface ITelegramUpdatePipeline
 public sealed record PipelineResult(bool Handled, string? ResponseText, string CorrelationId);
 ```
 
-Both the webhook controller and long-poll receiver first map the raw Telegram `Update` to a `MessengerEvent` using `TelegramUpdateMapper`, then pass the result to `ProcessAsync`. The `PipelineResult` return type (to be defined in the planned `AgentSwarm.Messaging.Abstractions` project, per implementation-plan Stage 1.3) provides structured outcome information: `Handled = true` when the pipeline fully processed the event (including duplicate short-circuits — a duplicate is "handled" by the deduplication stage, which returns `PipelineResult { Handled = true }` to signal that no further action is needed, consistent with implementation-plan Stage 2.2), `Handled = false` only when the event type is unrecognized or the pipeline cannot determine how to process it, `ResponseText` for any reply to send back to the user, and `CorrelationId` for tracing. Unauthorized events also return `Handled = true` with a rejection `ResponseText` enqueued to the outbound queue — the pipeline handled the event by rejecting it. This boundary aligns with implementation-plan Stage 2.5 and keeps `ITelegramUpdatePipeline` transport-agnostic — the pipeline never sees a Telegram-specific `Update` object.
+Both the webhook controller and `TelegramPollingService` first map the raw Telegram `Update` to a `MessengerEvent` using `TelegramUpdateMapper`, then pass the result to `ProcessAsync`. The `PipelineResult` return type (to be defined in the planned `AgentSwarm.Messaging.Abstractions` project, per implementation-plan Stage 1.3) provides structured outcome information: `Handled = true` when the pipeline fully processed the event (including duplicate short-circuits — a duplicate is "handled" by the deduplication stage, which returns `PipelineResult { Handled = true }` to signal that no further action is needed, consistent with implementation-plan Stage 2.2), `Handled = false` only when the event type is unrecognized or the pipeline cannot determine how to process it, `ResponseText` for any reply to send back to the user, and `CorrelationId` for tracing. Unauthorized events also return `Handled = true` with a rejection `ResponseText` enqueued to the outbound queue — the pipeline handled the event by rejecting it. This boundary aligns with implementation-plan Stage 2.5 and keeps `ITelegramUpdatePipeline` transport-agnostic — the pipeline never sees a Telegram-specific `Update` object.
 
 ### 4.3 IOperatorRegistry
 
@@ -907,7 +907,7 @@ AgentSwarm.Messaging.sln  (to be created)
 │   │                                            CallbackQueryHandler,
 │   │                                            TelegramMessageSender (impl of IMessageSender),
 │   │                                            WebhookController,
-│   │                                            LongPollReceiver,
+│   │                                            TelegramPollingService,
 │   │                                            QuestionTimeoutService,
 │   │                                            QuestionRecoverySweep,
 │   │                                            TelegramOptions (config POCO)
@@ -940,7 +940,8 @@ AgentSwarm.Messaging.sln  (to be created)
 | Setting | Source | Notes |
 |---|---|---|
 | `Telegram:BotToken` | Azure Key Vault (production) / .NET User Secrets (local dev) | Never logged. In production, loaded via `SecretClient` with periodic refresh (default every 5 min) through `IOptionsMonitor<TelegramOptions>`, enabling rotation without restart (per tech-spec.md R-5). In local/dev environments, loaded from .NET User Secrets (`dotnet user-secrets set "Telegram:BotToken" "<value>"`) per tech-spec.md S-8, avoiding plaintext tokens in `appsettings.json` or environment variables. |
-| `Telegram:WebhookUrl` | App configuration | Public HTTPS URL; set to empty to enable long-poll mode. |
+| `Telegram:WebhookUrl` | App configuration | Public HTTPS URL for production webhook receive mode. When empty/unset and `UsePolling = true`, the system uses polling mode instead. |
+| `Telegram:UsePolling` | App configuration | `bool`, default `false`. When `true`, enables `TelegramPollingService` for local/dev receive mode. Mutually exclusive with `WebhookUrl` — startup fails if both `UsePolling = true` and `WebhookUrl` is set (per implementation-plan.md Stage 2.5). |
 | `Telegram:SecretToken` | Key Vault (production) / .NET User Secrets (local dev) | Header value Telegram sends with each webhook POST; validated by `WebhookController`. |
 | `Telegram:AllowedUserIds` | App configuration | Comma-separated allowlist of Telegram **user IDs** authorized to register via `/start`. See "Allowlist Authorization Model" below for how user IDs, chat IDs, and tenant/workspace bindings interact. |
 | `Telegram:RateLimits:GlobalPerSecond` | App configuration | Default `30`. |
@@ -1030,12 +1031,12 @@ Every inbound update generates or adopts a `CorrelationId` (UUID v7 for time-ord
 
 ### 10.2 Receive-Mode Switching
 
-The connector supports two receive modes controlled by configuration:
+The connector supports two receive modes controlled by the `Telegram:UsePolling` configuration switch (§7) and the presence of `Telegram:WebhookUrl`:
 
 | Mode | When | Mechanism |
 |---|---|---|
 | **Webhook** | Production, staging | ASP.NET Core controller at `/api/telegram/webhook`. On startup, calls `setWebhook` with the configured URL and secret token. |
-| **Long polling** | Local dev, CI | `LongPollReceiver` BackgroundService calls `getUpdates` in a loop with 30-second timeout. On startup, calls `deleteWebhook` to avoid conflicts. |
+| **Long polling** | Local dev, CI | `TelegramPollingService` BackgroundService calls `getUpdates` in a loop with 30-second timeout. Enabled when `TelegramOptions.UsePolling = true`. On startup, calls `deleteWebhook` to avoid conflicts. Mutually exclusive with webhook mode — startup fails if both `UsePolling = true` and `WebhookUrl` is set. |
 
 Both modes feed into the same `ITelegramUpdatePipeline`, so all downstream logic — deduplication, authorization, command dispatch — is mode-agnostic.
 
@@ -1175,7 +1176,7 @@ Under a burst of 1 000+ simultaneous agent events:
 | **Outbound queue is durable, not in-memory** | The 2-second P95 latency target assumes queuing overhead is minimal, but durability is non-negotiable given the at-least-once delivery requirement and the burst scenario (100+ agents). The persistent store (database) is the source of truth for all enqueued messages; an in-memory `Channel<T>` serves only as a hot buffer (read-through acceleration) in front of the persistent store to keep the dequeue hot path fast. Messages are persisted before being placed in the `Channel<T>`, so a process crash loses zero enqueued messages. |
 | **`update_id` as the deduplication key** | Telegram guarantees `update_id` is unique and monotonically increasing per bot. Using it directly avoids the cost of hashing message content. |
 | **Webhook secret token validation** | Telegram supports a `secret_token` parameter on `setWebhook` (added in Bot API 6.0). This is cheaper and simpler than IP-allowlisting Telegram's data-center ranges. |
-| **Single `ITelegramUpdatePipeline`** | Forces webhook and long-poll modes through identical logic, eliminating a class of "works in dev, breaks in prod" bugs. |
+| **Single `ITelegramUpdatePipeline`** | Forces webhook and polling modes through identical logic, eliminating a class of "works in dev, breaks in prod" bugs. |
 | **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Encodes `QuestionId:ActionId` directly in `callback_data` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both IDs are constrained to ≤ 30 characters — anchored in the data model: `AgentQuestion.QuestionId` (§3.1, constraints) and `HumanAction.ActionId` (§3.1, `HumanAction` definition) — keeping the combined payload within Telegram's 64-byte `callback_data` limit (max 61 bytes including the `:` separator). The full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, written at inline-keyboard build time with expiry at `AgentQuestion.ExpiresAt + 5 minutes` (the 5-minute grace window ensures `CallbackQueryHandler` can still resolve the cached `HumanAction` for late button taps near the `ExpiresAt` boundary — aligned with implementation-plan.md Stage 2.3 and tech-spec D-3). On cache miss, the handler falls back to deserializing `PendingQuestionRecord.AgentQuestion` JSON (see §5.2 invariant 3). The cache serves interactive button callbacks (which occur before or near `ExpiresAt`); the `QuestionTimeoutService` does not depend on the cache — it uses `DefaultActionValue` (the resolved `HumanAction.Value`) from `PendingQuestionRecord` (see §10.3). On callback, the handler parses the key, resolves the full `HumanAction` from cache or durable fallback, and reads `HumanAction.Value` to populate `HumanDecisionEvent.ActionValue`. |
 
 ### 11.1 Formal Decision Records (Operator-Directed)
