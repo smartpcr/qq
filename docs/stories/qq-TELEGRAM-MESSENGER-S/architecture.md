@@ -116,7 +116,7 @@ Links a Telegram identity to the swarm's authorization model. Each row represent
 **Constraints:**
 - `UNIQUE (TelegramUserId, TelegramChatId, WorkspaceId)` — prevents duplicate bindings.
 - Composite index on `(TelegramUserId, TelegramChatId)` — used for authorization lookups (validates the chat/user pair).
-- Index on `OperatorAlias` — used for `/handoff` target resolution.
+- `UNIQUE (OperatorAlias, TenantId)` — ensures alias uniqueness within a tenant. `/handoff @alias` resolution calls `GetByAliasAsync(alias, tenantId)` which uses this index; because the index is tenant-scoped, two tenants may independently use the same alias without collision, and a `/handoff` in one tenant cannot accidentally resolve an operator in a different tenant.
 
 **Cardinality examples:**
 - 1:1 chat, single workspace: one row per operator.
@@ -318,8 +318,8 @@ public interface IOperatorRegistry
 {
     Task<IReadOnlyList<OperatorBinding>> GetBindingsAsync(long telegramUserId, long chatId, CancellationToken ct);
     Task<IReadOnlyList<OperatorBinding>> GetAllBindingsAsync(long telegramUserId, CancellationToken ct);
-    Task<OperatorBinding?> GetByAliasAsync(string operatorAlias, CancellationToken ct);
-    Task RegisterAsync(long telegramUserId, long chatId, string tenantId, string workspaceId, CancellationToken ct);
+    Task<OperatorBinding?> GetByAliasAsync(string operatorAlias, string tenantId, CancellationToken ct);
+    Task RegisterAsync(OperatorRegistration registration, CancellationToken ct);
     Task<bool> IsAuthorizedAsync(long telegramUserId, long chatId, CancellationToken ct);
 }
 ```
@@ -330,7 +330,25 @@ public interface IOperatorRegistry
 - **Exactly one result:** Unambiguous → command proceeds with that binding's `TenantId`/`WorkspaceId`.
 - **Multiple results:** The user has bindings in multiple workspaces for this chat → the `CommandDispatcher` presents an inline keyboard listing the available workspaces and waits for the operator to select one (per e2e-scenarios workspace disambiguation flow). The selected workspace is cached for the session to avoid repeated prompts.
 
-`GetAllBindingsAsync(userId)` returns all bindings across all chats for a user, used for administrative queries and `/status` across workspaces. `IsAuthorizedAsync(userId, chatId)` is a fast-path check returning `true` if at least one active binding exists for the pair — used by the allowlist gate before command processing.
+`GetAllBindingsAsync(userId)` returns all bindings across all chats for a user, used for administrative queries and `/status` across workspaces. `IsAuthorizedAsync(userId, chatId)` is a fast-path check returning `true` if at least one active binding exists for the pair — used by the allowlist gate before command processing. `GetByAliasAsync(alias, tenantId)` resolves an operator by alias within a tenant, used by `/handoff` target resolution; the `UNIQUE (OperatorAlias, TenantId)` constraint on `OperatorBinding` ensures at most one result per (alias, tenant) pair, preventing cross-tenant mis-resolution.
+
+#### OperatorRegistration (value object)
+
+`RegisterAsync` accepts an `OperatorRegistration` value object that carries all fields required to create an `OperatorBinding`:
+
+```csharp
+public sealed record OperatorRegistration(
+    long TelegramUserId,
+    long TelegramChatId,
+    ChatType ChatType,        // Private, Group, Supergroup — derived from Update.Message.Chat.Type
+    string TenantId,
+    string WorkspaceId,
+    string[] Roles,            // e.g., ["Operator", "Approver"]
+    string OperatorAlias       // e.g., "@alice"
+);
+```
+
+The `/start` handler constructs an `OperatorRegistration` from the Telegram `Update` (for `TelegramUserId`, `TelegramChatId`, `ChatType`) and the `Telegram:UserTenantMappings` configuration entry (for `TenantId`, `WorkspaceId`, `Roles`, `OperatorAlias`) and passes it to `IOperatorRegistry.RegisterAsync`, which creates the `OperatorBinding` with all fields populated (see §7.1).
 
 ### 4.4 IOutboundQueue
 
@@ -443,7 +461,7 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 
 **Key invariants:**
 1. The question includes `Severity`, `ExpiresAt`, `AllowedActions` rendered as inline keyboard buttons, and the proposed default action (if any). The default action is carried as sidecar metadata in `AgentQuestionEnvelope.ProposedDefaultActionId` (see §3.1). When the connector builds the inline keyboard, it reads `ProposedDefaultActionId` from the envelope and prepares a `PendingQuestionRecord` with `DefaultActionId` denormalized from that field. The `PendingQuestionRecord` is **persisted after the Telegram send succeeds** (once `TelegramMessageId` is available from the API response), not before — because `PendingQuestionRecord.TelegramMessageId` is required for timeout-driven message edits and cannot be known until the send completes.
-2. The `callback_data` field carries `QuestionId:ActionId` (≤ 64 bytes). `ActionId` is a short key that maps to the full `HumanAction` payload stored server-side in `IDistributedCache` (see tech-spec D-3). The cache entry is written when the inline keyboard is built and expires at `AgentQuestion.ExpiresAt + 5 minutes` (a grace period beyond the question's `ExpiresAt` to ensure `QuestionTimeoutService` can still resolve the `HumanAction` from cache when processing timeouts at or slightly after `ExpiresAt` — this eliminates the race condition where the cache entry expires before the timeout service reads it).
+2. The `callback_data` field carries a **generated short callback token** (≤ 64 bytes, guaranteed by construction). When the inline keyboard is built, each button's `callback_data` is set to a token of the form `cb:<token>` where `<token>` is a 20-character Base62-encoded random identifier (total: 23 bytes including the `cb:` prefix — well within the 64-byte limit). The server stores a mapping from `<token>` → `(QuestionId, ActionId)` in `IDistributedCache` (see tech-spec D-3). This design decouples `callback_data` from the lengths of `QuestionId` and `ActionId`, which are unconstrained domain strings — no matter how long they are, the callback token is always 23 bytes. The cache entry is written when the inline keyboard is built and expires at `AgentQuestion.ExpiresAt + 5 minutes` (a grace period beyond the question's `ExpiresAt` to ensure `QuestionTimeoutService` can still resolve the `HumanAction` from cache when processing timeouts at or slightly after `ExpiresAt` — this eliminates the race condition where the cache entry expires before the timeout service reads it).
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string. **However**, when the selected `HumanAction.RequiresComment` is `true` (e.g., the "Need info" action in e2e-scenarios.md), the `HumanDecisionEvent` is **deferred**: the `CallbackQueryHandler` sets `PendingQuestionRecord.Status = AwaitingComment`, sends a prompt to the operator ("Please reply with your comment"), and returns without emitting the event. When the operator's text reply arrives via the inbound pipeline's text-reply handler, it is matched to the `AwaitingComment` record by chat ID, the `HumanDecisionEvent` is then published with both the `ActionValue` (e.g., `"need-info"`) and the `Comment` (the operator's text), and the record transitions to `Answered`. This two-step flow is tested by e2e-scenarios.md "RequiresComment defers decision" and implementation-plan.md Stage 3.5 "RequiresComment flow."
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
 5. Audit record is written with `MessageId`, `UserId`, `AgentId`, timestamp, and `CorrelationId`.
@@ -536,7 +554,7 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 > `/handoff TASK-ID @operator-alias` performs a full oversight transfer. The handler:
 > 1. Validates syntax (two arguments: task ID and operator alias). If invalid, returns usage help: "Usage: `/handoff TASK-ID @operator-alias`".
 > 2. Validates that the specified task exists and the sending operator currently has oversight.
-> 3. Resolves the target operator (`@operator-alias`) via `IOperatorRegistry.GetByAliasAsync`. If the alias is not registered, returns an error.
+> 3. Resolves the target operator (`@operator-alias`) via `IOperatorRegistry.GetByAliasAsync(alias, tenantId)` where `tenantId` is the sending operator's tenant. The `UNIQUE (OperatorAlias, TenantId)` index ensures the lookup cannot resolve an operator in a different tenant. If the alias is not registered in the sending operator's tenant, returns an error.
 > 4. Transfers oversight by creating or updating a `TaskOversight` record (see below) mapping the task to the target operator.
 > 5. Notifies both operators — the sender receives confirmation, the target receives a handoff notification with task context.
 > 6. Persists an audit record with handoff details (task ID, source operator, target operator, timestamp, `CorrelationId`).
@@ -544,7 +562,7 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 >
 > **`TaskOversight` entity:** Defined in §3.1 above. A lightweight entity mapping `(TaskId, OperatorBindingId)` to track which operator currently has oversight of which task. The `/handoff` handler creates or updates this record, and the orchestrator subscription filter reads it to route agent events to the correct operator.
 >
-> **Cross-doc alignment note:** All four sibling documents are now aligned on full oversight transfer as the decided `/handoff` behavior. Implementation-plan.md Stage 3.2 specifies `HandoffCommandHandler` with full oversight transfer including validation, target resolution via `IOperatorRegistry.GetByAliasAsync`, `TaskOversight` record mutation, dual-operator notification, and audit. E2e-scenarios.md tests the full transfer flow. Tech-spec D-4 documents the decision. The `OperatorBinding.OperatorAlias` unique index supports alias resolution for the target operator lookup.
+> **Cross-doc alignment note:** All four sibling documents are now aligned on full oversight transfer as the decided `/handoff` behavior. Implementation-plan.md Stage 3.2 specifies `HandoffCommandHandler` with full oversight transfer including validation, target resolution via `IOperatorRegistry.GetByAliasAsync(alias, tenantId)`, `TaskOversight` record mutation, dual-operator notification, and audit. E2e-scenarios.md tests the full transfer flow. Tech-spec D-4 documents the decision. The `UNIQUE (OperatorAlias, TenantId)` constraint on `OperatorBinding` ensures alias resolution is tenant-scoped, preventing cross-tenant mis-resolution during `/handoff`.
 
 ---
 
@@ -629,7 +647,7 @@ Authorization uses a **two-tier model**: a static configuration-time allowlist g
 }
 ```
 
-When `/start` is received, the `StartCommandHandler` (1) checks `AllowedUserIds`, (2) looks up the user's entry in `UserTenantMappings` to obtain `TenantId`, `WorkspaceId`, `Roles`, and `OperatorAlias`, and (3) calls `IOperatorRegistry.RegisterAsync(userId, chatId, tenantId, workspaceId)` to create the `OperatorBinding` record with all required fields populated. If the mapping contains multiple workspace entries for a user, `/start` creates one `OperatorBinding` per workspace; subsequent commands trigger workspace disambiguation via inline keyboard (per §4.3). The `ChatType` field (`Private`, `Group`, `Supergroup`) is derived from the Telegram `Update.Message.Chat.Type` field at `/start` time.
+When `/start` is received, the `StartCommandHandler` (1) checks `AllowedUserIds`, (2) looks up the user's entry in `UserTenantMappings` to obtain `TenantId`, `WorkspaceId`, `Roles`, and `OperatorAlias`, (3) derives `ChatType` from `Update.Message.Chat.Type`, and (4) calls `IOperatorRegistry.RegisterAsync` with an `OperatorRegistration` value object carrying all required fields (`TelegramUserId`, `TelegramChatId`, `ChatType`, `TenantId`, `WorkspaceId`, `Roles`, `OperatorAlias`) to create the `OperatorBinding` record. If the mapping contains multiple workspace entries for a user, `/start` creates one `OperatorBinding` per workspace; subsequent commands trigger workspace disambiguation via inline keyboard (per §4.3). The `ChatType` field (`Private`, `Group`, `Supergroup`) is derived from the Telegram `Update.Message.Chat.Type` field at `/start` time.
 
 **Key design decisions:**
 - **Chat IDs are not independently allow-listed in configuration**, but the story's "validate chat/user allowlist" requirement is fully satisfied by the two-tier model. Here is why: the story requires that commands from unauthorized chats/users are rejected. Tier 2 accomplishes this — every inbound command is checked against `OperatorBinding` records, which store both `TelegramUserId` and `TelegramChatId`. A command from an unregistered (user, chat) pair is rejected, even if the user has a binding in a different chat. This is functionally equivalent to maintaining a separate `AllowedChatIds` configuration list, but more secure: chat authorization is always tied to a specific (user, chat, workspace) triple created through the auditable `/start` onboarding flow, rather than a static config list that could drift from reality. In effect, the `OperatorBinding` table **is** the chat/user allowlist — it is just persisted in the database rather than in configuration.
@@ -694,7 +712,7 @@ The 2-second P95 send-latency target and the 100+ agent burst requirement demand
 
 #### P95 Metric Definition
 
-The story requires "P95 send latency under 2 seconds after event is queued." This architecture defines the following **canonical** latency metrics. This document (architecture.md §10.4) is the **single canonical source** for metric names and measurement semantics; sibling documents should defer to these definitions. **Cross-document status (verified this iteration):** all sibling documents — tech-spec.md (HC-4, Section 10), implementation-plan.md (Stage 4.1, PERF001), and e2e-scenarios.md (performance scenarios, metrics table, footer) — are aligned on metric names (`telegram.send.first_attempt_latency_ms`, `telegram.send.all_attempts_latency_ms`, `telegram.send.queue_dwell_ms`), enqueue-to-HTTP-200 measurement points, and P95 scope. No divergences remain. The canonical definitions are:
+The story requires "P95 send latency under 2 seconds after event is queued." This architecture defines the following **canonical** latency metrics. This document (architecture.md §10.4) is the **single canonical source** for metric names and measurement semantics; sibling documents should defer to these definitions. The canonical definitions are:
 
 > **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = elapsed time from the **enqueue instant** (`OutboundMessage.CreatedAt`, the moment the message is persisted to the outbound queue) to Telegram Bot API returning HTTP 200, measured **only** for messages that succeed on their **first delivery attempt** and are **not** delayed by a 429 rate-limit hold. This measurement preserves the story requirement "P95 send latency under 2 seconds **after event is queued**" by starting the clock at enqueue, not dequeue. Per operator clarification (answer to `p95-metric-scope`), the P95 measurement includes only first-attempt, non-rate-limited sends — not retried sends or rate-limited wait time. This is the metric the **P95 ≤ 2 s** acceptance criterion applies to.
 >
@@ -769,7 +787,7 @@ Under a burst of 1 000+ simultaneous agent events:
 | **`update_id` as the deduplication key** | Telegram guarantees `update_id` is unique and monotonically increasing per bot. Using it directly avoids the cost of hashing message content. |
 | **Webhook secret token validation** | Telegram supports a `secret_token` parameter on `setWebhook` (added in Bot API 6.0). This is cheaper and simpler than IP-allowlisting Telegram's data-center ranges. |
 | **Single `ITelegramUpdatePipeline`** | Forces webhook and long-poll modes through identical logic, eliminating a class of "works in dev, breaks in prod" bugs. |
-| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Fits within Telegram's 64-byte `callback_data` limit. `ActionId` is a short identifier; the full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, with expiry set to `AgentQuestion.ExpiresAt + 5 minutes` (grace period ensures the cache entry survives past the question timeout for `QuestionTimeoutService` to resolve the default action). On callback, the handler looks up the original `AgentQuestion` and resolves the chosen action. This aligns with tech-spec decision D-3 and avoids encoding complex payloads in the 64-byte field. |
+| **Inline keyboard `callback_data` format: `cb:<token>`** | Uses a generated 20-character Base62 callback token (total `cb:` + token = 23 bytes, well within Telegram's 64-byte `callback_data` limit). The server stores a mapping from `<token>` → `(QuestionId, ActionId)` in `IDistributedCache` (see tech-spec D-3), decoupling the callback payload from domain ID lengths. The cache entry expires at `AgentQuestion.ExpiresAt + 5 minutes` (grace period ensures the entry survives past the question timeout for `QuestionTimeoutService` to resolve the default action). On callback, the handler looks up `(QuestionId, ActionId)` from the token, retrieves the original `AgentQuestion`, and resolves the chosen action. |
 
 ---
 
