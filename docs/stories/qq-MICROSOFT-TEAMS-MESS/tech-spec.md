@@ -31,7 +31,7 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 
 | Area | Detail |
 |------|--------|
-| **Bot Framework integration** | ASP.NET Core bot endpoint using `Microsoft.Bot.Builder`, `Microsoft.Bot.Builder.Integration.AspNet.Core`, and `Microsoft.Bot.Connector.Teams`. `TeamsActivityHandler` and Teams-specific middleware are provided by the `Microsoft.Bot.Builder` package itself (no separate `Microsoft.Bot.Builder.Teams` NuGet required). |
+| **Bot Framework integration** | ASP.NET Core bot endpoint using `Microsoft.Bot.Builder`, `Microsoft.Bot.Builder.Integration.AspNet.Core`, `Microsoft.Bot.Builder.Teams`, and `Microsoft.Bot.Connector.Teams`. `Microsoft.Bot.Builder.Teams` provides `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods. `Microsoft.Bot.Connector.Teams` provides Teams-specific model types (`TeamsChannelData`, `TeamInfo`, `TeamsChannelAccount`). |
 | **Command handling** | `agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume` — parsed from personal chat and team channel messages. |
 | **Adaptive Cards** | Card templates for: agent questions, approval gates, release gates, incident summaries. Card actions map to `HumanAction` values. Card update and delete for already-sent cards. |
 | **Proactive messaging** | Store `ConversationReference` per authorized user/channel. Rehydrate after restart. Deliver agent-initiated questions, approval requests, and incident notifications. |
@@ -86,7 +86,8 @@ These are non-negotiable requirements drawn from the story description, enterpri
 |------------|--------|
 | C# / .NET 8+ | Epic-level mandate (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Overview: "Implementation language must be C# / .NET 8+") |
 | `Microsoft.Bot.Builder` (≥ 4.22) + `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22) | Story description requirement. Provides `ActivityHandler`, `BotAdapter`, and ASP.NET Core integration. |
-| `Microsoft.Bot.Connector.Teams` (≥ 4.22) | Story description requirement (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Recommended C# Libraries under MSG-MT-001). Provides Teams-specific model types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`. Note: `TeamsActivityHandler`, Teams middleware, and helper methods for Teams activities are included in the `Microsoft.Bot.Builder` package — no separate `Microsoft.Bot.Builder.Teams` NuGet package is needed. |
+| `Microsoft.Bot.Builder.Teams` (≥ 4.22) | Provides `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods for Teams activities. This is a separate NuGet package from `Microsoft.Bot.Builder`. Aligned with `implementation-plan.md` Stage 2.1. |
+| `Microsoft.Bot.Connector.Teams` (≥ 4.22) | Story description requirement (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Recommended C# Libraries under MSG-MT-001). Provides Teams-specific model types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`. |
 | ASP.NET Core hosting | Required by Bot Builder Integration package |
 
 ### 4.2 Identity & Security

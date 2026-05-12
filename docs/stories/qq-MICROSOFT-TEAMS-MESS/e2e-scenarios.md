@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.3 — Iteration 3 (feedback-addressed)
+**Version:** 1.4 — Iteration 4 (feedback-addressed)
 
 ---
 
@@ -781,7 +781,7 @@ Feature: Edge Cases and Error Handling
     And subsequent proactive messages use the updated ServiceUrl
 
   Scenario: Concurrent approvals for the same single-decision question (first-writer-wins)
-    Given question "Q-999" is a single-decision question (RequiredApprovals = 1)
+    Given question "Q-999" is a single-decision question (the release gate threshold is 1)
     And question "Q-999" was sent to both "alice@contoso.com" and "bob@contoso.com"
     When both users click "Approve" within the same second
     Then exactly one HumanDecisionEvent is created (first-writer-wins)
@@ -789,7 +789,7 @@ Feature: Edge Cases and Error Handling
     And both outcomes are audit-logged
 
   Scenario: Concurrent approvals for a multi-approver release gate (all recorded)
-    Given question "Q-998" is a release-gate question with RequiredApprovals = 2
+    Given question "Q-998" is a release-gate question with a threshold of 2 required approvals
     And question "Q-998" was sent to both "alice@contoso.com" and "bob@contoso.com"
     When both users click "Approve" within the same second
     Then both approvals are accepted and recorded as separate HumanDecisionEvents
@@ -797,7 +797,7 @@ Feature: Edge Cases and Error Handling
     And both individual approvals are audit-logged
     And the release gate transitions to approved state only after reaching the required count
 
-  > **Note:** Single-decision questions (e.g., standard agent blocking questions) use first-writer-wins semantics — only the first response is authoritative. Multi-approver release gates (e.g., release-gate scenario in §Adaptive Cards) require a configurable `RequiredApprovals` count and record all individual decisions until the threshold is met. The `AgentQuestion.AllowedActions` metadata and a `RequiredApprovals` field on the question distinguish the two modes.
+  > **Note:** Single-decision questions (e.g., standard agent blocking questions) use first-writer-wins semantics — only the first response is authoritative. Multi-approver release gates (e.g., release-gate scenario in §Adaptive Cards) require a configurable approval threshold tracked at the orchestration/workflow layer (not on the `AgentQuestion` record itself, which only defines `AllowedActions`). The orchestrator records all individual decisions until the threshold is met. The `AgentQuestion.AllowedActions` metadata defines available buttons; the release-gate configuration determines how many approvals are needed.
 
   Scenario: Bot Framework token refresh during long-running operation
     Given the bot's authentication token is about to expire

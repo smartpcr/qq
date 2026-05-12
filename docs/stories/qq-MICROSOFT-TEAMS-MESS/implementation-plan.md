@@ -45,9 +45,9 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Implementation Steps
 - [ ] Create project `AgentSwarm.Messaging.Persistence` targeting .NET 8.
-- [ ] Define `IAuditLogger` interface with method `LogAsync(AuditEntry, CancellationToken)` where `AuditEntry` includes `Timestamp`, `Actor`, `Action`, `Resource`, `CorrelationId`, `Details`.
+- [ ] Define `IAuditLogger` interface with method `LogAsync(AuditEntry, CancellationToken)` where `AuditEntry` includes all canonical fields from `tech-spec.md` §4.3: `Timestamp` (DateTimeOffset), `CorrelationId` (string), `EventType` (string — values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`), `ActorId` (string — AAD object ID for users, agent ID for agents), `ActorType` (string — `User` or `Agent`), `TenantId` (string), `TaskId` (string, optional), `ConversationId` (string, optional), `Action` (string), `PayloadJson` (string — sanitized JSON payload), `Outcome` (string — `Success`, `Rejected`, `Failed`, `DeadLettered`).
 - [ ] Define `IMessageStore` interface for persisting inbound/outbound messages with methods: `SaveInboundAsync`, `SaveOutboundAsync`, `GetByCorrelationIdAsync`.
-- [ ] Implement `AuditEntry` as an immutable record with required fields for enterprise compliance review.
+- [ ] Implement `AuditEntry` as an immutable record with all canonical fields listed above plus an implementation-specific `Checksum` field (SHA-256 of row content for tamper detection).
 
 ### Dependencies
 - phase-messaging-abstractions-and-data-model/stage-core-data-models
@@ -255,7 +255,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 5.2: Audit Logging Implementation
 
 ### Implementation Steps
-- [ ] Implement `SqlAuditLogger : IAuditLogger` writing to an append-only `AuditLog` table with columns: `Id`, `Timestamp`, `Actor`, `ActorTenantId`, `Action`, `Resource`, `CorrelationId`, `Details` (JSON), `Checksum` (SHA-256 of row content for tamper detection).
+- [ ] Implement `SqlAuditLogger : IAuditLogger` writing to an append-only `AuditLog` table with columns matching the canonical schema from `tech-spec.md` §4.3: `Id` (surrogate PK), `Timestamp` (DateTimeOffset), `CorrelationId` (string), `EventType` (string — `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`), `ActorId` (string — AAD object ID or agent ID), `ActorType` (string — `User` or `Agent`), `TenantId` (string), `TaskId` (string, nullable), `ConversationId` (string, nullable), `Action` (string), `PayloadJson` (string — sanitized JSON), `Outcome` (string — `Success`, `Rejected`, `Failed`, `DeadLettered`), `Checksum` (SHA-256 of row content for tamper detection).
 - [ ] Create EF Core migration for the `AuditLog` table with a clustered index on `Timestamp` and non-clustered index on `CorrelationId`.
 - [ ] Instrument all command handlers to emit audit entries: log the command, user identity, tenant, timestamp, and outcome.
 - [ ] Instrument proactive message sends to emit audit entries: log the target user, message type, correlation ID, and delivery status.
