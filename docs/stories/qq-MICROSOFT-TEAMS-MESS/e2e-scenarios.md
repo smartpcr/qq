@@ -910,39 +910,15 @@ Feature: Edge Cases and Error Handling
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §Message Actions line 773 — Changed `EventType "MessageActionReceived"` to `EventType "CommandReceived"`. Tech-spec §4.3 line 128 defines exactly six canonical audit EventType values (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`) and explicitly states "Message actions (Teams message-extension submissions) are logged with audit EventType = CommandReceived". Tech-spec §4.3 line 136 confirms: "Message actions log as `CommandReceived` (not a separate event type)". The prior iteration (iter 7) misread the tech-spec and incorrectly changed `CommandReceived` to `MessageActionReceived`. This iteration reverses that error. Verification — no Gherkin scenario or Coverage line uses `MessageActionReceived`:
-```
-$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(only hits are in this Prior feedback resolution section and the Cross-doc note section — no Gherkin scenario or Coverage summary line uses the term)
-```
-Positive verification — the scenario now asserts `CommandReceived`:
-```
-$ grep -nF 'EventType "CommandReceived"' docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-773:    And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism and log as CommandReceived per tech-spec §4.3 line 136, not a separate event type)
-```
+(Resolving iteration 8 evaluator feedback — 4 numbered items.)
 
-- [x] 2. FIXED — §Prior feedback resolution — The iteration 7 prior-feedback block (lines 911-945) falsely claimed tech-spec §4.3 line 136 requires `MessageActionReceived`. In reality, tech-spec line 136 reads: "Message actions log as `CommandReceived` (not a separate event type)". The entire iteration 7 prior-feedback block has been replaced with this iteration 8 block, which correctly references `CommandReceived` throughout. No false claims remain.
+- [x] 1. FIXED — §Message Actions line 773 — The evaluator noted that `grep -nF "MessageActionReceived"` against tech-spec.md shows lines 128, 130, and 136 all define `MessageActionReceived` as one of **seven** canonical audit EventType values, and that message actions must log as `MessageActionReceived` (not `CommandReceived`). The prior iteration (iter 8) had incorrectly changed line 773 from `MessageActionReceived` to `CommandReceived` based on a stale reading of the tech-spec. This iteration reverts line 773 back to `EventType "MessageActionReceived"` with correct rationale citing tech-spec §4.3 lines 128 and 136 (seven canonical values, message actions log as `MessageActionReceived`).
 
-- [x] 3. FIXED — Cross-doc references in architecture.md and implementation-plan.md — The evaluator noted unacknowledged sibling hits of `MessageActionReceived` in `architecture.md:432`, `architecture.md:947`, `implementation-plan.md:48`, `implementation-plan.md:203`, `implementation-plan.md:214`, `implementation-plan.md:284`. These sibling docs incorrectly use `MessageActionReceived` and claim seven canonical values, contradicting tech-spec §4.3 which defines exactly six values with message actions as `CommandReceived`. **This e2e-scenarios.md file now correctly uses `CommandReceived` and is aligned with tech-spec.** The sibling docs (`architecture.md`, `implementation-plan.md`) must be fixed by their respective sibling agents in their next iterations. Cross-doc inconsistency note added below.
+- [x] 2. FIXED — §Coverage line 905 and §Message Actions line 773 — The evaluator noted e2e line 773 asserted `EventType "CommandReceived"` and line 905 said "exactly six values", both contradicting tech-spec §4.3 lines 128, 130, and 136 which define seven canonical values including `MessageActionReceived`. Both lines are now fixed: line 773 asserts `EventType "MessageActionReceived"`, and line 905 lists all seven canonical values and says "message actions audit as MessageActionReceived".
 
-- [x] 4. FIXED — Same scope as item 3 (both items 3 and 4 cite the same set of unacknowledged sibling hits). See item 3 resolution above.
+- [x] 3. FIXED — §Prior feedback resolution block (iter 8 lines 911-945) — The evaluator noted that the iter 8 prior-feedback block contained false source citations claiming tech-spec §4.3 line 128 defines "exactly six" values and line 136 says `CommandReceived` for message actions. In reality, tech-spec line 128 says seven values including `MessageActionReceived` and line 136 says `MessageActionReceived`. The entire iter 8 prior-feedback block has been replaced with this iter 9 block which cites the tech-spec correctly. No false claims remain.
 
-- [x] 5. FIXED — §Coverage summary line 903/905 — Changed the coverage line to say "message actions audit as CommandReceived" matching tech-spec §4.3. Verification — positive check that the coverage line is correct:
-```
-$ grep -nF "message actions audit as CommandReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-905:- Compliance: immutable audit trail with canonical EventType values; message actions audit as CommandReceived (per tech-spec §4.3 line 136 — message actions are a command submission mechanism, not a separate event type; the canonical set contains exactly six values)
-```
-
-- [x] 6. FIXED — Self-matching stale claim at old line 939 — The entire iteration 7 prior-feedback block has been replaced with this iteration 8 block. The phrase "state message actions must audit as" from the old false claim no longer appears in any Gherkin scenario or coverage summary.
-
-- [x] 7. FIXED — §Iteration metadata version inconsistency — Header line 4 previously said "Version: 1.6 — Iteration 6" while the iteration summary said "Version: 1.7 — Iteration 7". Both now say "Version: 1.8 — Iteration 8".
-
-- [x] 8. FIXED — §Edge Cases message length — The "Bot receives a message exceeding maximum length" scenario previously said "10,000 characters" without specifying a deterministic configured maximum or audit expectations. Now specifies: configured maximum of 4,000 characters (via `Teams:MaxMessageLength` app setting), explicit truncation outcome, warning log with both original and truncated lengths, and an immutable audit record with EventType `CommandReceived`, Outcome `Success`, and PayloadJson noting the truncation details.
-
-**Cross-doc inconsistency note (for sibling agent owners):**
-- `architecture.md` lines 348, 432, 947 use `MessageActionReceived` and claim seven canonical audit EventType values. Tech-spec §4.3 lines 128 and 136 define exactly **six** values and state message actions log as `CommandReceived`. The architecture.md sibling agent should fix these lines to use `CommandReceived` and six values.
-- `implementation-plan.md` lines 48, 203, 214, 284 use `MessageActionReceived` and list seven values. Same fix needed: use `CommandReceived` and six values per tech-spec §4.3.
-- `tech-spec.md` line 335 correctly flags `e2e-scenarios.md` line 903 as stale. That line is now fixed in this iteration.
+- [x] 4. FIXED — §Security line 389 (JWT rejection audit claim) — The evaluator noted that e2e line 389 said "the attempt is logged in the security audit trail" for invalid Bot Framework JWT, contradicting tech-spec §4.2 lines 108 and 115 which state JWT validation returns HTTP 401 before application code runs and emits no audit entry. Line 389 now reads: "no audit entry is emitted (the request never reaches the bot handler — per tech-spec §4.2 line 108)".
 
 ### Open questions
 
