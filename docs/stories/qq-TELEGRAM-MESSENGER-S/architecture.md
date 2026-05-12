@@ -1064,6 +1064,7 @@ A 100+ agent alert burst may generate far more than 50 Critical+High messages (e
 | Condition | P95 ≤ 2 s? | Message loss? |
 |---|---|---|
 | **Steady state** (queue depth < 100, no rate-limiting) | **Yes**, all severities | At-least-once delivered or dead-lettered |
+| ↳ *e2e-scenarios.md SC-PERF-01 (100 paced messages, queue depth < 100, no 429s)* | *Falls within this envelope — P95 ≤ 2 s across all severities is correctly asserted* | |
 | **Bounded burst** (≤ 50 Critical+High in a 1000-msg burst, distributed across ≥ 10 operator chats — operator-approved topology per `burst-topology-envelope`; see §10.4 Burst Scenario item 3) | **Yes**, Critical+High only; Normal/Low exceed 2 s | At-least-once delivered or dead-lettered |
 | **Near-boundary burst** (50–60 Critical+High) | **At risk** — P95 approaches/exceeds 2 s depending on HTTP variance | At-least-once delivered or dead-lettered |
 | **Degraded burst** (> ~60 Critical+High, e.g., 100+ agent cascade) | **No** — queue dwell grows proportionally; P95 may reach 5–30 s depending on volume | At-least-once delivered or dead-lettered; priority ordering ensures highest-severity messages drain first |
