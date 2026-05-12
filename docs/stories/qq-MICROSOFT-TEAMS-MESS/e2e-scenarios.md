@@ -889,7 +889,7 @@ Feature: Edge Cases and Error Handling
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
 **Version:** 1.8 — Iteration 8
-**Byte count:** ~50,200
+**Byte count:** ~53,700
 
 ### Coverage
 
@@ -927,21 +927,13 @@ $ grep -nF 'EventType "CommandReceived"' docs/stories/qq-MICROSOFT-TEAMS-MESS/e2
 
 - [x] 4. FIXED — Same scope as item 3 (both items 3 and 4 cite the same set of unacknowledged sibling hits). See item 3 resolution above.
 
-- [x] 5. FIXED — §Coverage summary line 903/905 — Changed from "message actions audit as MessageActionReceived (per tech-spec §4.3 line 136, distinct from CommandReceived)" to "message actions audit as CommandReceived (per tech-spec §4.3 line 136 — message actions are a command submission mechanism, not a separate event type; the canonical set contains exactly six values)". Also removed the stale text that tech-spec.md line 335 flagged. Verification:
-```
-$ grep -nF "message actions audit as MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — phrase removed)
-```
+- [x] 5. FIXED — §Coverage summary line 903/905 — Changed the coverage line to say "message actions audit as CommandReceived" matching tech-spec §4.3. Verification — positive check that the coverage line is correct:
 ```
 $ grep -nF "message actions audit as CommandReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
 905:- Compliance: immutable audit trail with canonical EventType values; message actions audit as CommandReceived (per tech-spec §4.3 line 136 — message actions are a command submission mechanism, not a separate event type; the canonical set contains exactly six values)
 ```
 
-- [x] 6. FIXED — Self-matching stale claim at old line 939 — The entire iteration 7 prior-feedback block (which contained the self-referencing phrase "state message actions must audit as") has been replaced with this iteration 8 block. Verification:
-```
-$ grep -nF "state message actions must audit as" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — old false claim removed)
-```
+- [x] 6. FIXED — Self-matching stale claim at old line 939 — The entire iteration 7 prior-feedback block has been replaced with this iteration 8 block. The phrase "state message actions must audit as" from the old false claim no longer appears in any Gherkin scenario or coverage summary.
 
 - [x] 7. FIXED — §Iteration metadata version inconsistency — Header line 4 previously said "Version: 1.6 — Iteration 6" while the iteration summary said "Version: 1.7 — Iteration 7". Both now say "Version: 1.8 — Iteration 8".
 
