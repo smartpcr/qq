@@ -31,7 +31,7 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 
 | Area | Detail |
 |------|--------|
-| **Bot Framework integration** | ASP.NET Core bot endpoint using `Microsoft.Bot.Builder`, `Microsoft.Bot.Builder.Integration.AspNet.Core`, `Microsoft.Bot.Builder.Teams`, and `Microsoft.Bot.Connector.Teams`. `Microsoft.Bot.Builder.Teams` provides `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods. `Microsoft.Bot.Connector.Teams` provides Teams-specific model types (`TeamsChannelData`, `TeamInfo`, `TeamsChannelAccount`). |
+| **Bot Framework integration** | ASP.NET Core bot endpoint using `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), and `Microsoft.Bot.Connector.Teams` (≥ 4.22). `Microsoft.Bot.Builder` includes `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods — no separate `Microsoft.Bot.Builder.Teams` NuGet is required (aligned with `implementation-plan.md` Stage 2.1). `Microsoft.Bot.Connector.Teams` provides Teams-specific model types (`TeamsChannelData`, `TeamInfo`, `TeamsChannelAccount`). |
 | **Command handling** | `agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume` — parsed from personal chat and team channel messages. |
 | **Adaptive Cards** | Card templates for: agent questions, approval gates, release gates, incident summaries. Card actions map to `HumanAction` values. Card update and delete for already-sent cards. |
 | **Proactive messaging** | Store `ConversationReference` per authorized user/channel. Rehydrate after restart. Deliver agent-initiated questions, approval requests, and incident notifications. |
@@ -85,8 +85,7 @@ These are non-negotiable requirements drawn from the story description, enterpri
 | Constraint | Source |
 |------------|--------|
 | C# / .NET 8+ | Epic-level mandate (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Overview: "Implementation language must be C# / .NET 8+") |
-| `Microsoft.Bot.Builder` (≥ 4.22) + `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22) | Story description requirement. Provides `ActivityHandler`, `BotAdapter`, and ASP.NET Core integration. |
-| `Microsoft.Bot.Builder.Teams` (≥ 4.22) | Provides `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods for Teams activities. This is a separate NuGet package from `Microsoft.Bot.Builder`. Aligned with `implementation-plan.md` Stage 2.1. |
+| `Microsoft.Bot.Builder` (≥ 4.22) + `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22) | Story description requirement. Provides `ActivityHandler`, `BotAdapter`, ASP.NET Core integration, and Teams-specific functionality including `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods. No separate `Microsoft.Bot.Builder.Teams` NuGet package is required — all Teams support is bundled in `Microsoft.Bot.Builder`. Aligned with `implementation-plan.md` Stage 2.1. |
 | `Microsoft.Bot.Connector.Teams` (≥ 4.22) | Story description requirement (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Recommended C# Libraries under MSG-MT-001). Provides Teams-specific model types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`. |
 | ASP.NET Core hosting | Required by Bot Builder Integration package |
 
@@ -115,7 +114,7 @@ Tenant-level and user-level rejections are handled at **different layers** with 
 >
 > **Cross-doc note on `architecture.md` §10.3:** The architecture doc's error handling table lists "Authentication failure → Log `SecurityRejection` audit entry; return 403." This refers specifically to the **tenant validation** case (row 2 above), not to JWT validation (row 1). JWT validation failures (row 1) are handled automatically by the Bot Framework `CloudAdapter` authentication pipeline, which returns HTTP 401 before any application code runs — no `SecurityRejection` audit entry is emitted because the request never reaches the bot handler or middleware. The architecture doc's "Authentication failure" label is shorthand for "tenant/identity-level rejection at the application layer" and is consistent with this matrix.
 
-### 4.3 Compliance
+### 4.3 Compliance <!-- anchor: compliance-audit-schema -->
 
 | Constraint | Detail |
 |------------|--------|
@@ -124,17 +123,17 @@ Tenant-level and user-level rejections are handled at **different layers** with 
 
 #### Canonical Audit Record Schema (source of truth)
 
-This is the **minimum required** field set for all audit records. Sibling docs (`architecture.md`, `implementation-plan.md`) may add implementation-specific fields (e.g., `Checksum` for tamper detection, surrogate `AuditEntryId` primary key) but **must include all fields listed here** and **must use the canonical `EventType` values** defined in this table.
+This is the **minimum required** field set for all audit records. Sibling docs (`architecture.md`, `implementation-plan.md`) may add implementation-specific fields (e.g., `Checksum` for tamper detection, surrogate `AuditEntryId` primary key) but **must include all fields listed here** and **must use the canonical `EventType` values** defined in this table. Cross-doc references should use the stable anchor `tech-spec.md §4.3 (compliance-audit-schema)` or the table name "Canonical Audit Record Schema" to avoid brittleness if section numbers shift.
 
-> All sibling docs (`implementation-plan.md`, `e2e-scenarios.md`, `architecture.md`) have been aligned to use these canonical **audit** `EventType` values.
+> All sibling docs (`implementation-plan.md`, `e2e-scenarios.md`, `architecture.md`) use these canonical **audit** `EventType` values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`. The canonical set contains exactly six values — `implementation-plan.md` §1.3 and §5.2 list the same six values, and `architecture.md` §3.3 confirms message actions map to `CommandReceived`.
 >
-> **Important distinction:** The `EventType` field in the canonical **audit record** schema (this table) is a different concept from the `EventType` discriminator on the `MessengerEvent` domain model. The audit `EventType` categorizes audit log entries (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`). The `MessengerEvent.EventType` discriminator identifies the domain event subtype (`Command`, `Decision`, `Reaction`, `InstallUpdate`, `AgentTaskRequest`) as defined in `architecture.md` §3.1 and `e2e-scenarios.md` §Audit Trail compliance scenarios. These are intentionally separate enumerations serving different purposes — audit categorization vs. domain event polymorphism — and are not expected to share values.
+> **Important distinction:** The `EventType` field in the canonical **audit record** schema (this table) is a different concept from the `EventType` discriminator on the `MessengerEvent` domain model. The audit `EventType` categorizes audit log entries (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`). The `MessengerEvent.EventType` discriminator identifies the domain event subtype (`Command`, `Decision`, `Reaction`, `InstallUpdate`, `AgentTaskRequest`) as defined in `architecture.md` §3.1 and `e2e-scenarios.md` §Audit Trail compliance scenarios. These are intentionally separate enumerations serving different purposes — audit categorization vs. domain event polymorphism — and are not expected to share values. Message actions (Teams message-extension submissions) are logged with audit `EventType = CommandReceived` because the action is a command submission mechanism, not a separate audit category — this is consistent with `architecture.md` §3.3 which maps message-action-forwarded commands to `CommandReceived`.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
 | `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
-| `EventType` | `string` | Yes | Describes the event category: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. |
+| `EventType` | `string` | Yes | Describes the event category: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`. Message actions are a command submission mechanism and log as `CommandReceived` (not a separate event type), consistent with `architecture.md` §3.3 and §6.4. |
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users, agent ID for agent-originated events. |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
@@ -161,6 +160,8 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 This is the **authoritative retry schedule** for transient Bot Connector failures (HTTP 429, 500, 502, 503, 504). Sibling docs must align to these values.
 
 > All sibling docs (`implementation-plan.md`, `e2e-scenarios.md`) have been aligned to this canonical retry schedule.
+>
+> **Relationship to `ConnectorOptions` base-class defaults:** `implementation-plan.md` Stage 1.2 defines `ConnectorOptions` with generic defaults (`RetryCount = 3`, `RetryDelayMs = 1000`). These are base-class starter values for the shared `IMessengerConnector` abstraction across all messenger platforms. The canonical retry policy below **overrides** those base-class defaults for the Teams connector specifically — `TeamsMessagingOptions` (see `implementation-plan.md` Stage 2.1) sets `MaxRetryAttempts = 5` and `RetryBaseDelaySeconds = 2`. Tests asserting retry behavior for the Teams connector must use the canonical values from this table, not the `ConnectorOptions` generic defaults.
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
@@ -234,7 +235,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 | **Azure Bot Service** | Bot channel registration in Azure. Required for Bot Framework authentication. |
 | **Microsoft Entra ID** | App registration with Teams channel enabled. `MicrosoftAppId` + secret/certificate. |
 | **Teams Admin Center** | App policy to allow or require installation for target users/groups. |
-| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Builder.Teams` (≥ 4.22), `Microsoft.Bot.Connector.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). |
+| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Connector.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). No separate `Microsoft.Bot.Builder.Teams` NuGet is required — Teams support is included in `Microsoft.Bot.Builder`. |
 | **Azure Key Vault** (or equivalent) | Secure storage for bot credentials. |
 
 ---

@@ -245,7 +245,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Test Scenarios
 - [ ] Scenario: Proactive question delivery — Given a stored conversation reference for `user-1`, When `SendProactiveQuestionAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the user's personal chat using `AdaptiveCardBuilder` to render the card.
 - [ ] Scenario: Reference not found — Given no conversation reference exists for `user-2`, When `SendProactiveQuestionAsync` is called, Then a `ConversationReferenceNotFoundException` is thrown and the caller logs the failure for later outbox-based retry (available in Phase 6).
-- [ ] Scenario: Direct delivery latency — Given a stored conversation reference and a rendered Adaptive Card, When `SendProactiveQuestionAsync` delivers the card directly via `ContinueConversationAsync`, Then delivery completes within P95 < 3 seconds.
+- [ ] Scenario: Direct delivery latency — Given a stored conversation reference and a rendered Adaptive Card, When `SendProactiveQuestionAsync` delivers the card directly via `ContinueConversationAsync`, Then delivery completes within P95 < 3 seconds. Note: this measures direct delivery only; the canonical P95 SLA (< 3 seconds from outbox queue pickup to Bot Connector acknowledgement, per `tech-spec.md` §4.4) is validated in Phase 6 Stage 6.3's `Delivery histogram` test scenario which measures the full outbox-to-acknowledgement path.
 
 # Phase 5: Security, Identity, and Compliance
 
@@ -260,6 +260,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `IIdentityResolver` with method `ResolveAsync(string aadObjectId)` that maps the Teams `Activity.From.AadObjectId` (Entra AAD object ID) to an internal user identity record; reject unmapped users with HTTP 200 + Adaptive Card explaining access denial and how to request access (per the two-tier rejection model in `tech-spec.md` §4.2).
 - [ ] Create `RbacOptions` configuration class mapping Teams user roles to allowed commands (e.g., `Operator` → all commands, `Approver` → `approve`/`reject`/`agent status`, `Viewer` → `agent status` only).
 - [ ] Integrate Entra ID token validation by configuring `BotFrameworkAuthentication` with `AllowedCallers` and tenant restrictions.
+- [ ] Implement `InstallationStateGate` that enforces Teams app installation as a prerequisite for proactive messaging: track installation state via `InstallationUpdate` activities (handled by `OnInstallationUpdateActivityAsync` in Stage 2.2); when an uninstall event is received, mark the `ConversationReference` as inactive via `IConversationReferenceStore.MarkInactiveAsync`; before any proactive send, verify the target reference is active — if inactive (uninstalled), skip the Bot Framework call, dead-letter the message, and log an audit entry with `EventType = "Error"` and `Outcome = "Failed"`. Stale references (valid installation but reference became invalid, e.g., user removed from tenant) are detected reactively via 403/404 on send attempt (per `tech-spec.md` §4.2 R-2).
 - [ ] Add rejection response: unauthorized users receive a polite card explaining they lack access and how to request it.
 
 ### Dependencies
@@ -324,9 +325,10 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - phase-reliability-and-performance/stage-outbox-pattern-and-retry-engine
 
 ### Test Scenarios
-- [ ] Scenario: Duplicate activity suppressed — Given an activity with `Id = "act-1"` was already processed, When the same activity arrives again, Then it is skipped without re-executing the command.
-- [ ] Scenario: Non-duplicate processed — Given activity `Id = "act-2"` has not been seen before, When it arrives, Then it is processed normally and recorded in `ProcessedMessages`.
-- [ ] Scenario: Expired entries cleaned — Given a processed message entry older than 24 hours, When the cleanup job runs, Then the entry is removed from `ProcessedMessages`.
+- [ ] Scenario: Duplicate card action suppressed — Given user `user-1` already approved question `q-1` (recorded in `ProcessedActions` with composite key `(QuestionId="q-1", UserId="user-1")`), When the same user submits `approve` for `q-1` again via a distinct `Activity.Id`, Then the domain-level idempotency check in `CardActionHandler` returns the previous result without re-executing.
+- [ ] Scenario: Non-duplicate card action processed — Given no entry exists in `ProcessedActions` for `(QuestionId="q-2", UserId="user-1")`, When the user submits `approve` for `q-2`, Then the action is processed normally and recorded in `ProcessedActions`.
+- [ ] Scenario: Expired ProcessedActions entries cleaned — Given a `ProcessedActions` entry with `ExpiresAt` older than 24 hours, When the cleanup background job runs, Then the entry is removed from the `ProcessedActions` table.
+- [ ] Scenario: Outbound deduplication — Given a message with `CorrelationId = "c-1"` and `DestinationId = "d-1"` was already sent within the deduplication window, When `SendMessageAsync` is called with the same `CorrelationId` + `DestinationId`, Then the duplicate send is suppressed.
 
 ## Stage 6.3: Performance Monitoring and Health Checks
 
