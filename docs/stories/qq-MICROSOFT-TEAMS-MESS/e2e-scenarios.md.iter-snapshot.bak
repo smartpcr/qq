@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.5 — Iteration 5 (feedback-addressed)
+**Version:** 1.4 — Iteration 4 (feedback-addressed)
 
 ---
 
@@ -43,8 +43,7 @@ Feature: Personal Chat — Agent Task Creation
   Scenario: User sends an unrecognised command
     Given user "alice@contoso.com" opens a personal chat with the Teams bot
     When the user sends "hello there"
-    And a MessengerEvent of type "Text" is enqueued with the raw input as payload
-    And the bot replies with a help card listing available commands:
+    Then the bot replies with a help card listing available commands:
       | Command       | Description        |
       | agent ask     | Create task        |
       | agent status  | Query status       |
@@ -667,7 +666,7 @@ Feature: Correlation and Traceability
     Then it contains all fields defined in the canonical MessengerEvent model (architecture.md §3.1):
       | Field          | Constraint                                              |
       | EventId        | Non-empty unique identifier                             |
-      | EventType      | One of: AgentTaskRequest, Command, Decision, Text, Escalation, PauseAgent, ResumeAgent, InstallUpdate, Reaction |
+      | EventType      | One of: AgentTaskRequest, Decision, Text, InstallUpdate, Reaction |
       | CorrelationId  | Non-empty UUID for end-to-end tracing                   |
       | Messenger      | "Teams"                                                 |
       | ExternalUserId | Non-empty (Teams AAD object ID)                         |
