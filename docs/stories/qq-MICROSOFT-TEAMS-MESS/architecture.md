@@ -951,7 +951,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 | `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`) |
 | `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IMessageOutbox`, retry policies, deduplication, rate limiting |
 | `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), storage implementations (SQL, Azure Table) |
-| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore` |
+| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore`, `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult` |
 | `AgentSwarm.Messaging.Worker` | Host | ASP.NET Core worker service hosting the Teams connector, DI registration, health checks, OpenTelemetry configuration |
 | `AgentSwarm.Messaging.Tests` | Test | Unit and integration tests for all assemblies |
 
@@ -1026,6 +1026,8 @@ services.AddSingleton<CommandParser>();
 services.AddSingleton<CardActionHandler>();
 services.AddSingleton<InstallHandler>();
 services.AddSingleton<MessageExtensionHandler>();
+services.AddSingleton<IIdentityResolver, EntraIdentityResolver>();
+services.AddSingleton<IUserAuthorizationService, RbacAuthorizationService>();
 services.AddHostedService<OutboxWorker>();
 ```
 
