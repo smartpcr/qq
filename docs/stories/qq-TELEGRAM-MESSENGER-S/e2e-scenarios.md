@@ -111,8 +111,7 @@ Feature: Agent blocking question delivered to Telegram
     And no human responds within 2 minutes
     When ExpiresAt is reached
     Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionId "act-1"
-    And resolves the corresponding HumanAction from the cache
-    And publishes a HumanDecisionEvent with that HumanAction.Value as ActionValue
+    And publishes a HumanDecisionEvent with DefaultActionId "act-1" as the ActionValue directly (no IDistributedCache lookup — the cache entry expires at ExpiresAt per tech-spec D-3 and may be evicted; the DefaultActionId string is sufficient per architecture.md §10.3)
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
 
   Scenario: Question timeout with no default action
@@ -288,11 +287,11 @@ Feature: Durable outbound message queue with retry and dead-letter
 
   Scenario: Burst of 1000+ agent alerts without message loss (within bounded-volume assumption)
     # architecture.md §10.4 bounded-volume assumption: P95 ≤ 2s for Critical/High
-    # holds when ≤ 60 Critical+High messages are in any burst window (at 30 msg/s
-    # with 10 workers, the top 60 priority messages drain in ≤ 2s of queue dwell).
+    # holds when ≤ 50 Critical+High messages are in any burst window (at 30 msg/s
+    # with token-bucket burst capacity, the top 50 priority messages drain in ≤ 2s of queue dwell).
     Given 1000 agents each enqueue one alert message simultaneously
-    And the messages have mixed severities: 30 Critical, 30 High, 440 Normal, 500 Low
-    And the Critical+High total (60) is within the bounded-volume assumption of ≤ 60 per burst (architecture.md §10.4)
+    And the messages have mixed severities: 25 Critical, 25 High, 450 Normal, 500 Low
+    And the Critical+High total (50) is within the bounded-volume assumption of ≤ 50 per burst (architecture.md §10.4)
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
@@ -301,17 +300,17 @@ Feature: Durable outbound message queue with retry and dead-letter
     And telegram.send.first_attempt_latency_ms (acceptance gate) is emitted for messages that succeed on first attempt without rate-limiting (per architecture.md §10.4: enqueue instant — OutboundMessage.CreatedAt — to HTTP 200, first-attempt, non-rate-limited sends only)
     And telegram.send.all_attempts_latency_ms (all-inclusive) is emitted for all 1000 messages regardless of attempt number or rate-limit holds (per architecture.md §10.4: enqueue to HTTP 200 — capacity planning)
     And telegram.send.queue_dwell_ms (diagnostic) is emitted for all 1000 messages (per architecture.md §10.4: enqueue to dequeue — queue backlog monitoring)
-    And P95 telegram.send.first_attempt_latency_ms for Critical and High severity messages is under 2 seconds (per architecture.md §10.4: with ≤ 60 Critical+High messages in the burst, priority queuing drains them within ~2s of queue dwell at 30 msg/s)
+    And P95 telegram.send.first_attempt_latency_ms for Critical and High severity messages is under 2 seconds (per architecture.md §10.4: with ≤ 50 Critical+High messages in the burst, the P95 — 48th message — completes at ~1,900 ms; between 50–60, P95 approaches and may exceed 2s)
     And Normal and Low severity messages may exceed the 2-second P95 under sustained burst due to accumulated queue dwell (per architecture.md §10.4: "Normal/Low first-attempt sends may exceed 2 s P95 under sustained burst due to accumulated queue dwell")
     And queue dwell time (telegram.send.queue_dwell_ms) increases under burst as expected; telegram.send.all_attempts_latency_ms (enqueue-to-200, all-inclusive) provides the full delivery view for capacity planning
     And time spent waiting during 429 backoff is tracked via telegram.send.rate_limited_wait_ms for operational diagnostics
 
   Scenario: Burst exceeding bounded-volume assumption degrades Critical/High P95 gracefully
-    # architecture.md §10.4: if a burst exceeds 60 Critical+High messages,
-    # some may breach the 2s P95; queue_dwell_ms provides visibility.
+    # architecture.md §10.4: if a burst exceeds 50 Critical+High messages,
+    # P95 approaches and may exceed 2s; beyond ~60, P95 clearly exceeds 2s.
     Given 1000 agents each enqueue one alert message simultaneously
     And the messages have mixed severities: 200 Critical, 200 High, 300 Normal, 300 Low
-    And the Critical+High total (400) exceeds the bounded-volume assumption of ≤ 60 per burst (architecture.md §10.4)
+    And the Critical+High total (400) exceeds the bounded-volume assumption of ≤ 50 per burst (architecture.md §10.4)
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered (zero message loss)
     And Critical/High messages are still dispatched before Normal/Low via priority queuing
@@ -695,7 +694,7 @@ Feature: Observability integration
       | telegram.send.queue_dwell_ms             | histogram | architecture.md §10.4: diagnostic (enqueue to dequeue — queue backlog monitoring) |
       | telegram.send.retry_latency_ms           | histogram | architecture.md §10.4 diagnostic (retried sends)            |
       | telegram.send.rate_limited_wait_ms       | histogram | architecture.md §10.4 rate-limit tracking                   |
-      | telegram.updates.received             | counter   | §8 metrics table               |
+      | telegram.messages.received            | counter   | §8 metrics table               |
       | telegram.messages.sent                | counter   | §8 metrics table               |
       | telegram.messages.dead_lettered       | counter   | §8 metrics table               |
       | telegram.messages.backpressure_dlq    | counter   | architecture.md §10.4 backpressure dead-letter (canonical name per operator answer to backpressure-dlq-metric-name; aligned across architecture.md and tech-spec.md HC-5) |
@@ -753,6 +752,6 @@ _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `appr
 _Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are aligned on `MaxAttempts` default 5._
 _Handoff semantics: `/handoff` performs full oversight transfer per architecture.md §5.5, tech-spec.md D-4, and implementation-plan.md Stage 3.2 — task validation, operator resolution via `IOperatorRegistry`, `TaskOversight` mutation, dual notification, and audit._
 _Metric naming: Per architecture.md §10.4 (canonical source): **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = enqueue instant (`OutboundMessage.CreatedAt`) to HTTP 200, first-attempt non-rate-limited sends only — P95 ≤ 2s. **`telegram.send.all_attempts_latency_ms`** (all-inclusive) = enqueue (`OutboundMessage.CreatedAt`) to HTTP 200, all messages regardless of attempt or rate-limit — capacity planning. **`telegram.send.queue_dwell_ms`** (diagnostic) = enqueue to dequeue. Additional diagnostics: `telegram.send.retry_latency_ms`, `telegram.send.rate_limited_wait_ms`. Backpressure dead-letter counter: `telegram.messages.backpressure_dlq` (canonical per architecture.md §10.4; operator-confirmed). All sibling documents (architecture.md §8/§10.4, tech-spec.md HC-4/Section 10, implementation-plan.md Stage 4.1/PERF001) are aligned on metric names, enqueue-to-HTTP-200 measurement points, and P95 scope._
-_P95 metric scope: Per operator answer to `p95-metric-scope`, the P95 ≤ 2s criterion applies to first-attempt, non-rate-limited sends only. Under normal load (low queue depth), the 2s target holds across all severities. Under burst (1000+ messages), priority queuing ensures Critical/High messages meet the 2s target when ≤ 60 Critical+High messages are in the burst (architecture.md §10.4 bounded-volume assumption: at 30 msg/s with 10 workers, top 60 priority messages drain in ≤ 2s of queue dwell); if a burst exceeds 60 Critical+High, some may breach 2s P95 and queue_dwell_ms provides visibility. Normal/Low may exceed 2s due to queue dwell (per architecture.md §10.4)._
+_P95 metric scope: Per operator answer to `p95-metric-scope`, the P95 ≤ 2s criterion applies to first-attempt, non-rate-limited sends only. Under normal load (low queue depth), the 2s target holds across all severities. Under burst (1000+ messages), priority queuing ensures Critical/High messages meet the 2s target when ≤ 50 Critical+High messages are in the burst (architecture.md §10.4 bounded-volume assumption: at 30 msg/s with token-bucket burst capacity, the P95 of 50 priority messages — the 48th message — completes at ~1,900 ms); between 50–60 Critical+High, P95 approaches and may exceed 2s depending on HTTP variance; beyond ~60, P95 clearly exceeds 2s. Normal/Low may exceed 2s due to queue dwell (per architecture.md §10.4)._
 _Group-chat authorization: Runtime authorization checks `OperatorBinding` records matching both `TelegramUserId` and `TelegramChatId` via `IOperatorRegistry.IsAuthorizedAsync`. Commands and button taps in groups are authorized by the (user, chat) pair. An unauthorized user in an authorized group is rejected (per tech-spec.md S-5)._
 _Authorization model: Two-tier model per architecture.md §7.1. Tier 1 (onboarding): `/start` checks `Telegram:AllowedUserIds`. Tier 2 (runtime): all other commands check `OperatorBinding` records via `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)`. Access revocation is modeled by setting `OperatorBinding.IsActive=false`._
