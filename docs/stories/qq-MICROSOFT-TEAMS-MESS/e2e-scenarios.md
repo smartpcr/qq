@@ -821,3 +821,57 @@ Feature: Edge Cases and Error Handling
     Then the user must resend the command — Bot Framework does not queue missed webhook deliveries
     And no stale or phantom commands appear in the inbound queue
 ```
+
+---
+
+## Iteration Summary
+
+**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
+**Byte count:** ~42,225 bytes
+**Version:** 1.4 — Iteration 4
+
+### Coverage
+
+- Personal chat task creation (agent ask, agent status, unrecognised commands)
+- Proactive messaging — blocking questions via Adaptive Cards
+- Adaptive Card approve/reject/need-more-info actions
+- Card update and delete lifecycle
+- Conversation reference persistence and rehydration
+- Security: tenant validation, RBAC, bot installation checks, Bot Framework token validation
+- Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, idempotency
+- Performance: P95 < 3s card delivery
+- Compliance: immutable audit trail with canonical EventType values
+- Observability: distributed tracing with CorrelationId
+- Message actions (message extensions)
+- Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes
+
+### Prior feedback resolution
+
+- [x] 1. FIXED — §Adaptive Cards line 591 + §Edge Cases lines 783, 791, 799 — Removed `RequiredApprovals` as an `AgentQuestion` field. Multi-approver release gates are now expressed as an orchestration/workflow-layer configuration ("threshold of 2 required approvals") rather than an unanchored field on `AgentQuestion`. The `AgentQuestion` record only uses fields defined in architecture.md §3.1. Verification:
+  ```
+  $ grep -nF "RequiredApprovals" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+  (empty — all references removed)
+  ```
+
+- [x] 2. FIXED — §Observability line 670 — Replaced non-canonical EventType list `Command, Decision, Reaction, InstallUpdate, AgentTaskRequest` with canonical values from architecture.md §3.1: `AgentTaskRequest, Decision, Text, InstallUpdate, Reaction`. Removed `Command` (which is the C# subtype name, not the EventType value) and added `Text` (for unrecognised free-text input). Verification:
+  ```
+  $ grep -nF "One of: Command" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+  (empty — non-canonical value removed)
+  ```
+
+- [x] 3. FIXED — §Observability lines 673–674 — Added `ActivityId` (nullable, for webhook dedup) and `Source` (nullable, null for DMs / "MessageAction" for forwarded messages) to the canonical MessengerEvent field table, matching architecture.md §3.1 lines 310–311. Verification:
+  ```
+  $ grep -nF "ActivityId" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+  451:      | PayloadJson       | {"questionId":"Q-1001","targetAadObjectId":"<alice's AadObjectId>","activityId":"<Teams activity ID>"} |
+  673:      | ActivityId     | Nullable — inbound Activity.Id for dedup (per architecture.md §3.1) |
+  ```
+
+- [x] 4. FIXED — §Security line 323 — Removed "And the stale reference is not retried (per tech-spec §4.3 R-2)" from the missing-reference scenario. This scenario establishes that NO conversation reference exists (line 317), so referencing a "stale reference" was contradictory. The scenario now consistently describes the no-reference path: detect missing reference → skip Bot Framework call → dead-letter → audit. Verification:
+  ```
+  $ grep -nF "stale reference is not retried" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+  (empty — contradictory line removed)
+  ```
+
+### Open questions
+
+None — all feedback items resolved this iteration.

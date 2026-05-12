@@ -112,6 +112,8 @@ Tenant-level and user-level rejections are handled at **different layers** with 
 | Allowed tenant, mapped user, insufficient RBAC role | `IUserAuthorizationService` (inside bot handler) | HTTP 200 + Adaptive Card explaining insufficient permissions | `InsufficientRoleRejected` |
 
 > **Design rationale:** Tenant-level rejection uses HTTP 403 because the middleware intercepts the request before the bot handler runs — there is no conversation context in which to send a card. User-level rejections (unmapped identity, insufficient RBAC) occur inside the bot handler where a conversation turn is active, so a polite Adaptive Card is the appropriate response. This two-tier rejection model is the canonical behavior across all plan docs — `implementation-plan.md` and `e2e-scenarios.md` have been aligned accordingly.
+>
+> **Cross-doc note on `architecture.md` §10.3:** The architecture doc's error handling table lists "Authentication failure → Log `SecurityRejection` audit entry; return 403." This refers specifically to the **tenant validation** case (row 2 above), not to JWT validation (row 1). JWT validation failures (row 1) are handled automatically by the Bot Framework `CloudAdapter` authentication pipeline, which returns HTTP 401 before any application code runs — no `SecurityRejection` audit entry is emitted because the request never reaches the bot handler or middleware. The architecture doc's "Authentication failure" label is shorthand for "tenant/identity-level rejection at the application layer" and is consistent with this matrix.
 
 ### 4.3 Compliance
 
@@ -232,7 +234,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 | **Azure Bot Service** | Bot channel registration in Azure. Required for Bot Framework authentication. |
 | **Microsoft Entra ID** | App registration with Teams channel enabled. `MicrosoftAppId` + secret/certificate. |
 | **Teams Admin Center** | App policy to allow or require installation for target users/groups. |
-| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Connector.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). |
+| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Builder.Teams` (≥ 4.22), `Microsoft.Bot.Connector.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). |
 | **Azure Key Vault** (or equivalent) | Secure storage for bot credentials. |
 
 ---

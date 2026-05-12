@@ -315,9 +315,9 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 6.2: Duplicate Suppression and Idempotency
 
 ### Implementation Steps
-- [ ] Create `IdempotencyStore` with a `ProcessedMessages` table containing: `MessageId` (unique), `ProcessedAt`, `ExpiresAt`.
-- [ ] Implement `IdempotencyMiddleware` for the activity handler pipeline that checks `activity.Id` against `ProcessedMessages` before processing.
-- [ ] Add cleanup background job to purge expired entries from `ProcessedMessages` (default TTL: 24 hours).
+- [ ] Create `IdempotencyStore` with a `ProcessedActions` table containing: `QuestionId` + `UserId` composite key, `ActionValue`, `ProcessedAt`, `ExpiresAt`. This provides domain-level idempotency for Adaptive Card action callbacks (per `architecture.md` §2.16 distinction: transport-level deduplication on `Activity.Id` is handled by `ActivityDeduplicationMiddleware` registered in the bot adapter pipeline in Stage 2.1; this domain-level store catches semantically duplicate card actions that arrive as distinct activities).
+- [ ] Implement domain-level idempotency check in `CardActionHandler`: before processing an Adaptive Card action, check if the `(QuestionId, UserId)` pair has already been processed in `IdempotencyStore`. If so, return the previous result without re-executing.
+- [ ] Add cleanup background job to purge expired entries from `ProcessedActions` (default TTL: 24 hours).
 - [ ] Implement outbound deduplication: `SendMessageAsync` checks if a message with the same `CorrelationId` + `DestinationId` was already sent within a configurable window.
 
 ### Dependencies

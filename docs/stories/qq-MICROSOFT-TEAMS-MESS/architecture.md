@@ -315,13 +315,17 @@ The base record carries the common envelope fields. Each subtype adds a typed pa
 
 | Subtype (C# record) | `EventType` value | Typed payload | When produced |
 |---|---|---|---|
-| `CommandEvent` | `AgentTaskRequest` | `ParsedCommand` | User sends `agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume` in chat or channel. Also produced for message-action forwards (with `Source = MessageAction`). Aligns with `e2e-scenarios.md` §Personal Chat lines 26, 40 which expect `MessengerEvent` type `AgentTaskRequest`. |
+| `CommandEvent` | `AgentTaskRequest` | `ParsedCommand` | User sends `agent ask <text>` in chat, channel, or via message-action forward (with `Source = MessageAction`). Aligns with `e2e-scenarios.md` §Personal Chat lines 26, 40. |
+| `CommandEvent` | `Command` | `ParsedCommand` | User sends `agent status`, `approve`, or `reject`. General-purpose command event for non-task-creation commands. Aligns with `e2e-scenarios.md` §Tracing line 670 which lists `Command` as an allowed `EventType`. |
+| `CommandEvent` | `Escalation` | `ParsedCommand` | User sends `escalate`. Aligns with `e2e-scenarios.md` §Escalation line 543. |
+| `CommandEvent` | `PauseAgent` | `ParsedCommand` | User sends `pause`. Aligns with `e2e-scenarios.md` §Pause line 551. |
+| `CommandEvent` | `ResumeAgent` | `ParsedCommand` | User sends `resume`. Aligns with `e2e-scenarios.md` §Resume line 560. |
 | `DecisionEvent` | `Decision` | `HumanDecisionEvent` | User taps an Adaptive Card action button (approve/reject/etc.). |
 | `TextEvent` | `Text` | `string` (raw text) | Unrecognized free-text input that does not match a command pattern. |
 | *(base)* | `InstallUpdate` | `InstallEventPayload` | Bot installed/uninstalled from personal scope or team. |
 | *(base)* | `Reaction` | `ReactionPayload` | User adds/removes a reaction to a bot message. |
 
-> **Cross-doc alignment:** `implementation-plan.md` §1.1 line 19 defines `MessengerEvent` as a base record with subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`. This architecture adopts that subtype structure and maps each subtype to a canonical `EventType` discriminator value. The `AgentTaskRequest` value (not `Command`) is used for all command-originated events, aligning with `e2e-scenarios.md` lines 26 and 40.
+> **Cross-doc alignment:** `implementation-plan.md` §1.1 line 19 defines `MessengerEvent` as a base record with subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`. This architecture adopts that subtype structure. The `CommandEvent` subtype uses variable `EventType` discriminator values depending on the parsed command — `AgentTaskRequest` for `agent ask`, `Command` for general commands, `Escalation`/`PauseAgent`/`ResumeAgent` for lifecycle commands — aligning with `e2e-scenarios.md` which expects these as distinct event types (lines 543, 551, 560, 670). The `CommandParser` sets the `EventType` based on the recognized command pattern.
 
 ### 3.2 Teams-Specific Entities
 
