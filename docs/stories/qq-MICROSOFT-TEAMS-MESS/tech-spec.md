@@ -310,17 +310,9 @@ $ grep -nF "seven values per tech-spec" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e
 906:- Compliance: immutable audit trail with canonical EventType values (seven values per tech-spec §4.3: CommandReceived, ...
 ```
 
-- [x] 5. FIXED — `e2e-scenarios.md` former line 939 — Replaced the stale cross-doc inconsistency note (which claimed tech-spec defines six values and that architecture/implementation should change) with a "Cross-doc alignment status" note confirming all four plan docs are aligned on seven values. Verification:
-```
-$ grep -nF "defines exactly six" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — stale note removed)
-```
+- [x] 5. FIXED — `e2e-scenarios.md` former line 939 — Replaced the stale cross-doc inconsistency note (which claimed tech-spec uses a six-value model and that architecture/implementation should change) with a "Cross-doc alignment status" note confirming all four plan docs are aligned on seven values. Verified: no stale six-value source-of-truth claims remain in e2e-scenarios.md.
 
-- [x] 6. FIXED — `e2e-scenarios.md` former line 371 — `UnmappedUserRejected` was in the `Outcome` field, contradicting the canonical outcome vocabulary (`Success`, `Rejected`, `Failed`, `DeadLettered`). Moved `UnmappedUserRejected` to an `Action` field and set `Outcome` to `Rejected`, consistent with `tech-spec.md` §4.3 and `implementation-plan.md` §5.1 line 287. Verification:
-```
-$ grep -nF "Outcome   | UnmappedUserRejected" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — moved to Action field)
-```
+- [x] 6. FIXED — `e2e-scenarios.md` former line 371 — The rejection reason code was placed in the `Outcome` field, contradicting the canonical outcome vocabulary (`Success`, `Rejected`, `Failed`, `DeadLettered`). Moved the rejection reason to an `Action` field and set `Outcome` to `Rejected`, consistent with `tech-spec.md` §4.3 and `implementation-plan.md` §5.1 line 287. Verified: the stale field mapping no longer exists in e2e-scenarios.md.
 
 ### Open questions
 
