@@ -1217,9 +1217,9 @@ This section tracks known discrepancies between architecture.md and sibling plan
 
 ### A.1 Discrepancies with implementation-plan.md
 
-All previously outstanding items have been resolved in iteration 13 by updating the sibling documents to match the canonical contracts defined in this architecture document.
+All previously outstanding items have been resolved through iteration 15 by updating the sibling documents to match the canonical contracts defined in this architecture document.
 
-#### Resolved items (iterations 3–13)
+#### Resolved items (iterations 3–15)
 
 1. **`OutboundMessage.SourceEnvelopeJson` — RESOLVED (iteration 4).** Implementation-plan.md Stage 1.2 now includes `SourceEnvelopeJson` (`string?`) in the `OutboundMessage` record definition, matching architecture.md §3.1.
 
@@ -1251,6 +1251,20 @@ All previously outstanding items have been resolved in iteration 13 by updating 
 
 15. **Timeout `ActionValue` semantics — RESOLVED (iteration 13).** Implementation-plan.md Stage 3.5 and e2e-scenarios.md timeout scenario now specify that the timeout path publishes `DefaultActionValue` (the resolved `HumanAction.Value`) as `ActionValue`, not `DefaultActionId` directly — consistent with architecture.md §3.1 and §10.3 where `HumanAction.Value` is the canonical `ActionValue` for both interactive and timeout paths.
 
-### A.2 Discrepancies with e2e-scenarios.md
+16. **`PendingQuestion` DTO completeness — RESOLVED (iteration 15).** Implementation-plan.md Stage 1.3 `PendingQuestion` DTO now includes all fields required by the architecture's timeout and RequiresComment flows: `DefaultActionValue` (for timeout event emission), `SelectedActionId` (for tracking operator's button selection), `SelectedActionValue` (for emitting `HumanDecisionEvent.ActionValue` from durable storage), `RespondentUserId` (for correlating follow-up text replies), and `StoredAt` (for deterministic tie-breaking in `GetAwaitingCommentAsync`). These fields match the `PendingQuestionRecord` persistence entity defined in architecture.md §3.1.
 
-All items resolved. E2e-scenarios.md timeout scenario (iteration 13) now uses `DefaultActionValue` ("approve") as the `ActionValue`, consistent with the data model where `HumanAction.Value` is the canonical `ActionValue` for all paths (interactive and timeout).
+### A.2 Discrepancies with tech-spec.md
+
+All items resolved. Tech-spec.md S-3, HC-3, and §8 Acceptance Criteria now use `DefaultActionValue` (the resolved `HumanAction.Value`) as the canonical value for timeout event emission, consistent with architecture.md §3.1 and §10.3.
+
+#### Resolved items (iteration 15)
+
+17. **Timeout semantics `DefaultActionId` → `DefaultActionValue` — RESOLVED (iteration 15).** Tech-spec.md S-3 (line 25), HC-3 (line 67), and §8 Acceptance Criteria (line 126) previously described timeout behavior using only `DefaultActionId`. Updated all three locations to specify that the connector denormalizes into both `PendingQuestionRecord.DefaultActionId` (for display/audit) and `PendingQuestionRecord.DefaultActionValue` (the resolved `HumanAction.Value`, for timeout event emission), and that `QuestionTimeoutService` reads `DefaultActionValue` to publish `HumanDecisionEvent.ActionValue` — consistent with architecture.md §3.1 `PendingQuestionRecord.DefaultActionValue` and §10.3.
+
+### A.3 Discrepancies with e2e-scenarios.md
+
+All items resolved. E2e-scenarios.md question-rendering steps now include both `DefaultActionId` and `DefaultActionValue` in the expected `PendingQuestionRecord` persistence shape, consistent with the timeout scenario (line 111) and architecture.md §3.1.
+
+#### Resolved items (iteration 15)
+
+18. **Question-rendering `PendingQuestionRecord` shape — RESOLVED (iteration 15).** E2e-scenarios.md lines 82 and 99 previously asserted that the connector creates a `PendingQuestionRecord` with only `DefaultActionId "act-1"`. Updated both lines to assert `DefaultActionId "act-1" and DefaultActionValue "approve"` (resolved from `HumanAction.Value` where `ActionId` matches `ProposedDefaultActionId`), consistent with the timeout scenario at line 111 and architecture.md §3.1.
