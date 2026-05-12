@@ -148,7 +148,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Lifecycle` |
-| **Responsibility** | Handle `installationUpdate` and `conversationUpdate` activities. On install/member-add: validate tenant ID against allowlist, extract `ConversationReference`, persist it in `ConversationReferenceStore`, and send a welcome Adaptive Card. On uninstall: mark the conversation reference as inactive. |
+| **Responsibility** | Handle `installationUpdate` and `conversationUpdate` activities. On install/member-add: validate tenant ID against allowlist, extract `ConversationReference`, persist it via `IConversationReferenceStore.SaveAsync`, and send a welcome Adaptive Card. On uninstall: call `IConversationReferenceStore.MarkInactiveAsync` to mark the conversation reference as inactive. |
 
 ### 2.8 ConversationReferenceStore
 
