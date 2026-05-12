@@ -935,7 +935,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 3. `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to `MessageExtensionHandler`.
 4. `MessageExtensionHandler` extracts the source message text and metadata, delegates to `CommandParser` to parse the forwarded content (aligned with `e2e-scenarios.md` §Message Actions which expects delegation to `CommandParser`).
 5. A `MessengerEvent` of type `AgentTaskRequest` is built with `Source = MessageAction` (aligned with `e2e-scenarios.md` which expects `MessengerEvent` type `AgentTaskRequest` with `Source = MessageAction`, not `MessageAction` type).
-6. An audit entry of type `MessageActionReceived` is logged (message actions use a dedicated canonical audit `EventType` from `tech-spec.md` §4.3, distinct from `CommandReceived` to capture the submission mechanism).
+6. An audit entry of type `CommandReceived` is logged (message actions are a command submission mechanism and use the canonical audit `EventType = CommandReceived` per `tech-spec.md` §4.3 line 136, not a separate event type).
 7. A confirmation card is returned to the user ("Message forwarded to agent — tracking ID: {CorrelationId}").
 8. `TeamsMessengerConnector` publishes the `MessengerEvent` to the inbound buffer.
 9. The orchestrator consumes the event and routes the forwarded context to the appropriate agent.

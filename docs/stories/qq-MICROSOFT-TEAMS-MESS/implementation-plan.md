@@ -84,6 +84,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Implementation Steps
 - [ ] Create `TeamsSwarmActivityHandler` extending `TeamsActivityHandler` with DI for `IConversationReferenceStore`, `IAuditLogger`, and `ILogger<TeamsSwarmActivityHandler>`.
 - [ ] Override `OnMessageActivityAsync` to parse incoming text commands (`agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume`) and route to a command dispatcher.
+- [ ] In `OnMessageActivityAsync`, before dispatching the command, extract the `ConversationReference` from the incoming `Activity` via `Activity.GetConversationReference()` and call `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it. This ensures conversation references are captured on first interaction (not only on install/member-add lifecycle events), satisfying `e2e-scenarios.md` §Conversation Reference Persistence scenario "Conversation reference is stored on first interaction" (lines 252-256).
 - [ ] Override `OnTeamsMembersAddedAsync` to capture and persist the conversation reference on bot installation.
 - [ ] Override `OnTeamsMembersRemovedAsync` to mark stored conversation references as inactive (retain for audit) on bot uninstall via `IConversationReferenceStore.MarkInactiveAsync`; do not delete references.
 - [ ] Override `OnInstallationUpdateActivityAsync` to handle Teams app install/uninstall lifecycle and log audit entries; on uninstall, mark conversation references inactive rather than removing them.
@@ -97,6 +98,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Command routing — Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
 - [ ] Scenario: Bot install captures reference — Given a `MembersAdded` activity where the bot is added, When processed, Then the conversation reference is persisted via `IConversationReferenceStore.SaveAsync`.
 - [ ] Scenario: Correlation ID propagation — Given an incoming activity without a `CorrelationId` header, When `OnTurnAsync` runs, Then a new GUID-based `CorrelationId` is attached to the turn context.
+- [ ] Scenario: First interaction saves reference — Given user `dave@contoso.com` has never interacted with the bot before, When `dave` sends `agent status` in personal chat, Then `OnMessageActivityAsync` extracts the conversation reference from the activity and calls `IConversationReferenceStore.SaveOrUpdateAsync`, persisting the reference keyed by `(AadObjectId, TenantId)` before dispatching the command.
 
 ## Stage 2.3: Teams Messenger Connector
 
@@ -216,10 +218,12 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 4.1: Conversation Reference Store Implementation
 
 ### Implementation Steps
-- [ ] Implement `SqlConversationReferenceStore : IConversationReferenceStore` using Entity Framework Core with a `ConversationReferences` table containing: `Id`, `UserId`, `TenantId`, `ChannelId`, `ServiceUrl`, `ConversationJson` (serialized `ConversationReference`), `CreatedAt`, `UpdatedAt`.
-- [ ] Create EF Core migration for the `ConversationReferences` table with indexes on `UserId` and `TenantId`.
-- [ ] Implement `GetByUserIdAsync` and `GetByChannelIdAsync` query methods for targeted proactive messaging.
-- [ ] Implement reference update logic: if a newer reference arrives for the same user/channel, update in place rather than insert duplicate.
+- [ ] Implement `SqlConversationReferenceStore : IConversationReferenceStore` using Entity Framework Core with a `ConversationReferences` table containing: `Id` (PK), `UserId`, `TenantId`, `ChannelId`, `ServiceUrl`, `ConversationJson` (serialized `ConversationReference`), `IsActive` (bool, default `true` — set to `false` by `MarkInactiveAsync` on uninstall), `DeactivatedAt` (DateTimeOffset, nullable — timestamp when marked inactive), `DeactivationReason` (string, nullable — `Uninstalled` or `StaleReference`), `CreatedAt`, `UpdatedAt`.
+- [ ] Create EF Core migration for the `ConversationReferences` table with indexes on `(UserId, TenantId)` (unique), `TenantId`, `ChannelId`, and a filtered index on `IsActive = true` for efficient active-reference queries used by `GetAllActiveAsync` and proactive send pre-checks.
+- [ ] Implement `MarkInactiveAsync(string userId, string tenantId)` to set `IsActive = false`, `DeactivatedAt = DateTimeOffset.UtcNow`, and `DeactivationReason = "Uninstalled"` without deleting the row (retained for audit).
+- [ ] Implement `IsActiveAsync(string userId, string tenantId)` to check `IsActive` status before proactive sends, used by `InstallationStateGate` (Stage 5.1) and `ProactiveNotifier` (Stage 4.2) to skip inactive references.
+- [ ] Implement `GetByUserIdAsync` and `GetByChannelIdAsync` query methods returning only active references for targeted proactive messaging.
+- [ ] Implement `SaveOrUpdateAsync` with upsert logic: if a reference arrives for the same `(UserId, TenantId)`, update in place and reset `IsActive = true`, `DeactivatedAt = null` — this handles re-installation after a prior uninstall.
 
 ### Dependencies
 - _none — start stage_
