@@ -103,6 +103,24 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 
 Links a Telegram identity to the swarm's authorization model. Each row represents one (user, chat, workspace) binding, supporting multi-chat and multi-workspace scenarios described in e2e-scenarios (§Agent Routing and Tenant Mapping).
 
+#### MessengerMessage (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
+
+The common message envelope used by `IMessengerConnector.SendMessageAsync` for all non-question outbound messages (status updates, command acknowledgements, alert notifications). Carries the full metadata required by tech-spec HC-9 and implementation-plan.md Stage 1.2.
+
+| Field | Type | Description |
+|---|---|---|
+| `MessageId` | `string` | Unique message identifier (UUID). |
+| `CorrelationId` | `string` | End-to-end trace/correlation ID. |
+| `AgentId` | `string` | Originating or target agent identifier. Required by tech-spec HC-9. |
+| `TaskId` | `string` | Associated task/work-item identifier. Required by tech-spec HC-9. |
+| `ConversationId` | `string` | Conversation context identifier linking related messages. Required by tech-spec HC-9. |
+| `Timestamp` | `DateTimeOffset` | Message creation time (UTC). Required by tech-spec HC-9. |
+| `Text` | `string` | Message body text. |
+| `Severity` | `MessageSeverity` | Enum: `Critical`, `High`, `Normal`, `Low`. Determines outbound priority queue ordering. |
+| `Metadata` | `Dictionary<string, string>` | Extensible key-value pairs for connector-specific context (e.g., formatting hints, routing overrides). |
+
+> **Cross-doc alignment (MessengerMessage):** Implementation-plan.md Stage 1.2 defines `MessengerMessage` with these exact fields (`MessageId`, `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, `Text`, `Severity`, `Metadata`). Tech-spec HC-9 requires all messages to carry `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, and `Timestamp`. The `OutboundMessage` entity (below) wraps `MessengerMessage` as its serialized `Payload` field, adding queue-specific fields (`IdempotencyKey`, `Status`, `AttemptCount`, etc.) for durable delivery.
+
 | Field | Type | Description |
 |---|---|---|
 | `Id` | `Guid` | Surrogate primary key. |
@@ -384,6 +402,7 @@ public interface IOperatorRegistry
     Task<IReadOnlyList<OperatorBinding>> GetBindingsAsync(long telegramUserId, long chatId, CancellationToken ct);
     Task<IReadOnlyList<OperatorBinding>> GetAllBindingsAsync(long telegramUserId, CancellationToken ct);
     Task<OperatorBinding?> GetByAliasAsync(string operatorAlias, string tenantId, CancellationToken ct);
+    Task<IReadOnlyList<OperatorBinding>> GetByWorkspaceAsync(string workspaceId, CancellationToken ct);
     Task RegisterAsync(OperatorRegistration registration, CancellationToken ct);
     Task<bool> IsAuthorizedAsync(long telegramUserId, long chatId, CancellationToken ct);
 }
@@ -395,7 +414,7 @@ public interface IOperatorRegistry
 - **Exactly one result:** Unambiguous → command proceeds with that binding's `TenantId`/`WorkspaceId`.
 - **Multiple results:** The user has bindings in multiple workspaces for this chat → the `CommandDispatcher` presents an inline keyboard listing the available workspaces and waits for the operator to select one (per e2e-scenarios workspace disambiguation flow). The selected workspace is cached for the session to avoid repeated prompts.
 
-`GetAllBindingsAsync(userId)` returns all bindings across all chats for a user, used for administrative queries and `/status` across workspaces. `IsAuthorizedAsync(userId, chatId)` is a fast-path check returning `true` if at least one active binding exists for the pair — used by the allowlist gate before command processing. `GetByAliasAsync(alias, tenantId)` resolves an operator by alias within a tenant, used by `/handoff` target resolution; the `UNIQUE (OperatorAlias, TenantId)` constraint on `OperatorBinding` ensures at most one result per (alias, tenant) pair, preventing cross-tenant mis-resolution.
+`GetAllBindingsAsync(userId)` returns all bindings across all chats for a user, used for administrative queries and `/status` across workspaces. `GetByWorkspaceAsync(workspaceId)` returns all active `OperatorBinding` rows for a given workspace, used by alert fallback routing (§5.6) when no `TaskOversight` record exists for an alert's `TaskId` — the first active binding in the workspace receives the alert. `IsAuthorizedAsync(userId, chatId)` is a fast-path check returning `true` if at least one active binding exists for the pair — used by the allowlist gate before command processing. `GetByAliasAsync(alias, tenantId)` resolves an operator by alias within a tenant, used by `/handoff` target resolution; the `UNIQUE (OperatorAlias, TenantId)` constraint on `OperatorBinding` ensures at most one result per (alias, tenant) pair, preventing cross-tenant mis-resolution.
 
 #### OperatorRegistration (value object)
 
@@ -459,7 +478,9 @@ The Telegram connector publishes commands (task creation, approvals, pauses) via
 
 `SwarmEvent` is a discriminated union (or base class with subtypes) covering `AgentQuestionEvent`, `AgentAlertEvent`, and `AgentStatusUpdateEvent`. The Telegram connector's `BackgroundService` calls `SubscribeAsync` at startup for each active tenant and processes events as they arrive — rendering questions as inline-keyboard messages, alerts as priority text, and status updates as informational messages. The transport backing this subscription (in-process `Channel<T>`, message broker, gRPC stream) is outside this story's scope; the interface abstracts it.
 
-**`AgentAlertEvent` fields:** `AlertId` (string, unique), `AgentId` (string), `TaskId` (string — the task the agent was executing when the alert fired; required for `TaskOversight` routing in §5.6), `Severity` (`MessageSeverity`), `AlertType` (string — e.g., `"Error"`, `"Timeout"`, `"ResourceExhausted"`), `Summary` (string), `WorkspaceId` (string), `TenantId` (string), `CorrelationId` (string), `Timestamp` (DateTimeOffset). The `TaskId` field is always populated because agents execute within a task context; the alert routing in §5.6 depends on this to resolve the oversight operator via `ITaskOversightRepository.GetByTaskIdAsync(taskId)`.
+**`AgentAlertEvent` fields:** `AlertId` (string, unique), `AgentId` (string), `TaskId` (string — the task the agent was executing when the alert fired; required for `TaskOversight` routing in §5.6), `Title` (string — short alert headline, e.g., "Build failure"), `Body` (string — detailed alert description), `Severity` (`MessageSeverity`), `WorkspaceId` (string), `TenantId` (string), `CorrelationId` (string), `Timestamp` (DateTimeOffset). The `TaskId` field is always populated because agents execute within a task context; the alert routing in §5.6 depends on this to resolve the oversight operator via `ITaskOversightRepository.GetByTaskIdAsync(taskId)`.
+
+> **Cross-doc alignment (AgentAlertEvent):** Implementation-plan.md Stage 1.3 defines the base `AgentAlertEvent` fields as `AgentId`, `AlertId`, `Title`, `Body`, `Severity`, and `CorrelationId`. This architecture document extends those with routing-required fields (`TaskId`, `WorkspaceId`, `TenantId`, `Timestamp`) that the Telegram connector needs for operator resolution and priority queuing. The field names `Title` and `Body` are aligned with implementation-plan.md; earlier drafts used `AlertType`/`Summary` which have been replaced. Implementation-plan.md should add `TaskId`, `WorkspaceId`, `TenantId`, and `Timestamp` to its `AgentAlertEvent` definition to complete the alignment.
 
 > **Cross-doc alignment:** Implementation-plan.md Stage 1.3 now defines all four methods on `ISwarmCommandBus`: `PublishCommandAsync`, `QueryStatusAsync`, `QueryAgentsAsync`, and `SubscribeAsync(string tenantId, CancellationToken)` returning `IAsyncEnumerable<SwarmEvent>`. All sibling documents are aligned on this interface contract.
 
@@ -738,7 +759,7 @@ AgentSwarm           ISwarmCommandBus      TelegramConnector    OutboundQueue   
 1. **Event ingress:** The `TelegramConnector` receives `AgentAlertEvent` via `ISwarmCommandBus.SubscribeAsync(tenantId)` — the same event subscription used for `AgentQuestionEvent` and `AgentStatusUpdateEvent` (see §4.6). The `SwarmEvent` discriminated union routes the event to the alert-handling path.
 2. **Tenant/workspace routing:** `AgentAlertEvent` includes a `TaskId` field (the task the agent was executing when the alert fired — agents always operate in the context of a task). The connector resolves the target operator chat by looking up `AgentAlertEvent.TaskId` → `ITaskOversightRepository.GetByTaskIdAsync(taskId)` (§4.10) → `TaskOversight.OperatorBindingId` → `OperatorBinding.TelegramChatId`. If no `TaskOversight` record exists for that `TaskId`, the alert falls back to the workspace's default operator (the first active `OperatorBinding` for that `WorkspaceId`, resolved via `IOperatorRegistry.GetByWorkspaceAsync`). This ensures alerts are routed even for tasks not currently under explicit oversight. No `AgentId → TaskId` lookup is needed because the event carries both fields.
 3. **Priority queuing:** Alert messages are enqueued to `OutboundMessageQueue` with severity copied from `AgentAlertEvent.Severity` (typically `Critical` or `High`). The priority queue (§10.4) ensures these are dequeued ahead of `Normal`/`Low` messages, meeting the P95 ≤ 2 s SLO for the bounded burst envelope (≤ 60 Critical+High messages).
-4. **Message formatting:** Alert messages include a severity badge (🚨 Critical, ⚠️ High), the agent ID, alert type, summary text, and `CorrelationId` for traceability. No inline keyboard — alerts are informational, not interactive (operators use `/status TASK-ID` or `/pause AGENT-ID` to act on alerts).
+4. **Message formatting:** Alert messages include a severity badge (🚨 Critical, ⚠️ High), the agent ID, alert title (`AgentAlertEvent.Title`), body text (`AgentAlertEvent.Body`), and `CorrelationId` for traceability. No inline keyboard — alerts are informational, not interactive (operators use `/status TASK-ID` or `/pause AGENT-ID` to act on alerts).
 5. **Idempotency:** The `OutboundMessage.IdempotencyKey` for alerts is `alert:{agentId}:{alertId}`, preventing the same alert from being enqueued twice if the event subscription delivers it more than once.
 6. **Correlation and audit:** The `CorrelationId` from the originating agent event flows through the outbound message to the audit record, enabling end-to-end tracing from agent error → alert event → Telegram delivery → operator visibility.
 7. **Burst behavior:** Under a 100+ agent burst, alert messages compete for priority queue position by severity. With ≤ 60 Critical+High alerts in the burst, P95 send latency stays at/near 2 s (see §10.4 burst math). Normal/Low alerts experience longer dwell times but are never lost.
@@ -824,9 +845,9 @@ AgentSwarm.Messaging.sln  (to be created)
 
 | Setting | Source | Notes |
 |---|---|---|
-| `Telegram:BotToken` | Azure Key Vault / K8s secret | Never logged. Loaded via `SecretClient` with periodic refresh (default every 5 min) through `IOptionsMonitor<TelegramOptions>`, enabling rotation without restart (per tech-spec.md R-5). |
+| `Telegram:BotToken` | Azure Key Vault (production) / .NET User Secrets (local dev) | Never logged. In production, loaded via `SecretClient` with periodic refresh (default every 5 min) through `IOptionsMonitor<TelegramOptions>`, enabling rotation without restart (per tech-spec.md R-5). In local/dev environments, loaded from .NET User Secrets (`dotnet user-secrets set "Telegram:BotToken" "<value>"`) per tech-spec.md S-8, avoiding plaintext tokens in `appsettings.json` or environment variables. |
 | `Telegram:WebhookUrl` | App configuration | Public HTTPS URL; set to empty to enable long-poll mode. |
-| `Telegram:SecretToken` | Key Vault | Header value Telegram sends with each webhook POST; validated by `WebhookController`. |
+| `Telegram:SecretToken` | Key Vault (production) / .NET User Secrets (local dev) | Header value Telegram sends with each webhook POST; validated by `WebhookController`. |
 | `Telegram:AllowedUserIds` | App configuration | Comma-separated allowlist of Telegram **user IDs** authorized to register via `/start`. See "Allowlist Authorization Model" below for how user IDs, chat IDs, and tenant/workspace bindings interact. |
 | `Telegram:RateLimits:GlobalPerSecond` | App configuration | Default `30`. |
 | `Telegram:RateLimits:PerChatPerMinute` | App configuration | Default `20`. |
@@ -883,7 +904,7 @@ When `/start` is received, the `StartCommandHandler` (1) checks `AllowedUserIds`
 1. **Webhook validation** — Every inbound POST must carry the `X-Telegram-Bot-Api-Secret-Token` header matching the configured `Telegram:SecretToken`. Requests with a missing or invalid secret token return `403 Forbidden`. This aligns with e2e-scenarios and implementation-plan which both specify HTTP 403 for webhook secret validation failures.
 2. **Operator allowlist** — `TelegramUserId` and `ChatId` are checked against `OperatorBinding` records. Unregistered users receive a generic "not authorized" reply and the attempt is logged.
 3. **Role enforcement** — Two-tier authorization model (per §7.1 and implementation-plan.md Stage 5.2): Tier 1 (onboarding) checks `TelegramOptions.AllowedUserIds` for `/start` only. Tier 2 (runtime) requires an active `OperatorBinding` for all other commands. Beyond Tier 2 binding, only role-gated commands require a specific role: `/approve` and `/reject` require the `Approver` role; `/pause` and `/resume` require the `Operator` role. Commands `/status`, `/agents`, `/ask`, and `/handoff` have no role requirement beyond Tier 2 binding authorization (aligned with implementation-plan.md Stage 5.2). If an operator lacks the required role for a role-gated command, the command is rejected with an "insufficient permissions" reply and an audit log entry at Warning level.
-4. **Secret isolation and rotation** — Bot token is loaded from Key Vault at startup using `SecretClient` and injected via `IOptionsMonitor<TelegramOptions>`. The connector supports **periodic token refresh** (every 5 minutes by default, configurable via `Telegram:SecretRefreshIntervalMinutes`) using `IOptionsMonitor<T>`'s change-notification mechanism, so that a Key Vault rotation takes effect without a full process restart — consistent with tech-spec.md R-5's recommendation. The refreshed token is applied to the `TelegramBotClient` instance on the next API call. The token value is never serialized, logged, or exposed via health endpoints; in-memory representation uses a `SecureString`-equivalent wrapper that is cleared on disposal.
+4. **Secret isolation and rotation** — Bot token is loaded from Azure Key Vault in production using `SecretClient` and from .NET User Secrets in local/dev environments (per tech-spec.md S-8: `dotnet user-secrets set "Telegram:BotToken" "<value>"`), and injected via `IOptionsMonitor<TelegramOptions>`. In production, the connector supports **periodic token refresh** (every 5 minutes by default, configurable via `Telegram:SecretRefreshIntervalMinutes`) using `IOptionsMonitor<T>`'s change-notification mechanism, so that a Key Vault rotation takes effect without a full process restart — consistent with tech-spec.md R-5's recommendation. The refreshed token is applied to the `TelegramBotClient` instance on the next API call. The token value is never serialized, logged, or exposed via health endpoints; in-memory representation uses a `SecureString`-equivalent wrapper that is cleared on disposal.
 5. **Rate limiting** — Inbound commands are rate-limited per user (10 commands/minute) to prevent abuse from a compromised account.
 
 ---
