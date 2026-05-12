@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.35-draft (iteration 30)
+**Version:** v0.36-draft (iteration 31)
 
 ---
 
@@ -285,9 +285,13 @@ Feature: Durable outbound message queue with retry and dead-letter
     And P99 telegram.send.first_attempt_latency_ms across ALL 100 messages is under 3 seconds
     And under these test conditions (no retries, no rate-limiting, low queue depth), telegram.send.first_attempt_latency_ms (enqueue-to-200) and telegram.send.all_attempts_latency_ms (enqueue-to-200) converge to the same value since every message succeeds on first attempt without rate-limiting
 
-  Scenario: Burst of 1000+ agent alerts without message loss
+  Scenario: Burst of 1000+ agent alerts without message loss (within bounded-volume assumption)
+    # architecture.md §10.4 bounded-volume assumption: P95 ≤ 2s for Critical/High
+    # holds when ≤ 60 Critical+High messages are in any burst window (at 30 msg/s
+    # with 10 workers, the top 60 priority messages drain in ≤ 2s of queue dwell).
     Given 1000 agents each enqueue one alert message simultaneously
-    And the messages have mixed severities: 100 Critical, 200 High, 300 Normal, 400 Low
+    And the messages have mixed severities: 30 Critical, 30 High, 440 Normal, 500 Low
+    And the Critical+High total (60) is within the bounded-volume assumption of ≤ 60 per burst (architecture.md §10.4)
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
@@ -296,10 +300,23 @@ Feature: Durable outbound message queue with retry and dead-letter
     And telegram.send.first_attempt_latency_ms (acceptance gate) is emitted for messages that succeed on first attempt without rate-limiting (per architecture.md §10.4: enqueue instant — OutboundMessage.CreatedAt — to HTTP 200, first-attempt, non-rate-limited sends only)
     And telegram.send.all_attempts_latency_ms (all-inclusive) is emitted for all 1000 messages regardless of attempt number or rate-limit holds (per architecture.md §10.4: enqueue to HTTP 200 — capacity planning)
     And telegram.send.queue_dwell_ms (diagnostic) is emitted for all 1000 messages (per architecture.md §10.4: enqueue to dequeue — queue backlog monitoring)
-    And P95 telegram.send.first_attempt_latency_ms for Critical and High severity messages is under 2 seconds (per architecture.md §10.4: priority queuing ensures Critical/High are dequeued first with minimal queue dwell, keeping their enqueue-to-200 latency within the 2-second window under burst)
+    And P95 telegram.send.first_attempt_latency_ms for Critical and High severity messages is under 2 seconds (per architecture.md §10.4: with ≤ 60 Critical+High messages in the burst, priority queuing drains them within ~2s of queue dwell at 30 msg/s)
     And Normal and Low severity messages may exceed the 2-second P95 under sustained burst due to accumulated queue dwell (per architecture.md §10.4: "Normal/Low first-attempt sends may exceed 2 s P95 under sustained burst due to accumulated queue dwell")
     And queue dwell time (telegram.send.queue_dwell_ms) increases under burst as expected; telegram.send.all_attempts_latency_ms (enqueue-to-200, all-inclusive) provides the full delivery view for capacity planning
     And time spent waiting during 429 backoff is tracked via telegram.send.rate_limited_wait_ms for operational diagnostics
+
+  Scenario: Burst exceeding bounded-volume assumption degrades Critical/High P95 gracefully
+    # architecture.md §10.4: if a burst exceeds 60 Critical+High messages,
+    # some may breach the 2s P95; queue_dwell_ms provides visibility.
+    Given 1000 agents each enqueue one alert message simultaneously
+    And the messages have mixed severities: 200 Critical, 200 High, 300 Normal, 300 Low
+    And the Critical+High total (400) exceeds the bounded-volume assumption of ≤ 60 per burst (architecture.md §10.4)
+    When all 1000 messages are processed through the outbound queue
+    Then all 1000 messages are eventually delivered or dead-lettered (zero message loss)
+    And Critical/High messages are still dispatched before Normal/Low via priority queuing
+    And some Critical/High messages may exceed the 2-second P95 due to queue dwell from the volume exceeding the bounded assumption
+    And telegram.send.queue_dwell_ms surfaces the breach for capacity-planning response (per architecture.md §10.4)
+    And telegram.send.all_attempts_latency_ms provides the full delivery view for all 1000 messages
 ```
 
 ---
@@ -393,6 +410,30 @@ Feature: Telegram bot command handling
     Given an open AgentQuestion "Q-2001" exists with AllowedActions [{ActionId:"act-10", Label:"Approve", Value:"approve"}, {ActionId:"act-11", Label:"Reject", Value:"reject"}]
     When user "operator-1" sends "/reject Q-2001"
     Then a HumanDecisionEvent with ActionValue "reject" is published for "Q-2001"
+
+  Scenario: /approve rejected for user without Approver role
+    # architecture.md §9 Security Model: /approve requires the Approver role
+    Given user "viewer-1" with Telegram user ID "444555666" has an active OperatorBinding for chat "998877" with role "Operator"
+    And an open AgentQuestion "Q-2002" exists
+    When user "viewer-1" sends "/approve Q-2002"
+    Then the gateway validates via IOperatorRegistry.IsAuthorizedAsync(userId=444555666, chatId=998877)
+    And the gateway checks that user "viewer-1" has the "Approver" role (per architecture.md §9 Security Model)
+    And the role check fails because "viewer-1" has role "Operator", not "Approver"
+    And the bot replies with "❌ Unauthorized — /approve requires the Approver role"
+    And no HumanDecisionEvent is published for "Q-2002"
+    And an audit record is persisted with user ID "444555666", command "/approve", and rejection reason "insufficient_role"
+
+  Scenario: /reject rejected for user without Approver role
+    # architecture.md §9 Security Model: /reject requires the Approver role
+    Given user "viewer-1" with Telegram user ID "444555666" has an active OperatorBinding for chat "998877" with role "Operator"
+    And an open AgentQuestion "Q-2003" exists
+    When user "viewer-1" sends "/reject Q-2003"
+    Then the gateway validates via IOperatorRegistry.IsAuthorizedAsync(userId=444555666, chatId=998877)
+    And the gateway checks that user "viewer-1" has the "Approver" role (per architecture.md §9 Security Model)
+    And the role check fails because "viewer-1" has role "Operator", not "Approver"
+    And the bot replies with "❌ Unauthorized — /reject requires the Approver role"
+    And no HumanDecisionEvent is published for "Q-2003"
+    And an audit record is persisted with user ID "444555666", command "/reject", and rejection reason "insufficient_role"
 
   Scenario: /handoff transfers oversight to another operator
     # architecture.md §5.5: Full oversight transfer (Decided).
@@ -705,12 +746,12 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 30._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 31._
 _DefaultAction modeling: This document adopts the sidecar envelope model per architecture.md §3.1 and implementation-plan.md Stage 1.2. The shared `AgentQuestion` model does **not** include a `DefaultAction` property. The proposed default action is carried as `ProposedDefaultActionId` on the `AgentQuestionEnvelope`. The connector reads `ProposedDefaultActionId` from the envelope, denormalizes it into `PendingQuestionRecord.DefaultActionId`, displays the default in the message body, and applies it on timeout. When `null`, the question expires with `ActionValue = "__timeout__"`._
 _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively. Inline button presses emit the `HumanAction.Value` from `AllowedActions` via `CallbackQueryHandler`. All `AllowedActions` fixtures include `ActionId` for consistency with the `HumanAction` model used in callback/default resolution._
 _Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are aligned on `MaxAttempts` default 5._
 _Handoff semantics: `/handoff` performs full oversight transfer per architecture.md §5.5, tech-spec.md D-4, and implementation-plan.md Stage 3.2 — task validation, operator resolution via `IOperatorRegistry`, `TaskOversight` mutation, dual notification, and audit._
-_Metric naming: Per architecture.md §10.4 (canonical source): **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = enqueue instant (`OutboundMessage.CreatedAt`) to HTTP 200, first-attempt non-rate-limited sends only — P95 ≤ 2s. **`telegram.send.all_attempts_latency_ms`** (all-inclusive) = enqueue (`OutboundMessage.CreatedAt`) to HTTP 200, all messages regardless of attempt or rate-limit — capacity planning. **`telegram.send.queue_dwell_ms`** (diagnostic) = enqueue to dequeue. Additional diagnostics: `telegram.send.retry_latency_ms`, `telegram.send.rate_limited_wait_ms`. Backpressure dead-letter counter: `telegram.messages.backpressure_dlq` (canonical, aligned across architecture.md and tech-spec.md HC-5). This document is aligned with architecture.md §10.4 on enqueue-to-HTTP-200 measurement for the acceptance gate and `all_attempts_latency_ms` naming for the all-inclusive metric. Sibling-doc note: tech-spec.md HC-4 and Section 10 currently use dequeue-to-HTTP-200 measurement for `first_attempt_latency_ms` and the name `telegram.send.latency_ms` for the all-inclusive metric; this is an editorial divergence within tech-spec.md — architecture.md §10.4 is the canonical source and this document follows it._
-_P95 metric scope: Per operator answer to `p95-metric-scope`, the P95 ≤ 2s criterion applies to first-attempt, non-rate-limited sends only. Under normal load (low queue depth), the 2s target holds across all severities. Under burst (1000+ messages), priority queuing ensures Critical/High messages meet the 2s target; Normal/Low may exceed it due to queue dwell (per architecture.md §10.4)._
+_Metric naming: Per architecture.md §10.4 (canonical source): **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = enqueue instant (`OutboundMessage.CreatedAt`) to HTTP 200, first-attempt non-rate-limited sends only — P95 ≤ 2s. **`telegram.send.all_attempts_latency_ms`** (all-inclusive) = enqueue (`OutboundMessage.CreatedAt`) to HTTP 200, all messages regardless of attempt or rate-limit — capacity planning. **`telegram.send.queue_dwell_ms`** (diagnostic) = enqueue to dequeue. Additional diagnostics: `telegram.send.retry_latency_ms`, `telegram.send.rate_limited_wait_ms`. Backpressure dead-letter counter: `telegram.messages.backpressure_dlq` (canonical, aligned across architecture.md and tech-spec.md HC-5). Sibling-doc alignment status: architecture.md §8/§10.4, tech-spec.md HC-4 and Section 10, and this document are all aligned on enqueue-to-HTTP-200 measurement for the acceptance gate and `telegram.send.all_attempts_latency_ms` naming for the all-inclusive metric. Note: tech-spec.md Section 10 contains a stale cross-document note claiming this document uses dequeue-to-HTTP-200 and `telegram.send.latency_ms` — that was true in earlier iterations but has been resolved; tech-spec.md's Section 10 cross-reference table should be updated to reflect this alignment in its next iteration._
+_P95 metric scope: Per operator answer to `p95-metric-scope`, the P95 ≤ 2s criterion applies to first-attempt, non-rate-limited sends only. Under normal load (low queue depth), the 2s target holds across all severities. Under burst (1000+ messages), priority queuing ensures Critical/High messages meet the 2s target when ≤ 60 Critical+High messages are in the burst (architecture.md §10.4 bounded-volume assumption: at 30 msg/s with 10 workers, top 60 priority messages drain in ≤ 2s of queue dwell); if a burst exceeds 60 Critical+High, some may breach 2s P95 and queue_dwell_ms provides visibility. Normal/Low may exceed 2s due to queue dwell (per architecture.md §10.4)._
 _Group-chat authorization: Runtime authorization checks `OperatorBinding` records matching both `TelegramUserId` and `TelegramChatId` via `IOperatorRegistry.IsAuthorizedAsync`. Commands and button taps in groups are authorized by the (user, chat) pair. An unauthorized user in an authorized group is rejected (per tech-spec.md S-5)._
 _Authorization model: Two-tier model per architecture.md §7.1. Tier 1 (onboarding): `/start` checks `Telegram:AllowedUserIds`. Tier 2 (runtime): all other commands check `OperatorBinding` records via `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)`. Access revocation is modeled by setting `OperatorBinding.IsActive=false`._
