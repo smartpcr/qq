@@ -911,11 +911,23 @@ Feature: Edge Cases and Error Handling
 
 ### Prior feedback resolution
 
-(Resolving iteration 9 evaluator feedback — 4 numbered items.)
+(Resolving iteration 10 evaluator feedback — 7 numbered items. STRUCTURAL CHANGE this iteration: previous iterations oscillated between six-value and seven-value audit sets because the prior-feedback block misread tech-spec.md. This iteration re-read tech-spec.md §4.3 lines 128, 130, and 138 directly. All three say exactly seven canonical audit EventType values including MessageActionReceived. architecture.md §3.2 line 432 and §6.7 line 955 confirm seven values. This iteration aligns e2e-scenarios.md to the actual on-disk content of tech-spec.md and architecture.md.)
 
-- [x] 1–4. Prior iter 9/10 feedback items were resolved; iter 13 realigned this file from the stale six-value model to the current seven-value canonical set per tech-spec §4.3.
+- [x] 1. FIXED — §Message Actions line 774 — Changed audit EventType from "CommandReceived" to "MessageActionReceived" to match tech-spec.md §4.3 Canonical Audit Record Schema (line 128: "Message actions log as MessageActionReceived") and architecture.md §6.7 line 955. Updated parenthetical to cite seven values.
 
-> **Cross-doc alignment status:** All four plan docs (`tech-spec.md` §4.3, `architecture.md` §3.2, `implementation-plan.md` §1.3/§3.4/§5.2, and this file) are now aligned on exactly seven canonical audit `EventType` values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. Message actions log as `MessageActionReceived`.
+- [x] 2. FIXED — §Coverage line 905 — Changed from "six values…CommandReceived" to "seven values per tech-spec §4.3 Canonical Audit Record Schema: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error" with message actions auditing as MessageActionReceived. This matches tech-spec.md lines 128 and 138 which both list seven values.
+
+- [x] 3. FIXED — Removed the backwards cross-doc inconsistency note (former line 939) which incorrectly claimed tech-spec.md defines six values. The actual tech-spec.md line 128 defines seven values. Replaced with a correct alignment note referencing implementation-plan.md as the only remaining out-of-sync sibling.
+
+- [x] 4. ADDRESSED — The iter 10 resolution block contained "MessageActionReceived" in its own text, making its grep claim of "(empty)" false. This iteration replaces the entire iter 10 resolution block. The term now correctly appears in the normative Gherkin steps (line 774) and coverage summary (line 905) where it belongs per tech-spec.md.
+
+- [x] 5. ADDRESSED — The iter 10 resolution block claimed grep for "seven values" was empty, but the phrase existed in sibling docs and the resolution block itself. This iteration correctly uses "seven values" in the normative Gherkin and coverage sections (matching tech-spec.md), so the phrase is present by design in those locations.
+
+- [x] 6. ADDRESSED — The iter 10 resolution block's verification command (former line 929) contained the exact search phrase. That entire block is now replaced. This block avoids quoting that phrase verbatim.
+
+- [x] 7. ADDRESSED — The phrase "TeamsActivityHandler delegates to the CommandParser" existed in the iter 10 resolution block at former lines 933 and 935. That entire block is now replaced. The normative Gherkin at lines 765-766 correctly uses the two-step flow (TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync → MessageExtensionHandler → CommandParser), matching architecture.md §6.7.
+
+> **Cross-doc alignment note:** This file (e2e-scenarios.md) now aligns with tech-spec.md §4.3 Canonical Audit Record Schema (lines 128, 130, 138) and architecture.md §3.2 (line 432) and §6.7 (line 955) on seven canonical audit EventType values including MessageActionReceived. implementation-plan.md §Iteration Summary (line 415) still claims six values — that sibling doc should update to match tech-spec.md in its next iteration.
 
 ### Open questions
 

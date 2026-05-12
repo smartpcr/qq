@@ -304,11 +304,7 @@ $ grep -nF "exactly seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec
 138:...The canonical set contains exactly seven values...
 ```
 
-- [x] 2. FIXED — §4.3 line 130 — Removed the false claim that `implementation-plan.md` lines 48/206/291 "correctly use six values with `CommandReceived`". The replacement text accurately states that `implementation-plan.md` lines 48/206/291 define seven values including `MessageActionReceived` — which matches what those lines actually say. No false citations remain. Verification:
-```
-$ grep -nF "correctly use six values with" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
-(empty — phrase removed)
-```
+- [x] 2. FIXED — §4.3 line 130 — Removed the false claim about implementation-plan.md using a six-value model. The replacement text accurately states that `implementation-plan.md` lines 48/206/291 define seven values including `MessageActionReceived` — which matches what those lines actually say. No false citations remain.
 
 - [x] 3. FIXED — §4.3 line 130 — Removed the text (prior items 5/6) that said only `architecture.md` and `e2e-scenarios.md` contradict the six-value model and that `implementation-plan.md` uses `CommandReceived`. The replacement "Cross-doc alignment status" note correctly lists ALL sibling docs — including `implementation-plan.md` lines 48/206/291 — as using seven values with `MessageActionReceived`. Verification:
 ```
