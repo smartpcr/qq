@@ -84,7 +84,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 | **TelegramUpdateRouter** | `AgentSwarm.Messaging.Telegram` (to be created) | Central inbound pipeline stage. Deduplicates by `update_id`, checks the operator allowlist, enriches with correlation ID, and dispatches to `CommandDispatcher` or `CallbackQueryHandler`. |
 | **CommandDispatcher** | `AgentSwarm.Messaging.Telegram` (to be created) | Maps incoming text commands to strongly typed `SwarmCommand` objects. Delegates callback-query payloads (button presses) to `CallbackQueryHandler` which produces `HumanDecisionEvent`. |
 | **AuthZ Service** | `AgentSwarm.Messaging.Core` (to be created) | Validates that the Telegram user ID + chat ID pair is in the authorized operator registry. Returns tenant/workspace binding or rejects the request. |
-| **Operator Registry** | `AgentSwarm.Messaging.Core` (to be created) | Persistent map of `(TelegramUserId, TelegramChatId) → OperatorBinding(TenantId, WorkspaceId, Roles, OperatorAlias)`. Authorization lookups are keyed by the `(TelegramUserId, TelegramChatId, WorkspaceId)` tuple (see §4.3, §7.1). Populated via `/start` registration flow and admin configuration. |
+| **Operator Registry** | `AgentSwarm.Messaging.Core` (to be created) | Persistent map of `(TelegramUserId, TelegramChatId) → one or more OperatorBinding(TenantId, WorkspaceId, Roles, OperatorAlias)`. Runtime authorization first checks whether any active binding exists for the `(TelegramUserId, TelegramChatId)` pair via `IsAuthorizedAsync`; when multiple bindings exist (the operator is registered in several workspaces for the same chat), `GetBindingsAsync` returns all matching rows and the caller disambiguates workspace via inline keyboard (see §4.3, §7.1). The `UNIQUE` constraint is on `(TelegramUserId, TelegramChatId, WorkspaceId)` to prevent duplicate bindings for the same workspace. Populated via `/start` registration flow and admin configuration. |
 | **Swarm Command Bus** | `AgentSwarm.Messaging.Core` (to be created) | Publishes validated, strongly typed commands to the agent swarm orchestrator. Subscribes to agent-originated events (questions, alerts, status) via `SubscribeAsync` and routes them to the correct outbound connector. Both command publishing and event subscription are on the single `ISwarmCommandBus` interface (see §4.6). |
 | **OutboundMessageQueue** | `AgentSwarm.Messaging.Core` (to be created) | Durable queue for outbound messages backed by a persistent store (database) with an in-memory `Channel<T>` hot buffer for low-latency dequeue. The persistent store is the source of truth; the `Channel<T>` is a read-through acceleration layer, not a standalone queue. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 5 attempts), and dead-letter after exhaustion. |
 | **TelegramSender** | `AgentSwarm.Messaging.Telegram` (to be created) | Wraps `ITelegramBotClient` from the `Telegram.Bot` library. Formats messages with MarkdownV2, builds `InlineKeyboardMarkup` for agent questions, enforces Telegram rate limits. |
@@ -206,7 +206,7 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `TelegramMessageId` | `int` | Telegram `message_id` of the sent inline-keyboard message. |
 | `DefaultActionId` | `string?` | Denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at question-send time. Stored here so that `QuestionTimeoutService` can poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the full envelope. When present, the timeout service resolves the full `HumanAction` and applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
 | `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
-| `Status` | `enum` | `Pending`, `AwaitingComment`, `Answered`, `TimedOut`. `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). |
+| `Status` | `enum` | `Pending`, `AwaitingComment`, `Answered`, `Expired`. `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). **Canonical status name:** This document uses `Expired` as the single canonical status name for timed-out questions across the abstraction DTO (`PendingQuestion.Status`), the persistence entity (`PendingQuestionRecord.Status`), and the timeout flow (`QuestionTimeoutService`). Implementation-plan.md Stage 1.3 defines the abstraction DTO with `Expired`; Stage 3.5 must use `Expired` (not `TimedOut`) for the persistence entity to maintain consistency. |
 | `StoredAt` | `DateTimeOffset` | When the record was persisted (after successful Telegram send). |
 | `CorrelationId` | `string` | Trace/correlation ID for end-to-end observability. |
 
@@ -398,6 +398,70 @@ The Telegram connector publishes commands (task creation, approvals, pauses) via
 
 > **Cross-doc alignment:** Implementation-plan.md Stage 1.3 now defines all four methods on `ISwarmCommandBus`: `PublishCommandAsync`, `QueryStatusAsync`, `QueryAgentsAsync`, and `SubscribeAsync(string tenantId, CancellationToken)` returning `IAsyncEnumerable<SwarmEvent>`. All sibling documents are aligned on this interface contract.
 
+### 4.7 IPendingQuestionStore (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
+
+Manages the lifecycle of pending agent questions awaiting operator response.
+
+```csharp
+public interface IPendingQuestionStore
+{
+    Task StoreAsync(AgentQuestionEnvelope envelope, long telegramChatId, int telegramMessageId, CancellationToken ct);
+    Task<PendingQuestion?> GetAsync(string questionId, CancellationToken ct);
+    Task<PendingQuestion?> GetByTelegramMessageIdAsync(int telegramMessageId, CancellationToken ct);
+    Task MarkAnsweredAsync(string questionId, CancellationToken ct);
+    Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct);
+    Task<IReadOnlyList<PendingQuestion>> GetExpiredAsync(CancellationToken ct);
+}
+```
+
+`StoreAsync` accepts the full `AgentQuestionEnvelope` so the store can extract `AgentQuestion` fields and denormalize `ProposedDefaultActionId` into `PendingQuestion.DefaultActionId`. `GetExpiredAsync` returns all questions with `Status = Pending` past their `ExpiresAt`, used by `QuestionTimeoutService` (§10.3). All query methods return the `PendingQuestion` abstraction DTO; the concrete `PersistentPendingQuestionStore` (implementation-plan Stage 3.5) maps between the persistence entity `PendingQuestionRecord` and the DTO.
+
+### 4.8 IInboundUpdateStore (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
+
+Provides persistence and idempotency tracking for inbound Telegram webhook updates.
+
+```csharp
+public interface IInboundUpdateStore
+{
+    Task<bool> TryInsertAsync(InboundUpdate update, CancellationToken ct);
+    Task MarkProcessingAsync(long updateId, CancellationToken ct);
+    Task MarkCompletedAsync(long updateId, CancellationToken ct);
+    Task MarkFailedAsync(long updateId, string errorDetail, CancellationToken ct);
+    Task<IReadOnlyList<InboundUpdate>> GetStuckAsync(TimeSpan threshold, CancellationToken ct);
+}
+```
+
+`TryInsertAsync` returns `false` if the `update_id` already exists (the `UNIQUE` constraint on `UpdateId` is the canonical deduplication mechanism for webhook delivery — see §5.4). `GetStuckAsync` returns updates in `Processing` status older than the threshold, used by `InboundRecoverySweep` to detect and retry crashed processing attempts. Status transitions follow the `InboundUpdate.IdempotencyStatus` enum: `Received → Processing → Completed|Failed`.
+
+### 4.9 IDeduplicationService (to be defined in planned `AgentSwarm.Messaging.Core`)
+
+Provides fast in-pipeline deduplication as a supplementary layer above `IInboundUpdateStore`.
+
+```csharp
+public interface IDeduplicationService
+{
+    Task<bool> IsProcessedAsync(string eventId, CancellationToken ct);
+    Task MarkProcessedAsync(string eventId, CancellationToken ct);
+}
+```
+
+Backed by a sliding-window cache (e.g., `IDistributedCache`) with a configurable TTL (default 1 hour, per implementation-plan Stage 4.3). This provides fast in-pipeline deduplication for the `TelegramUpdatePipeline` processing path without a database query. The `IInboundUpdateStore` (§4.8) remains the canonical deduplication mechanism; this service is an acceleration layer. Both layers must agree an event is new before it is processed.
+
+### 4.10 ITaskOversightRepository (to be defined in planned `AgentSwarm.Messaging.Core`)
+
+Manages task-to-operator oversight assignments for the `/handoff` flow.
+
+```csharp
+public interface ITaskOversightRepository
+{
+    Task AssignAsync(TaskOversight oversight, CancellationToken ct);
+    Task<TaskOversight?> GetByTaskIdAsync(string taskId, CancellationToken ct);
+    Task ReassignAsync(string taskId, Guid newOperatorBindingId, string reassignedBy, CancellationToken ct);
+}
+```
+
+`AssignAsync` creates a new oversight record binding a task to an operator. `GetByTaskIdAsync` returns the current oversight assignment for routing agent questions and alerts to the responsible operator. `ReassignAsync` atomically transfers oversight to a different operator (used by `/handoff`). The concrete `PersistentTaskOversightRepository` (implementation-plan Stage 3.2) stores `TaskOversight` entities via EF Core.
+
 ---
 
 ## 5. End-to-End Sequence Flows
@@ -465,7 +529,7 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 
 **Key invariants:**
 1. The question includes `Severity`, `ExpiresAt`, `AllowedActions` rendered as inline keyboard buttons, and the proposed default action (if any). The default action is carried as sidecar metadata in `AgentQuestionEnvelope.ProposedDefaultActionId` (see §3.1). When the connector builds the inline keyboard, it reads `ProposedDefaultActionId` from the envelope and prepares a `PendingQuestionRecord` with `DefaultActionId` denormalized from that field. The `PendingQuestionRecord` is **persisted after the Telegram send succeeds** (once `TelegramMessageId` is available from the API response), not before — because `PendingQuestionRecord.TelegramMessageId` is required for timeout-driven message edits and cannot be known until the send completes.
-2. The `callback_data` field carries the format `QuestionId:ActionId` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both `QuestionId` and `ActionId` are constrained to a maximum of 30 characters each, ensuring the combined `callback_data` (including the `:` separator) fits within Telegram's 64-byte limit (max 61 bytes). The server stores the full `HumanAction` payload in `IDistributedCache` keyed by `QuestionId:ActionId`, written when the inline keyboard is built and expiring at `AgentQuestion.ExpiresAt + 5 minutes` (a grace period beyond the question's `ExpiresAt` to ensure `QuestionTimeoutService` can still resolve the `HumanAction` from cache when processing timeouts at or slightly after `ExpiresAt` — this eliminates the race condition where the cache entry expires before the timeout service reads it). On callback, the handler parses `QuestionId:ActionId` from the callback data, looks up the full `HumanAction` from cache, retrieves the original `AgentQuestion` from the pending-questions store, and resolves the chosen action.
+2. The `callback_data` field carries the format `QuestionId:ActionId` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both `QuestionId` and `ActionId` are constrained to a maximum of 30 characters each, ensuring the combined `callback_data` (including the `:` separator) fits within Telegram's 64-byte limit (max 61 bytes). The server stores the full `HumanAction` payload in `IDistributedCache` keyed by `QuestionId:ActionId`, written when the inline keyboard is built and expiring at `AgentQuestion.ExpiresAt + 5 minutes` (a grace period beyond the question's `ExpiresAt` to ensure `QuestionTimeoutService` can still resolve the `HumanAction` from cache when processing timeouts at or slightly after `ExpiresAt` — this eliminates the race condition where the cache entry expires before the timeout service reads it). On callback, the handler parses `QuestionId:ActionId` from the callback data, looks up the full `HumanAction` from cache, retrieves the original `AgentQuestion` from the pending-questions store, and resolves the chosen action. **Cross-doc note:** tech-spec.md §7 (R-3/D-3) and §10 currently say the cache expires at `AgentQuestion.ExpiresAt` without the 5-minute grace period. This architecture (§5.2, §10.3, §11) defines the canonical expiry as `ExpiresAt + 5 minutes`; tech-spec should be updated to match in its next iteration.
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string. **However**, when the selected `HumanAction.RequiresComment` is `true` (e.g., the "Need info" action in e2e-scenarios.md), the `HumanDecisionEvent` is **deferred**: the `CallbackQueryHandler` sets `PendingQuestionRecord.Status = AwaitingComment`, sends a prompt to the operator ("Please reply with your comment"), and returns without emitting the event. When the operator's text reply arrives via the inbound pipeline's text-reply handler, it is matched to the `AwaitingComment` record by chat ID, the `HumanDecisionEvent` is then published with both the `ActionValue` (e.g., `"need-info"`) and the `Comment` (the operator's text), and the record transitions to `Answered`. This two-step flow is tested by e2e-scenarios.md "RequiresComment defers decision" and implementation-plan.md Stage 3.5 "RequiresComment flow."
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
 5. Audit record is written with `MessageId`, `UserId`, `AgentId`, timestamp, and `CorrelationId`.
@@ -707,12 +771,18 @@ Both modes feed into the same `ITelegramUpdatePipeline`, so all downstream logic
 A `QuestionTimeoutService` (BackgroundService) polls for `PendingQuestionRecord` entries with `Status = Pending` past their `ExpiresAt`. When a question times out:
 1. Reads `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at send time). If present, resolves the full `HumanAction` from `IDistributedCache` (the cache entry has a grace period of 5 minutes beyond `ExpiresAt`, ensuring it is still available when the timeout service processes the question) and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
 2. Updates the original Telegram message (using `PendingQuestionRecord.TelegramMessageId`) to indicate the timeout ("⏰ Timed out — default action applied: *skip*" or "⏰ Timed out — no default action").
-3. Sets `PendingQuestionRecord.Status = TimedOut`.
+3. Sets `PendingQuestionRecord.Status = Expired`.
 4. Writes an audit record noting the timeout.
 
 ### 10.4 Performance: Concurrency, Backpressure, and Rate Limiting
 
 The 2-second P95 send-latency target and the 100+ agent burst requirement demand explicit concurrency, priority queuing, and backpressure design.
+
+> **⚠ OPERATOR-APPROVED SCOPE NARROWING (p95-metric-scope)**
+>
+> The story says: *"P95 send latency under 2 seconds after event is queued."*
+>
+> **Operator answer:** The P95 measurement covers **first-attempt, non-rate-limited sends only** — not retried sends or rate-limited wait time. This materially narrows the original story wording by excluding Telegram-side retry and rate-limit overhead from the acceptance gate. The operator was asked (question ID `p95-metric-scope`): "Should the P95 measurement include retried sends and rate-limited wait time, or only first-attempt, non-rate-limited sends?" and answered: **"First-attempt non-rate-limited only."** Retried and rate-limited sends are tracked separately via `telegram.send.all_attempts_latency_ms` for capacity planning.
 
 #### P95 Metric Definition
 
@@ -791,7 +861,7 @@ Under a burst of 1 000+ simultaneous agent events:
 | **`update_id` as the deduplication key** | Telegram guarantees `update_id` is unique and monotonically increasing per bot. Using it directly avoids the cost of hashing message content. |
 | **Webhook secret token validation** | Telegram supports a `secret_token` parameter on `setWebhook` (added in Bot API 6.0). This is cheaper and simpler than IP-allowlisting Telegram's data-center ranges. |
 | **Single `ITelegramUpdatePipeline`** | Forces webhook and long-poll modes through identical logic, eliminating a class of "works in dev, breaks in prod" bugs. |
-| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Encodes `QuestionId:ActionId` directly in `callback_data` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both IDs are constrained to ≤ 30 characters, keeping the combined payload within Telegram's 64-byte `callback_data` limit. The full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, written at inline-keyboard build time with expiry at `AgentQuestion.ExpiresAt + 5 minutes` (grace period ensures the entry survives past the question timeout for `QuestionTimeoutService` to resolve the default action). On callback, the handler parses the key, looks up the full `HumanAction` from cache, and resolves the chosen action. |
+| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Encodes `QuestionId:ActionId` directly in `callback_data` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both IDs are constrained to ≤ 30 characters, keeping the combined payload within Telegram's 64-byte `callback_data` limit. The full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, written at inline-keyboard build time with expiry at `AgentQuestion.ExpiresAt + 5 minutes` (grace period ensures the entry survives past the question timeout for `QuestionTimeoutService` to resolve the default action). **Cross-doc note:** tech-spec.md D-3/§10 says expiry at `ExpiresAt` without the grace period; this architecture defines `ExpiresAt + 5 minutes` as canonical (see §5.2). On callback, the handler parses the key, looks up the full `HumanAction` from cache, and resolves the chosen action. |
 
 ---
 
