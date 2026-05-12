@@ -182,7 +182,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Proactive` |
-| **Responsibility** | Send messages to users/channels without a prior inbound turn. Retrieves the `ConversationReference` from `ConversationReferenceStore`, calls `CloudAdapter.ContinueConversationAsync` (or `CreateConversationAsync` for new team-channel threads), and delivers the `Activity`. |
+| **Responsibility** | Send messages to users/channels without a prior inbound turn. Retrieves the stored `ConversationReference` from `IConversationReferenceStore` and calls `CloudAdapter.ContinueConversationAsync` to deliver the `Activity`. This is the primary and required delivery path — it depends on a stored reference from a prior app-installation event. For team channels where the bot needs to start a new reply thread (not a new conversation), `ConnectorClient.Conversations.CreateConversationAsync` may be used, but only within teams where the app is already installed. Both paths require a persisted `ConversationReference` proving the app is installed. |
 | **Prerequisite** | The Teams app must be installed for the target user or in the target team before proactive messaging can succeed. |
 
 ### 2.12 OutboxRetryEngine
@@ -341,16 +341,21 @@ Durable outbound message queue entry. Defined in `AgentSwarm.Messaging.Core`.
 
 #### AuditEntry
 
-Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`.
+Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields aligned with `tech-spec.md` §4.3 compliance constraints.
 
 | Field | Type | Description |
 |---|---|---|
 | `AuditEntryId` | `string` | Primary key (GUID). |
 | `CorrelationId` | `string` | End-to-end trace ID. |
-| `EventType` | `string` | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`. |
-| `ActorId` | `string` | AAD object ID or agent ID. |
+| `EventType` | `string` | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. |
+| `AgentId` | `string?` | Originating or target agent identity (null for security rejections). |
+| `TaskId` | `string?` | Associated task/work item (null when not applicable). |
+| `ConversationId` | `string` | Bot Framework conversation ID. |
+| `UserId` | `string` | AAD object ID (Entra ID) of the acting user. |
 | `TenantId` | `string` | Entra ID tenant. |
-| `PayloadJson` | `string` | Full event payload (JSON). |
+| `Action` | `string` | Specific action taken (e.g., `approve`, `reject`, `agent ask`). |
+| `Outcome` | `string` | Result of the action: `Success`, `Rejected`, `Failed`, `DeadLettered`. |
+| `PayloadJson` | `string` | Full event payload (JSON, sanitized). |
 | `Timestamp` | `DateTimeOffset` | UTC event time. |
 
 ### 3.3 Entity Relationship Diagram
