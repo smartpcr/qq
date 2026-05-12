@@ -164,8 +164,8 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | Attribute | Value |
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
-| **Interface** | `IMessengerConnector` |
-| **Responsibility** | Implements `SendMessageAsync`, `SendQuestionAsync`, and `ReceiveAsync` from the shared abstraction. Translates `MessengerMessage` to Bot Framework `Activity` with Adaptive Card attachments. Translates inbound `Activity` to `MessengerEvent`. Uses `ProactiveNotifier` for outbound delivery and `ConversationReferenceStore` for addressing. |
+| **Interface** | `IMessengerConnector`, `ITeamsCardManager` |
+| **Responsibility** | Implements `SendMessageAsync`, `SendQuestionAsync`, and `ReceiveAsync` from the shared `IMessengerConnector` abstraction. Also implements `ITeamsCardManager` for Teams-specific card update/delete operations (§4.1.1). Translates `MessengerMessage` to Bot Framework `Activity` with Adaptive Card attachments. Translates inbound `Activity` to `MessengerEvent`. Uses `ProactiveNotifier` for outbound delivery and `ConversationReferenceStore` for addressing. |
 
 ### 2.10 AdaptiveCardRenderer
 
@@ -572,7 +572,7 @@ public interface IAdaptiveCardRenderer
 Components communicate through two internal channels:
 
 1. **Inbound queue** — `TeamsSwarmActivityHandler` → domain handlers → `TeamsMessengerConnector.ReceiveAsync()` buffer. The orchestrator polls `ReceiveAsync` or subscribes to a push-based `IObservable<MessengerEvent>` variant.
-2. **Outbound queue** — Orchestrator calls `SendMessageAsync` / `SendQuestionAsync` / `UpdateCardAsync` / `DeleteCardAsync` → `OutboxRetryEngine` enqueues → background worker dequeues → `ProactiveNotifier` delivers via Bot Framework.
+2. **Outbound queue** — Orchestrator calls `SendMessageAsync` / `SendQuestionAsync` (via `IMessengerConnector`) or `UpdateCardAsync` / `DeleteCardAsync` (via `ITeamsCardManager`) → `OutboxRetryEngine` enqueues → background worker dequeues → `ProactiveNotifier` delivers via Bot Framework.
 
 ### 4.8 IActivityIdStore (webhook deduplication)
 
@@ -677,14 +677,14 @@ Orchestrator    TeamsMessengerConnector    OutboxRetryEngine    ProactiveNotifie
 ```
 
 1. Orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`.
-2. `TeamsMessengerConnector` creates an `OutboxEntry` and persists it via `IOutboxStore.EnqueueAsync`.
+2. `TeamsMessengerConnector` creates an `OutboxEntry` and persists it via `IMessageOutbox.EnqueueAsync`.
 3. The outbox background worker dequeues the entry and delegates to `ProactiveNotifier`.
 4. `ProactiveNotifier` looks up the `ConversationReference` for the target user from `ConversationReferenceStore`.
 5. `AdaptiveCardRenderer.RenderQuestionCard` builds the Adaptive Card with action buttons.
 6. `ProactiveNotifier` calls `CloudAdapter.ContinueConversationAsync` with the conversation reference, sending the card as an `Activity`.
 7. Teams returns the `activityId` of the sent message.
 8. `CardStateStore.SaveAsync` persists the `TeamsCardState` with the `activityId` (needed for future update/delete).
-9. `OutboxRetryEngine` marks the entry as `Delivered`.
+9. `OutboxRetryEngine` marks the entry as `Sent` (via `IMessageOutbox.AcknowledgeAsync`).
 10. If delivery fails with a transient error (HTTP 429, 500, 502, 503, 504), the engine schedules a retry per `tech-spec.md` §4.4 (exponential backoff with ±25% jitter; `Retry-After` override for 429).
 
 ### 6.3 Scenario: Human approves via Adaptive Card action
@@ -799,7 +799,7 @@ User (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityH
 ### 6.5 Scenario: Message update/delete for already-sent approval card
 
 ```text
-Orchestrator    IMessengerConnector           TeamsMessengerConnector    CardStateStore    ProactiveNotifier    Teams
+Orchestrator    ITeamsCardManager             TeamsMessengerConnector    CardStateStore    ProactiveNotifier    Teams
      │                    │                          │                     │                  │                │
      │── UpdateCardAsync ─>│ (or DeleteCardAsync)    │                     │                  │                │
      │   (questionId,      │── delegate ────────────>│                     │                  │                │
@@ -813,7 +813,7 @@ Orchestrator    IMessengerConnector           TeamsMessengerConnector    CardSta
      │                    │                          │  (Expired/Deleted)   │                  │                │
 ```
 
-1. The orchestrator calls `IMessengerConnector.UpdateCardAsync(questionId, CardUpdateAction.MarkExpired)` (or `DeleteCardAsync` for deletion). This is the public contract surface through which the orchestrator triggers card updates without knowledge of Teams-specific types.
+1. The orchestrator (or a Teams-aware coordinator) calls `ITeamsCardManager.UpdateCardAsync(questionId, CardUpdateAction.MarkExpired)` (or `DeleteCardAsync` for deletion). `ITeamsCardManager` is the Teams-specific contract surface for card updates — separate from the platform-agnostic `IMessengerConnector` (see §4.1 and §4.1.1).
 2. `TeamsMessengerConnector` retrieves the `TeamsCardState` to obtain the `activityId` and `conversationId`.
 3. A new Adaptive Card is rendered showing the updated status (e.g., "This approval has expired").
 4. `ProactiveNotifier` calls `TurnContext.UpdateActivityAsync` (via `ConnectorClient.Conversations.UpdateActivityAsync`) with the stored `activityId`.
@@ -881,10 +881,10 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 
 | Assembly | Layer | Responsibility |
 |---|---|---|
-| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `CardUpdateAction`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`) |
-| `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IOutboxStore`, retry policies, deduplication, rate limiting |
+| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`) |
+| `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IMessageOutbox`, retry policies, deduplication, rate limiting |
 | `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), storage implementations (SQL, Azure Table) |
-| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore` |
+| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore` |
 | `AgentSwarm.Messaging.Worker` | Host | ASP.NET Core worker service hosting the Teams connector, DI registration, health checks, OpenTelemetry configuration |
 | `AgentSwarm.Messaging.Tests` | Test | Unit and integration tests for all assemblies |
 
