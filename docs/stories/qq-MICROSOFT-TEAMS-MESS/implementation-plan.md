@@ -219,7 +219,8 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Implementation Steps
 - [ ] Create `TenantValidationMiddleware` for the Bot Framework pipeline that rejects activities from tenants not in the `AllowedTenantIds` configuration list.
 - [ ] Implement `IUserAuthorizationService` with method `AuthorizeAsync(string tenantId, string userId, string command)` that checks RBAC permissions.
-- [ ] Create `RbacOptions` configuration class mapping Teams user roles to allowed commands (e.g., `Operator` → all commands, `Viewer` → `agent status` only).
+- [ ] Implement `IIdentityResolver` with method `ResolveAsync(string aadObjectId)` that maps the Teams `Activity.From.AadObjectId` (Entra AAD object ID) to an internal user identity record; reject unmapped users with HTTP 403.
+- [ ] Create `RbacOptions` configuration class mapping Teams user roles to allowed commands (e.g., `Operator` → all commands, `Approver` → `approve`/`reject`/`agent status`, `Viewer` → `agent status` only).
 - [ ] Integrate Entra ID token validation by configuring `BotFrameworkAuthentication` with `AllowedCallers` and tenant restrictions.
 - [ ] Add rejection response: unauthorized users receive a polite card explaining they lack access and how to request it.
 
@@ -261,6 +262,8 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create EF Core migration for the `OutboxMessages` table with index on `Status` and `NextRetryAt`.
 - [ ] Implement `OutboxProcessor` as `BackgroundService` that polls for pending messages, attempts delivery, and updates status.
 - [ ] Implement exponential backoff retry: delays of 1s, 2s, 4s, 8s, 16s with jitter, up to `DeadLetterThreshold` (default 5) attempts.
+- [ ] Implement `Retry-After` header handling: when the Bot Framework returns HTTP 429, parse the `Retry-After` response header and use its value as the minimum delay before the next retry attempt, overriding the computed backoff if `Retry-After` is longer.
+- [ ] Implement token-bucket rate limiter in the outbound pipeline to proactively avoid Bot Framework rate limits (default: 50 msgs/sec per bot, configurable).
 - [ ] Implement dead-letter handling: messages exceeding retry threshold are moved to `DeadLettered` status with the last error recorded.
 
 ### Dependencies

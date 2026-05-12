@@ -151,7 +151,7 @@ Feature: Adaptive Card Approvals
       | ActionValue       | approve          |
       | Comment           | <null>           |
       | Messenger         | teams            |
-      | ExternalUserId    | alice@contoso.com |
+      | ExternalUserId    | <alice's AadObjectId> |
       | ExternalMessageId | <Teams activity ID> |
       | CorrelationId     | <original UUID>  |
     And the event is enqueued to the inbound queue
@@ -299,7 +299,7 @@ Feature: Security — Tenant and User Validation
       | Field     | Value                       |
       | Event     | UnauthorizedTenantRejected  |
       | TenantId  | evil-corp-tenant-id         |
-      | UserId    | mallory@evil-corp.com       |
+      | UserId    | <mallory's AadObjectId>     |
 
   Scenario: User without the required RBAC role is denied
     Given user "viewer-only@contoso.com" has RBAC role "viewer"
@@ -429,7 +429,7 @@ Feature: Compliance — Immutable Audit Trail
       | EventType         | InboundCommand                                     |
       | Messenger         | teams                                              |
       | TenantId          | contoso-tenant-id                                  |
-      | UserId            | alice@contoso.com                                  |
+      | UserId            | <alice's AadObjectId (Entra OID)>                  |
       | Command           | agent ask                                          |
       | Payload           | create e2e test scenarios for update service       |
       | CorrelationId     | <UUID>                                             |
@@ -441,7 +441,7 @@ Feature: Compliance — Immutable Audit Trail
       | Field             | Value                     |
       | EventType         | OutboundNotification      |
       | QuestionId        | Q-1001                    |
-      | TargetUserId      | alice@contoso.com         |
+      | TargetUserId      | <alice's AadObjectId> |
       | DeliveryStatus    | Delivered                 |
       | ActivityId        | <Teams activity ID>       |
       | CorrelationId     | <UUID>                    |
@@ -454,7 +454,7 @@ Feature: Compliance — Immutable Audit Trail
       | QuestionId        | Q-1001            |
       | ActionValue       | approve           |
       | Comment           | LGTM              |
-      | UserId            | alice@contoso.com |
+      | UserId            | <alice's AadObjectId> |
       | CorrelationId     | <UUID>            |
 
   Scenario: Security rejections are audit-logged
