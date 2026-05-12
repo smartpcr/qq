@@ -247,7 +247,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create `IProactiveNotifier` interface with methods: `SendProactiveAsync(string userId, MessengerMessage message, CancellationToken ct)`, `SendProactiveQuestionAsync(string userId, AgentQuestion question, CancellationToken ct)`, `SendToChannelAsync(string channelId, string tenantId, MessengerMessage message, CancellationToken ct)`, and `SendQuestionToChannelAsync(string channelId, string tenantId, AgentQuestion question, CancellationToken ct)`. The channel-targeted methods route to a team channel using the channel's stored `ConversationReference` (retrieved via `IConversationReferenceStore.GetByChannelIdAsync`), supporting the story requirement to send proactive notifications to both personal chat and team channels.
 - [ ] Implement `TeamsProactiveNotifier : IProactiveNotifier` using `CloudAdapter.ContinueConversationAsync` with stored conversation references. For user-targeted sends, look up by `(UserId, TenantId)`; for channel-targeted sends, look up by `(ChannelId, TenantId)`.
 - [ ] Implement conversation reference rehydration: deserialize stored `ConversationReference` JSON and invoke `ContinueConversationAsync` with the app credentials.
-- [ ] Add proactive message delivery via direct `ContinueConversationAsync` calls; durable outbox queuing is layered on top in Phase 6 Stage 6.1 when `OutboxRetryEngine` becomes available.
+- [ ] Add proactive message delivery via direct `ContinueConversationAsync` calls as an interim implementation; this will be replaced by outbox-mediated sends in Phase 6 Stage 6.1 (the direct-send code path is removed when Stage 6.1's outbox wiring step lands).
 - [ ] Implement notification routing: determine whether to send to personal chat or team channel based on message priority and user preferences.
 
 ### Dependencies
@@ -319,6 +319,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement token-bucket rate limiter in the outbound pipeline to proactively avoid Bot Framework rate limits (default: 50 msgs/sec per bot, configurable).
 - [ ] Implement dead-letter handling: messages exceeding retry threshold are moved to `DeadLettered` status with the last error recorded.
 - [ ] Wire `TeamsMessengerConnector.SendMessageAsync`, `TeamsMessengerConnector.SendQuestionAsync`, `TeamsProactiveNotifier.SendProactiveAsync`, `TeamsProactiveNotifier.SendProactiveQuestionAsync`, `TeamsProactiveNotifier.SendToChannelAsync`, and `TeamsProactiveNotifier.SendQuestionToChannelAsync` to persist outbound notifications to `IMessageOutbox.EnqueueAsync` BEFORE attempting delivery. The `OutboxRetryEngine` becomes the canonical send path: all outbound messages are first enqueued with `Status = Pending`, then picked up by the engine which calls `ContinueConversationAsync`. Direct sends in Stage 4.2 are replaced by outbox-mediated sends. This ensures no notification is lost even if the process crashes between intent-to-send and actual delivery, satisfying the reliability requirement to persist outbound notifications and retry transient failures.
+- [ ] Refactor `TeamsProactiveNotifier` and `TeamsMessengerConnector` to remove direct `ContinueConversationAsync` calls from their send methods: each send method now only calls `IMessageOutbox.EnqueueAsync` to persist the message, and `OutboxRetryEngine.ProcessPendingAsync` is the sole code path that invokes `ContinueConversationAsync`. Verify by confirming no direct `ContinueConversationAsync` calls remain in `TeamsProactiveNotifier` or `TeamsMessengerConnector` after this step.
 
 ### Dependencies
 - _none — start stage_
@@ -410,8 +411,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md`
-**Byte count:** ~49,219
-**Covers:** All story requirements — Bot Framework/Teams APIs, Entra ID integration, personal chat + team channel scopes, Adaptive Cards, message actions, proactive notifications with channel-capable API, conversation reference persistence (user-scoped and channel-scoped), command handling with @mention normalization, durable outbox as canonical send path, RBAC/tenant enforcement, immutable audit trail with six canonical EventType values per `tech-spec.md` §4.3, message update/delete, P95 delivery SLA, end-to-end acceptance tests.
+**Covers:** All story requirements — Bot Framework/Teams APIs, Entra ID integration, personal chat + team channel scopes, Adaptive Cards, message actions, proactive notifications with channel-capable API, conversation reference persistence (user-scoped and channel-scoped), command handling with @mention normalization, durable outbox as canonical send path with explicit switchover, RBAC/tenant enforcement with default-deny identity resolution, immutable audit trail with seven canonical EventType values per `tech-spec.md` §4.3, message update/delete, P95 delivery SLA, end-to-end acceptance tests.
 
 ### Prior feedback resolution
 
