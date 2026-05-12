@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 10
+**Status:** Draft — iteration 11
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -722,13 +722,15 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmAc
 1. Human types `agent ask create e2e test scenarios for update service` in Teams.
 2. Bot Framework delivers the activity to `POST /api/messages`.
 3. `TeamsBotAdapter` runs middleware: tenant validation passes, rate limit check passes.
-4. `TeamsSwarmActivityHandler.OnMessageActivityAsync` extracts the `ConversationReference` from the activity via `Activity.GetConversationReference()` and calls `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it. This ensures conversation references are captured on every interaction, including first contact (aligned with `implementation-plan.md` §2.2 line 87 and `e2e-scenarios.md` §Conversation Reference Persistence).
-5. Handler delegates to `CommandParser`.
-6. `CommandParser` recognizes `agent ask` prefix, extracts payload, generates `CorrelationId`.
-7. An acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}") is sent back to the user.
-8. `TeamsMessengerConnector` publishes a `CommandEvent` (a `MessengerEvent` subtype with `EventType = AgentTaskRequest`) to the inbound buffer.
-9. The orchestrator consumes the event and dispatches work to agents.
-10. `AuditLogger` records the command with full correlation data.
+4. Handler delegates to `CommandParser`.
+5. `CommandParser` recognizes `agent ask` prefix, extracts payload, generates `CorrelationId`.
+6. Handler invokes `IIdentityResolver.ResolveAsync` with `Activity.From.AadObjectId` to map the Entra identity to an internal user. If the user is unmapped, the flow diverts to §6.4.2 (unmapped-user rejection) — no conversation reference is stored.
+7. Handler invokes `IUserAuthorizationService.AuthorizeAsync` to check RBAC permissions. If insufficient, the flow diverts to §6.4.3 (RBAC rejection) — no conversation reference is stored.
+8. After successful identity resolution and authorization, handler extracts the `ConversationReference` from the activity via `Activity.GetConversationReference()` and calls `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it. This ensures conversation references are stored only for authorized users (aligned with `implementation-plan.md` §2.2 line 87 which stores only after identity resolution and authorization, and `e2e-scenarios.md` §Conversation Reference Persistence). Install events (`OnTeamsMembersAddedAsync`, `OnInstallationUpdateActivityAsync`) store references separately during the installation lifecycle — see §2 InstallHandler component.
+9. An acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}") is sent back to the user.
+10. `TeamsMessengerConnector` publishes a `CommandEvent` (a `MessengerEvent` subtype with `EventType = AgentTaskRequest`) to the inbound buffer.
+11. The orchestrator consumes the event and dispatches work to agents.
+12. `AuditLogger` records the command with full correlation data.
 
 ### 6.2 Scenario: Agent proactively sends a blocking question
 
@@ -1047,7 +1049,7 @@ services.AddHostedService<OutboxWorker>();
 | Error class | Handling |
 |---|---|
 | Transient (HTTP 429, 500, 502, 503, 504) | Exponential backoff retry via outbox engine per `tech-spec.md` §4.4: base 2 s, 2× multiplier, max 60 s, 5 total attempts, ±25% jitter, `Retry-After` header override for HTTP 429. |
-| Invalid Bot Framework JWT (pre-application) | Handled automatically by Bot Framework `CloudAdapter` authentication pipeline — returns HTTP 401 before any application code or middleware runs. No `SecurityRejection` audit entry is emitted because the request never reaches the bot handler (per `tech-spec.md` §4.2 rejection matrix row 1). **Sibling-doc conflict (escalated as Open Question `invalid-jwt-audit`):** `e2e-scenarios.md` lines 383–389 state the invalid-JWT attempt should be "logged in the security audit trail" — this contradicts `tech-spec.md` §4.2 rejection matrix. This architecture follows `tech-spec.md` as the source of truth because the Bot Framework SDK rejects the request at the HTTP layer before any application code runs, making audit logging architecturally infeasible without a custom `HttpModule` or reverse-proxy layer. **Resolution options:** (A) Accept no application-level audit for pre-authentication rejections — rely on infrastructure logs (Azure Front Door WAF, API gateway access logs) for forensic coverage; (B) Add an ASP.NET Core `IAuthorizationMiddlewareResultHandler` or custom `DelegatingHandler` before the Bot Framework pipeline to intercept 401s and emit audit entries — adds complexity but satisfies the e2e scenario requirement; (C) Update `e2e-scenarios.md` to remove the audit requirement for invalid-JWT, aligning with `tech-spec.md`. Operator decision required — see Open Question `invalid-jwt-audit`. |
+| Invalid Bot Framework JWT (pre-application) | Handled automatically by Bot Framework `CloudAdapter` authentication pipeline — returns HTTP 401 before any application code or middleware runs. No `SecurityRejection` audit entry is emitted because the request never reaches the bot handler (per `tech-spec.md` §4.2 rejection matrix row 1). **Cross-doc alignment (resolved):** All sibling docs now agree — `e2e-scenarios.md` lines 387–389 explicitly state "no application code or middleware runs" and "no audit entry is emitted (the request never reaches the bot handler — per tech-spec §4.2 line 108)". `tech-spec.md` §4.2 rejection matrix row 1 confirms this behavior. No open question remains. |
 | Tenant not in allow-list | `TenantValidationMiddleware` rejects with HTTP 403; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 2). |
 | Unmapped user identity | `IIdentityResolver` returns null; handler responds with HTTP 200 + access-denial Adaptive Card; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 3). |
 | Insufficient RBAC role | `IUserAuthorizationService` rejects; handler responds with HTTP 200 + insufficient-permissions Adaptive Card; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 4). |
