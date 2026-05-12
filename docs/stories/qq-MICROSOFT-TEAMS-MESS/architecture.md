@@ -282,17 +282,34 @@ Emitted when a human responds to an agent question.
 
 #### MessengerEvent
 
-Platform-agnostic inbound event. Defined in `AgentSwarm.Messaging.Abstractions`.
+Platform-agnostic inbound event. Defined in `AgentSwarm.Messaging.Abstractions` as a base record with concrete subtypes per `implementation-plan.md` §1.1.
+
+The base record carries the common envelope fields. Each subtype adds a typed payload. The `EventType` discriminator is a `string` field on the base record that identifies the subtype.
+
+**Base record fields:**
 
 | Field | Type | Description |
 |---|---|---|
 | `EventId` | `string` | Unique event identifier. |
-| `EventType` | `string` | `Command`, `Decision`, `Reaction`, `InstallUpdate`, `AgentTaskRequest`. |
+| `EventType` | `string` | Discriminator — see subtype table below. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
 | `Messenger` | `string` | `"Teams"`. |
 | `ExternalUserId` | `string` | Teams AAD object ID. |
-| `Payload` | `object` | Typed payload — `ParsedCommand`, `HumanDecisionEvent`, or `MessageActionRequest`. For message-action-originated events, the `EventType` is `AgentTaskRequest` with `Source = MessageAction` (aligned with `e2e-scenarios.md` §Message Actions). |
+| `ActivityId` | `string?` | Inbound `Activity.Id` — used for webhook deduplication (see §4.8). |
+| `Source` | `string?` | Origin context: `null` for direct messages, `MessageAction` for forwarded messages. |
 | `Timestamp` | `DateTimeOffset` | UTC receipt time. |
+
+**Subtypes and EventType values:**
+
+| Subtype (C# record) | `EventType` value | Typed payload | When produced |
+|---|---|---|---|
+| `CommandEvent` | `AgentTaskRequest` | `ParsedCommand` | User sends `agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume` in chat or channel. Also produced for message-action forwards (with `Source = MessageAction`). Aligns with `e2e-scenarios.md` §Personal Chat lines 26, 40 which expect `MessengerEvent` type `AgentTaskRequest`. |
+| `DecisionEvent` | `Decision` | `HumanDecisionEvent` | User taps an Adaptive Card action button (approve/reject/etc.). |
+| `TextEvent` | `Text` | `string` (raw text) | Unrecognized free-text input that does not match a command pattern. |
+| *(base)* | `InstallUpdate` | `InstallEventPayload` | Bot installed/uninstalled from personal scope or team. |
+| *(base)* | `Reaction` | `ReactionPayload` | User adds/removes a reaction to a bot message. |
+
+> **Cross-doc alignment:** `implementation-plan.md` §1.1 line 19 defines `MessengerEvent` as a base record with subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`. This architecture adopts that subtype structure and maps each subtype to a canonical `EventType` discriminator value. The `AgentTaskRequest` value (not `Command`) is used for all command-originated events, aligning with `e2e-scenarios.md` lines 26 and 40.
 
 ### 3.2 Teams-Specific Entities
 
@@ -320,7 +337,7 @@ Persisted Bot Framework `ConversationReference` for proactive messaging.
 |---|---|---|
 | `Id` | `string` | Primary key (GUID). |
 | `TenantId` | `string` | Entra ID tenant. |
-| `UserId` | `string` | AAD object ID (null for channel refs). |
+| `UserId` | `string?` | AAD object ID. Null for channel-scoped references (where `ChannelId` is set instead). |
 | `ChannelId` | `string?` | Teams channel ID (null for personal chats). |
 | `ServiceUrl` | `string` | Bot Connector endpoint. |
 | `ConversationId` | `string` | Bot Framework conversation ID. |
@@ -564,8 +581,8 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmAc
      │                        │                       │                    │                     │  {Ask, "create..."}│                      │
      │                        │                       │                    │<── ack card ────────│                    │                      │
      │<── "Task submitted" ───│<──────────────────────│<───────────────────│                     │                    │                      │
-     │                        │                       │                    │                     │                    │── MessengerEvent ───>│
-     │                        │                       │                    │                     │                    │  {Command, Ask}      │
+     │                        │                       │                    │                     │                    │── CommandEvent ─────>│
+     │                        │                       │                    │                     │                    │  {AgentTaskRequest}  │
      │                        │                       │                    │                     │                    │                      │── audit log
 ```
 
@@ -575,7 +592,7 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmAc
 4. `TeamsSwarmActivityHandler.OnMessageActivityAsync` delegates to `CommandParser`.
 5. `CommandParser` recognizes `agent ask` prefix, extracts payload, generates `CorrelationId`.
 6. An acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}") is sent back to the user.
-7. `TeamsMessengerConnector` publishes a `MessengerEvent` of type `Command` to the inbound buffer.
+7. `TeamsMessengerConnector` publishes a `CommandEvent` (a `MessengerEvent` subtype with `EventType = AgentTaskRequest`) to the inbound buffer.
 8. The orchestrator consumes the event and dispatches work to agents.
 9. `AuditLogger` records the command with full correlation data.
 
