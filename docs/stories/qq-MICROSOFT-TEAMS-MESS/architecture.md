@@ -217,6 +217,18 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 | **Trigger** | `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to this handler. |
 | **Manifest** | Requires a `composeExtensions` entry in the Teams app manifest with `type: "action"` and `fetchTask: false` (or `true` if a task module is used to collect additional input). |
 
+### 2.16 ActivityDeduplicationMiddleware
+
+| Attribute | Value |
+|---|---|
+| **Assembly** | `AgentSwarm.Messaging.Teams` |
+| **Namespace** | `AgentSwarm.Messaging.Teams.Middleware` |
+| **Type** | Bot Framework middleware (`IMiddleware`) |
+| **Position in pipeline** | After `TenantValidationMiddleware`, before `RateLimitMiddleware` (see §2.3). |
+| **Responsibility** | Suppress duplicate inbound webhook deliveries. Teams and the Bot Connector service may retry an HTTP POST if the initial response times out, resulting in the same logical activity being delivered more than once. This middleware deduplicates by `Activity.Id` (or `Activity.ReplyToId` for invoke activities) per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. |
+| **Store** | `IActivityIdStore` — a lightweight store (in-memory + durable backing) that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes). When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
+| **Distinction from §2.6 idempotency** | This middleware operates at the **transport level** on raw `Activity.Id`, catching retried HTTP POSTs before any handler runs. The `CardActionHandler` idempotency set (§2.6) operates at the **domain level** on `(QuestionId, UserId)`, catching semantically duplicate card actions that may arrive as distinct activities. Both layers are necessary. |
+
 ---
 
 ## 3. Data Model
@@ -543,7 +555,23 @@ public interface IAdaptiveCardRenderer
 Components communicate through two internal channels:
 
 1. **Inbound queue** — `TeamsSwarmActivityHandler` → domain handlers → `TeamsMessengerConnector.ReceiveAsync()` buffer. The orchestrator polls `ReceiveAsync` or subscribes to a push-based `IObservable<MessengerEvent>` variant.
-2. **Outbound queue** — Orchestrator calls `SendMessageAsync` / `SendQuestionAsync` → `OutboxRetryEngine` enqueues → background worker dequeues → `ProactiveNotifier` delivers via Bot Framework.
+2. **Outbound queue** — Orchestrator calls `SendMessageAsync` / `SendQuestionAsync` / `UpdateCardAsync` / `DeleteCardAsync` → `OutboxRetryEngine` enqueues → background worker dequeues → `ProactiveNotifier` delivers via Bot Framework.
+
+### 4.8 IActivityIdStore (webhook deduplication)
+
+```csharp
+// Assembly: AgentSwarm.Messaging.Teams
+public interface IActivityIdStore
+{
+    /// <summary>
+    /// Returns true if the activity ID was already seen (duplicate).
+    /// If not seen, atomically marks it as seen with the configured TTL.
+    /// </summary>
+    Task<bool> IsSeenOrMarkAsync(string activityId, CancellationToken ct);
+}
+```
+
+`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 10 minutes). For multi-instance deployments, a Redis-backed implementation is recommended.
 
 ---
 

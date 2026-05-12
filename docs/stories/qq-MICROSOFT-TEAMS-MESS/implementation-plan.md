@@ -64,7 +64,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 2.1: ASP.NET Core Bot Host
 
 ### Implementation Steps
-- [ ] Create project `AgentSwarm.Messaging.Teams` with NuGet references: `Microsoft.Bot.Builder` (4.22+), `Microsoft.Bot.Builder.Integration.AspNet.Core` (4.22+), `Microsoft.Bot.Connector.Teams` (4.22+). Note: `Microsoft.Bot.Builder` already includes the `Microsoft.Bot.Builder.Teams` namespace containing `TeamsActivityHandler`; the separate `Microsoft.Bot.Connector.Teams` package provides Teams-specific types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`.
+- [ ] Create project `AgentSwarm.Messaging.Teams` with NuGet references: `Microsoft.Bot.Builder` (4.22+), `Microsoft.Bot.Builder.Integration.AspNet.Core` (4.22+), `Microsoft.Bot.Builder.Teams` (4.22+), and `Microsoft.Bot.Connector.Teams` (4.22+). `Microsoft.Bot.Builder.Teams` provides `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods. `Microsoft.Bot.Connector.Teams` provides Teams-specific model types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`.
 - [ ] Create `TeamsMessagingOptions` configuration class with properties: `MicrosoftAppId`, `MicrosoftAppPassword`, `MicrosoftAppTenantId`, `AllowedTenantIds` (list), `BotEndpoint`.
 - [ ] Implement `Startup`/`Program.cs` registering `CloudAdapter` (from `Microsoft.Bot.Builder.Integration.AspNet.Core`) as the bot adapter with middleware pipeline (Telemetry → TenantFilter → RateLimit), `IBot`, health check endpoints (`/health`, `/ready`), and OpenTelemetry tracing.
 - [ ] Create `BotController` with POST endpoint at `/api/messages` that delegates to `CloudAdapter.ProcessAsync`.
@@ -225,7 +225,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Test Scenarios
 - [ ] Scenario: Proactive question delivery — Given a stored conversation reference for `user-1`, When `SendProactiveQuestionAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the user's personal chat using `AdaptiveCardBuilder` to render the card.
-- [ ] Scenario: Reference not found — Given no conversation reference exists for `user-2`, When `SendProactiveQuestionAsync` is called, Then the notification is dead-lettered with reason `NoConversationReference`.
+- [ ] Scenario: Reference not found — Given no conversation reference exists for `user-2`, When `SendProactiveQuestionAsync` is called, Then a `ConversationReferenceNotFoundException` is thrown and the caller logs the failure for later outbox-based retry (available in Phase 6).
 - [ ] Scenario: Direct delivery latency — Given a stored conversation reference and a rendered Adaptive Card, When `SendProactiveQuestionAsync` delivers the card directly via `ContinueConversationAsync`, Then delivery completes within P95 < 3 seconds.
 
 # Phase 5: Security, Identity, and Compliance
@@ -289,9 +289,9 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - _none — start stage_
 
 ### Test Scenarios
-- [ ] Scenario: Successful delivery — Given a message is enqueued with status `Pending`, When the outbox processor runs and delivery succeeds, Then the status is updated to `Sent`.
-- [ ] Scenario: Transient failure retry — Given delivery fails with a transient `HttpRequestException`, When the outbox processor runs, Then `RetryCount` is incremented and `NextRetryAt` is set with exponential backoff.
-- [ ] Scenario: Dead-letter after max retries — Given a message has failed 5 times, When the outbox processor runs, Then the status is set to `DeadLettered` and `LastError` contains the failure reason.
+- [ ] Scenario: Successful delivery — Given a message is enqueued with status `Pending`, When `OutboxRetryEngine` runs and delivery succeeds, Then the status is updated to `Sent`.
+- [ ] Scenario: Transient failure retry — Given delivery fails with a transient `HttpRequestException`, When `OutboxRetryEngine` runs, Then `RetryCount` is incremented and `NextRetryAt` is set with exponential backoff.
+- [ ] Scenario: Dead-letter after max retries — Given a message has failed 5 times, When `OutboxRetryEngine` runs, Then the status is set to `DeadLettered` and `LastError` contains the failure reason.
 
 ## Stage 6.2: Duplicate Suppression and Idempotency
 
