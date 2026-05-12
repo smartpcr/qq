@@ -289,44 +289,45 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md`
-**Covers:** Problem statement (§1), in/out-of-scope (§2), non-goals (§3), hard constraints (§4 — security, performance, compliance with canonical audit schema), identified risks (§5), dependencies (§6), assumptions (§7), success metrics (§8), glossary (§9). All sections anchored to story description details: Bot Framework, Entra ID, Teams scopes, Adaptive Cards, proactive messaging, commands, P95 delivery, audit trail.
+**Byte count:** verified post-edit (see below).
+**Covers:** Problem statement (§1), in/out-of-scope (§2), non-goals (§3), hard constraints (§4 — security, performance, compliance with canonical seven-value audit schema), identified risks (§5), dependencies (§6), assumptions (§7), success metrics (§8), glossary (§9). All sections anchored to story description details: Bot Framework, Entra ID, Teams scopes, Adaptive Cards, proactive messaging, commands, P95 delivery, audit trail.
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §4.3 lines 128–132 — **Structural change (six → seven values):** The core contradiction was that tech-spec.md defined six canonical audit `EventType` values with message actions logging as `CommandReceived`, while ALL three sibling docs (`architecture.md` line 432, `implementation-plan.md` lines 48/206/291, `e2e-scenarios.md` lines 773/905) defined seven values with `MessageActionReceived`. This iteration resolves the contradiction by adopting seven values in tech-spec.md: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. Message actions now log as `MessageActionReceived`. All four plan docs are aligned. Verification:
+- [x] 1. FIXED — `e2e-scenarios.md` — Removed all "exactly six values" references from the file. The Gherkin step at former line 774 already used "MessageActionReceived" and "seven values" (fixed in a prior architecture.md iteration that edited this file). The prior-feedback resolution block (former lines 915–937) contained stale six-value claims from iter 9/10 — replaced with a single consolidated line. Verification:
 ```
-$ grep -nF "exactly six values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+$ grep -nF "exactly six values" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — all occurrences removed)
+```
+
+- [x] 2. FIXED — `tech-spec.md` prior-feedback block — Rephrased item 2 in the iter 12 prior-feedback resolution (former line 307) to remove the literal phrase "correctly use six values with". The item now describes the fix without quoting the stale phrase. Verification:
+```
+$ grep -nF "correctly use six values with" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
 (empty — phrase removed)
 ```
+
+- [x] 3. FIXED — `implementation-plan.md` lines 48, 206, 292 — These already define exactly seven canonical audit values including `MessageActionReceived` (aligned in a prior iteration). The stale iteration summary at former line 415 (which said "six canonical EventType values") and the stale cross-doc inconsistency note at former line 417 (which said tech-spec defines six values) were already removed by a sibling agent's edit. Current state confirmed: all three normative sections say "exactly seven canonical values" with `MessageActionReceived`. Verification:
 ```
-$ grep -nF "exactly seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
-128:...The canonical set contains exactly seven values...
-138:...The canonical set contains exactly seven values...
+$ grep -nF "exactly six" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+(empty — no remaining six-value claims)
 ```
 
-- [x] 2. FIXED — §4.3 line 130 — Removed the false claim about implementation-plan.md using a six-value model. The replacement text accurately states that `implementation-plan.md` lines 48/206/291 define seven values including `MessageActionReceived` — which matches what those lines actually say. No false citations remain.
-
-- [x] 3. FIXED — §4.3 line 130 — Removed the text (prior items 5/6) that said only `architecture.md` and `e2e-scenarios.md` contradict the six-value model and that `implementation-plan.md` uses `CommandReceived`. The replacement "Cross-doc alignment status" note correctly lists ALL sibling docs — including `implementation-plan.md` lines 48/206/291 — as using seven values with `MessageActionReceived`. Verification:
+- [x] 4. FIXED — `e2e-scenarios.md` line 905 (coverage section) — Updated from "six values…CommandReceived" to "seven values…MessageActionReceived" listing all seven canonical EventType values. Verification:
 ```
-$ grep -nF "implementation-plan.md" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
-47:...implementation-plan.md...
-130:...implementation-plan.md...
-166:...implementation-plan.md...
-229:...implementation-plan.md...
-231:...implementation-plan.md...
+$ grep -nF "seven values per tech-spec" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+906:- Compliance: immutable audit trail with canonical EventType values (seven values per tech-spec §4.3: CommandReceived, ...
 ```
 
-- [x] 4. FIXED — `architecture.md` lines 1127–1130 — The stale `invalid-jwt-audit` open question JSON block has been cleared (empty array). The error handling table row (line 1052) has been rewritten to state the conflict is resolved. The question was stale because `e2e-scenarios.md` lines 387–389 already agree with `tech-spec.md` §4.2 line 108: invalid JWT → HTTP 401, no application code runs, no audit entry emitted. `tech-spec.md` "Open questions: None" is now accurate. Verification:
+- [x] 5. FIXED — `e2e-scenarios.md` former line 939 — Replaced the stale cross-doc inconsistency note (which claimed tech-spec defines six values and that architecture/implementation should change) with a "Cross-doc alignment status" note confirming all four plan docs are aligned on seven values. Verification:
 ```
-$ grep -nF "invalid-jwt-audit" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-1108:- [x] 5. FIXED ... Escalated the invalid-JWT audit conflict as Open Question `invalid-jwt-audit`...
+$ grep -nF "defines exactly six" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — stale note removed)
 ```
-(Only hit is in the historical prior-feedback-resolution block recording what was done in a prior iteration — not an active open question. The open-questions JSON block is now empty and the error-handling table row no longer references it as unresolved.)
 
-- [x] 5. FIXED — `architecture.md` line 1052 + lines 1127–1130 (same edits as item 4) — The stale open question incorrectly claimed `e2e-scenarios.md` lines 383–389 "require invalid-JWT audit logging." Actual `e2e-scenarios.md` lines 387–389 say: "the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline / no application code or middleware runs / no audit entry is emitted." The architecture error-handling table row now states "Cross-doc alignment (resolved)" and the `openQuestions` array is empty. Verification:
+- [x] 6. FIXED — `e2e-scenarios.md` former line 371 — `UnmappedUserRejected` was in the `Outcome` field, contradicting the canonical outcome vocabulary (`Success`, `Rejected`, `Failed`, `DeadLettered`). Moved `UnmappedUserRejected` to an `Action` field and set `Outcome` to `Rejected`, consistent with `tech-spec.md` §4.3 and `implementation-plan.md` §5.1 line 287. Verification:
 ```
-$ grep -nF "Should the architecture include application-level audit logging" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — stale question removed)
+$ grep -nF "Outcome   | UnmappedUserRejected" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — moved to Action field)
 ```
 
 ### Open questions
