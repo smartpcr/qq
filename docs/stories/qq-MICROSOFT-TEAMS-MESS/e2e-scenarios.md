@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.0 — Iteration 1
+**Version:** 1.1 — Iteration 2
 
 ---
 
@@ -16,7 +16,7 @@ Feature: Personal Chat — Agent Task Creation
     Given the Teams bot is registered with a valid Bot Framework app registration
     And the bot is installed for user "alice@contoso.com" in tenant "contoso-tenant-id"
     And the user "alice@contoso.com" has RBAC role "operator"
-    And the Messenger Gateway worker service is running
+    And the AgentSwarm.Messaging.Worker host service is running
     And a conversation reference is stored for user "alice@contoso.com"
 
   Scenario: User creates an agent task via personal chat
@@ -91,7 +91,7 @@ Feature: Proactive Messaging — Blocking Questions
       | AllowedActions | Approve, Reject, Need more info            |
       | ExpiresAt      | <now + 24 hours>                           |
       | CorrelationId  | <UUID>                                     |
-    When the Messenger Gateway picks up the question from the outbound queue
+    When the OutboxRetryEngine picks up the question from the outbound queue
     Then the bot sends a proactive Adaptive Card to "alice@contoso.com" using the stored conversation reference
     And the card is delivered within 3 seconds (P95)
     And the Adaptive Card displays the Title and Body
@@ -111,10 +111,10 @@ Feature: Proactive Messaging — Blocking Questions
     And the card is threaded under the original task context if one exists
 
   Scenario: Proactive message delivery after service restart
-    Given the Messenger Gateway was restarted
+    Given the AgentSwarm.Messaging.Worker host was restarted
     And conversation references were persisted before the restart
     When agent "test-agent-02" publishes an AgentQuestion for user "alice@contoso.com"
-    Then the gateway rehydrates the conversation reference from the persistence store
+    Then the ProactiveNotifier rehydrates the conversation reference from the ConversationReferenceStore
     And the Adaptive Card is delivered successfully to the user
     And connector recovery completes within 30 seconds
 
@@ -212,7 +212,7 @@ Feature: Message Update and Delete
 
   Scenario: Bot deletes a recalled question card
     Given agent "arch-agent-03" recalls question "Q-701" before a human responds
-    When the Messenger Gateway processes the recall event
+    When the TeamsMessengerConnector processes the recall event
     Then the bot calls DeleteActivityAsync with activity ID "act-901"
     And the card is removed from the conversation
     And an audit record is persisted for the deletion
@@ -260,7 +260,7 @@ Feature: Conversation Reference Persistence
 
   Scenario: Conversation references survive full service restart
     Given conversation references exist for 50 users
-    When the Messenger Gateway worker service is restarted
+    When the AgentSwarm.Messaging.Worker host service is restarted
     Then all 50 conversation references are available from the persistence store
     And proactive messages can be sent to all 50 users without re-interaction
 
@@ -345,8 +345,8 @@ Covers transient failure handling, durable queuing, and connector recovery.
 Feature: Reliability — Retry and Recovery
 
   Background:
-    Given the Messenger Gateway worker service is running
-    And the outbound notification queue is configured with retry policy:
+    Given the AgentSwarm.Messaging.Worker host service is running
+    And the OutboxRetryEngine is configured with retry policy:
       | Setting          | Value              |
       | MaxRetries       | 5                  |
       | InitialBackoff   | 1 second           |
@@ -373,7 +373,7 @@ Feature: Reliability — Retry and Recovery
 
   Scenario: Outbound notifications survive service crash
     Given 3 notifications are in the durable outbound queue
-    When the Messenger Gateway process crashes unexpectedly
+    When the AgentSwarm.Messaging.Worker process crashes unexpectedly
     And the process is restarted by the orchestrator
     Then the 3 pending notifications are recovered from the durable queue
     And delivery resumes from where it left off
@@ -484,7 +484,7 @@ Feature: Performance — Card Delivery SLA
 
   Scenario: P95 Adaptive Card delivery under 3 seconds
     Given 100 AgentQuestions are published to the outbound queue in a burst
-    When the Messenger Gateway processes all 100 notifications
+    When the OutboxRetryEngine processes all 100 notifications
     Then at least 95 of the 100 Adaptive Cards are delivered within 3 seconds of queue pickup
     And the delivery latency for each card is recorded as a metric
     And no cards are lost

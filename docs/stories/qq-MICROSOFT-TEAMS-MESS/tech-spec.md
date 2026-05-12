@@ -83,9 +83,9 @@ These are non-negotiable requirements drawn from the story description, enterpri
 
 | Constraint | Source |
 |------------|--------|
-| C# / .NET 8+ | Epic-level mandate (see attachment §Implementation language) |
+| C# / .NET 8+ | Epic-level mandate (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Overview: "Implementation language must be C# / .NET 8+") |
 | `Microsoft.Bot.Builder` + `Microsoft.Bot.Builder.Integration.AspNet.Core` | Story description requirement |
-| Teams extensions (`Microsoft.Bot.Connector.Teams` or `Microsoft.Bot.Builder.Teams`) | Story description requirement |
+| `Microsoft.Bot.Connector.Teams` (Teams extension types) | Story description requirement (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Recommended C# Libraries under MSG-MT-001) |
 | ASP.NET Core hosting | Required by Bot Builder Integration package |
 
 ### 4.2 Identity & Security
@@ -94,7 +94,7 @@ These are non-negotiable requirements drawn from the story description, enterpri
 |------------|--------|
 | **Tenant ID validation** | Every inbound `Activity` must have its `ChannelData.Tenant.Id` checked against an allow-list. Activities from disallowed tenants are rejected with HTTP 403 before processing. |
 | **User identity via Entra ID** | The bot must resolve `Activity.From.AadObjectId` to an internal user record. Unauthenticated or unmapped users are rejected. |
-| **Teams app installation gate** | Proactive messaging requires the app to be installed in the user's personal scope or in the team. The connector must not attempt proactive messaging to uninstalled contexts. |
+| **Teams app installation gate** | Proactive messaging requires the app to be installed in the user's personal scope or in the team. The connector tracks installation state via `InstallationUpdate` activities: when an uninstall event is received, the corresponding `ConversationReference` is marked inactive and no proactive sends are attempted. This is distinct from *stale persisted references* (see R-2 in §5.1), which are references that became invalid without a prior uninstall event (e.g., user removed from tenant); those are detected reactively via 403/404 on send attempt. |
 | **RBAC enforcement** | Each command maps to a required role. `approve`/`reject` require `Approver` role. `agent ask`, `pause`, `resume`, `escalate` require `Operator` role. `agent status` requires `Viewer` role (or above). |
 | **Secret storage** | Bot Framework `MicrosoftAppId` and `MicrosoftAppPassword` (or certificate) must be stored in Azure Key Vault or equivalent secure store. Never logged, never in source. |
 
@@ -135,10 +135,10 @@ These are non-negotiable requirements drawn from the story description, enterpri
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|------------|--------|------------|
 | R-1 | **Bot Framework rate limiting under burst** — 100+ agents sending proactive notifications simultaneously may hit Bot Connector rate limits (default ~50 msgs/sec per bot). | Medium | High — delayed card delivery, missed SLO | Implement token-bucket rate limiter in the outbound pipeline. Respect `Retry-After` headers. Queue with priority (approval cards > status updates). |
-| R-2 | **Conversation reference staleness** — Users uninstall the app, leave a team, or are removed from the tenant. Stored `ConversationReference` becomes invalid; proactive send returns 403/404. | High | Medium — failed proactive delivery, alert noise | Catch `ErrorResponseException` on proactive send. Mark stale references. Emit metric. Do not retry permanently-failed references. Refresh on next inbound activity from that user. |
+| R-2 | **Stale persisted conversation references** — A stored `ConversationReference` may become invalid without a corresponding `InstallationUpdate` uninstall event (e.g., user removed from tenant, team deleted). Unlike known-uninstalled contexts (handled proactively in §4.2), stale references are detected reactively when a proactive send returns HTTP 403 or 404. | High | Medium — failed proactive delivery, alert noise | Catch `ErrorResponseException` on proactive send. On 403/404, mark the reference as stale (inactive) and emit a `teams.proactive.reference.stale` metric. Do not retry permanently-failed references. Reactivate if a fresh inbound `Activity` arrives from the same user/channel. |
 | R-3 | **Adaptive Card schema drift** — Teams client updates may change supported card schema versions or rendering behavior. | Low | Medium — broken card layouts | Pin card schema version in templates. Include card-rendering integration tests against Teams test tenant. |
 | R-4 | **Entra ID token validation latency** — Validating JWT tokens from Bot Framework on every request adds latency to the inbound pipeline. | Low | Low — increased P95 but still within budget | Cache JWKS keys with appropriate TTL. Use `Microsoft.Bot.Connector.Authentication` built-in caching. |
-| R-5 | **Service Principal permissions** — The bot's Entra app registration requires `TeamsAppInstallation.ReadForUser` or `TeamsActivity.Send` permissions. Admin consent may be delayed by enterprise IT. | Medium | High — blocks deployment entirely | Document required permissions early. Provide admin-consent request template. Include in deployment checklist. |
+| R-5 | **Bot registration and admin consent** — The bot's Entra app registration requires Azure Bot Service channel registration and Teams app manifest approval. Admin consent for the Teams app installation policy may be delayed by enterprise IT. | Medium | High — blocks deployment entirely | Document required Azure Bot Service setup and Teams admin-center approval steps early. Provide admin-consent request template. Include in deployment checklist. No Microsoft Graph API permissions are required — proactive messaging uses `BotAdapter.ContinueConversationAsync` with the bot's own `MicrosoftAppId`, not Graph endpoints. |
 
 ### 5.2 Operational Risks
 
@@ -175,7 +175,7 @@ These are non-negotiable requirements drawn from the story description, enterpri
 | **Azure Bot Service** | Bot channel registration in Azure. Required for Bot Framework authentication. |
 | **Microsoft Entra ID** | App registration with Teams channel enabled. `MicrosoftAppId` + secret/certificate. |
 | **Teams Admin Center** | App policy to allow or require installation for target users/groups. |
-| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Builder.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). |
+| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Connector.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). |
 | **Azure Key Vault** (or equivalent) | Secure storage for bot credentials. |
 
 ---
@@ -220,4 +220,4 @@ These are non-negotiable requirements drawn from the story description, enterpri
 
 ---
 
-*Cross-references: Architecture details in `architecture.md`. Implementation phasing in `implementation-plan.md`. E2E test scenarios in `e2e-scenarios.md`.*
+*Sibling plan documents in this story folder (`docs/stories/qq-MICROSOFT-TEAMS-MESS/`): `architecture.md`, `implementation-plan.md`, `e2e-scenarios.md`.*
