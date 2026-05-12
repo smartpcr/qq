@@ -1054,3 +1054,78 @@ services.AddHostedService<OutboxWorker>();
 | Card update conflict (activity not found) | Log warning; mark card state as `Deleted`; send a **new replacement card** to the user with the updated status (aligned with `e2e-scenarios.md` §Update/Delete — "bot sends a new replacement card"); do not infinitely retry the stale update. |
 | Serialization error | Log error; move to dead-letter queue. |
 | Unhandled exception | `OnTurnError` handler logs, sends error card to user, publishes dead-letter event. |
+
+---
+
+## Iteration Summary
+
+**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md`
+**Version:** 1.10 — Iteration 10
+**Byte count:** ~88 KB
+
+### Coverage
+
+- Components and responsibilities (§2): TeamsWebhookController, TeamsBotAdapter, TeamsSwarmActivityHandler, CommandParser, CardActionHandler, InstallHandler, ConversationReferenceStore, TeamsMessengerConnector, AdaptiveCardRenderer, ProactiveNotifier, OutboxRetryEngine, AuditLogger, MessageExtensionHandler, IIdentityResolver, IUserAuthorizationService
+- Data model (§3): MessengerEvent (base + subtypes), MessageActionRequest, TeamsConversationReference, TeamsCardState, OutboxEntry, AuditEntry — with canonical audit EventType (seven values including `MessageActionReceived` per tech-spec §4.3) and domain EventType (nine values) clearly separated
+- Interfaces (§4): IMessengerConnector, IConversationReferenceStore, ITeamsCardManager, IAdaptiveCardRenderer, IAuditLogger, IIdentityResolver, IUserAuthorizationService, ICardStateStore, IActivityIdStore
+- Security (§5): Entra ID tenant validation, user identity resolution, RBAC, Bot Framework JWT
+- Sequence flows (§6): personal chat command, proactive messaging, card approve/reject, card update/delete, security rejections (tenant, unmapped user, insufficient RBAC), message actions
+- Assembly mapping (§7): proposed project structure
+- Observability (§8): OpenTelemetry, structured logging, metrics, health checks
+- Performance (§9): P95 < 3s card delivery, concurrent user support
+- Error handling (§10.3): transient retry, invalid JWT, tenant rejection, unmapped user, RBAC, card conflicts
+
+### Prior feedback resolution
+
+- [x] 1. FIXED — §3.1 line 348, §3.2 line 432, §6.4 line 949 — Changed canonical audit EventType from six values (`CommandReceived` for message actions) to seven values including `MessageActionReceived` (per `tech-spec.md` §4.3 lines 128 and 136). Message actions now audit as `MessageActionReceived` throughout. Verification:
+```
+$ grep -nF "exactly the six canonical" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+(empty — phrase removed)
+```
+```
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+348:...MessageActionReceived`, `Error`) defined in §3.2 `AuditEntry`...exactly seven values per tech-spec.md §4.3...
+432:...`MessageActionReceived`, `Error` — exactly the seven canonical values from `tech-spec.md` §4.3...
+949:...audit entry of type `MessageActionReceived` is logged (message actions log as `MessageActionReceived` per `tech-spec.md` §4.3 lines 128 and 136...
+```
+
+- [x] 2. FIXED — Same scope as item 1. Architecture.md §3.2 line 432 now lists seven values including `MessageActionReceived`, and §6.4 line 949 logs message actions as `MessageActionReceived` — matching the tech-spec claims that were previously unverified. Verification:
+```
+$ grep -nF "exactly the seven canonical" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+432:...exactly the seven canonical values from `tech-spec.md` §4.3 (compliance-audit-schema)...
+```
+
+- [x] 3. FIXED — Same scope as items 1 and 2. The tech-spec's sibling citations (`architecture.md §3.2 line 432` uses seven values, `architecture.md §6.4 line 949` uses `MessageActionReceived`) are now accurate. No remaining `CommandReceived` usage for message actions in audit context. Verification:
+```
+$ grep -nF "message actions log as" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+949:...message actions log as `MessageActionReceived` per `tech-spec.md` §4.3 lines 128 and 136...
+```
+
+- [x] 4. DEFERRED — `e2e-scenarios.md` line 943 contains a stale cross-doc note that incorrectly claims architecture.md should change from `MessageActionReceived` to `CommandReceived`. This note is factually wrong on two counts: (a) it claims tech-spec defines six values with `CommandReceived`, but tech-spec §4.3 lines 128/136 define seven values with `MessageActionReceived`; (b) it recommends a change that would contradict the tech-spec source of truth. **This requires editing a sibling doc** — the e2e-scenarios.md agent must remove or correct lines 942–944 in its next iteration. Architecture.md is now correctly aligned with tech-spec.md.
+
+- [x] 5. FIXED — §10.3 line 1050 — Escalated the invalid-JWT audit conflict as Open Question `invalid-jwt-audit` with three concrete resolution options (A: accept no app-level audit, rely on infra logs; B: add custom DelegatingHandler to intercept 401s; C: update e2e-scenarios.md to remove audit requirement). The architecture still follows tech-spec.md as source of truth but now explicitly surfaces the decision for the operator rather than silently choosing one side.
+
+- [x] 6. FIXED — §3.2 AuditEntry field mapping note (after line 440) — Added explicit "Outcome field semantics" cross-doc note: the `Outcome` field uses a closed vocabulary of exactly four values (`Success`, `Rejected`, `Failed`, `DeadLettered`); rejection reason codes like `UnmappedUserRejected` belong in the `Action` field, not `Outcome`. Called out `e2e-scenarios.md` lines 366–371 as needing correction (`Outcome: UnmappedUserRejected` → `Outcome: Rejected` + `Action: UnmappedUserRejected`). Architecture.md §6.4.2 line 847 already uses the correct mapping: `Outcome: Rejected`, `Action: UnmappedUserRejected`. Verification:
+```
+$ grep -nF "Outcome: Rejected" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+835:...Outcome: Rejected}...
+847:...Outcome: Rejected and Action: UnmappedUserRejected...
+862:...Outcome: Rejected}...
+1051:...Outcome: Rejected...
+1052:...Outcome: Rejected...
+1053:...Outcome: Rejected...
+```
+```
+$ grep -nF "Outcome field semantics" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+445:> **Outcome field semantics — cross-doc alignment:** The `Outcome` field uses a closed canonical vocabulary...
+```
+
+### Open questions
+
+None for architecture.md itself — all items either fixed or deferred to sibling docs.
+
+```json open-questions
+{ "openQuestions": [
+    { "id": "invalid-jwt-audit", "text": "Should the architecture include application-level audit logging for invalid Bot Framework JWT rejections (HTTP 401)? Tech-spec §4.2 says no audit entry (request rejected before app code runs). E2e-scenarios §383-389 says log it in the security audit trail. These contradict.", "type": "choice", "choices": ["A: No app-level audit — rely on infrastructure logs (Azure Front Door WAF, API gateway)", "B: Add custom DelegatingHandler before Bot Framework pipeline to intercept 401s and emit audit entries", "C: Update e2e-scenarios.md to remove the audit requirement for invalid-JWT, aligning with tech-spec"] }
+] }
+```
