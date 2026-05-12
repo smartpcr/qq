@@ -170,7 +170,7 @@ The common message envelope used by `IMessengerConnector.SendMessageAsync` for a
 | `NextRetryAt` | `DateTimeOffset?` | Scheduled next attempt. |
 | `CreatedAt` | `DateTimeOffset` | Enqueue time. |
 | `SentAt` | `DateTimeOffset?` | Telegram confirmation time. |
-| `TelegramMessageId` | `int?` | Telegram's returned `message_id` on success. |
+| `TelegramMessageId` | `long?` | Telegram's returned `message_id` on success. **Canonical type is `long`** (nullable `long?` here because it is null before the first successful send). All references across the architecture use `long` consistently: `OutboundMessage.TelegramMessageId` (`long?`), `PendingQuestionRecord.TelegramMessageId` (`long`, non-nullable — the record is created only after a successful send), `IPendingQuestionStore.StoreAsync` parameter (`long telegramMessageId`), `IPendingQuestionStore.GetByTelegramMessageAsync` parameter (`long telegramMessageId`), and `IOutboundQueue.MarkSentAsync` parameter (`long telegramMessageId`). Telegram's `message_id` is an `int` in the Bot API JSON, but is stored as `long` to accommodate future Bot API changes and to unify the type across all internal interfaces. Implementation-plan.md should use the same `long`/`long?` convention. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
 | `SourceType` | `enum` | `Question`, `Alert`, `StatusUpdate`, `CommandAck`. Discriminator for origin type. |
 | `SourceId` | `string?` | The `QuestionId` for question messages; alert rule ID for alerts; command correlation ID for acks. Null only for fire-and-forget status broadcasts. |
@@ -244,7 +244,7 @@ This two-gap analysis avoids a pre-send placeholder record (no `Sending` state i
 **Constraints:**
 - `UNIQUE (QuestionId)` — one pending record per question.
 - Index on `(Status, ExpiresAt)` — used by `QuestionTimeoutService` to poll for expired questions.
-- Index on `TelegramMessageId` — used by `CallbackQueryHandler` to look up the pending question from a callback.
+- Index on `(TelegramChatId, TelegramMessageId)` — composite index because Telegram `message_id` is only unique within a chat; used by `QuestionRecoverySweep` (which correlates `OutboundMessage` rows with their `PendingQuestionRecord` by chat+message pair) and by `QuestionTimeoutService` (which edits the original Telegram message using both identifiers). **Not** used for callback query resolution — the `CallbackQueryHandler` parses `QuestionId` from the `callback_data` field (`QuestionId:ActionId` format) and calls `IPendingQuestionStore.GetAsync(questionId)`, which looks up by the primary key `QuestionId`. This avoids cross-chat `message_id` collisions entirely.
 
 #### HumanDecisionEvent (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -434,7 +434,7 @@ public sealed record OperatorRegistration(
 
 The `/start` handler constructs an `OperatorRegistration` from the Telegram `Update` (for `TelegramUserId`, `TelegramChatId`, `ChatType`) and the `Telegram:UserTenantMappings` configuration entry (for `TenantId`, `WorkspaceId`, `Roles`, `OperatorAlias`) and passes it to `IOperatorRegistry.RegisterAsync`, which creates the `OperatorBinding` with all fields populated (see §7.1).
 
-> **Cross-doc alignment status (IOperatorRegistry) — resolved.** This document (§4.3) defines the **canonical** `IOperatorRegistry` interface contract: `GetByAliasAsync(string operatorAlias, string tenantId, CancellationToken)` with tenant-scoped resolution, `RegisterAsync(OperatorRegistration, CancellationToken)` accepting the `OperatorRegistration` value object, and a `UNIQUE (OperatorAlias, TenantId)` index on `OperatorBinding`. Implementation-plan.md is fully aligned: Stage 1.3 defines the interface with these exact signatures, and Stage 3.4 specifies the tenant-scoped unique composite index `(OperatorAlias, TenantId)` (line 333), the `PersistentOperatorRegistry.GetByAliasAsync(alias, tenantId)` implementation querying by both alias and tenant (line 335), and test scenarios exercising tenant-scoped alias resolution with two arguments (line 346). No divergences remain.
+> **Cross-doc alignment status (IOperatorRegistry) — one divergence requiring implementation-plan update.** This document (§4.3) defines the **canonical** `IOperatorRegistry` interface contract with **six** methods: `GetBindingsAsync`, `GetAllBindingsAsync`, `GetByAliasAsync`, `GetByWorkspaceAsync`, `RegisterAsync`, and `IsAuthorizedAsync`. Implementation-plan.md Stage 1.3 (line 80) defines only **five** of these methods — it **omits `GetByWorkspaceAsync`**. This is a concrete contract gap, not just a documentation issue: implementation-plan.md Stage 2.7 alert fallback routing (line 242) already **calls** `IOperatorRegistry.GetByWorkspaceAsync(event.WorkspaceId)` to resolve the workspace-default operator when no `TaskOversight` record exists, but Stage 1.3 never declares the method on the interface. Implementation-plan.md must add `GetByWorkspaceAsync(string workspaceId, CancellationToken)` returning `IReadOnlyList<OperatorBinding>` to Stage 1.3's `IOperatorRegistry` definition; Stage 3.4 `PersistentOperatorRegistry` (line 336) must implement it by querying active `OperatorBinding` rows filtered by `WorkspaceId`. The other five methods are present in both documents with matching signatures: `GetBindingsAsync(long, long, CT)`, `GetAllBindingsAsync(long, CT)`, `GetByAliasAsync(string, string, CT)`, `RegisterAsync(OperatorRegistration, CT)`, `IsAuthorizedAsync(long, long, CT)`.
 
 ### 4.4 IOutboundQueue
 
@@ -443,7 +443,7 @@ public interface IOutboundQueue
 {
     Task EnqueueAsync(OutboundMessage message, CancellationToken ct);
     Task<OutboundMessage?> DequeueAsync(CancellationToken ct);
-    Task MarkSentAsync(Guid messageId, int telegramMessageId, CancellationToken ct);
+    Task MarkSentAsync(Guid messageId, long telegramMessageId, CancellationToken ct);
     Task MarkFailedAsync(Guid messageId, string error, CancellationToken ct);
     Task DeadLetterAsync(Guid messageId, CancellationToken ct);
 }
@@ -480,7 +480,7 @@ The Telegram connector publishes commands (task creation, approvals, pauses) via
 
 **`AgentAlertEvent` fields:** `AlertId` (string, unique), `AgentId` (string), `TaskId` (string — the task the agent was executing when the alert fired; required for `TaskOversight` routing in §5.6), `Title` (string — short alert headline, e.g., "Build failure"), `Body` (string — detailed alert description), `Severity` (`MessageSeverity`), `WorkspaceId` (string), `TenantId` (string), `CorrelationId` (string), `Timestamp` (DateTimeOffset). The `TaskId` field is always populated because agents execute within a task context; the alert routing in §5.6 depends on this to resolve the oversight operator via `ITaskOversightRepository.GetByTaskIdAsync(taskId)`.
 
-> **Cross-doc alignment (AgentAlertEvent):** Implementation-plan.md Stage 1.3 defines `AgentAlertEvent` with the full ten-field set: `AlertId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `WorkspaceId`, `TenantId`, `CorrelationId`, and `Timestamp` — matching this architecture document exactly. The field names `Title` and `Body` are aligned across both documents; earlier drafts used `AlertType`/`Summary` which have been fully retired. Implementation-plan.md Stage 2.7 alert routing uses `TaskOversight` lookup with fallback to workspace default operator via `IOperatorRegistry.GetByWorkspaceAsync`, consistent with §5.6. E2e-scenarios.md bounded-burst threshold is ≤ 50 Critical+High messages, consistent with §10.4. The receive counter is `telegram.messages.received` across all documents.
+> **Cross-doc alignment (AgentAlertEvent):** Implementation-plan.md Stage 1.3 defines `AgentAlertEvent` with the full ten-field set: `AlertId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `WorkspaceId`, `TenantId`, `CorrelationId`, and `Timestamp` — matching this architecture document exactly. The field names `Title` and `Body` are aligned across both documents; earlier drafts used `AlertType`/`Summary` which have been fully retired. Implementation-plan.md Stage 2.7 alert routing uses `TaskOversight` lookup with fallback to workspace default operator via `IOperatorRegistry.GetByWorkspaceAsync` (line 242), consistent with §5.6 — however, the `IOperatorRegistry` interface definition in Stage 1.3 (line 80) currently omits `GetByWorkspaceAsync`; see §4.3 alignment note for the specific gap and required fix. E2e-scenarios.md bounded-burst threshold is ≤ 50 Critical+High messages, consistent with §10.4. The receive counter is `telegram.messages.received` across all documents.
 
 > **Cross-doc alignment:** Implementation-plan.md Stage 1.3 now defines all four methods on `ISwarmCommandBus`: `PublishCommandAsync`, `QueryStatusAsync`, `QueryAgentsAsync`, and `SubscribeAsync(string tenantId, CancellationToken)` returning `IAsyncEnumerable<SwarmEvent>`. All sibling documents are aligned on this interface contract.
 
@@ -493,14 +493,16 @@ public interface IPendingQuestionStore
 {
     Task StoreAsync(AgentQuestionEnvelope envelope, long telegramChatId, long telegramMessageId, CancellationToken ct);
     Task<PendingQuestion?> GetAsync(string questionId, CancellationToken ct);
-    Task<PendingQuestion?> GetByTelegramMessageIdAsync(long telegramMessageId, CancellationToken ct);
+    Task<PendingQuestion?> GetByTelegramMessageAsync(long telegramChatId, long telegramMessageId, CancellationToken ct);
     Task MarkAnsweredAsync(string questionId, CancellationToken ct);
     Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct);
     Task<IReadOnlyList<PendingQuestion>> GetExpiredAsync(CancellationToken ct);
 }
 ```
 
-`StoreAsync` accepts the full `AgentQuestionEnvelope` so the store can extract `AgentQuestion` fields and denormalize `ProposedDefaultActionId` into `PendingQuestion.DefaultActionId`. `GetExpiredAsync` returns all questions with `Status = Pending` past their `ExpiresAt`, used by `QuestionTimeoutService` (§10.3). All query methods return the `PendingQuestion` abstraction DTO; the concrete `PersistentPendingQuestionStore` (implementation-plan Stage 3.5) maps between the persistence entity `PendingQuestionRecord` and the DTO.
+`StoreAsync` accepts the full `AgentQuestionEnvelope` so the store can extract `AgentQuestion` fields and denormalize `ProposedDefaultActionId` into `PendingQuestion.DefaultActionId`. `GetAsync(questionId)` is the **primary callback lookup path**: when an operator taps an inline button, the `CallbackQueryHandler` parses `QuestionId` from the `callback_data` field (`QuestionId:ActionId` format per §5.2) and calls `GetAsync(questionId)` — this uses the `QuestionId` primary key and is immune to cross-chat `message_id` collisions. `GetByTelegramMessageAsync(chatId, messageId)` uses the composite `(TelegramChatId, TelegramMessageId)` pair (because Telegram `message_id` is only unique within a chat) and is used only by `QuestionRecoverySweep` for backfill correlation — never for callback resolution. `GetExpiredAsync` returns all questions with `Status = Pending` past their `ExpiresAt`, used by `QuestionTimeoutService` (§10.3). All query methods return the `PendingQuestion` abstraction DTO; the concrete `PersistentPendingQuestionStore` (implementation-plan Stage 3.5) maps between the persistence entity `PendingQuestionRecord` and the DTO.
+
+> **Cross-doc alignment (IPendingQuestionStore) — one signature divergence.** This document (§4.7) defines the canonical `GetByTelegramMessageAsync(long telegramChatId, long telegramMessageId, CancellationToken)` accepting **two** identifiers (chat ID + message ID) because Telegram `message_id` is only unique within a chat — querying by `message_id` alone risks cross-chat collisions. Implementation-plan.md Stage 1.3 (line 66) defines `GetByTelegramMessageIdAsync(long telegramMessageId, CancellationToken)` with only **one** parameter (`telegramMessageId`), omitting `telegramChatId`. Implementation-plan.md should update this method to `GetByTelegramMessageAsync(long telegramChatId, long telegramMessageId, CancellationToken)` matching the architecture's composite-key signature. The method name also differs (`GetByTelegramMessageIdAsync` vs `GetByTelegramMessageAsync`) — both should use the canonical name `GetByTelegramMessageAsync` to reflect that the lookup requires the (chat, message) pair, not a message ID alone.
 
 ### 4.8 IInboundUpdateStore (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -873,14 +875,23 @@ Authorization uses a **two-tier model**: a static configuration-time allowlist g
   "Telegram": {
     "AllowedUserIds": ["12345", "67890"],
     "UserTenantMappings": {
-      "12345": { "TenantId": "acme", "WorkspaceId": "factory-1", "Roles": ["Operator", "Approver"], "OperatorAlias": "@alice" },
-      "67890": { "TenantId": "acme", "WorkspaceId": "factory-2", "Roles": ["Operator"], "OperatorAlias": "@bob" }
+      "12345": [
+        { "TenantId": "acme", "WorkspaceId": "factory-1", "Roles": ["Operator", "Approver"], "OperatorAlias": "@alice" }
+      ],
+      "67890": [
+        { "TenantId": "acme", "WorkspaceId": "factory-2", "Roles": ["Operator"], "OperatorAlias": "@bob" },
+        { "TenantId": "acme", "WorkspaceId": "factory-3", "Roles": ["Operator"], "OperatorAlias": "@bob" }
+      ]
     }
   }
 }
 ```
 
-When `/start` is received, the `StartCommandHandler` (1) checks `AllowedUserIds`, (2) looks up the user's entry in `UserTenantMappings` to obtain `TenantId`, `WorkspaceId`, `Roles`, and `OperatorAlias`, (3) derives `ChatType` from `Update.Message.Chat.Type`, and (4) calls `IOperatorRegistry.RegisterAsync` with an `OperatorRegistration` value object carrying all required fields (`TelegramUserId`, `TelegramChatId`, `ChatType`, `TenantId`, `WorkspaceId`, `Roles`, `OperatorAlias`) to create the `OperatorBinding` record. If the mapping contains multiple workspace entries for a user, `/start` creates one `OperatorBinding` per workspace; subsequent commands trigger workspace disambiguation via inline keyboard (per §4.3). The `ChatType` field (`Private`, `Group`, `Supergroup`) is derived from the Telegram `Update.Message.Chat.Type` field at `/start` time.
+> **JSON shape: each user ID maps to a JSON array** (not a single object). The array contains one element per workspace. User `12345` has one workspace entry (single-element array); user `67890` has two workspace entries (two-element array). The `/start` handler iterates the array and calls `IOperatorRegistry.RegisterAsync` once per entry, creating one `OperatorBinding` per workspace.
+
+Each user ID maps to an **array** of workspace entries. Most operators have a single entry; operators who oversee multiple workspaces (like user `67890` above) have multiple entries. When `/start` is received, the `StartCommandHandler` iterates the array and creates one `OperatorBinding` per entry.
+
+When `/start` is received, the `StartCommandHandler` (1) checks `AllowedUserIds`, (2) looks up the user's entry in `UserTenantMappings` to obtain the array of workspace entries (each containing `TenantId`, `WorkspaceId`, `Roles`, and `OperatorAlias`), (3) derives `ChatType` from `Update.Message.Chat.Type`, and (4) for each workspace entry in the array, calls `IOperatorRegistry.RegisterAsync` with an `OperatorRegistration` value object carrying all required fields (`TelegramUserId`, `TelegramChatId`, `ChatType`, `TenantId`, `WorkspaceId`, `Roles`, `OperatorAlias`) to create one `OperatorBinding` record per workspace. Most operators have a single workspace entry; operators overseeing multiple workspaces get one binding per entry. Subsequent commands trigger workspace disambiguation via inline keyboard when multiple bindings exist for the same (user, chat) pair (per §4.3). The `ChatType` field (`Private`, `Group`, `Supergroup`) is derived from the Telegram `Update.Message.Chat.Type` field at `/start` time.
 
 **Key design decisions:**
 - **Chat IDs are not independently allow-listed in configuration**, but the story's "validate chat/user allowlist" requirement is fully satisfied by the two-tier model. Here is why: the story requires that commands from unauthorized chats/users are rejected. Tier 2 accomplishes this — every inbound command is checked against `OperatorBinding` records, which store both `TelegramUserId` and `TelegramChatId`. A command from an unregistered (user, chat) pair is rejected, even if the user has a binding in a different chat. This is functionally equivalent to maintaining a separate `AllowedChatIds` configuration list, but more secure: chat authorization is always tied to a specific (user, chat, workspace) triple created through the auditable `/start` onboarding flow, rather than a static config list that could drift from reality. In effect, the `OperatorBinding` table **is** the chat/user allowlist — it is just persisted in the database rather than in configuration.
@@ -943,6 +954,17 @@ A `QuestionTimeoutService` (BackgroundService) polls for `PendingQuestionRecord`
 
 The 2-second P95 send-latency target and the 100+ agent burst requirement demand explicit concurrency, priority queuing, and backpressure design.
 
+#### Acceptance vs. Degraded Burst — Explicit Distinction
+
+The story says: "P95 send latency under 2 seconds after event is queued; support burst alerts from 100+ agents without message loss." These are **two distinct requirements** with different satisfaction criteria:
+
+| Requirement | Scope | How satisfied |
+|---|---|---|
+| **P95 ≤ 2 s** (acceptance gate metric: `telegram.send.first_attempt_latency_ms`) | **Operator-scoped, bounded burst**: applies to first-attempt, non-429 sends under steady state (queue depth < 100) and bounded bursts (≤ 50 Critical+High messages). This is the acceptance criterion that is tested and measured. | Priority queuing + token-bucket burst capacity + 10 concurrent workers. The 48th message of 50 completes in ~1,900 ms (see burst math below). |
+| **100+ agents without message loss** | **System-wide, unbounded**: applies to any burst size, including a cascading failure where all 100+ agents alert simultaneously. This is a **delivery guarantee**, not a latency guarantee. | At-least-once delivery or dead-letter. Every message is either delivered to Telegram or dead-lettered with a traceable reason and retained for replay. No silent discard. Priority ordering ensures highest-severity messages drain first even when P95 exceeds 2 s. |
+
+When a 100+ agent alert burst generates **more than 50 Critical+High messages** (e.g., 80–100 Critical alerts from a cascading failure), the system enters the **degraded burst** regime. In this regime: (a) all messages are still delivered at-least-once or dead-lettered — the "without message loss" guarantee holds unconditionally; (b) messages drain in severity-priority order — Critical before High before Normal before Low; (c) P95 send latency exceeds 2 s and scales linearly with volume (at 30 msg/s sustained throughput, 100 Critical messages drain in ~3.3 s, putting P95 at ~3.1 s); (d) the `telegram.send.queue_dwell_ms` and `telegram.send.all_attempts_latency_ms` metrics provide real-time visibility into the degraded regime for capacity planning and alerting. The acceptance gate metric `telegram.send.first_attempt_latency_ms` **continues to be recorded** in the degraded regime but is not expected to meet P95 ≤ 2 s — operators monitor the diagnostic metrics to detect burst conditions and scale capacity.
+
 > **⚠ OPERATOR-APPROVED SCOPE NARROWING (p95-metric-scope)**
 >
 > The story says: *"P95 send latency under 2 seconds after event is queued."*
@@ -963,16 +985,23 @@ This document (architecture.md §10.4) is the **single canonical source** for me
 
 #### What acceptance is and is not proving
 
+The P95 ≤ 2 s acceptance gate is an **operator-scoped, bounded-burst SLO** — not a universal guarantee under arbitrary load. The distinction matters when the story says "support burst alerts from 100+ agents without message loss":
+
+- **"Without message loss"** is satisfied unconditionally: every message is either delivered (at-least-once) or dead-lettered with a traceable reason, regardless of burst size.
+- **"P95 ≤ 2 s"** is satisfied under **normal load** and **bounded bursts** (≤ 50 Critical+High messages). Beyond that bound, latency degrades gracefully — messages are still delivered, but the SLO is not met.
+
+A 100+ agent alert burst may generate far more than 50 Critical+High messages (e.g., a cascading failure where all agents alert simultaneously). In that **degraded burst** regime, the system prioritizes delivery correctness over latency: messages queue, drain in severity order, and are delivered within seconds to minutes depending on volume. The `telegram.send.queue_dwell_ms` and `telegram.send.all_attempts_latency_ms` metrics provide real-time visibility into the degraded regime for capacity planning and alerting.
+
 | Condition | P95 ≤ 2 s? | Message loss? |
 |---|---|---|
 | **Steady state** (queue depth < 100, no rate-limiting) | **Yes**, all severities | At-least-once delivered or dead-lettered |
 | **Bounded burst** (≤ 50 Critical+High in a 1000-msg burst) | **Yes**, Critical+High only; Normal/Low exceed 2 s | At-least-once delivered or dead-lettered |
 | **Near-boundary burst** (50–60 Critical+High) | **At risk** — P95 approaches/exceeds 2 s depending on HTTP variance | At-least-once delivered or dead-lettered |
-| **Exceeding burst** (> ~60 Critical+High) | **No guarantee** — queue dwell grows proportionally | At-least-once delivered or dead-lettered |
+| **Degraded burst** (> ~60 Critical+High, e.g., 100+ agent cascade) | **No** — queue dwell grows proportionally; P95 may reach 5–30 s depending on volume | At-least-once delivered or dead-lettered; priority ordering ensures highest-severity messages drain first |
 | **Rate-limited sends** (Telegram 429) | **Excluded** from acceptance gate metric (tracked by `all_attempts_latency_ms`) | At-least-once delivered or dead-lettered |
 | **Retried sends** | **Excluded** from acceptance gate metric (tracked by `all_attempts_latency_ms`) | At-least-once delivered or dead-lettered |
 
-**In summary:** P95 ≤ 2 s is a **steady-state SLO** that extends to bounded Critical+High bursts (≤ 50 messages). Between 50–60 Critical+High messages, P95 approaches and may exceed 2 s. Beyond ~60, P95 clearly exceeds 2 s. It degrades gracefully beyond that bound. No message is silently discarded — every message is either delivered to Telegram (at-least-once) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Low-severity messages may be backpressure-dead-lettered under extreme queue depth (see below); Critical, High, and Normal messages are never backpressure-DLQ'd. At-least-once delivery implies narrow duplicate-send windows during crash recovery (see §3.1 Gap A).
+**In summary:** P95 ≤ 2 s is a **bounded-burst SLO** that holds under steady state and bursts with ≤ 50 Critical+High messages. Between 50–60 Critical+High messages, P95 approaches and may exceed 2 s. Beyond ~60 (including a full 100+ agent cascade), P95 clearly exceeds 2 s and the system enters the **degraded burst** regime — messages are still delivered at-least-once in severity-priority order, but latency scales with volume. The story's "without message loss" requirement is satisfied across all burst sizes: no message is silently discarded — every message is either delivered to Telegram (at-least-once) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Low-severity messages may be backpressure-dead-lettered under extreme queue depth (see below); Critical, High, and Normal messages are never backpressure-DLQ'd. At-least-once delivery implies narrow duplicate-send windows during crash recovery (see §3.1 Gap A).
 
 The architecture meets the P95 target through:
 
