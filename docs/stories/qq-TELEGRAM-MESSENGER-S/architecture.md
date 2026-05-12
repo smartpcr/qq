@@ -1217,9 +1217,9 @@ This section tracks known discrepancies between architecture.md and sibling plan
 
 ### A.1 Discrepancies with implementation-plan.md
 
-All previously outstanding items have been resolved through iteration 15 by updating the sibling documents to match the canonical contracts defined in this architecture document.
+All previously outstanding items have been resolved through iteration 16 by updating implementation-plan.md to match the canonical contracts defined in this architecture document.
 
-#### Resolved items (iterations 3–15)
+#### Resolved items (iterations 3–16)
 
 1. **`OutboundMessage.SourceEnvelopeJson` — RESOLVED (iteration 4).** Implementation-plan.md Stage 1.2 now includes `SourceEnvelopeJson` (`string?`) in the `OutboundMessage` record definition, matching architecture.md §3.1.
 
@@ -1252,6 +1252,12 @@ All previously outstanding items have been resolved through iteration 15 by upda
 15. **Timeout `ActionValue` semantics — RESOLVED (iteration 13).** Implementation-plan.md Stage 3.5 and e2e-scenarios.md timeout scenario now specify that the timeout path publishes `DefaultActionValue` (the resolved `HumanAction.Value`) as `ActionValue`, not `DefaultActionId` directly — consistent with architecture.md §3.1 and §10.3 where `HumanAction.Value` is the canonical `ActionValue` for both interactive and timeout paths.
 
 16. **`PendingQuestion` DTO completeness — RESOLVED (iteration 15).** Implementation-plan.md Stage 1.3 `PendingQuestion` DTO now includes all fields required by the architecture's timeout and RequiresComment flows: `DefaultActionValue` (for timeout event emission), `SelectedActionId` (for tracking operator's button selection), `SelectedActionValue` (for emitting `HumanDecisionEvent.ActionValue` from durable storage), `RespondentUserId` (for correlating follow-up text replies), and `StoredAt` (for deterministic tie-breaking in `GetAwaitingCommentAsync`). These fields match the `PendingQuestionRecord` persistence entity defined in architecture.md §3.1.
+
+17. **`OutboundMessage.Payload` semantics — RESOLVED (iteration 16).** Implementation-plan.md Stage 1.2 previously described `Payload` as "serialized MessengerMessage or AgentQuestion". Updated to match architecture.md §3.1: for `CommandAck`/`StatusUpdate`/`Alert`, `Payload` is pre-rendered Telegram MarkdownV2 text; for `Question`, it is a human-readable preview for debugging/dead-letter inspection — the actual Telegram send is rendered at send time by `TelegramMessageSender.SendQuestionAsync` from `SourceEnvelopeJson`.
+
+18. **`PendingQuestionRecord` index alignment — RESOLVED (iteration 16).** Implementation-plan.md Stage 3.5 previously specified indexes only on `ExpiresAt` and `TelegramMessageId`. Updated to specify the three composite indexes required by architecture.md §3.1 constraints: `(Status, ExpiresAt)` for timeout polling, `(TelegramChatId, RespondentUserId, Status)` for comment correlation, and `(TelegramChatId, TelegramMessageId)` for sweep/timeout message editing. Also updated the `PersistentPendingQuestionStore` indexed lookup description to match.
+
+19. **`QuestionRecoverySweep` `DefaultActionValue` backfill — RESOLVED (iteration 16).** Implementation-plan.md Stage 3.6 previously only mentioned `DefaultActionId` in the backfill step and test scenario. Updated to include `DefaultActionValue` (resolved by looking up the matching `HumanAction.Value` from `AllowedActions`) in both the implementation step and the Gap B test scenario — consistent with architecture.md §3.1 line 251 which requires the sweep to backfill both fields.
 
 ### A.2 Discrepancies with tech-spec.md
 
