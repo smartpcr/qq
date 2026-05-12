@@ -206,7 +206,7 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `TelegramMessageId` | `long` | Telegram `message_id` of the sent inline-keyboard message. Typed as `long` to match implementation-plan.md Stage 1.3 `PendingQuestion.TelegramMessageId` and Stage 3.5 `PendingQuestionRecord.TelegramMessageId`. |
 | `DefaultActionId` | `string?` | Denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at question-send time. Stored here so that `QuestionTimeoutService` can poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the full envelope. When present, the timeout service resolves the full `HumanAction` and applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
 | `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
-| `Status` | `enum` | `Pending`, `AwaitingComment`, `Answered`, `TimedOut`. `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). **Canonical status values:** `TimedOut` is the canonical status name for timed-out questions across the abstraction DTO (`PendingQuestion.Status`), the persistence entity (`PendingQuestionRecord.Status`), and the timeout flow (`QuestionTimeoutService`). Implementation-plan.md Stage 1.3 defines the abstraction DTO with `Expired` as a synonym; both names refer to the same terminal state. The canonical enum value used in code is `TimedOut`, matching implementation-plan.md Stage 3.5's persistence entity and `QuestionTimeoutService` logic. |
+| `Status` | `enum` | `Pending`, `AwaitingComment`, `Answered`, `TimedOut`. `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). `TimedOut` is the single canonical enum value for timed-out questions, used consistently across the abstraction DTO (`PendingQuestion.Status` — implementation-plan.md Stage 1.3), the persistence entity (`PendingQuestionRecord.Status` — implementation-plan.md Stage 3.5), and the timeout flow (`QuestionTimeoutService`). |
 | `StoredAt` | `DateTimeOffset` | When the record was persisted (after successful Telegram send). |
 | `CorrelationId` | `string` | Trace/correlation ID for end-to-end observability. |
 
@@ -230,22 +230,37 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 
 #### AuditEntry / AuditLogEntry
 
-The abstraction-level entity is `AuditEntry` (defined in the planned `AgentSwarm.Messaging.Abstractions`, per implementation-plan.md Stage 1.3). The persistence-level entity is `AuditLogEntry` (defined in `AgentSwarm.Messaging.Persistence`, per implementation-plan.md Stage 5.3), which extends `AuditEntry` with `TenantId`, `Platform`, and database-specific columns. The `PersistentAuditLogger` maps from `AuditEntry` to `AuditLogEntry`.
+The abstraction-level entity is `AuditEntry` (defined in the planned `AgentSwarm.Messaging.Abstractions`, per implementation-plan.md Stage 1.3). The persistence-level entity is `AuditLogEntry` (defined in `AgentSwarm.Messaging.Persistence`, per implementation-plan.md Stage 5.3), which extends `AuditEntry` with `TenantId`, `Platform`, and database-specific columns. The `PersistentAuditLogger` maps from the abstraction `AuditEntry` to the persistence `AuditLogEntry` entity.
+
+**`AuditEntry` (Abstractions layer — implementation-plan.md Stage 1.3):**
 
 | Field | Type | Description |
 |---|---|---|
-| `Id` | `Guid` | Primary key. |
+| `EntryId` | `Guid` | Primary key (generated at creation). |
 | `MessageId` | `string` | Telegram `message_id` or internal ID. |
-| `UserId` | `string` | Telegram user ID. |
-| `OperatorBindingId` | `string` | FK to `OperatorBinding.Id`. Unambiguously identifies the operator binding (a user may have multiple bindings across workspaces). |
-| `TelegramChatId` | `long` | Telegram chat ID where the action occurred. Disambiguates multi-workspace and group-chat contexts. |
-| `WorkspaceId` | `string` | Tenant/workspace the action applies to. Derived from the `OperatorBinding`. |
+| `UserId` | `string` | External user ID (e.g., Telegram user ID). |
 | `AgentId` | `string` | Target or source agent. |
 | `Action` | `string` | Command or decision value. |
 | `Timestamp` | `DateTimeOffset` | UTC. |
 | `CorrelationId` | `string` | Trace ID. |
-| `TenantId` | `string` | Operator's tenant. |
-| `RawPayload` | `string` | Serialized original message for forensics. |
+| `Details` | `string` | Serialized additional context (JSON). |
+
+**`AuditLogEntry` (Persistence layer — implementation-plan.md Stage 5.3):**
+
+The persistence entity maps from `AuditEntry` and adds deployment-context columns:
+
+| Field | Type | Description |
+|---|---|---|
+| `Id` | `Guid` | Primary key (mapped from `AuditEntry.EntryId`). |
+| `MessageId` | `string` | From `AuditEntry.MessageId`. |
+| `ExternalUserId` | `string` | From `AuditEntry.UserId`. Named `ExternalUserId` in the persistence schema to distinguish from internal identity. |
+| `AgentId` | `string` | From `AuditEntry.AgentId`. |
+| `Action` | `string` | From `AuditEntry.Action`. |
+| `Timestamp` | `DateTimeOffset` | From `AuditEntry.Timestamp`. |
+| `CorrelationId` | `string` | From `AuditEntry.CorrelationId`. |
+| `TenantId` | `string` | Operator's tenant (derived from `OperatorBinding` at mapping time). |
+| `Details` | `string` | From `AuditEntry.Details` (JSON). |
+| `Platform` | `string` | Always `"Telegram"` for this connector. |
 
 #### TaskOversight
 
@@ -254,7 +269,7 @@ Tracks which operator currently has oversight of which task. Created/updated by 
 | Field | Type | Description |
 |---|---|---|
 | `TaskId` | `string` | Primary key. The task being overseen. |
-| `OperatorBindingId` | `string` | FK to `OperatorBinding.Id`. The operator who currently has oversight. |
+| `OperatorBindingId` | `Guid` | FK to `OperatorBinding.Id`. The operator who currently has oversight. Typed as `Guid` to match `OperatorBinding.Id` and implementation-plan.md Stage 1.2. |
 | `AssignedAt` | `DateTimeOffset` | When oversight was assigned or last transferred. |
 | `AssignedBy` | `string` | The operator who initiated the handoff (their `OperatorBinding.Id`). |
 | `CorrelationId` | `string` | Trace ID for the handoff action. |
@@ -270,8 +285,8 @@ OutboundMessage        (alerts, acks, status updates have no AgentQuestion relat
 InboundUpdate   1──0..1 HumanDecisionEvent (for callback queries; linked by processing context,
                                             not a direct FK — the update triggers the event)
 PendingQuestionRecord *──1 AgentQuestion   (via PendingQuestionRecord.QuestionId = AgentQuestion.QuestionId)
-AuditLogEntry   *──1 OperatorBinding       (via AuditLogEntry.OperatorBindingId = OperatorBinding.Id;
-                                            unambiguous FK — not just UserId, which can have multiple bindings)
+AuditLogEntry   *──1 OperatorBinding       (via AuditLogEntry.ExternalUserId → OperatorBinding lookup;
+                                            resolved at query time through the operator registry, not a direct FK)
 AuditLogEntry   *──0..1 AgentQuestion      (via AuditLogEntry.CorrelationId; joins through the
                                             correlation context, not a direct FK)
 TaskOversight   *──1 OperatorBinding       (via TaskOversight.OperatorBindingId = OperatorBinding.Id;
@@ -376,7 +391,7 @@ public interface IAuditLogger
 }
 ```
 
-`AuditEntry` is defined in the planned `AgentSwarm.Messaging.Abstractions` project (per implementation-plan.md Stage 1.3) with properties: `EntryId`, `MessageId`, `UserId`, `AgentId`, `Action`, `Timestamp`, `CorrelationId`, `Details`. The concrete persistence entity `AuditLogEntry` (implementation-plan.md Stage 5.3) extends this with `TenantId`, `Platform`, and database-specific columns; the `PersistentAuditLogger` maps from the abstraction `AuditEntry` to the persistence `AuditLogEntry` entity.
+`AuditEntry` is defined in the planned `AgentSwarm.Messaging.Abstractions` project (per implementation-plan.md Stage 1.3) with properties: `EntryId`, `MessageId`, `UserId`, `AgentId`, `Action`, `Timestamp`, `CorrelationId`, `Details` (see §3.1 for the full field table). The concrete persistence entity `AuditLogEntry` (implementation-plan.md Stage 5.3) maps from `AuditEntry` and adds `TenantId`, `Platform`, and renames `UserId` → `ExternalUserId` at the persistence boundary (see §3.1 for the full `AuditLogEntry` field table).
 
 ### 4.6 ISwarmCommandBus (shared abstraction — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -641,44 +656,48 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 ```text
 AgentSwarm.Messaging.sln  (to be created)
 │
-├── AgentSwarm.Messaging.Abstractions     ← IMessengerConnector, AgentQuestion,
-│                                            HumanDecisionEvent, HumanAction,
-│                                            MessengerMessage, MessengerEvent,
-│                                            ISwarmCommandBus, IAuditLogger (interface),
-│                                            AuditEntry, ITelegramUpdatePipeline,
-│                                            PipelineResult, IDeduplicationService,
-│                                            IPendingQuestionStore, PendingQuestion
+├── src/
+│   ├── AgentSwarm.Messaging.Abstractions     ← IMessengerConnector, AgentQuestion,
+│   │                                            HumanDecisionEvent, HumanAction,
+│   │                                            MessengerMessage, MessengerEvent,
+│   │                                            ISwarmCommandBus, IAuditLogger (interface),
+│   │                                            AuditEntry, ITelegramUpdatePipeline,
+│   │                                            PipelineResult, IDeduplicationService,
+│   │                                            IPendingQuestionStore, PendingQuestion
+│   │
+│   ├── AgentSwarm.Messaging.Core             ← IOutboundQueue, IOperatorRegistry,
+│   │                                            AuthZ service, TaskOversight (entity),
+│   │                                            ITaskOversightRepository,
+│   │                                            CommandDispatcher base,
+│   │                                            RetryPolicy
+│   │
+│   ├── AgentSwarm.Messaging.Telegram         ← TelegramMessengerConnector,
+│   │                                            TelegramUpdateRouter,
+│   │                                            TelegramCommandDispatcher,
+│   │                                            CallbackQueryHandler,
+│   │                                            TelegramSender,
+│   │                                            WebhookController,
+│   │                                            LongPollReceiver,
+│   │                                            QuestionTimeoutService,
+│   │                                            TelegramOptions (config POCO)
+│   │
+│   ├── AgentSwarm.Messaging.Persistence      ← PersistentAuditLogger (impl of IAuditLogger),
+│   │                                            OutboundQueueStore,
+│   │                                            InboundUpdateStore,
+│   │                                            OperatorBindingStore,
+│   │                                            PendingQuestionRecord,
+│   │                                            PersistentPendingQuestionStore,
+│   │                                            DeduplicationService (impl of IDeduplicationService),
+│   │                                            AuditLogEntry (persistence entity),
+│   │                                            EF Core DbContext + migrations
+│   │
+│   └── AgentSwarm.Messaging.Worker           ← ASP.NET Core host,
+│                                                DI registration,
+│                                                Health checks,
+│                                                OpenTelemetry bootstrap
 │
-├── AgentSwarm.Messaging.Core             ← IOutboundQueue, IOperatorRegistry,
-│                                            AuthZ service,
-│                                            CommandDispatcher base,
-│                                            RetryPolicy
-│
-├── AgentSwarm.Messaging.Telegram         ← TelegramMessengerConnector,
-│                                            TelegramUpdateRouter,
-│                                            TelegramCommandDispatcher,
-│                                            CallbackQueryHandler,
-│                                            TelegramSender,
-│                                            WebhookController,
-│                                            LongPollReceiver,
-│                                            QuestionTimeoutService,
-│                                            TelegramOptions (config POCO)
-│
-├── AgentSwarm.Messaging.Persistence      ← PersistentAuditLogger (impl of IAuditLogger),
-│                                            OutboundQueueStore,
-│                                            InboundUpdateStore,
-│                                            OperatorBindingStore,
-│                                            PendingQuestionRecord,
-│                                            PersistentPendingQuestionStore,
-│                                            DeduplicationService (impl of IDeduplicationService),
-│                                            EF Core DbContext + migrations
-│
-├── AgentSwarm.Messaging.Worker           ← ASP.NET Core host,
-│                                            DI registration,
-│                                            Health checks,
-│                                            OpenTelemetry bootstrap
-│
-└── AgentSwarm.Messaging.Tests            ← Unit + integration tests
+└── tests/
+    └── AgentSwarm.Messaging.Tests            ← Unit + integration tests
 ```
 
 ---
@@ -735,7 +754,7 @@ When `/start` is received, the `StartCommandHandler` (1) checks `AllowedUserIds`
 | Signal | Implementation |
 |---|---|
 | **Traces** | OpenTelemetry `ActivitySource("AgentSwarm.Messaging.Telegram")`. Every inbound update and outbound send starts a span carrying `CorrelationId` as a baggage item. |
-| **Metrics** | Counters: `telegram.updates.received`, `telegram.messages.sent`, `telegram.messages.dead_lettered`, `telegram.commands.processed`, `telegram.messages.backpressure_dlq`. Histograms: `telegram.send.first_attempt_latency_ms` (acceptance gate; enqueue — `OutboundMessage.CreatedAt` — to HTTP 200, first-attempt, non-rate-limited sends only — P95 ≤ 2 s target; see §10.4), `telegram.send.all_attempts_latency_ms` (all-inclusive; enqueue to HTTP 200 regardless of attempt number or rate-limit holds — capacity planning), `telegram.send.queue_dwell_ms` (diagnostic; enqueue to dequeue — queue backlog monitoring), `telegram.send.retry_latency_ms` (diagnostic; retried sends), `telegram.send.rate_limited_wait_ms` (diagnostic; 429 backoff duration). |
+| **Metrics** | Counters: `telegram.messages.received`, `telegram.messages.sent`, `telegram.messages.dead_lettered`, `telegram.commands.processed`, `telegram.messages.backpressure_dlq`. Histograms: `telegram.send.first_attempt_latency_ms` (acceptance gate; enqueue — `OutboundMessage.CreatedAt` — to HTTP 200, first-attempt, non-rate-limited sends only — P95 ≤ 2 s target; see §10.4), `telegram.send.all_attempts_latency_ms` (all-inclusive; enqueue to HTTP 200 regardless of attempt number or rate-limit holds — capacity planning), `telegram.send.queue_dwell_ms` (diagnostic; enqueue to dequeue — queue backlog monitoring), `telegram.send.retry_latency_ms` (diagnostic; retried sends), `telegram.send.rate_limited_wait_ms` (diagnostic; 429 backoff duration). |
 | **Logs** | Structured logging via `ILogger<T>`. Correlation ID included in every log scope. Bot token is excluded from all log output via a custom redaction enricher. |
 | **Health** | `/healthz` endpoint (aligning with implementation-plan and Dockerfile `HEALTHCHECK`). Aggregates checks: Telegram API reachable (`getMe`), outbound queue depth < threshold, dead-letter queue depth < configurable threshold, database connectivity. Returns JSON detail output with per-check status. |
 
