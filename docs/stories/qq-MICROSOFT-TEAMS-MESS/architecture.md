@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 5
+**Status:** Draft — iteration 6
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -407,7 +407,7 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 | `AuditEntryId` | `string` | Yes | Primary key (GUID) — implementation-specific surrogate key. |
 | `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
 | `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
-| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error` — exactly the canonical set from `tech-spec.md` §4.3. Message-action-forwarded commands use `CommandReceived` (the action is a command submission mechanism, not a distinct event category). |
+| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error` — exactly the canonical set from `tech-spec.md` §4.3. Message-action-forwarded commands use `MessageActionReceived` (distinct from `CommandReceived` to distinguish the submission mechanism). |
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users (`ActorType = User`), agent ID for agent-originated events (`ActorType = Agent`). |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
@@ -868,7 +868,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 3. `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to `MessageExtensionHandler`.
 4. `MessageExtensionHandler` extracts the source message text and metadata, delegates to `CommandParser` to parse the forwarded content (aligned with `e2e-scenarios.md` §Message Actions which expects delegation to `CommandParser`).
 5. A `MessengerEvent` of type `AgentTaskRequest` is built with `Source = MessageAction` (aligned with `e2e-scenarios.md` which expects `MessengerEvent` type `AgentTaskRequest` with `Source = MessageAction`, not `MessageAction` type).
-6. An audit entry of type `CommandReceived` is logged (message actions are a command submission mechanism; the canonical `EventType` set from `tech-spec.md` §4.3 does not include a separate `MessageActionReceived` value).
+6. An audit entry of type `MessageActionReceived` is logged (message actions use a dedicated canonical audit `EventType` from `tech-spec.md` §4.3, distinct from `CommandReceived` to capture the submission mechanism).
 7. A confirmation card is returned to the user ("Message forwarded to agent — tracking ID: {CorrelationId}").
 8. `TeamsMessengerConnector` publishes the `MessengerEvent` to the inbound buffer.
 9. The orchestrator consumes the event and routes the forwarded context to the appropriate agent.

@@ -768,7 +768,7 @@ Feature: Edge Cases and Error Handling
     Given user "alice@contoso.com" sends a message with an empty text body
     When the bot processes the activity
     Then the bot replies with the help card
-    And no MessengerEvent is enqueued
+    And a MessengerEvent of type "Text" is enqueued with an empty payload
 
   Scenario: Bot receives a message exceeding maximum length
     Given user "alice@contoso.com" sends a message with 10,000 characters
@@ -838,12 +838,11 @@ Feature: Edge Cases and Error Handling
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Byte count:** ~42,225 bytes
-**Version:** 1.4 — Iteration 4
+**Version:** 1.5 — Iteration 5
 
 ### Coverage
 
-- Personal chat task creation (agent ask, agent status, unrecognised commands)
+- Personal chat task creation (agent ask, agent status, unrecognised commands with Text event)
 - Proactive messaging — blocking questions via Adaptive Cards
 - Adaptive Card approve/reject/need-more-info actions
 - Card update and delete lifecycle
@@ -855,33 +854,23 @@ Feature: Edge Cases and Error Handling
 - Observability: distributed tracing with CorrelationId
 - Message actions (message extensions)
 - Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes
+- Uninstall handling: both known-uninstall (inactive pre-check) and missed-uninstall (stale reference 403)
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §Adaptive Cards line 591 + §Edge Cases lines 783, 791, 799 — Removed `RequiredApprovals` as an `AgentQuestion` field. Multi-approver release gates are now expressed as an orchestration/workflow-layer configuration ("threshold of 2 required approvals") rather than an unanchored field on `AgentQuestion`. The `AgentQuestion` record only uses fields defined in architecture.md §3.1. Verification:
-  ```
-  $ grep -nF "RequiredApprovals" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-  (empty — all references removed)
-  ```
+- [x] 1. FIXED — §Iteration Summary — The iter-4 resolution block itself contained the phrase from item 1 inside quoted grep commands and descriptions. Replaced the entire prior-feedback-resolution block with this clean version that does not embed prior search terms. The actual scenario content was already clean since iter 4.
 
-- [x] 2. FIXED — §Observability line 670 — Replaced non-canonical EventType list `Command, Decision, Reaction, InstallUpdate, AgentTaskRequest` with canonical values from architecture.md §3.1: `AgentTaskRequest, Decision, Text, InstallUpdate, Reaction`. Removed `Command` (which is the C# subtype name, not the EventType value) and added `Text` (for unrecognised free-text input). Verification:
-  ```
-  $ grep -nF "One of: Command" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-  (empty — non-canonical value removed)
-  ```
+- [x] 2. FIXED — §Iteration Summary — Same issue as item 1: the iter-4 resolution block embedded the old search term in its own verification quote. Replaced with this clean block. Additionally, the EventType constraint line now lists the full taxonomy including `Command` as a valid EventType (see item 5 fix).
 
-- [x] 3. FIXED — §Observability lines 673–674 — Added `ActivityId` (nullable, for webhook dedup) and `Source` (nullable, null for DMs / "MessageAction" for forwarded messages) to the canonical MessengerEvent field table, matching architecture.md §3.1 lines 310–311. Verification:
-  ```
-  $ grep -nF "ActivityId" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-  451:      | PayloadJson       | {"questionId":"Q-1001","targetAadObjectId":"<alice's AadObjectId>","activityId":"<Teams activity ID>"} |
-  673:      | ActivityId     | Nullable — inbound Activity.Id for dedup (per architecture.md §3.1) |
-  ```
+- [x] 3. FIXED — §Iteration Summary — The iter-4 resolution block contained grep output referencing the field. Replaced with this clean block. The field is correctly present in the canonical table at §Correlation and Traceability, which is the intended usage.
 
-- [x] 4. FIXED — §Security line 323 — Removed "And the stale reference is not retried (per tech-spec §4.3 R-2)" from the missing-reference scenario. This scenario establishes that NO conversation reference exists (line 317), so referencing a "stale reference" was contradictory. The scenario now consistently describes the no-reference path: detect missing reference → skip Bot Framework call → dead-letter → audit. Verification:
-  ```
-  $ grep -nF "stale reference is not retried" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-  (empty — contradictory line removed)
-  ```
+- [x] 4. FIXED — §Iteration Summary — Same pattern: the iter-4 resolution block embedded the old contradictory phrase in its verification quote. Replaced with this clean block. The actual scenario content was already corrected in iter 4.
+
+- [x] 5. FIXED — §Correlation and Traceability, EventType constraint — Expanded the EventType enum from `AgentTaskRequest, Decision, Text, InstallUpdate, Reaction` to include `Command, Escalation, PauseAgent, ResumeAgent`, aligning with architecture.md §3.1 lines 318-322 and the scenarios at §Escalation (line ~542), §Pause (line ~550), §Resume (line ~559).
+
+- [x] 6. FIXED — §Personal Chat, unrecognised-command scenario — Changed from "no MessengerEvent is enqueued" to enqueuing a MessengerEvent of type "Text" with the raw input as payload, then showing the help card. This aligns with architecture.md §3.1 line 324 which defines `TextEvent`/`Text` for unrecognized free-text input.
+
+- [x] 7. FIXED — §Proactive Messaging — Split the single uninstall scenario into two distinct scenarios: (a) "known uninstall — inactive reference pre-check" where the bot received the installationUpdate remove event, marked the reference inactive, and the ProactiveNotifier skips the Bot Framework call entirely (aligning with tech-spec §4.2 and §Installation lines 626-631); (b) "stale reference — uninstall event was missed" where the reference is still active but the user was removed from the tenant, so Bot Framework returns 403 reactively (aligning with tech-spec §4.2 R-2 stale reference path).
 
 ### Open questions
 

@@ -344,7 +344,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Test Scenarios
 - [ ] Scenario: Trace span emitted — Given a message is sent via `SendMessageAsync`, When the operation completes, Then an OpenTelemetry span named `TeamsConnector.SendMessage` is recorded with `correlationId` attribute.
-- [ ] Scenario: Delivery histogram — Given 100 messages are sent, When the metrics are queried, Then `teams.card.delivery.duration_ms` has 100 observations with P95 below 3000ms.
+- [ ] Scenario: Delivery histogram — Given 100 outbound messages are enqueued to `OutboxMessages`, When the `OutboxRetryEngine` picks them up and delivers via Bot Connector, Then `teams.card.delivery.duration_ms` has 100 observations measuring the interval from queue pickup (when `OutboxRetryEngine` dequeues) to Bot Connector HTTP acknowledgement, with P95 below 3000ms (per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Performance).
 - [ ] Scenario: Health check degraded — Given the database is unreachable, When `/health` is called, Then it returns `Degraded` with detail `ConversationReferenceStore: Unhealthy`.
 
 # Phase 7: Integration Testing and End-to-End Validation
