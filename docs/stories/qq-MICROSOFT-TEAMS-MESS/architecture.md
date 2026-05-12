@@ -207,6 +207,16 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 
 The orchestrator is outside the scope of this story. It produces `AgentQuestion` and `MessengerMessage` payloads for outbound delivery and consumes `MessengerEvent` / `HumanDecisionEvent` from the inbound queue. The interface contract is defined in `AgentSwarm.Messaging.Abstractions`.
 
+### 2.15 MessageExtensionHandler
+
+| Attribute | Value |
+|---|---|
+| **Assembly** | `AgentSwarm.Messaging.Teams` |
+| **Namespace** | `AgentSwarm.Messaging.Teams.Extensions` |
+| **Responsibility** | Handle Teams message-extension action commands (`composeExtension/submitAction`). When a user invokes a message action (e.g., right-clicks a message and selects "Forward to Agent"), this handler extracts the source message content, builds a `MessageActionRequest`, and publishes it as a `MessengerEvent` of type `MessageAction` to the inbound buffer. Returns a task-submitted confirmation card to the user. |
+| **Trigger** | `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to this handler. |
+| **Manifest** | Requires a `composeExtensions` entry in the Teams app manifest with `type: "action"` and `fetchTask: false` (or `true` if a task module is used to collect additional input). |
+
 ---
 
 ## 3. Data Model
@@ -277,11 +287,11 @@ Platform-agnostic inbound event. Defined in `AgentSwarm.Messaging.Abstractions`.
 | Field | Type | Description |
 |---|---|---|
 | `EventId` | `string` | Unique event identifier. |
-| `EventType` | `string` | `Command`, `Decision`, `Reaction`, `InstallUpdate`. |
+| `EventType` | `string` | `Command`, `Decision`, `Reaction`, `InstallUpdate`, `MessageAction`. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
 | `Messenger` | `string` | `"Teams"`. |
 | `ExternalUserId` | `string` | Teams AAD object ID. |
-| `Payload` | `object` | Typed payload — `ParsedCommand` or `HumanDecisionEvent`. |
+| `Payload` | `object` | Typed payload — `ParsedCommand`, `HumanDecisionEvent`, or `MessageActionRequest`. |
 | `Timestamp` | `DateTimeOffset` | UTC receipt time. |
 
 ### 3.2 Teams-Specific Entities
