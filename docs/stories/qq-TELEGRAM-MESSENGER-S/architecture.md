@@ -226,7 +226,9 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `ReceivedAt` | `DateTimeOffset` | UTC receipt time. |
 | `CorrelationId` | `string` | Trace ID. |
 
-#### AuditRecord
+#### AuditEntry / AuditLogEntry
+
+The abstraction-level entity is `AuditEntry` (defined in the planned `AgentSwarm.Messaging.Abstractions`, per implementation-plan.md Stage 1.3). The persistence-level entity is `AuditLogEntry` (defined in `AgentSwarm.Messaging.Persistence`, per implementation-plan.md Stage 5.3), which extends `AuditEntry` with `TenantId`, `Platform`, and database-specific columns. The `PersistentAuditLogger` maps from `AuditEntry` to `AuditLogEntry`.
 
 | Field | Type | Description |
 |---|---|---|
@@ -266,9 +268,9 @@ OutboundMessage        (alerts, acks, status updates have no AgentQuestion relat
 InboundUpdate   1──0..1 HumanDecisionEvent (for callback queries; linked by processing context,
                                             not a direct FK — the update triggers the event)
 PendingQuestionRecord *──1 AgentQuestion   (via PendingQuestionRecord.QuestionId = AgentQuestion.QuestionId)
-AuditRecord     *──1 OperatorBinding       (via AuditRecord.OperatorBindingId = OperatorBinding.Id;
+AuditLogEntry   *──1 OperatorBinding       (via AuditLogEntry.OperatorBindingId = OperatorBinding.Id;
                                             unambiguous FK — not just UserId, which can have multiple bindings)
-AuditRecord     *──0..1 AgentQuestion      (via AuditRecord.CorrelationId; joins through the
+AuditLogEntry   *──0..1 AgentQuestion      (via AuditLogEntry.CorrelationId; joins through the
                                             correlation context, not a direct FK)
 TaskOversight   *──1 OperatorBinding       (via TaskOversight.OperatorBindingId = OperatorBinding.Id;
                                             tracks which operator currently oversees the task)
@@ -348,9 +350,11 @@ public interface IOutboundQueue
 ```csharp
 public interface IAuditLogger
 {
-    Task RecordAsync(AuditRecord record, CancellationToken ct);
+    Task LogAsync(AuditEntry entry, CancellationToken ct);
 }
 ```
+
+`AuditEntry` is defined in the planned `AgentSwarm.Messaging.Abstractions` project (per implementation-plan.md Stage 1.3) with properties: `EntryId`, `MessageId`, `UserId`, `AgentId`, `Action`, `Timestamp`, `CorrelationId`, `Details`. The concrete persistence entity `AuditLogEntry` (implementation-plan.md Stage 5.3) extends this with `TenantId`, `Platform`, and database-specific columns; the `PersistentAuditLogger` maps from the abstraction `AuditEntry` to the persistence `AuditLogEntry` entity.
 
 ### 4.6 ISwarmCommandBus (shared abstraction — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -439,7 +443,7 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 
 **Key invariants:**
 1. The question includes `Severity`, `ExpiresAt`, `AllowedActions` rendered as inline keyboard buttons, and the proposed default action (if any). The default action is carried as sidecar metadata in `AgentQuestionEnvelope.ProposedDefaultActionId` (see §3.1). When the connector builds the inline keyboard, it reads `ProposedDefaultActionId` from the envelope and prepares a `PendingQuestionRecord` with `DefaultActionId` denormalized from that field. The `PendingQuestionRecord` is **persisted after the Telegram send succeeds** (once `TelegramMessageId` is available from the API response), not before — because `PendingQuestionRecord.TelegramMessageId` is required for timeout-driven message edits and cannot be known until the send completes.
-2. The `callback_data` field carries `QuestionId:ActionId` (≤ 64 bytes). `ActionId` is a short key that maps to the full `HumanAction` payload stored server-side in `IDistributedCache` (see tech-spec D-3). The cache entry is written when the inline keyboard is built and expires at `AgentQuestion.ExpiresAt`.
+2. The `callback_data` field carries `QuestionId:ActionId` (≤ 64 bytes). `ActionId` is a short key that maps to the full `HumanAction` payload stored server-side in `IDistributedCache` (see tech-spec D-3). The cache entry is written when the inline keyboard is built and expires at `AgentQuestion.ExpiresAt + 5 minutes` (a grace period beyond the question's `ExpiresAt` to ensure `QuestionTimeoutService` can still resolve the `HumanAction` from cache when processing timeouts at or slightly after `ExpiresAt` — this eliminates the race condition where the cache entry expires before the timeout service reads it).
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string. **However**, when the selected `HumanAction.RequiresComment` is `true` (e.g., the "Need info" action in e2e-scenarios.md), the `HumanDecisionEvent` is **deferred**: the `CallbackQueryHandler` sets `PendingQuestionRecord.Status = AwaitingComment`, sends a prompt to the operator ("Please reply with your comment"), and returns without emitting the event. When the operator's text reply arrives via the inbound pipeline's text-reply handler, it is matched to the `AwaitingComment` record by chat ID, the `HumanDecisionEvent` is then published with both the `ActionValue` (e.g., `"need-info"`) and the `Comment` (the operator's text), and the record transitions to `Answered`. This two-step flow is tested by e2e-scenarios.md "RequiresComment defers decision" and implementation-plan.md Stage 3.5 "RequiresComment flow."
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
 5. Audit record is written with `MessageId`, `UserId`, `AgentId`, timestamp, and `CorrelationId`.
@@ -611,6 +615,22 @@ Authorization uses a **two-tier model**: a static configuration-time allowlist g
 | **Tier 1: Onboarding allowlist** | `Telegram:AllowedUserIds` — a static list of Telegram **user IDs** (not chat IDs). | App configuration (environment variable, appsettings, or config provider). | At `/start` time only. If the user's Telegram user ID is not in this list, `/start` is rejected and no `OperatorBinding` is created. |
 | **Tier 2: Runtime bindings** | `OperatorBinding` records — each row contains **both** `TelegramUserId` and `TelegramChatId`, plus `TenantId`, `WorkspaceId`, and `Roles`. | Persistence store (database). | On every inbound command (after deduplication). The `AuthZ Service` calls `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)` which queries the `OperatorBinding` table for an active row matching both the user ID and the chat ID. If no matching binding exists, the command is rejected. |
 
+**`/start` registration data sources:** When `/start` succeeds (user ID is in `Telegram:AllowedUserIds`), the system creates an `OperatorBinding` record. The required fields — `TenantId`, `WorkspaceId`, `Roles`, and `OperatorAlias` — are sourced from a pre-configured **user-to-tenant mapping** stored in app configuration under `Telegram:UserTenantMappings`. Each entry maps a Telegram user ID to its tenant, workspace, roles, and alias:
+
+```json
+{
+  "Telegram": {
+    "AllowedUserIds": ["12345", "67890"],
+    "UserTenantMappings": {
+      "12345": { "TenantId": "acme", "WorkspaceId": "factory-1", "Roles": ["Operator", "Approver"], "OperatorAlias": "@alice" },
+      "67890": { "TenantId": "acme", "WorkspaceId": "factory-2", "Roles": ["Operator"], "OperatorAlias": "@bob" }
+    }
+  }
+}
+```
+
+When `/start` is received, the `StartCommandHandler` (1) checks `AllowedUserIds`, (2) looks up the user's entry in `UserTenantMappings` to obtain `TenantId`, `WorkspaceId`, `Roles`, and `OperatorAlias`, and (3) calls `IOperatorRegistry.RegisterAsync(userId, chatId, tenantId, workspaceId)` to create the `OperatorBinding` record with all required fields populated. If the mapping contains multiple workspace entries for a user, `/start` creates one `OperatorBinding` per workspace; subsequent commands trigger workspace disambiguation via inline keyboard (per §4.3). The `ChatType` field (`Private`, `Group`, `Supergroup`) is derived from the Telegram `Update.Message.Chat.Type` field at `/start` time.
+
 **Key design decisions:**
 - **Chat IDs are not independently allow-listed in configuration**, but the story's "validate chat/user allowlist" requirement is fully satisfied by the two-tier model. Here is why: the story requires that commands from unauthorized chats/users are rejected. Tier 2 accomplishes this — every inbound command is checked against `OperatorBinding` records, which store both `TelegramUserId` and `TelegramChatId`. A command from an unregistered (user, chat) pair is rejected, even if the user has a binding in a different chat. This is functionally equivalent to maintaining a separate `AllowedChatIds` configuration list, but more secure: chat authorization is always tied to a specific (user, chat, workspace) triple created through the auditable `/start` onboarding flow, rather than a static config list that could drift from reality. In effect, the `OperatorBinding` table **is** the chat/user allowlist — it is just persisted in the database rather than in configuration.
 - **Group chat attribution:** In group chats, commands are attributed to the sending `TelegramUserId` (the `from.id` field on the Telegram `Update`), not the group's `TelegramChatId`. This means each group member must have their own `OperatorBinding` — an unauthorized user in an authorized group is rejected (per tech-spec S-5).
@@ -646,7 +666,7 @@ Authorization uses a **two-tier model**: a static configuration-time allowlist g
 Every inbound update generates or adopts a `CorrelationId` (UUID v7 for time-ordering). The ID flows through:
 - `TelegramUpdateRouter` → `CommandDispatcher` → `SwarmCommandBus` (outbound to orchestrator)
 - `SwarmCommandBus` (inbound event) → `OutboundMessageQueue` → `TelegramSender`
-- All `AuditRecord` entries
+- All `AuditLogEntry` entries
 - All OpenTelemetry spans (as `trace.correlation_id` attribute)
 
 ### 10.2 Receive-Mode Switching
@@ -663,7 +683,7 @@ Both modes feed into the same `ITelegramUpdatePipeline`, so all downstream logic
 ### 10.3 Question Timeout Handling
 
 A `QuestionTimeoutService` (BackgroundService) polls for `PendingQuestionRecord` entries with `Status = Pending` past their `ExpiresAt`. When a question times out:
-1. Reads `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at send time). If present, resolves the full `HumanAction` from `IDistributedCache` and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
+1. Reads `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at send time). If present, resolves the full `HumanAction` from `IDistributedCache` (the cache entry has a grace period of 5 minutes beyond `ExpiresAt`, ensuring it is still available when the timeout service processes the question) and publishes a `HumanDecisionEvent` with that action value. If absent (`null`), publishes a `HumanDecisionEvent` with `ActionValue = "__timeout__"` so the agent is notified of timeout without an automatic decision.
 2. Updates the original Telegram message (using `PendingQuestionRecord.TelegramMessageId`) to indicate the timeout ("⏰ Timed out — default action applied: *skip*" or "⏰ Timed out — no default action").
 3. Sets `PendingQuestionRecord.Status = TimedOut`.
 4. Writes an audit record noting the timeout.
@@ -698,12 +718,12 @@ The architecture meets the P95 target through:
 | Condition | Behavior | Mechanism |
 |---|---|---|
 | **Normal load** (queue depth < 100, no rate-limiting) | P95 `telegram.send.first_attempt_latency_ms` ≤ 2 s across all severities. Queue dwell is negligible (< 50 ms), leaving ample headroom for the HTTP round-trip (~200–500 ms typical). | 10 concurrent workers drain the queue faster than it fills. |
-| **Burst load** (100+ agents, 1000+ messages) | P95 `telegram.send.first_attempt_latency_ms` ≤ 2 s for Critical/High severities (dequeued first via priority ordering, minimal queue dwell). Normal/Low first-attempt sends may exceed 2 s P95 under sustained burst due to accumulated queue dwell. Zero message loss. | Priority queuing dispatches Critical/High first. 10 concurrent workers at 30 msg/s sustained drain Critical/High messages (typically < 10% of burst volume) within the first few seconds, keeping their dequeue-to-200 latency within the 2 s window. |
+| **Burst load** (100+ agents, 1000+ messages) | P95 `telegram.send.first_attempt_latency_ms` ≤ 2 s for Critical/High severities (dequeued first via priority ordering, minimal queue dwell). Normal/Low first-attempt sends may exceed 2 s P95 under sustained burst due to accumulated queue dwell. Zero message loss. | Priority queuing dispatches Critical/High first. 10 concurrent workers at 30 msg/s sustained drain Critical/High messages (typically < 10% of burst volume) within the first few seconds, keeping their enqueue-to-200 latency within the 2 s window. |
 | **Beyond capacity envelope** (sustained inflow > 30 msg/s) | Zero message loss; queue dwell increases for lower severities. | Low-severity messages are backpressure-DLQ'd when queue depth exceeds `MaxQueueDepth` (5000). All other messages are delivered. |
 
 Under **normal operating conditions** (the expected steady state), queue dwell is negligible (< 50 ms with 10 workers) and the vast majority of sends are first-attempt and non-rate-limited, so `telegram.send.first_attempt_latency_ms` comfortably meets P95 ≤ 2 s across all severities.
 
-Under **extreme burst** (1000+ simultaneous messages), the priority queuing design ensures Critical/High messages are dequeued first and reach the Telegram API quickly, keeping their dequeue-to-200 latency within the 2-second window. Normal/Low messages are also delivered without loss but may experience longer queue dwell under sustained burst. The all-inclusive `telegram.send.latency_ms` and the diagnostic `telegram.send.queue_dwell_ms` provide visibility into the full delivery experience.
+Under **extreme burst** (1000+ simultaneous messages), the priority queuing design ensures Critical/High messages are dequeued first and reach the Telegram API quickly, keeping their enqueue-to-200 latency within the 2-second window. Normal/Low messages are also delivered without loss but may experience longer queue dwell under sustained burst. The all-inclusive `telegram.send.all_attempts_latency_ms` and the diagnostic `telegram.send.queue_dwell_ms` provide visibility into the full delivery experience.
 
 #### Queue Processor Concurrency
 
@@ -725,7 +745,7 @@ The `TelegramSender` enforces Telegram Bot API rate limits via a dual-layer toke
 1. **Global limiter** — `Telegram:RateLimits:GlobalPerSecond` (default `30`). Applies across all chats. When exhausted, workers block and wait for a token rather than issuing requests that will be 429'd.
 2. **Per-chat limiter** — `Telegram:RateLimits:PerChatPerMinute` (default `20`). Prevents flooding a single operator's chat.
 
-When the Telegram API returns `429 Too Many Requests`, the sender reads the `retry_after` header and pauses the affected worker for that duration. Rate-limited wait time is tracked via the dedicated `telegram.send.rate_limited_wait_ms` histogram for operational diagnostics. Messages that hit rate limits are excluded from the acceptance gate metric `telegram.send.first_attempt_latency_ms` (dequeue to HTTP 200, first-attempt only) and are captured by the all-inclusive `telegram.send.latency_ms` (enqueue to HTTP 200) for capacity planning.
+When the Telegram API returns `429 Too Many Requests`, the sender reads the `retry_after` header and pauses the affected worker for that duration. Rate-limited wait time is tracked via the dedicated `telegram.send.rate_limited_wait_ms` histogram for operational diagnostics. Messages that hit rate limits are excluded from the acceptance gate metric `telegram.send.first_attempt_latency_ms` (enqueue to HTTP 200, first-attempt only) and are captured by the all-inclusive `telegram.send.all_attempts_latency_ms` (enqueue to HTTP 200) for capacity planning.
 
 #### Burst Scenario (100+ Agents)
 
@@ -734,7 +754,7 @@ Under a burst of 1 000+ simultaneous agent events:
 1. **Enqueue**: Events are written to the durable outbox store immediately (sub-millisecond per insert, batched where possible). Each event is tagged with its severity.
 2. **Priority drain**: The 10 concurrent processor workers dequeue by severity priority. Critical/High messages (typically < 10% of burst volume — blocking questions, approval requests) are processed first and reach the Telegram API within the 2-second window.
 3. **Multi-chat fan-out**: In production, 100+ agents typically span multiple tenants/workspaces, routing to multiple operator chats. The per-chat rate limit (20 msg/min) constrains individual operators, but the global rate limit (30 msg/s) applies across all chats. With messages distributed across N operator chats, effective throughput is `min(30, N × 20/60)` msg/s. For 10+ operator chats, the global limit of 30 msg/s is the binding constraint.
-4. **Throughput**: At 30 msg/s sustained, a burst of 1 000 messages drains in ~34 seconds. With priority queuing, Critical/High messages are processed first and have minimal queue dwell (< 2 s for the top ~60 messages). The acceptance metric `telegram.send.first_attempt_latency_ms` (dequeue to HTTP 200, first-attempt, non-rate-limited sends per §10.4) targets P95 ≤ 2 s under normal load; under burst, priority queuing ensures Critical/High messages meet this target. Sends that hit rate limits are tracked via `telegram.send.latency_ms` (all-inclusive, enqueue to 200) for capacity planning.
+4. **Throughput**: At 30 msg/s sustained, a burst of 1 000 messages drains in ~34 seconds. With priority queuing, Critical/High messages are processed first and have minimal queue dwell (< 2 s for the top ~60 messages). The acceptance metric `telegram.send.first_attempt_latency_ms` (enqueue to HTTP 200, first-attempt, non-rate-limited sends per §10.4) targets P95 ≤ 2 s under normal load; under burst, priority queuing ensures Critical/High messages meet this target. Sends that hit rate limits are tracked via `telegram.send.all_attempts_latency_ms` (all-inclusive, enqueue to 200) for capacity planning.
 5. **Backpressure**: If queue depth exceeds `MaxQueueDepth`, low-severity messages are dead-lettered immediately with reason `backpressure:queue_depth_exceeded` (see §10.4 table) and a `telegram.messages.backpressure_dlq` counter is incremented. An alert is sent to the ops channel. Critical, High, and Normal messages are always accepted.
 6. **Zero loss guarantee**: All messages are either delivered or dead-lettered with a traceable reason — zero silent loss (per e2e-scenarios burst test). Dead-lettered messages (whether from retry exhaustion or backpressure) are available for manual replay.
 
@@ -749,7 +769,7 @@ Under a burst of 1 000+ simultaneous agent events:
 | **`update_id` as the deduplication key** | Telegram guarantees `update_id` is unique and monotonically increasing per bot. Using it directly avoids the cost of hashing message content. |
 | **Webhook secret token validation** | Telegram supports a `secret_token` parameter on `setWebhook` (added in Bot API 6.0). This is cheaper and simpler than IP-allowlisting Telegram's data-center ranges. |
 | **Single `ITelegramUpdatePipeline`** | Forces webhook and long-poll modes through identical logic, eliminating a class of "works in dev, breaks in prod" bugs. |
-| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Fits within Telegram's 64-byte `callback_data` limit. `ActionId` is a short identifier; the full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, with expiry matching `AgentQuestion.ExpiresAt`. On callback, the handler looks up the original `AgentQuestion` and resolves the chosen action. This aligns with tech-spec decision D-3 and avoids encoding complex payloads in the 64-byte field. |
+| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Fits within Telegram's 64-byte `callback_data` limit. `ActionId` is a short identifier; the full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, with expiry set to `AgentQuestion.ExpiresAt + 5 minutes` (grace period ensures the cache entry survives past the question timeout for `QuestionTimeoutService` to resolve the default action). On callback, the handler looks up the original `AgentQuestion` and resolves the chosen action. This aligns with tech-spec decision D-3 and avoids encoding complex payloads in the 64-byte field. |
 
 ---
 
@@ -757,6 +777,6 @@ Under a burst of 1 000+ simultaneous agent events:
 
 1. **Single-bot deployment** — One Telegram bot per swarm instance. Multi-bot is not in scope.
 2. **No file/media handling** — The connector handles text messages and inline buttons only. Photo/document attachments from operators are out of scope for this story.
-3. **Persistence technology** — The architecture assumes EF Core for `OperatorBinding`, `InboundUpdate`, `OutboundMessage`, and `AuditRecord`. The implementation-plan (Stages 3.x–4.x) specifies **SQLite** as the initial provider for all persistence (outbox, dedup store, dead-letter queue, audit log), designed for swap to PostgreSQL or SQL Server via EF Core provider change for scaled deployments. This architecture aligns with that approach: SQLite is the V1 provider; production scaling to a full RDBMS is a configuration change, not a schema change.
+3. **Persistence technology** — The architecture assumes EF Core for `OperatorBinding`, `InboundUpdate`, `OutboundMessage`, and `AuditLogEntry`. The implementation-plan (Stages 3.x–4.x) specifies **SQLite** as the initial provider for all persistence (outbox, dedup store, dead-letter queue, audit log), designed for swap to PostgreSQL or SQL Server via EF Core provider change for scaled deployments. This architecture aligns with that approach: SQLite is the V1 provider; production scaling to a full RDBMS is a configuration change, not a schema change.
 4. **Swarm orchestrator interface** — `ISwarmCommandBus` is to be defined in the planned `AgentSwarm.Messaging.Abstractions` project. Its transport (in-process, message broker, gRPC) is outside this story's scope.
-5. **Allowlist-based `/start` registration** — When a user sends `/start`, the connector checks whether their Telegram user ID is in the pre-configured allowlist. If present, the `OperatorBinding` is created or updated immediately with `IsActive = true`. If absent, the user receives a "not authorized" reply. No admin approval step is required for allowlisted users; the `IsActive` flag remains available for future soft-disable workflows.
+5. **Allowlist-based `/start` registration** — When a user sends `/start`, the connector checks whether their Telegram user ID is in the pre-configured allowlist (`Telegram:AllowedUserIds`). If present, the `OperatorBinding` is created or updated immediately with `IsActive = true`, sourcing `TenantId`, `WorkspaceId`, `Roles`, and `OperatorAlias` from the `Telegram:UserTenantMappings` configuration entry for that user ID (see §7.1). If absent, the user receives a "not authorized" reply. No admin approval step is required for allowlisted users; the `IsActive` flag remains available for future soft-disable workflows.
