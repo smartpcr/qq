@@ -64,7 +64,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 2.1: ASP.NET Core Bot Host
 
 ### Implementation Steps
-- [ ] Create project `AgentSwarm.Messaging.Teams` with NuGet references: `Microsoft.Bot.Builder` (4.22+), `Microsoft.Bot.Builder.Integration.AspNet.Core`, `Microsoft.Bot.Connector`.
+- [ ] Create project `AgentSwarm.Messaging.Teams` with NuGet references: `Microsoft.Bot.Builder` (4.22+), `Microsoft.Bot.Builder.Integration.AspNet.Core`, `Microsoft.Bot.Builder.Teams` (4.22+).
 - [ ] Create `TeamsMessagingOptions` configuration class with properties: `MicrosoftAppId`, `MicrosoftAppPassword`, `MicrosoftAppTenantId`, `AllowedTenantIds` (list), `BotEndpoint`.
 - [ ] Implement `Startup`/`Program.cs` registering `IBotFrameworkHttpAdapter`, `IBot`, health check endpoints (`/health`, `/ready`), and OpenTelemetry tracing.
 - [ ] Create `BotController` with POST endpoint at `/api/messages` that delegates to `IBotFrameworkHttpAdapter.ProcessAsync`.

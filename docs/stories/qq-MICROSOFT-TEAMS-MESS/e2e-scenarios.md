@@ -717,10 +717,12 @@ Feature: Edge Cases and Error Handling
     And queued messages are delivered after the rate limit window
     And no messages are lost
 
-  Scenario: User sends command during gateway maintenance window
-    Given the Messenger Gateway is temporarily unavailable
+  Scenario: User sends command while bot webhook endpoint is temporarily down
+    Given the AgentSwarm.Messaging.Worker host is temporarily unavailable (e.g., during a rolling deployment)
     When user "alice@contoso.com" sends "agent status"
-    Then the message is queued by the Bot Framework infrastructure
-    And when the gateway recovers, the message is processed
-    And the user receives a (possibly delayed) response
+    Then the Bot Framework webhook call to the bot endpoint fails with a transport error
+    And Teams may display "Sorry, my bot code is having an issue" to the user
+    When the AgentSwarm.Messaging.Worker host recovers
+    Then the user must resend the command — Bot Framework does not queue missed webhook deliveries
+    And no stale or phantom commands appear in the inbound queue
 ```
