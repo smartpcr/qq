@@ -925,7 +925,7 @@ Feature: Edge Cases and Error Handling
 
 - [x] 6. ADDRESSED — The iter 10 resolution block's verification command (former line 929) contained the exact search phrase. That entire block is now replaced. This block avoids quoting that phrase verbatim.
 
-- [x] 7. ADDRESSED — The phrase "TeamsActivityHandler delegates to the CommandParser" existed in the iter 10 resolution block at former lines 933 and 935. That entire block is now replaced. The normative Gherkin at lines 765-766 correctly uses the two-step flow (TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync → MessageExtensionHandler → CommandParser), matching architecture.md §6.7.
+- [x] 7. ADDRESSED — The iter 10 resolution block (former lines 933/935) quoted the exact pre-edit handler-delegation phrase. That entire block is now replaced. The normative Gherkin at lines 765-766 correctly uses the two-step flow via TeamsSwarmActivityHandler, then MessageExtensionHandler, then CommandParser — matching architecture.md §6.7.
 
 > **Cross-doc alignment note:** This file (e2e-scenarios.md) now aligns with tech-spec.md §4.3 Canonical Audit Record Schema (lines 128, 130, 138) and architecture.md §3.2 (line 432) and §6.7 (line 955) on seven canonical audit EventType values including MessageActionReceived. implementation-plan.md §Iteration Summary (line 415) still claims six values — that sibling doc should update to match tech-spec.md in its next iteration.
 
