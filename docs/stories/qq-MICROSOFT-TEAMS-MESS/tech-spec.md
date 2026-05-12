@@ -320,13 +320,14 @@ $ grep -nF "implementation-plan.md" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-sp
 231:...implementation-plan.md...
 ```
 
-- [x] 4. FIXED — `architecture.md` lines 1127–1130 — The stale `invalid-jwt-audit` open question has been cleared. The question was stale because `e2e-scenarios.md` lines 387–389 already agree with `tech-spec.md` §4.2 line 108: invalid JWT → HTTP 401, no application code runs, no audit entry emitted. The contradiction the open question described no longer exists. `tech-spec.md` "Open questions: None" is now accurate. Verification:
+- [x] 4. FIXED — `architecture.md` lines 1127–1130 — The stale `invalid-jwt-audit` open question JSON block has been cleared (empty array). The error handling table row (line 1052) has been rewritten to state the conflict is resolved. The question was stale because `e2e-scenarios.md` lines 387–389 already agree with `tech-spec.md` §4.2 line 108: invalid JWT → HTTP 401, no application code runs, no audit entry emitted. `tech-spec.md` "Open questions: None" is now accurate. Verification:
 ```
 $ grep -nF "invalid-jwt-audit" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — open question removed)
+1108:- [x] 5. FIXED ... Escalated the invalid-JWT audit conflict as Open Question `invalid-jwt-audit`...
 ```
+(Only hit is in the historical prior-feedback-resolution block recording what was done in a prior iteration — not an active open question. The open-questions JSON block is now empty and the error-handling table row no longer references it as unresolved.)
 
-- [x] 5. FIXED — `architecture.md` lines 1127–1130 (same edit as item 4) — The stale open question incorrectly claimed `e2e-scenarios.md` lines 383–389 "require invalid-JWT audit logging." Actual `e2e-scenarios.md` lines 387–389 say: "the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline / no application code or middleware runs / no audit entry is emitted." The architecture open question was based on outdated e2e-scenarios content. Removed the stale question; the `openQuestions` array is now empty. Verification:
+- [x] 5. FIXED — `architecture.md` line 1052 + lines 1127–1130 (same edits as item 4) — The stale open question incorrectly claimed `e2e-scenarios.md` lines 383–389 "require invalid-JWT audit logging." Actual `e2e-scenarios.md` lines 387–389 say: "the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline / no application code or middleware runs / no audit entry is emitted." The architecture error-handling table row now states "Cross-doc alignment (resolved)" and the `openQuestions` array is empty. Verification:
 ```
 $ grep -nF "Should the architecture include application-level audit logging" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
 (empty — stale question removed)
