@@ -114,6 +114,23 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Receive command event — Given the activity handler processes an `agent status` message, When `ReceiveAsync` is awaited, Then a `CommandEvent` with `Command = "status"` is returned.
 - [ ] Scenario: Send with missing reference — Given no conversation reference exists for the target user, When `SendMessageAsync` is called, Then an `InvalidOperationException` is thrown with a descriptive message.
 
+## Stage 2.4: Teams App Manifest
+
+### Implementation Steps
+- [ ] Create Teams app manifest `manifest.json` conforming to manifest schema v1.16+ with `$schema`, `manifestVersion`, `id` (bot's AAD app ID), `version`, `name`, `description`, and `developer` fields.
+- [ ] Configure bot capability in manifest with `botId` referencing the `MicrosoftAppId`, `scopes` set to `["personal", "team"]`, and `supportsFiles: false`.
+- [ ] Add message extension (compose extension) stub in manifest with `type: "action"`, `commandId`, `title`, and `context: ["message", "commandBox"]` to support forwarding message context to agents.
+- [ ] Add `validDomains` for the bot endpoint and `webApplicationInfo` with `id` (AAD app ID) and `resource` (API URI) for SSO support.
+- [ ] Create `manifest.zip` packaging script that bundles `manifest.json`, `color.png` (192×192), and `outline.png` (32×32) icons for sideloading or admin deployment.
+
+### Dependencies
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
+
+### Test Scenarios
+- [ ] Scenario: Manifest schema validation — Given the generated `manifest.json`, When validated against the Teams manifest schema v1.16, Then no schema errors are reported.
+- [ ] Scenario: Required scopes present — Given the manifest, When the `bots[0].scopes` field is inspected, Then it contains both `personal` and `team`.
+- [ ] Scenario: Message extension stub present — Given the manifest, When the `composeExtensions` field is inspected, Then it contains at least one action command entry.
+
 # Phase 3: Adaptive Cards and Command Processing
 
 ## Dependencies
