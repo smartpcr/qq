@@ -917,7 +917,7 @@ Feature: Edge Cases and Error Handling
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Version:** 1.13 — Iteration 13
+**Version:** 1.14 — Iteration 14
 
 ### Coverage
 
@@ -928,12 +928,12 @@ Feature: Edge Cases and Error Handling
 - Card update and delete lifecycle
 - Conversation reference persistence and rehydration
 - Security: tenant validation (with explicit `Action: UnauthorizedTenantRejected`), unmapped Entra identity rejection (with explicit `Action: UnmappedUserRejected`), RBAC (with explicit `Action: InsufficientRoleRejected`), bot installation checks, Bot Framework token validation
-- Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, idempotency
+- Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, two-layer idempotency (transport-level `ActivityDeduplicationMiddleware` + domain-level `CardActionHandler` processed-action set)
 - Performance: P95 < 3s card delivery
-- Compliance: immutable audit trail with canonical EventType values (seven values per tech-spec §4.3 Canonical Audit Record Schema: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error); message actions audit as MessageActionReceived — a dedicated audit event type distinct from CommandReceived because message-action submissions arrive through the composeExtension/submitAction invoke mechanism rather than direct text commands
+- Compliance: immutable audit trail with canonical EventType values (seven values per tech-spec §4.3 Canonical Audit Record Schema: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error); message actions audit as MessageActionReceived; malformed card actions audit as Error
 - Observability: distributed tracing with CorrelationId
 - Message actions (message extensions)
-- Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes, deterministic max message length with audit trail
+- Edge cases: concurrent approvals, malformed payloads (now with Error audit record), rate limiting, service URL changes, max message length (softened — no unanchored config surface)
 - Uninstall handling: both known-uninstall (inactive pre-check) and missed-uninstall (stale reference 403)
 
 ### Prior feedback resolution
