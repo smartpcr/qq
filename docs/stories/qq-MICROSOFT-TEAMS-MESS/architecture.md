@@ -191,7 +191,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Core` |
 | **Namespace** | `AgentSwarm.Messaging.Core.Outbox` |
-| **Responsibility** | Durable outbox pattern. Every outbound message is first persisted to the outbox table, then delivered. A background worker polls for undelivered or failed messages and retries with exponential backoff (base 2 s, max 60 s, 5 attempts). Messages exceeding max retries move to the dead-letter queue. |
+| **Responsibility** | Durable outbox pattern. Every outbound message is first persisted to the outbox table, then delivered. A background worker polls for undelivered or failed messages and retries transient Bot Connector failures (HTTP 429, 500, 502, 503, 504) with exponential backoff per `tech-spec.md` §4.4: base 2 s, multiplier 2×, max delay 60 s, 5 total attempts (1 initial + 4 retries), ±25% jitter on each computed delay to avoid thundering herd. When Bot Framework returns HTTP 429 with a `Retry-After` header, the header value is used as the minimum delay if it exceeds the computed backoff. Messages exceeding max retries move to the dead-letter queue. |
 | **Idempotency** | Each outbox entry has a unique `OutboxEntryId`; the Bot Connector service is tolerant of duplicate `Activity` sends, but the engine deduplicates on its side as well. |
 
 ### 2.13 AuditLogger
@@ -213,7 +213,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Extensions` |
-| **Responsibility** | Handle Teams message-extension action commands (`composeExtension/submitAction`). When a user invokes a message action (e.g., right-clicks a message and selects "Forward to Agent"), this handler extracts the source message content, builds a `MessageActionRequest`, and publishes it as a `MessengerEvent` of type `MessageAction` to the inbound buffer. Returns a task-submitted confirmation card to the user. |
+| **Responsibility** | Handle Teams message-extension action commands (`composeExtension/submitAction`). When a user invokes a message action (e.g., right-clicks a message and selects "Forward to Agent"), this handler extracts the source message content, delegates to `CommandParser` to parse the forwarded text (aligned with `e2e-scenarios.md` §Message Actions), and publishes a `MessengerEvent` of type `AgentTaskRequest` with `Source = MessageAction` to the inbound buffer. Returns a task-submitted confirmation card to the user. |
 | **Trigger** | `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to this handler. |
 | **Manifest** | Requires a `composeExtensions` entry in the Teams app manifest with `type: "action"` and `fetchTask: false` (or `true` if a task module is used to collect additional input). |
 
@@ -287,11 +287,11 @@ Platform-agnostic inbound event. Defined in `AgentSwarm.Messaging.Abstractions`.
 | Field | Type | Description |
 |---|---|---|
 | `EventId` | `string` | Unique event identifier. |
-| `EventType` | `string` | `Command`, `Decision`, `Reaction`, `InstallUpdate`, `MessageAction`. |
+| `EventType` | `string` | `Command`, `Decision`, `Reaction`, `InstallUpdate`, `AgentTaskRequest`. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
 | `Messenger` | `string` | `"Teams"`. |
 | `ExternalUserId` | `string` | Teams AAD object ID. |
-| `Payload` | `object` | Typed payload — `ParsedCommand`, `HumanDecisionEvent`, or `MessageActionRequest`. |
+| `Payload` | `object` | Typed payload — `ParsedCommand`, `HumanDecisionEvent`, or `MessageActionRequest`. For message-action-originated events, the `EventType` is `AgentTaskRequest` with `Source = MessageAction` (aligned with `e2e-scenarios.md` §Message Actions). |
 | `Timestamp` | `DateTimeOffset` | UTC receipt time. |
 
 ### 3.2 Teams-Specific Entities
@@ -367,22 +367,25 @@ Durable outbound message queue entry. Defined in `AgentSwarm.Messaging.Core`.
 
 #### AuditEntry
 
-Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields aligned with `tech-spec.md` §4.3 compliance constraints.
+Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields aligned with `tech-spec.md` §4.3 canonical audit record schema — all canonical required fields are included below; `AuditEntryId` and `Checksum` are implementation-specific additions.
 
-| Field | Type | Description |
-|---|---|---|
-| `AuditEntryId` | `string` | Primary key (GUID). |
-| `CorrelationId` | `string` | End-to-end trace ID. |
-| `EventType` | `string` | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. |
-| `AgentId` | `string?` | Originating or target agent identity (null for security rejections). |
-| `TaskId` | `string?` | Associated task/work item (null when not applicable). |
-| `ConversationId` | `string` | Bot Framework conversation ID. |
-| `UserId` | `string` | AAD object ID (Entra ID) of the acting user. |
-| `TenantId` | `string` | Entra ID tenant. |
-| `Action` | `string` | Specific action taken (e.g., `approve`, `reject`, `agent ask`). |
-| `Outcome` | `string` | Result of the action: `Success`, `Rejected`, `Failed`, `DeadLettered`. |
-| `PayloadJson` | `string` | Full event payload (JSON, sanitized). |
-| `Timestamp` | `DateTimeOffset` | UTC event time. |
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `AuditEntryId` | `string` | Yes | Primary key (GUID) — implementation-specific surrogate key. |
+| `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
+| `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
+| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. |
+| `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users (`ActorType = User`), agent ID for agent-originated events (`ActorType = Agent`). |
+| `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
+| `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
+| `TaskId` | `string?` | No | Agent task/work-item ID (null for security rejection events). |
+| `ConversationId` | `string?` | No | Bot Framework conversation ID (null for events outside a conversation). |
+| `Action` | `string` | Yes | Specific action taken (e.g., `approve`, `reject`, `agent ask`, `send_card`). |
+| `PayloadJson` | `string` | Yes | JSON-serialized event payload (sanitized — no secrets or PII beyond identity). |
+| `Outcome` | `string` | Yes | Result of the action: `Success`, `Rejected`, `Failed`, `DeadLettered`. |
+| `Checksum` | `string` | Yes | SHA-256 hash of the record for tamper detection — implementation addition. |
+
+> **Field mapping note:** `ActorId` + `ActorType` replace the previous `AgentId` / `UserId` fields to align with `tech-spec.md` §4.3 canonical schema. When logging a user action, set `ActorId` = AAD object ID and `ActorType` = `User`. When logging an agent-originated event, set `ActorId` = agent ID and `ActorType` = `Agent`.
 
 ### 3.3 Entity Relationship Diagram
 
@@ -432,10 +435,18 @@ public interface IConversationReferenceStore
     Task<TeamsConversationReference?> GetByUserIdAsync(string tenantId, string userId, CancellationToken ct);
     Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct);
     Task<IReadOnlyList<TeamsConversationReference>> GetAllAsync(string tenantId, CancellationToken ct);
+
+    // Personal-scope overloads (keyed by userId)
     Task MarkInactiveAsync(string tenantId, string userId, CancellationToken ct);
     Task DeleteAsync(string tenantId, string userId, CancellationToken ct);
+
+    // Channel-scope overloads (keyed by channelId)
+    Task MarkInactiveByChannelAsync(string tenantId, string channelId, CancellationToken ct);
+    Task DeleteByChannelAsync(string tenantId, string channelId, CancellationToken ct);
 }
 ```
+
+> **Design note:** The channel-scoped `MarkInactiveByChannelAsync` and `DeleteByChannelAsync` methods mirror the personal-scope variants to ensure symmetry with `GetByChannelIdAsync`. When a bot is uninstalled from a team, `MarkInactiveByChannelAsync` is called for each channel in that team; when audit retention permits, `DeleteByChannelAsync` performs hard removal.
 
 ### 4.3 ICardStateStore
 
@@ -633,6 +644,10 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 
 ### 6.4 Scenario: Unauthorized tenant/user is rejected
 
+This scenario covers three distinct rejection paths per `tech-spec.md` §4.2 rejection behavior matrix.
+
+#### 6.4.1 Unauthorized tenant
+
 ```text
 Attacker (Teams)    TeamsWebhookController    TeamsBotAdapter    TenantValidationMiddleware    AuditLogger
      │                     │                       │                       │                       │
@@ -647,8 +662,61 @@ Attacker (Teams)    TeamsWebhookController    TeamsBotAdapter    TenantValidatio
 
 1. Activity arrives from an unrecognized tenant.
 2. `TenantValidationMiddleware` extracts the tenant ID and checks the allowlist.
-3. Tenant is not found — middleware short-circuits, logs a `SecurityRejection` audit entry, and returns HTTP 403.
+3. Tenant is not found — middleware short-circuits, logs a `SecurityRejection` audit entry (`EventType: SecurityRejection`, `Outcome: Rejected`), and returns HTTP 403.
 4. The user sees no bot response (Bot Framework does not surface 403 to the user; the message simply goes unprocessed).
+
+#### 6.4.2 Allowed tenant, unmapped user
+
+```text
+User (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    IIdentityResolver    AuditLogger
+     │                  │                       │                    │                        │                   │
+     │── message ──────>│                       │                    │                        │                   │
+     │                  │── POST /api/messages─>│                    │                        │                   │
+     │                  │                       │── middleware OK ──>│                        │                   │
+     │                  │                       │  (tenant ✓)       │── resolve user ───────>│                   │
+     │                  │                       │                    │                        │── NOT mapped       │
+     │                  │                       │                    │<── null ───────────────│                   │
+     │                  │                       │                    │── log rejection ─────────────────────────>│
+     │                  │                       │                    │    {EventType: SecurityRejection,          │
+     │                  │                       │                    │     Outcome: Rejected}                     │
+     │<── access denial │<──────────────────────│<───────────────────│                        │                   │
+     │   Adaptive Card  │  HTTP 200             │                    │                        │                   │
+     │   "Your account  │                       │                    │                        │                   │
+     │   is not mapped" │                       │                    │                        │                   │
+```
+
+1. Activity arrives from an allowed tenant. `TenantValidationMiddleware` passes.
+2. `TeamsSwarmActivityHandler` invokes `IIdentityResolver` with `Activity.From.AadObjectId`.
+3. AAD object ID is not mapped to any internal user record.
+4. Handler logs a `SecurityRejection` audit entry with `Outcome: Rejected` and audit event `UnmappedUserRejected`.
+5. An Adaptive Card is returned to the user explaining the access denial and how to request access.
+
+#### 6.4.3 Allowed tenant, mapped user, insufficient RBAC role
+
+```text
+User (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    IUserAuthorizationService    AuditLogger
+     │                  │                       │                    │                            │                       │
+     │── "approve" ────>│                       │                    │                            │                       │
+     │                  │── POST /api/messages─>│                    │                            │                       │
+     │                  │                       │── middleware OK ──>│                            │                       │
+     │                  │                       │  (tenant ✓)       │── check role ─────────────>│                       │
+     │                  │                       │                    │                            │── role = Viewer        │
+     │                  │                       │                    │                            │   (needs Approver)     │
+     │                  │                       │                    │<── insufficient ──────────│                       │
+     │                  │                       │                    │── log rejection ──────────────────────────────────>│
+     │                  │                       │                    │    {EventType: SecurityRejection,                  │
+     │                  │                       │                    │     Outcome: Rejected}                             │
+     │<── permissions   │<──────────────────────│<───────────────────│                            │                       │
+     │   Adaptive Card  │  HTTP 200             │                    │                            │                       │
+     │   "Insufficient  │                       │                    │                            │                       │
+     │    permissions"  │                       │                    │                            │                       │
+```
+
+1. Activity arrives from an allowed tenant and a mapped user.
+2. `TeamsSwarmActivityHandler` parses the command (e.g., `approve`) and invokes `IUserAuthorizationService` to check whether the user's role permits the command.
+3. The user has `Viewer` role, but `approve` requires `Approver` — authorization fails.
+4. Handler logs a `SecurityRejection` audit entry with `Outcome: Rejected` and audit event `InsufficientRoleRejected`.
+5. An Adaptive Card is returned explaining insufficient permissions and which role is required.
 
 ### 6.5 Scenario: Message update/delete for already-sent approval card
 
@@ -696,28 +764,34 @@ Service (restart)    ConvRefStore    ProactiveNotifier    Teams
 ### 6.7 Scenario: Message action — user forwards a message to an agent
 
 ```text
-Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    MessageExtensionHandler    TeamsMessengerConnector    Orchestrator
-     │                  │                       │                    │                           │                          │                      │
-     │── msg action ───>│                       │                    │                           │                          │                      │
-     │  (right-click    │── invoke activity ───>│                    │                           │                          │                      │
-     │   "Forward to    │   composeExtension/   │── middleware ─────>│                           │                          │                      │
-     │    Agent")       │   submitAction        │                    │── ext dispatch ──────────>│                          │                      │
-     │                  │                       │                    │                           │── extract source msg     │                      │
-     │                  │                       │                    │                           │── build MessageAction    │                      │
-     │                  │                       │                    │                           │    Request               │                      │
-     │                  │                       │                    │                           │── audit log              │                      │
-     │                  │                       │                    │<── confirmation card ─────│                          │                      │
-     │<── "Forwarded" ──│<──────────────────────│<───────────────────│                           │── MessengerEvent ───────>│                      │
-     │                  │                       │                    │                           │  {MessageAction}         │── MessengerEvent ───>│
+Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    MessageExtensionHandler    CommandParser    TeamsMessengerConnector    Orchestrator
+     │                  │                       │                    │                           │                       │                  │                      │
+     │── msg action ───>│                       │                    │                           │                       │                  │                      │
+     │  (right-click    │── invoke activity ───>│                    │                           │                       │                  │                      │
+     │   "Forward to    │   composeExtension/   │── middleware ─────>│                           │                       │                  │                      │
+     │    Agent")       │   submitAction        │                    │── ext dispatch ──────────>│                       │                  │                      │
+     │                  │                       │                    │                           │── extract source msg   │                  │                      │
+     │                  │                       │                    │                           │── delegate to parser ─>│                  │                      │
+     │                  │                       │                    │                           │<── parsed context ─────│                  │                      │
+     │                  │                       │                    │                           │── build AgentTask      │                  │                      │
+     │                  │                       │                    │                           │    Request (Source=    │                  │                      │
+     │                  │                       │                    │                           │    MessageAction)      │                  │                      │
+     │                  │                       │                    │                           │── audit log            │                  │                      │
+     │                  │                       │                    │<── confirmation card ─────│                       │                  │                      │
+     │<── "Forwarded" ──│<──────────────────────│<───────────────────│                           │── MessengerEvent ────────────────────────>│                      │
+     │                  │                       │                    │                           │  {AgentTaskRequest,    │                  │── MessengerEvent ───>│
+     │                  │                       │                    │                           │   Source=MessageAction} │                  │                      │
 ```
 
 1. Human right-clicks a message in Teams and selects the "Forward to Agent" message action (defined as a `composeExtension` command in the app manifest).
 2. Teams sends an `invoke` activity with `name: "composeExtension/submitAction"` containing the source message content.
 3. `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to `MessageExtensionHandler`.
-4. `MessageExtensionHandler` extracts the source message text and metadata, builds a `MessageActionRequest`, and logs an audit entry of type `MessageActionReceived`.
-5. A confirmation card is returned to the user ("Message forwarded to agent — tracking ID: {CorrelationId}").
-6. `TeamsMessengerConnector` publishes a `MessengerEvent` of type `MessageAction` with the `MessageActionRequest` payload to the inbound buffer.
-7. The orchestrator consumes the event and routes the forwarded context to the appropriate agent.
+4. `MessageExtensionHandler` extracts the source message text and metadata, delegates to `CommandParser` to parse the forwarded content (aligned with `e2e-scenarios.md` §Message Actions which expects delegation to `CommandParser`).
+5. A `MessengerEvent` of type `AgentTaskRequest` is built with `Source = MessageAction` (aligned with `e2e-scenarios.md` which expects `MessengerEvent` type `AgentTaskRequest` with `Source = MessageAction`, not `MessageAction` type).
+6. An audit entry of type `MessageActionReceived` is logged.
+7. A confirmation card is returned to the user ("Message forwarded to agent — tracking ID: {CorrelationId}").
+8. `TeamsMessengerConnector` publishes the `MessengerEvent` to the inbound buffer.
+9. The orchestrator consumes the event and routes the forwarded context to the appropriate agent.
 
 ---
 
@@ -810,8 +884,8 @@ services.AddHostedService<OutboxWorker>();
 
 | Error class | Handling |
 |---|---|
-| Transient (HTTP 429, 502, 503) | Exponential backoff retry via outbox engine. |
+| Transient (HTTP 429, 500, 502, 503, 504) | Exponential backoff retry via outbox engine per `tech-spec.md` §4.4: base 2 s, 2× multiplier, max 60 s, 5 total attempts, ±25% jitter, `Retry-After` header override for HTTP 429. |
 | Authentication failure | Log `SecurityRejection` audit entry; return 403. |
-| Card update conflict (activity not found) | Log warning; mark card state as `Deleted`; do not retry. |
+| Card update conflict (activity not found) | Log warning; mark card state as `Deleted`; send a **new replacement card** to the user with the updated status (aligned with `e2e-scenarios.md` §Update/Delete — "bot sends a new replacement card"); do not infinitely retry the stale update. |
 | Serialization error | Log error; move to dead-letter queue. |
 | Unhandled exception | `OnTurnError` handler logs, sends error card to user, publishes dead-letter event. |

@@ -64,10 +64,10 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 2.1: ASP.NET Core Bot Host
 
 ### Implementation Steps
-- [ ] Create project `AgentSwarm.Messaging.Teams` with NuGet references: `Microsoft.Bot.Builder` (4.22+), `Microsoft.Bot.Builder.Integration.AspNet.Core`, `Microsoft.Bot.Builder.Teams` (4.22+).
+- [ ] Create project `AgentSwarm.Messaging.Teams` with NuGet references: `Microsoft.Bot.Builder` (4.22+), `Microsoft.Bot.Builder.Integration.AspNet.Core` (4.22+), `Microsoft.Bot.Connector.Teams` (4.22+). Note: `Microsoft.Bot.Builder` already includes the `Microsoft.Bot.Builder.Teams` namespace containing `TeamsActivityHandler`; the separate `Microsoft.Bot.Connector.Teams` package provides Teams-specific types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`.
 - [ ] Create `TeamsMessagingOptions` configuration class with properties: `MicrosoftAppId`, `MicrosoftAppPassword`, `MicrosoftAppTenantId`, `AllowedTenantIds` (list), `BotEndpoint`.
-- [ ] Implement `Startup`/`Program.cs` registering `IBotFrameworkHttpAdapter`, `IBot`, health check endpoints (`/health`, `/ready`), and OpenTelemetry tracing.
-- [ ] Create `BotController` with POST endpoint at `/api/messages` that delegates to `IBotFrameworkHttpAdapter.ProcessAsync`.
+- [ ] Implement `Startup`/`Program.cs` registering `CloudAdapter` (from `Microsoft.Bot.Builder.Integration.AspNet.Core`) as the bot adapter with middleware pipeline (Telemetry → TenantFilter → RateLimit), `IBot`, health check endpoints (`/health`, `/ready`), and OpenTelemetry tracing.
+- [ ] Create `BotController` with POST endpoint at `/api/messages` that delegates to `CloudAdapter.ProcessAsync`.
 - [ ] Register `TeamsMessagingOptions` from `appsettings.json` and environment variables using the Options pattern.
 
 ### Dependencies
@@ -100,7 +100,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 2.3: Teams Messenger Connector
 
 ### Implementation Steps
-- [ ] Implement `TeamsMessengerConnector : IMessengerConnector` with constructor injection of `IBotFrameworkHttpAdapter`, `TeamsMessagingOptions`, `IConversationReferenceStore`.
+- [ ] Implement `TeamsMessengerConnector : IMessengerConnector` with constructor injection of `CloudAdapter`, `TeamsMessagingOptions`, `IConversationReferenceStore`.
 - [ ] Implement `SendMessageAsync` to send a text message to the stored conversation reference using `adapter.ContinueConversationAsync`.
 - [ ] Implement `SendQuestionAsync` to render an `AgentQuestion` as a simple text summary and send it proactively via `ContinueConversationAsync`; Adaptive Card rendering is wired in Phase 3 Stage 3.1 when `AdaptiveCardBuilder` becomes available.
 - [ ] Implement `ReceiveAsync` using an in-memory channel (`System.Threading.Channels.Channel<MessengerEvent>`) fed by the activity handler.
@@ -179,6 +179,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement card update logic in `TeamsMessengerConnector` using `turnContext.UpdateActivityAsync` to replace an existing approval card with a resolved status card.
 - [ ] Implement card delete logic using `turnContext.DeleteActivityAsync` for expired or cancelled questions.
 - [ ] Add `ActivityId` capture in `OnMessageActivityAsync` reply flow so sent card IDs are stored in `ICardStateStore`.
+- [ ] Add `ActivityId` capture for proactively sent Adaptive Cards: in `SendQuestionAsync` and `ProactiveNotifier`, read the `ResourceResponse.Id` returned by `SendActivityAsync`/`ContinueConversationAsync` and persist it to `ICardStateStore` so that proactive approval cards can be updated or deleted later.
 
 ### Dependencies
 - phase-adaptive-cards-and-command-processing/stage-command-dispatcher
@@ -213,18 +214,19 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Implementation Steps
 - [ ] Create `IProactiveNotifier` interface with `SendProactiveAsync(string userId, MessengerMessage message, CancellationToken ct)` and `SendProactiveQuestionAsync(string userId, AgentQuestion question, CancellationToken ct)`.
-- [ ] Implement `TeamsProactiveNotifier : IProactiveNotifier` using `BotAdapter.ContinueConversationAsync` with stored conversation references.
+- [ ] Implement `TeamsProactiveNotifier : IProactiveNotifier` using `CloudAdapter.ContinueConversationAsync` with stored conversation references.
 - [ ] Implement conversation reference rehydration: deserialize stored `ConversationReference` JSON and invoke `ContinueConversationAsync` with the app credentials.
-- [ ] Add proactive message delivery via direct `ContinueConversationAsync` calls; durable outbox queuing is layered on top in Phase 6 Stage 6.1 when `SqlMessageOutbox` becomes available.
+- [ ] Add proactive message delivery via direct `ContinueConversationAsync` calls; durable outbox queuing is layered on top in Phase 6 Stage 6.1 when `OutboxRetryEngine` becomes available.
 - [ ] Implement notification routing: determine whether to send to personal chat or team channel based on message priority and user preferences.
 
 ### Dependencies
 - phase-proactive-messaging-and-conversation-reference-management/stage-conversation-reference-store-implementation
+- phase-adaptive-cards-and-command-processing/stage-adaptive-card-templates
 
 ### Test Scenarios
-- [ ] Scenario: Proactive question delivery — Given a stored conversation reference for `user-1`, When `SendProactiveQuestionAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the user's personal chat.
+- [ ] Scenario: Proactive question delivery — Given a stored conversation reference for `user-1`, When `SendProactiveQuestionAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the user's personal chat using `AdaptiveCardBuilder` to render the card.
 - [ ] Scenario: Reference not found — Given no conversation reference exists for `user-2`, When `SendProactiveQuestionAsync` is called, Then the notification is dead-lettered with reason `NoConversationReference`.
-- [ ] Scenario: Queue-based delivery — Given 10 notifications are enqueued, When the background service processes them, Then all 10 are sent within P95 < 3 seconds per message.
+- [ ] Scenario: Direct delivery latency — Given a stored conversation reference and a rendered Adaptive Card, When `SendProactiveQuestionAsync` delivers the card directly via `ContinueConversationAsync`, Then delivery completes within P95 < 3 seconds.
 
 # Phase 5: Security, Identity, and Compliance
 
@@ -277,7 +279,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Implementation Steps
 - [ ] Implement `SqlMessageOutbox : IMessageOutbox` with an `OutboxMessages` table containing: `Id`, `Payload` (JSON), `DestinationType` (personal/channel), `DestinationId`, `Status` (Pending/Processing/Sent/Failed/DeadLettered), `RetryCount`, `NextRetryAt`, `CreatedAt`, `LastError`.
 - [ ] Create EF Core migration for the `OutboxMessages` table with index on `Status` and `NextRetryAt`.
-- [ ] Implement `OutboxProcessor` as `BackgroundService` that polls for pending messages, attempts delivery, and updates status.
+- [ ] Implement `OutboxRetryEngine` as `BackgroundService` that polls for pending messages, attempts delivery, and updates status.
 - [ ] Implement exponential backoff retry: delays of 1s, 2s, 4s, 8s, 16s with jitter, up to `DeadLetterThreshold` (default 5) attempts.
 - [ ] Implement `Retry-After` header handling: when the Bot Framework returns HTTP 429, parse the `Retry-After` response header and use its value as the minimum delay before the next retry attempt, overriding the computed backoff if `Retry-After` is longer.
 - [ ] Implement token-bucket rate limiter in the outbound pipeline to proactively avoid Bot Framework rate limits (default: 50 msgs/sec per bot, configurable).

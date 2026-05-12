@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.1 — Iteration 2
+**Version:** 1.2 — Iteration 2 (feedback-addressed)
 
 ---
 
@@ -386,7 +386,7 @@ Feature: Reliability — Retry and Recovery
   Scenario: Duplicate inbound webhook is suppressed
     Given user "alice@contoso.com" sends "approve" for question "Q-801"
     And the Bot Framework delivers the activity twice (network retry)
-    When the gateway processes both deliveries
+    When the TeamsMessengerConnector processes both deliveries
     Then the first delivery creates a HumanDecisionEvent
     And the second delivery is detected as a duplicate via the Activity ID
     And no duplicate event is created
@@ -777,7 +777,7 @@ Feature: Edge Cases and Error Handling
   Scenario: Rate limiting from Bot Framework
     Given the bot is sending proactive messages at a high rate
     When the Bot Framework returns HTTP 429 with Retry-After header
-    Then the gateway respects the Retry-After interval
+    Then the OutboxRetryEngine respects the Retry-After interval
     And queued messages are delivered after the rate limit window
     And no messages are lost
 

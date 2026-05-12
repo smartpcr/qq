@@ -31,7 +31,7 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 
 | Area | Detail |
 |------|--------|
-| **Bot Framework integration** | ASP.NET Core bot endpoint using `Microsoft.Bot.Builder`, `Microsoft.Bot.Builder.Integration.AspNet.Core`, and `Microsoft.Bot.Connector.Teams`. |
+| **Bot Framework integration** | ASP.NET Core bot endpoint using `Microsoft.Bot.Builder`, `Microsoft.Bot.Builder.Integration.AspNet.Core`, `Microsoft.Bot.Builder.Teams`, and `Microsoft.Bot.Connector.Teams`. |
 | **Command handling** | `agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume` — parsed from personal chat and team channel messages. |
 | **Adaptive Cards** | Card templates for: agent questions, approval gates, release gates, incident summaries. Card actions map to `HumanAction` values. Card update and delete for already-sent cards. |
 | **Proactive messaging** | Store `ConversationReference` per authorized user/channel. Rehydrate after restart. Deliver agent-initiated questions, approval requests, and incident notifications. |
@@ -44,6 +44,7 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 | **Compliance** | Immutable audit trail for all inbound commands and outbound notifications. Include `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, user identity, and action taken. |
 | **Observability** | OpenTelemetry traces and metrics. Structured logging. Health-check endpoint. Latency histograms for card delivery. |
 | **Shared abstractions** | Implement `IMessengerConnector` (planned in `AgentSwarm.Messaging.Abstractions` — to be created as part of the epic-level shared infrastructure; see §6.1) for Teams. Use shared data models: `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage`. |
+| **Teams-specific contracts** | `IConversationReferenceStore` is defined in `AgentSwarm.Messaging.Teams` (not in the shared abstractions) because conversation reference shapes are platform-specific. `implementation-plan.md` Stage 1.2 places the interface definition step in the shared connector-interface stage for convenience of ordering, but the assembly owner is `AgentSwarm.Messaging.Teams`. This is consistent with `architecture.md` §2.8 and §4.2. |
 | **Solution structure** | New project `AgentSwarm.Messaging.Teams` within the recommended solution structure. |
 
 ### 2.2 Out of Scope
@@ -110,7 +111,9 @@ Tenant-level and user-level rejections are handled at **different layers** with 
 | Allowed tenant, `AadObjectId` not mapped to internal user | `IIdentityResolver` (inside bot handler) | HTTP 200 + Adaptive Card explaining access denial and how to request access | `UnmappedUserRejected` |
 | Allowed tenant, mapped user, insufficient RBAC role | `IUserAuthorizationService` (inside bot handler) | HTTP 200 + Adaptive Card explaining insufficient permissions | `InsufficientRoleRejected` |
 
-> **Design rationale:** Tenant-level rejection uses HTTP 403 because the middleware intercepts the request before the bot handler runs — there is no conversation context in which to send a card. User-level rejections (unmapped identity, insufficient RBAC) occur inside the bot handler where a conversation turn is active, so a polite Adaptive Card is the appropriate response. Sibling docs (`implementation-plan.md`, `e2e-scenarios.md`) must align to this two-tier model.
+> **Design rationale:** Tenant-level rejection uses HTTP 403 because the middleware intercepts the request before the bot handler runs — there is no conversation context in which to send a card. User-level rejections (unmapped identity, insufficient RBAC) occur inside the bot handler where a conversation turn is active, so a polite Adaptive Card is the appropriate response.
+>
+> **Cross-doc alignment required:** `implementation-plan.md` Stage 5.1 (line 239) currently says unmapped users are "rejected with HTTP 403" — this must be corrected to HTTP 200 + Adaptive Card per this matrix. Similarly, `implementation-plan.md` Stage 7.2 (line 356) says the unauthorized-tenant E2E test "returns appropriate error card" — this must be corrected to expect HTTP 403 with no bot response/card for tenant-level rejection. The two-tier model defined in this matrix is canonical.
 
 ### 4.3 Compliance
 
@@ -121,7 +124,9 @@ Tenant-level and user-level rejections are handled at **different layers** with 
 
 #### Canonical Audit Record Schema (source of truth)
 
-This is the **minimum required** field set for all audit records. Sibling docs (`architecture.md`, `implementation-plan.md`) may add implementation-specific fields (e.g., `Checksum` for tamper detection, surrogate `AuditEntryId` primary key) but **must include all fields listed here**.
+This is the **minimum required** field set for all audit records. Sibling docs (`architecture.md`, `implementation-plan.md`) may add implementation-specific fields (e.g., `Checksum` for tamper detection, surrogate `AuditEntryId` primary key) but **must include all fields listed here** and **must use the canonical `EventType` values** defined in this table.
+
+> **Cross-doc alignment required:** `e2e-scenarios.md` §Compliance (lines 429, 442, 453) currently uses `EventType` values `InboundCommand`, `OutboundNotification`, and `HumanDecision` — these must be corrected to `CommandReceived`, `MessageSent` (or `ProactiveNotification` for outbound cards), and `CardActionReceived` per the canonical `EventType` enum below.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -151,7 +156,9 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 
 #### Canonical Retry Policy (source of truth)
 
-This is the **authoritative retry schedule** for transient Bot Connector failures (HTTP 429, 500, 502, 503, 504). Sibling docs (`architecture.md`, `implementation-plan.md`) must align to these values.
+This is the **authoritative retry schedule** for transient Bot Connector failures (HTTP 429, 500, 502, 503, 504). Sibling docs must align to these values.
+
+> **Cross-doc alignment required:** `implementation-plan.md` Stage 6.1 (line 281) currently specifies delays of 1s, 2s, 4s, 8s, 16s (base delay 1s) with 5 total attempts — this must be corrected to base delay 2s with delays of 2s, 4s, 8s, 16s per this table. `e2e-scenarios.md` §Reliability (lines 352-357) currently specifies `MaxRetries 5, InitialBackoff 1 second, MaxBackoff 30 seconds` — this must be corrected to `MaxRetries 4, InitialBackoff 2 seconds, MaxBackoff 60 seconds` per this table. The tech-spec retry policy table below is canonical.
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
@@ -225,7 +232,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 | **Azure Bot Service** | Bot channel registration in Azure. Required for Bot Framework authentication. |
 | **Microsoft Entra ID** | App registration with Teams channel enabled. `MicrosoftAppId` + secret/certificate. |
 | **Teams Admin Center** | App policy to allow or require installation for target users/groups. |
-| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Connector.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). |
+| **NuGet packages** | `Microsoft.Bot.Builder` (≥ 4.22), `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22), `Microsoft.Bot.Builder.Teams` (≥ 4.22), `Microsoft.Bot.Connector.Teams` (≥ 4.22), `AdaptiveCards` (≥ 3.1). |
 | **Azure Key Vault** (or equivalent) | Secure storage for bot credentials. |
 
 ---
