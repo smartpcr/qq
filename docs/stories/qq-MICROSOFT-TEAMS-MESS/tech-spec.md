@@ -43,7 +43,7 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 | **Performance** | P95 Adaptive Card delivery < 3 seconds after queue pickup. Connector recovery < 30 seconds. Support 1000+ concurrent users. |
 | **Compliance** | Immutable audit trail for all inbound commands and outbound notifications. Include `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, user identity, and action taken. |
 | **Observability** | OpenTelemetry traces and metrics. Structured logging. Health-check endpoint. Latency histograms for card delivery. |
-| **Shared abstractions** | Implement `IMessengerConnector` (defined in `AgentSwarm.Messaging.Abstractions`) for Teams. Use shared data models: `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage`. |
+| **Shared abstractions** | Implement `IMessengerConnector` (planned in `AgentSwarm.Messaging.Abstractions` — to be created as part of the epic-level shared infrastructure; see §6.1) for Teams. Use shared data models: `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage`. |
 | **Solution structure** | New project `AgentSwarm.Messaging.Teams` within the recommended solution structure. |
 
 ### 2.2 Out of Scope
@@ -84,27 +84,59 @@ These are non-negotiable requirements drawn from the story description, enterpri
 | Constraint | Source |
 |------------|--------|
 | C# / .NET 8+ | Epic-level mandate (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Overview: "Implementation language must be C# / .NET 8+") |
-| `Microsoft.Bot.Builder` + `Microsoft.Bot.Builder.Integration.AspNet.Core` | Story description requirement |
-| `Microsoft.Bot.Connector.Teams` (Teams extension types) | Story description requirement (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Recommended C# Libraries under MSG-MT-001) |
+| `Microsoft.Bot.Builder` (≥ 4.22) + `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22) | Story description requirement. **Note:** `Microsoft.Bot.Builder` includes the `Microsoft.Bot.Builder.Teams` namespace containing `TeamsActivityHandler`; no separate `Microsoft.Bot.Builder.Teams` NuGet package is needed. |
+| `Microsoft.Bot.Connector.Teams` (≥ 4.22) | Story description requirement (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Recommended C# Libraries under MSG-MT-001). Provides Teams-specific types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`. |
 | ASP.NET Core hosting | Required by Bot Builder Integration package |
 
 ### 4.2 Identity & Security
 
 | Constraint | Detail |
 |------------|--------|
-| **Tenant ID validation** | Every inbound `Activity` must have its `ChannelData.Tenant.Id` checked against an allow-list. Activities from disallowed tenants are rejected with HTTP 403 before processing. |
-| **User identity via Entra ID** | The bot must resolve `Activity.From.AadObjectId` to an internal user record. Unauthenticated or unmapped users are rejected. |
+| **Tenant ID validation** | Every inbound `Activity` must have its `ChannelData.Tenant.Id` checked against an allow-list. Activities from disallowed tenants are rejected at the middleware layer before the bot handler runs (see rejection matrix below). |
+| **User identity via Entra ID** | The bot must resolve `Activity.From.AadObjectId` to an internal user record. Unmapped users are rejected (see rejection matrix below). |
 | **Teams app installation gate** | Proactive messaging requires the app to be installed in the user's personal scope or in the team. The connector tracks installation state via `InstallationUpdate` activities: when an uninstall event is received, the corresponding `ConversationReference` is marked inactive and no proactive sends are attempted. This is distinct from *stale persisted references* (see R-2 in §5.1), which are references that became invalid without a prior uninstall event (e.g., user removed from tenant); those are detected reactively via 403/404 on send attempt. |
-| **RBAC enforcement** | Each command maps to a required role. `approve`/`reject` require `Approver` role. `agent ask`, `pause`, `resume`, `escalate` require `Operator` role. `agent status` requires `Viewer` role (or above). |
+| **RBAC enforcement** | Each command maps to a required role. `approve`/`reject` require `Approver` role. `agent ask`, `pause`, `resume`, `escalate` require `Operator` role. `agent status` requires `Viewer` role (or above). Users with insufficient role receive a polite card (see rejection matrix below). |
 | **Secret storage** | Bot Framework `MicrosoftAppId` and `MicrosoftAppPassword` (or certificate) must be stored in Azure Key Vault or equivalent secure store. Never logged, never in source. |
+
+#### Rejection Behavior Matrix
+
+Tenant-level and user-level rejections are handled at **different layers** with **different responses**:
+
+| Condition | Layer | Response | Audit Event |
+|-----------|-------|----------|-------------|
+| Invalid Bot Framework JWT | Bot Connector auth | HTTP 401 — request never reaches bot handler | `AuthenticationFailed` |
+| Valid JWT, tenant ID not in allow-list | `TenantValidationMiddleware` (runs before bot handler) | HTTP 403 — no bot response sent | `UnauthorizedTenantRejected` |
+| Allowed tenant, `AadObjectId` not mapped to internal user | `IIdentityResolver` (inside bot handler) | HTTP 200 + Adaptive Card explaining access denial and how to request access | `UnmappedUserRejected` |
+| Allowed tenant, mapped user, insufficient RBAC role | `IUserAuthorizationService` (inside bot handler) | HTTP 200 + Adaptive Card explaining insufficient permissions | `InsufficientRoleRejected` |
+
+> **Design rationale:** Tenant-level rejection uses HTTP 403 because the middleware intercepts the request before the bot handler runs — there is no conversation context in which to send a card. User-level rejections (unmapped identity, insufficient RBAC) occur inside the bot handler where a conversation turn is active, so a polite Adaptive Card is the appropriate response. Sibling docs (`implementation-plan.md`, `e2e-scenarios.md`) must align to this two-tier model.
 
 ### 4.3 Compliance
 
 | Constraint | Detail |
 |------------|--------|
 | **Immutable audit trail** | Every inbound command, outbound notification, and Adaptive Card action callback must produce an append-only audit record. |
-| **Audit record fields** | `Timestamp`, `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `UserId` (Entra OID), `Action`, `Payload` (sanitized), `Outcome`. |
 | **Retention** | Audit records must be retained for the duration mandated by the enterprise compliance policy (configurable, default 7 years). |
+
+#### Canonical Audit Record Schema (source of truth)
+
+This is the **minimum required** field set for all audit records. Sibling docs (`architecture.md`, `implementation-plan.md`) may add implementation-specific fields (e.g., `Checksum` for tamper detection, surrogate `AuditEntryId` primary key) but **must include all fields listed here**.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
+| `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
+| `EventType` | `string` | Yes | Describes the event category: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`. |
+| `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users, agent ID for agent-originated events. |
+| `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
+| `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
+| `TaskId` | `string` | No | Agent task/work-item ID (null for security rejection events). |
+| `ConversationId` | `string` | No | Teams conversation ID (null for events outside a conversation). |
+| `Action` | `string` | Yes | The specific action taken (e.g., `approve`, `reject`, `agent ask`, `send_card`). |
+| `PayloadJson` | `string` | Yes | JSON-serialized event payload (sanitized — no secrets or PII beyond identity). |
+| `Outcome` | `string` | Yes | Result of the action: `Success`, `Rejected`, `Failed`, `DeadLettered`. |
+
+> **Field mapping guidance for sibling docs:** `AgentId` from the story requirements maps to `ActorId` when `ActorType = Agent`. `UserId` maps to `ActorId` when `ActorType = User`. `Payload` maps to `PayloadJson`. The architecture doc's `AuditEntryId` is an implementation-specific surrogate key. The implementation plan's `Actor` maps to `ActorId`, `Resource` maps to `TaskId` + `ConversationId`, `Details` maps to `PayloadJson`, and `Checksum` is an implementation addition for tamper detection.
 
 ### 4.4 Reliability & Performance
 
@@ -115,6 +147,23 @@ These are non-negotiable requirements drawn from the story description, enterpri
 | **Connector recovery** | After crash or restart, the connector must resume processing within 30 seconds using persisted conversation references and durable queues. |
 | **Idempotency** | Duplicate inbound activities (Teams sometimes retries webhook delivery) must be deduplicated using `Activity.Id` or `Activity.ReplyToId`. |
 | **Concurrent users** | Must support 1000+ concurrent users issuing commands and receiving proactive notifications without degradation. |
+
+#### Canonical Retry Policy (source of truth)
+
+This is the **authoritative retry schedule** for transient Bot Connector failures (HTTP 429, 500, 502, 503, 504). Sibling docs (`architecture.md`, `implementation-plan.md`) must align to these values.
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Initial attempt | 1 | The first delivery attempt (not counted as a retry). |
+| Max retries | 4 | Up to 4 retries after the initial attempt (5 total attempts). |
+| Base delay | 2 seconds | Delay before the first retry. |
+| Multiplier | 2× | Each subsequent retry doubles the delay. |
+| Max delay cap | 60 seconds | No single retry delay exceeds 60 seconds. |
+| Jitter | ±25% | Applied to each computed delay to avoid thundering herd. |
+| `Retry-After` override | Yes | When Bot Framework returns HTTP 429 with `Retry-After` header, use that value as the minimum delay if it exceeds the computed backoff. |
+| Dead-letter | After final failed attempt | Messages that fail all 5 attempts are moved to dead-letter queue. |
+
+Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 
 ### 4.5 Bot Framework / Teams Platform
 
@@ -164,9 +213,9 @@ These are non-negotiable requirements drawn from the story description, enterpri
 
 | Dependency | Owner | Status |
 |------------|-------|--------|
-| `AgentSwarm.Messaging.Abstractions` — `IMessengerConnector`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage` | Shared / Epic | Must be stable before Teams connector implementation begins |
-| `AgentSwarm.Messaging.Core` — Retry engine, rate limiter, deduplication, outbox/inbox | Shared / Epic | Must be available; Teams connector consumes these services |
-| `AgentSwarm.Messaging.Persistence` — Durable queue, conversation reference store, audit log sink | Shared / Epic | Must be available; Teams connector depends on persistence for conversation references and audit trail |
+| `AgentSwarm.Messaging.Abstractions` — `IMessengerConnector`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage` | Shared / Epic | **Planned** — to be created as part of epic-level shared infrastructure (see `implementation-plan.md` Stage 1.1). Must be stable before Teams connector implementation begins. |
+| `AgentSwarm.Messaging.Core` — Retry engine, rate limiter, deduplication, outbox/inbox | Shared / Epic | **Planned** — to be created as part of epic-level shared infrastructure. Must be available before Teams connector integration testing. |
+| `AgentSwarm.Messaging.Persistence` — Durable queue, conversation reference store, audit log sink | Shared / Epic | **Planned** — to be created as part of epic-level shared infrastructure (see `implementation-plan.md` Stage 1.3). Must be available before Teams connector integration testing. |
 
 ### 6.2 External Dependencies
 
@@ -182,13 +231,13 @@ These are non-negotiable requirements drawn from the story description, enterpri
 
 ## 7. Assumptions
 
-1. The `AgentSwarm.Messaging.Abstractions` and `AgentSwarm.Messaging.Core` packages are developed in parallel (or already exist) and will be stable by the time the Teams connector reaches integration testing.
+1. The `AgentSwarm.Messaging.Abstractions` and `AgentSwarm.Messaging.Core` packages are developed in parallel as part of epic-level shared infrastructure and will be stable by the time the Teams connector reaches integration testing.
 2. A dedicated Azure Bot Service registration and Entra ID app registration will be provisioned before development begins.
 3. A test tenant with Teams licenses and admin consent for the bot app will be available for integration and E2E testing.
 4. The agent orchestrator publishes events (questions, approval requests, notifications) to a durable queue that the Teams connector subscribes to — the connector does not poll the orchestrator.
 5. The bot will be deployed as a single-tenant app (not multi-tenant SaaS) unless the operator explicitly configures multiple allowed tenant IDs.
 6. Adaptive Cards schema version 1.4 is the minimum supported by the target Teams clients (desktop, web, mobile).
-7. The persistence layer for conversation references and audit logs is provided by `AgentSwarm.Messaging.Persistence` and supports the required durability and retention guarantees.
+7. The persistence layer for conversation references and audit logs will be provided by `AgentSwarm.Messaging.Persistence` (planned) and will support the required durability and retention guarantees.
 
 ---
 

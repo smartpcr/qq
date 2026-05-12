@@ -296,6 +296,22 @@ Platform-agnostic inbound event. Defined in `AgentSwarm.Messaging.Abstractions`.
 
 ### 3.2 Teams-Specific Entities
 
+#### MessageActionRequest
+
+Represents a message-extension action invocation from Teams. Produced by `MessageExtensionHandler`.
+
+| Field | Type | Description |
+|---|---|---|
+| `RequestId` | `string` | Unique request identifier (GUID). |
+| `SourceMessageId` | `string` | Teams activity ID of the original message the user acted on. |
+| `SourceMessageText` | `string` | Text content of the source message. |
+| `ActionCommandId` | `string` | The `commandId` from the Teams app manifest (e.g., `forwardToAgent`). |
+| `UserId` | `string` | AAD object ID of the invoking user. |
+| `TenantId` | `string` | Entra ID tenant. |
+| `ConversationId` | `string` | Conversation where the action was invoked. |
+| `CorrelationId` | `string` | End-to-end trace ID. |
+| `Timestamp` | `DateTimeOffset` | UTC invocation time. |
+
 #### TeamsConversationReference
 
 Persisted Bot Framework `ConversationReference` for proactive messaging.
@@ -681,12 +697,14 @@ Service (restart)    ConvRefStore    ProactiveNotifier    Teams
 
 ## 7. Assembly / Project Mapping
 
+> **Note:** These are proposed target projects aligned with the recommended solution structure in the epic attachment and `implementation-plan.md`. No source projects exist in the repository yet.
+
 | Assembly | Layer | Responsibility |
 |---|---|---|
 | `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` |
 | `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IOutboxStore`, retry policies, deduplication, rate limiting |
-| `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, storage implementations (SQL, Azure Table) |
-| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `ConversationReferenceStore`, `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `TeamsCardState`, `ICardStateStore` |
+| `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), storage implementations (SQL, Azure Table) |
+| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore` |
 | `AgentSwarm.Messaging.Worker` | Host | ASP.NET Core worker service hosting the Teams connector, DI registration, health checks, OpenTelemetry configuration |
 | `AgentSwarm.Messaging.Tests` | Test | Unit and integration tests for all assemblies |
 
