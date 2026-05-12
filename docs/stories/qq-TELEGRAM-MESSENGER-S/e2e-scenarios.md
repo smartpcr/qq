@@ -1,7 +1,7 @@
 # E2E Scenarios — Telegram Messenger Support
 
 **Story:** `qq:TELEGRAM-MESSENGER-S`
-**Version:** v0.32-draft (iteration 27)
+**Version:** v0.33-draft (iteration 28)
 
 ---
 
@@ -443,6 +443,30 @@ Feature: Telegram bot command handling
     Then agent "arch-agent-7" is resumed
     And the bot confirms "▶️ arch-agent-7 resumed"
 
+  Scenario: /pause rejected for user without Operator role
+    Given user "viewer-1" with Telegram user ID "444555666" has an active OperatorBinding for chat "998877" with role "Viewer"
+    When user "viewer-1" sends "/pause arch-agent-7"
+    Then the gateway validates via IOperatorRegistry.IsAuthorizedAsync(userId=444555666, chatId=998877)
+    And the gateway checks that user "viewer-1" has the "Operator" role (per architecture.md §9 Security Model)
+    And the role check fails because "viewer-1" has role "Viewer", not "Operator"
+    And the bot replies with "❌ Unauthorized — /pause requires the Operator role"
+    And an audit record is persisted with user ID "444555666", command "/pause", and rejection reason "insufficient_role"
+
+  Scenario: /resume rejected for user without Operator role
+    Given user "approver-1" with Telegram user ID "555666777" has an active OperatorBinding for chat "998877" with role "Approver"
+    When user "approver-1" sends "/resume arch-agent-7"
+    Then the gateway validates via IOperatorRegistry.IsAuthorizedAsync(userId=555666777, chatId=998877)
+    And the gateway checks that user "approver-1" has the "Operator" role (per architecture.md §9 Security Model)
+    And the role check fails because "approver-1" has role "Approver", not "Operator"
+    And the bot replies with "❌ Unauthorized — /resume requires the Operator role"
+    And an audit record is persisted with user ID "555666777", command "/resume", and rejection reason "insufficient_role"
+
+  Scenario: /pause with invalid agent ID
+    When user "operator-1" sends "/pause nonexistent-agent-99"
+    Then the bot replies with "❌ Agent nonexistent-agent-99 not found"
+    And no agent state change occurs
+    And an audit record is persisted with user ID "111222333", command "/pause nonexistent-agent-99", and outcome "agent_not_found"
+
   Scenario: Unknown command returns help
     When user "operator-1" sends "/foobar"
     Then the bot replies with "Unknown command. Use /start for available commands."
@@ -680,12 +704,12 @@ Feature: Edge cases and error handling
 
 ---
 
-_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 27._
+_Document generated for story qq:TELEGRAM-MESSENGER-S, iteration 28._
 _DefaultAction modeling: This document adopts the sidecar envelope model per architecture.md §3.1 and implementation-plan.md Stage 1.2. The shared `AgentQuestion` model does **not** include a `DefaultAction` property. The proposed default action is carried as `ProposedDefaultActionId` on the `AgentQuestionEnvelope`. The connector reads `ProposedDefaultActionId` from the envelope, denormalizes it into `PendingQuestionRecord.DefaultActionId`, displays the default in the message body, and applies it on timeout. When `null`, the question expires with `ActionValue = "__timeout__"`._
 _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively. Inline button presses emit the `HumanAction.Value` from `AllowedActions` via `CallbackQueryHandler`. All `AllowedActions` fixtures include `ActionId` for consistency with the `HumanAction` model used in callback/default resolution._
 _Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are aligned on `MaxAttempts` default 5._
 _Handoff semantics: `/handoff` performs full oversight transfer per architecture.md §5.5, tech-spec.md D-4, and implementation-plan.md Stage 3.2 — task validation, operator resolution via `IOperatorRegistry`, `TaskOversight` mutation, dual notification, and audit._
-_Metric naming: Per architecture.md §8/§10.4 (canonical source): **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = enqueue instant (`OutboundMessage.CreatedAt`) to HTTP 200, first-attempt non-rate-limited sends only — P95 ≤ 2s. **`telegram.send.all_attempts_latency_ms`** (all-inclusive) = enqueue to HTTP 200, all messages regardless of attempt or rate-limit — capacity planning. **`telegram.send.queue_dwell_ms`** (diagnostic) = enqueue to dequeue. Additional diagnostics: `telegram.send.retry_latency_ms`, `telegram.send.rate_limited_wait_ms`. Backpressure dead-letter counter: `telegram.messages.backpressure_dlq` (canonical, aligned across architecture.md and tech-spec.md HC-5). **Remaining sibling-doc contradiction:** implementation-plan.md and tech-spec.md HC-4 define `first_attempt_latency_ms` as dequeue-to-HTTP-200, while architecture.md §8/§10.4 defines it as enqueue-to-HTTP-200; this document follows the architecture.md definition. Implementation-plan.md and tech-spec.md also use the shorter name `telegram.send.latency_ms` for the all-inclusive metric, while architecture.md §8 uses `telegram.send.all_attempts_latency_ms`; this document follows the architecture.md name._
+_Metric naming: Per architecture.md §8/§10.4 (canonical source): **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = enqueue instant (`OutboundMessage.CreatedAt`) to HTTP 200, first-attempt non-rate-limited sends only — P95 ≤ 2s. **`telegram.send.all_attempts_latency_ms`** (all-inclusive) = enqueue to HTTP 200, all messages regardless of attempt or rate-limit — capacity planning. **`telegram.send.queue_dwell_ms`** (diagnostic) = enqueue to dequeue. Additional diagnostics: `telegram.send.retry_latency_ms`, `telegram.send.rate_limited_wait_ms`. Backpressure dead-letter counter: `telegram.messages.backpressure_dlq` (canonical, aligned across architecture.md and tech-spec.md HC-5). This document and implementation-plan.md are aligned with architecture.md §10.4 on enqueue-to-HTTP-200 measurement and `all_attempts_latency_ms` naming. Tech-spec.md HC-4 uses the dequeue-to-HTTP-200 measurement point and the shorter name `telegram.send.latency_ms` for the all-inclusive metric; tech-spec.md Section 10 documents this as a known editorial divergence to be reconciled within that document before implementation._
 _P95 metric scope: Per operator answer to `p95-metric-scope`, the P95 ≤ 2s criterion applies to first-attempt, non-rate-limited sends only. Under normal load (low queue depth), the 2s target holds across all severities. Under burst (1000+ messages), priority queuing ensures Critical/High messages meet the 2s target; Normal/Low may exceed it due to queue dwell (per architecture.md §10.4)._
 _Group-chat authorization: Runtime authorization checks `OperatorBinding` records matching both `TelegramUserId` and `TelegramChatId` via `IOperatorRegistry.IsAuthorizedAsync`. Commands and button taps in groups are authorized by the (user, chat) pair. An unauthorized user in an authorized group is rejected (per tech-spec.md S-5)._
 _Authorization model: Two-tier model per architecture.md §7.1. Tier 1 (onboarding): `/start` checks `Telegram:AllowedUserIds`. Tier 2 (runtime): all other commands check `OperatorBinding` records via `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)`. Access revocation is modeled by setting `OperatorBinding.IsActive=false`._
