@@ -79,7 +79,7 @@ Feature: Agent blocking question delivered to Telegram
       | CorrelationId            | corr-abc-123                                       |
       | ProposedDefaultAction    | act-1 (carried as AgentQuestionEnvelope.ProposedDefaultActionId per architecture.md §3.1) |
     When the Messenger Gateway dequeues the question
-    Then the Telegram connector reads ProposedDefaultActionId "act-1" from the AgentQuestionEnvelope and creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Then the Telegram connector reads ProposedDefaultActionId "act-1" from the AgentQuestionEnvelope and creates a PendingQuestionRecord with DefaultActionId "act-1" and DefaultActionValue "approve" (resolved from HumanAction.Value where ActionId matches ProposedDefaultActionId, per architecture.md §3.1)
     And the bot sends a Telegram message to chat "998877" containing:
       | Element         | Content                                            |
       | Text            | Title, Body, Severity, timeout, and proposed default action label |
@@ -96,7 +96,7 @@ Feature: Agent blocking question delivered to Telegram
       | AllowedActions           | [{ActionId:"act-1", Label:"Approve", Value:"approve"}, {ActionId:"act-2", Label:"Reject", Value:"reject"}] |
       | ProposedDefaultAction    | act-1 (carried as AgentQuestionEnvelope.ProposedDefaultActionId per architecture.md §3.1) |
     When the message is rendered in Telegram
-    Then the Telegram connector reads ProposedDefaultActionId "act-1" from the AgentQuestionEnvelope and creates a PendingQuestionRecord with DefaultActionId "act-1"
+    Then the Telegram connector reads ProposedDefaultActionId "act-1" from the AgentQuestionEnvelope and creates a PendingQuestionRecord with DefaultActionId "act-1" and DefaultActionValue "approve" (resolved from HumanAction.Value where ActionId matches ProposedDefaultActionId, per architecture.md §3.1)
     And the message body includes the TaskId and AgentId identifying the originating task and agent context
     And the message body includes the Title "Database migration strategy"
     And the message body includes the Body text "Should we use blue-green or rolling migration?"
@@ -107,11 +107,12 @@ Feature: Agent blocking question delivered to Telegram
   Scenario: Question timeout expires without human response
     Given agent "arch-agent-7" publishes an agent question with ExpiresAt 2 minutes from now
     And the question includes ProposedDefaultActionId "act-1" on the AgentQuestionEnvelope (per architecture.md §3.1)
-    And the Telegram connector reads ProposedDefaultActionId "act-1" from the envelope and creates a PendingQuestionRecord with DefaultActionId "act-1"
+    And the AllowedActions list contains {ActionId:"act-1", Label:"Approve", Value:"approve"}
+    And the Telegram connector reads ProposedDefaultActionId "act-1" from the envelope and creates a PendingQuestionRecord with DefaultActionId "act-1" and DefaultActionValue "approve" (resolved from HumanAction.Value where ActionId matches ProposedDefaultActionId, per architecture.md §3.1)
     And no human responds within 2 minutes
     When ExpiresAt is reached
-    Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionId "act-1"
-    And publishes a HumanDecisionEvent with DefaultActionId "act-1" as the ActionValue directly (no IDistributedCache lookup — the cache entry expires at ExpiresAt per tech-spec D-3 and may be evicted; the DefaultActionId string is sufficient per architecture.md §10.3)
+    Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionValue "approve" (the HumanAction.Value resolved and denormalized at send time)
+    And publishes a HumanDecisionEvent with ActionValue "approve" (consistent with the interactive button-tap path where HumanAction.Value is always the canonical ActionValue — no IDistributedCache lookup; per architecture.md §10.3)
     And the Telegram message is updated to show "⏱️ Timed out – default applied"
 
   Scenario: Question timeout with no default action
@@ -231,7 +232,7 @@ Feature: Durable outbound message queue with retry and dead-letter
     And retries delivery (attempt 2)
     When the Telegram Bot API returns HTTP 200 on attempt 2
     Then the message is marked as delivered
-    And telegram.send.first_attempt_latency_ms (acceptance gate) is NOT recorded for this message because it did not succeed on first attempt without rate-limiting (per architecture.md §10.4: this metric covers only first-attempt, non-rate-limited successes measured from enqueue instant — OutboundMessage.CreatedAt — to HTTP 200; P95 ≤ 2s acceptance criterion applies to this metric)
+    And telegram.send.first_attempt_latency_ms (acceptance gate) is NOT recorded for this message because it did not succeed on first attempt (per architecture.md §10.4: this metric covers only first-attempt sends that did not receive a Telegram 429 response, measured from enqueue instant — OutboundMessage.CreatedAt — to HTTP 200; local token-bucket wait is included; P95 ≤ 2s acceptance criterion applies to this metric)
     And telegram.send.all_attempts_latency_ms (all-inclusive) records elapsed time from OutboundMessage.CreatedAt (enqueue) to final HTTP 200, including the rate-limit wait (per architecture.md §10.4: all-inclusive metric covering ALL messages regardless of attempt number or rate-limit holds — used for capacity planning)
     And telegram.send.rate_limited_wait_ms records the time spent waiting during the 429 backoff
 
@@ -266,38 +267,49 @@ Feature: Durable outbound message queue with retry and dead-letter
   Scenario: P95 send latency under 2 seconds (normal load)
     # Per architecture.md §10.4: telegram.send.first_attempt_latency_ms (acceptance gate)
     # = elapsed time from enqueue instant (OutboundMessage.CreatedAt) to Telegram API HTTP 200,
-    # measured ONLY for messages that succeed on first attempt without rate-limit waits —
+    # measured ONLY for first-attempt sends that did not receive a Telegram 429 response;
+    # local token-bucket wait (proactive rate limiting) IS included in the measurement.
     # the P95 ≤ 2s acceptance criterion applies to this metric (per operator answer to
-    # p95-metric-scope: first-attempt, non-rate-limited only).
+    # p95-metric-scope: first-attempt sends that did not receive a Telegram 429 response;
+    # local token-bucket wait is included — per architecture.md §10.4 canonical definition).
     # telegram.send.all_attempts_latency_ms (all-inclusive) = elapsed time from
     # OutboundMessage.CreatedAt (enqueue) to HTTP 200, measured for ALL messages
     # regardless of attempt number or rate-limit holds — for capacity planning.
     # telegram.send.queue_dwell_ms (diagnostic) = enqueue to dequeue — queue backlog.
-    Given 100 outbound messages are enqueued sequentially with mixed severities (25 Critical, 25 High, 25 Normal, 25 Low)
+    # This scenario validates the STEADY-STATE envelope (architecture.md §10.4:
+    # "Normal load — queue depth < 100 — P95 ≤ 2s across all severities").
+    # 100 messages enqueued with paced arrivals ensures queue depth stays below 100
+    # throughout the run. For bounded-burst (≤ 50 Critical+High) P95 validation,
+    # see the "Burst of 1000+ agent alerts" scenario below.
+    Given 100 outbound messages are enqueued with paced steady-state arrivals (one every 50 ms, ensuring queue depth remains below 100 throughout the run) with mixed severities (25 Critical, 25 High, 25 Normal, 25 Low)
     And the Telegram Bot API responds HTTP 200 with ≤ 50 ms latency on every request
     And no HTTP 429 rate-limit responses occur
+    And queue depth remains below 100 at all measurement points (steady-state constraint per architecture.md §10.4)
     When all 100 messages are processed and sent
-    Then all 100 messages are delivered successfully on first attempt without rate-limiting
-    And telegram.send.first_attempt_latency_ms (acceptance gate) is emitted for every send (per architecture.md §10.4: enqueue instant — OutboundMessage.CreatedAt — to HTTP 200, first-attempt, non-rate-limited sends only)
+    Then all 100 messages are delivered successfully on first attempt without receiving any Telegram 429 response
+    And telegram.send.first_attempt_latency_ms (acceptance gate) is emitted for every send (per architecture.md §10.4: enqueue instant — OutboundMessage.CreatedAt — to HTTP 200, first-attempt sends excluding Telegram 429 responses; local token-bucket wait included)
     And telegram.send.all_attempts_latency_ms (all-inclusive) is also emitted for all 100 messages (per architecture.md §10.4: enqueue to HTTP 200, all messages regardless of attempt number or rate-limit holds)
     And telegram.send.queue_dwell_ms (diagnostic) is emitted for all 100 messages (per architecture.md §10.4: enqueue to dequeue — queue backlog monitoring)
-    And P95 telegram.send.first_attempt_latency_ms across ALL 100 messages (all severities) is under 2 seconds (per operator answer to p95-metric-scope: the P95 ≤ 2s acceptance criterion applies to first-attempt, non-rate-limited sends only, measured from enqueue instant — OutboundMessage.CreatedAt — to HTTP 200)
+    And P95 telegram.send.first_attempt_latency_ms across ALL 100 messages (all severities) is under 2 seconds (this holds because the scenario is constrained to steady-state — queue depth < 100 — where architecture.md §10.4 guarantees P95 ≤ 2s across all severities; per operator answer to p95-metric-scope: the acceptance criterion applies to first-attempt sends excluding Telegram 429 responses; local token-bucket wait included; measured from enqueue instant — OutboundMessage.CreatedAt — to HTTP 200)
     And P99 telegram.send.first_attempt_latency_ms across ALL 100 messages is under 3 seconds
-    And under these test conditions (no retries, no rate-limiting, low queue depth), telegram.send.first_attempt_latency_ms (enqueue-to-200) and telegram.send.all_attempts_latency_ms (enqueue-to-200) converge to the same value since every message succeeds on first attempt without rate-limiting
+    And under these test conditions (no retries, no Telegram 429 responses, low queue depth), telegram.send.first_attempt_latency_ms (enqueue-to-200) and telegram.send.all_attempts_latency_ms (enqueue-to-200) converge to the same value since every message succeeds on first attempt
 
   Scenario: Burst of 1000+ agent alerts without message loss (within bounded-volume assumption)
     # architecture.md §10.4 bounded-volume assumption: P95 ≤ 2s for Critical/High
     # holds when ≤ 50 Critical+High messages are in any burst window (at 30 msg/s
     # with token-bucket burst capacity, the top 50 priority messages drain in ≤ 2s of queue dwell).
+    # D-BURST topology (architecture.md §11.1): the burst SLO requires ≥ 10 operator chats
+    # with no single chat receiving more than 5 messages (per-chat burst capacity constraint).
     Given 1000 agents each enqueue one alert message simultaneously
     And the messages have mixed severities: 25 Critical, 25 High, 450 Normal, 500 Low
     And the Critical+High total (50) is within the bounded-volume assumption of ≤ 50 per burst (architecture.md §10.4)
+    And the 50 Critical+High messages are distributed across ≥ 10 operator chats with no single chat receiving more than 5 messages (D-BURST topology per architecture.md §11.1 — this is the expected production topology given 100+ agents spanning multiple tenants/workspaces with distinct operator assignments)
     When all 1000 messages are processed through the outbound queue
     Then all 1000 messages are eventually delivered or dead-lettered
     And zero messages are lost
     And queue depth is observable via the health check (architecture.md §8: outbound queue depth < threshold)
     And the priority queuing design (architecture.md §5.2: severity-based dispatch ordering) ensures Critical/High messages are dispatched first
-    And telegram.send.first_attempt_latency_ms (acceptance gate) is emitted for messages that succeed on first attempt without rate-limiting (per architecture.md §10.4: enqueue instant — OutboundMessage.CreatedAt — to HTTP 200, first-attempt, non-rate-limited sends only)
+    And telegram.send.first_attempt_latency_ms (acceptance gate) is emitted for messages that succeed on first attempt without receiving a Telegram 429 response (per architecture.md §10.4: enqueue instant — OutboundMessage.CreatedAt — to HTTP 200; local token-bucket wait included)
     And telegram.send.all_attempts_latency_ms (all-inclusive) is emitted for all 1000 messages regardless of attempt number or rate-limit holds (per architecture.md §10.4: enqueue to HTTP 200 — capacity planning)
     And telegram.send.queue_dwell_ms (diagnostic) is emitted for all 1000 messages (per architecture.md §10.4: enqueue to dequeue — queue backlog monitoring)
     And P95 telegram.send.first_attempt_latency_ms for Critical and High severity messages is under 2 seconds (per architecture.md §10.4: with ≤ 50 Critical+High messages in the burst, the P95 — 48th message — completes at ~1,900 ms; between 50–60, P95 approaches and may exceed 2s)
@@ -689,7 +701,7 @@ Feature: Observability integration
     Given the outbound queue processes messages
     Then the following metrics are emitted via OpenTelemetry:
       | Metric                                   | Type      | Source                                                      |
-      | telegram.send.first_attempt_latency_ms   | histogram | architecture.md §10.4: acceptance gate (enqueue — OutboundMessage.CreatedAt — to HTTP 200, first-attempt, non-rate-limited — P95 ≤ 2s) |
+      | telegram.send.first_attempt_latency_ms   | histogram | architecture.md §10.4: acceptance gate (enqueue — OutboundMessage.CreatedAt — to HTTP 200, first-attempt sends excluding Telegram 429 responses; local token-bucket wait included — P95 ≤ 2s) |
       | telegram.send.all_attempts_latency_ms    | histogram | architecture.md §10.4: all-inclusive (enqueue to HTTP 200, all sends regardless of attempt or rate-limit — capacity planning) |
       | telegram.send.queue_dwell_ms             | histogram | architecture.md §10.4: diagnostic (enqueue to dequeue — queue backlog monitoring) |
       | telegram.send.retry_latency_ms           | histogram | architecture.md §10.4 diagnostic (retried sends)            |
@@ -751,7 +763,7 @@ _DefaultAction modeling: This document adopts the sidecar envelope model per arc
 _ActionValue semantics: `/approve` and `/reject` commands emit ActionValue `approve` and `reject` respectively. Inline button presses emit the `HumanAction.Value` from `AllowedActions` via `CallbackQueryHandler`. All `AllowedActions` fixtures include `ActionId` for consistency with the `HumanAction` model used in callback/default resolution._
 _Retry count: architecture.md §5.3 and implementation-plan.md Stage 4.2 are aligned on `MaxAttempts` default 5._
 _Handoff semantics: `/handoff` performs full oversight transfer per architecture.md §5.5, tech-spec.md D-4, and implementation-plan.md Stage 3.2 — task validation, operator resolution via `IOperatorRegistry`, `TaskOversight` mutation, dual notification, and audit._
-_Metric naming: Per architecture.md §10.4 (canonical source): **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = enqueue instant (`OutboundMessage.CreatedAt`) to HTTP 200, first-attempt non-rate-limited sends only — P95 ≤ 2s. **`telegram.send.all_attempts_latency_ms`** (all-inclusive) = enqueue (`OutboundMessage.CreatedAt`) to HTTP 200, all messages regardless of attempt or rate-limit — capacity planning. **`telegram.send.queue_dwell_ms`** (diagnostic) = enqueue to dequeue. Additional diagnostics: `telegram.send.retry_latency_ms`, `telegram.send.rate_limited_wait_ms`. Backpressure dead-letter counter: `telegram.messages.backpressure_dlq` (canonical per architecture.md §10.4; operator-confirmed). All sibling documents (architecture.md §8/§10.4, tech-spec.md HC-4/Section 10, implementation-plan.md Stage 4.1/PERF001) are aligned on metric names, enqueue-to-HTTP-200 measurement points, and P95 scope._
-_P95 metric scope: Per operator answer to `p95-metric-scope`, the P95 ≤ 2s criterion applies to first-attempt, non-rate-limited sends only. Under normal load (low queue depth), the 2s target holds across all severities. Under burst (1000+ messages), priority queuing ensures Critical/High messages meet the 2s target when ≤ 50 Critical+High messages are in the burst (architecture.md §10.4 bounded-volume assumption: at 30 msg/s with token-bucket burst capacity, the P95 of 50 priority messages — the 48th message — completes at ~1,900 ms); between 50–60 Critical+High, P95 approaches and may exceed 2s depending on HTTP variance; beyond ~60, P95 clearly exceeds 2s. Normal/Low may exceed 2s due to queue dwell (per architecture.md §10.4)._
+_Metric naming: Per architecture.md §10.4 (canonical source): **`telegram.send.first_attempt_latency_ms`** (acceptance gate) = enqueue instant (`OutboundMessage.CreatedAt`) to HTTP 200, first-attempt sends that did not receive a Telegram 429 response; local token-bucket wait (proactive rate limiting) is included in the measurement — P95 ≤ 2s. **`telegram.send.all_attempts_latency_ms`** (all-inclusive) = enqueue (`OutboundMessage.CreatedAt`) to HTTP 200, all messages regardless of attempt or rate-limit — capacity planning. **`telegram.send.queue_dwell_ms`** (diagnostic) = enqueue to dequeue. Additional diagnostics: `telegram.send.retry_latency_ms`, `telegram.send.rate_limited_wait_ms`. Backpressure dead-letter counter: `telegram.messages.backpressure_dlq` (canonical per architecture.md §10.4; operator-confirmed). All sibling documents (architecture.md §8/§10.4, tech-spec.md HC-4/Section 10, implementation-plan.md Stage 4.1/PERF001) are aligned on metric names, enqueue-to-HTTP-200 measurement points, and P95 scope._
+_P95 metric scope: Per operator answer to `p95-metric-scope`, the P95 ≤ 2s criterion applies to first-attempt sends that did not receive a Telegram 429 response; local token-bucket wait (proactive rate limiting) is included in the measurement. Under normal load (low queue depth), the 2s target holds across all severities. Under burst (1000+ messages), priority queuing ensures Critical/High messages meet the 2s target when ≤ 50 Critical+High messages are in the burst (architecture.md §10.4 bounded-volume assumption: at 30 msg/s with token-bucket burst capacity, the P95 of 50 priority messages — the 48th message — completes at ~1,900 ms); between 50–60 Critical+High, P95 approaches and may exceed 2s depending on HTTP variance; beyond ~60, P95 clearly exceeds 2s. Normal/Low may exceed 2s due to queue dwell (per architecture.md §10.4)._
 _Group-chat authorization: Runtime authorization checks `OperatorBinding` records matching both `TelegramUserId` and `TelegramChatId` via `IOperatorRegistry.IsAuthorizedAsync`. Commands and button taps in groups are authorized by the (user, chat) pair. An unauthorized user in an authorized group is rejected (per tech-spec.md S-5)._
 _Authorization model: Two-tier model per architecture.md §7.1. Tier 1 (onboarding): `/start` checks `Telegram:AllowedUserIds`. Tier 2 (runtime): all other commands check `OperatorBinding` records via `IOperatorRegistry.IsAuthorizedAsync(userId, chatId)`. Access revocation is modeled by setting `OperatorBinding.IsActive=false`._
