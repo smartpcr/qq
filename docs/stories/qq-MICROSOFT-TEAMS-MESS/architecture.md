@@ -1125,7 +1125,5 @@ $ grep -nF "Outcome field semantics" docs/stories/qq-MICROSOFT-TEAMS-MESS/archit
 None for architecture.md itself — all items either fixed or deferred to sibling docs.
 
 ```json open-questions
-{ "openQuestions": [
-    { "id": "invalid-jwt-audit", "text": "Should the architecture include application-level audit logging for invalid Bot Framework JWT rejections (HTTP 401)? Tech-spec §4.2 says no audit entry (request rejected before app code runs). E2e-scenarios §383-389 says log it in the security audit trail. These contradict.", "type": "choice", "choices": ["A: No app-level audit — rely on infrastructure logs (Azure Front Door WAF, API gateway)", "B: Add custom DelegatingHandler before Bot Framework pipeline to intercept 401s and emit audit entries", "C: Update e2e-scenarios.md to remove the audit requirement for invalid-JWT, aligning with tech-spec"] }
-] }
+{ "openQuestions": [] }
 ```

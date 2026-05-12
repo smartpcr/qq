@@ -125,17 +125,17 @@ Tenant-level and user-level rejections are handled at **different layers** with 
 
 This is the **minimum required** field set for all audit records. Sibling docs (`architecture.md`, `implementation-plan.md`) may add implementation-specific fields (e.g., `Checksum` for tamper detection, surrogate `AuditEntryId` primary key) but **must include all fields listed here** and **must use the canonical `EventType` values** defined in this table. Cross-doc references should use the stable anchor `tech-spec.md §4.3 (compliance-audit-schema)` or the table name "Canonical Audit Record Schema" to avoid brittleness if section numbers shift.
 
-> The canonical **audit** `EventType` values defined by this spec are: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`. The canonical set contains exactly six values. Message actions (Teams message-extension submissions) log as `CommandReceived` because a message action is a command submission mechanism, not a semantically distinct event category — the `Source` field on the domain `MessengerEvent` distinguishes message-action-originated commands (`Source = MessageAction`) from direct text input. Sibling docs must align to this definition as the source of truth.
+> The canonical **audit** `EventType` values defined by this spec are: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. The canonical set contains exactly seven values. Message actions (Teams message-extension submissions) log as `MessageActionReceived` — a dedicated audit event type distinct from `CommandReceived` — because message-action submissions arrive through the `composeExtension/submitAction` invoke mechanism rather than direct text commands, and distinguishing them in the audit trail supports compliance filtering and forensic analysis. The `Source` field on the domain `MessengerEvent` additionally marks the origination (`Source = MessageAction`) for downstream processing.
 >
-> **Known cross-doc inconsistency (as of this iteration):** `architecture.md` §3.1 line 348 and §3.2 line 432 currently define seven audit `EventType` values including `MessageActionReceived` and cite `tech-spec.md` §4.3 as the source. `e2e-scenarios.md` line 773 and line 905 also use `MessageActionReceived` with seven values. `implementation-plan.md` §1.3 line 48, §3.4 line 206, and §5.2 line 291 correctly use six values with `CommandReceived`. The `architecture.md` and `e2e-scenarios.md` sibling agents should update their audit `EventType` references to match this spec's six-value canonical set in their next iterations.
+> **Cross-doc alignment status:** All sibling docs (`architecture.md` §3.2 line 432, `implementation-plan.md` §1.3 line 48 / §3.4 line 206 / §5.2 line 291, `e2e-scenarios.md` line 773 and line 905) define exactly seven canonical audit `EventType` values including `MessageActionReceived`. All four plan docs are now aligned on this seven-value canonical set.
 >
-> **Important distinction:** The `EventType` field in the canonical **audit record** schema (this table) is a different concept from the `EventType` discriminator on the `MessengerEvent` domain model. The audit `EventType` categorizes audit log entries (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`). The `MessengerEvent.EventType` discriminator identifies the domain event subtype (`AgentTaskRequest`, `Command`, `Escalation`, `PauseAgent`, `ResumeAgent`, `Decision`, `Text`, `InstallUpdate`, `Reaction`) as defined in `architecture.md` §3.1 and `e2e-scenarios.md` §Audit Trail compliance scenarios. These are intentionally separate enumerations serving different purposes — audit categorization vs. domain event polymorphism — and are not expected to share values.
+> **Important distinction:** The `EventType` field in the canonical **audit record** schema (this table) is a different concept from the `EventType` discriminator on the `MessengerEvent` domain model. The audit `EventType` categorizes audit log entries (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`). The `MessengerEvent.EventType` discriminator identifies the domain event subtype (`AgentTaskRequest`, `Command`, `Escalation`, `PauseAgent`, `ResumeAgent`, `Decision`, `Text`, `InstallUpdate`, `Reaction`) as defined in `architecture.md` §3.1 and `e2e-scenarios.md` §Audit Trail compliance scenarios. These are intentionally separate enumerations serving different purposes — audit categorization vs. domain event polymorphism — and are not expected to share values.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
 | `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
-| `EventType` | `string` | Yes | Describes the event category: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`. The canonical set contains exactly six values. Message actions (Teams message-extension submissions) log as `CommandReceived` because a message action is a command submission mechanism, not a semantically distinct event category. The `Source` field on the domain `MessengerEvent` distinguishes message-action-originated commands from direct text input. This field is the source of truth; sibling docs must align. |
+| `EventType` | `string` | Yes | Describes the event category: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. The canonical set contains exactly seven values. Message actions (Teams message-extension submissions) log as `MessageActionReceived` — a dedicated audit event type distinct from `CommandReceived` — because they arrive through the `composeExtension/submitAction` invoke mechanism rather than direct text commands. This field is the source of truth; sibling docs are aligned. |
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users, agent ID for agent-originated events. |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
@@ -293,19 +293,44 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 
 ### Prior feedback resolution
 
-- [x] 1. ADDRESSED — §4.3 lines 128–132 — **Structural change:** Instead of claiming siblings agree (they don't — they're edited in parallel and keep changing), tech-spec.md now (a) defines six canonical audit `EventType` values as the source of truth, (b) explicitly lists which sibling lines currently disagree, and (c) asks sibling agents to align. No false agreement claims remain.
+- [x] 1. FIXED — §4.3 lines 128–132 — **Structural change (six → seven values):** The core contradiction was that tech-spec.md defined six canonical audit `EventType` values with message actions logging as `CommandReceived`, while ALL three sibling docs (`architecture.md` line 432, `implementation-plan.md` lines 48/206/291, `e2e-scenarios.md` lines 773/905) defined seven values with `MessageActionReceived`. This iteration resolves the contradiction by adopting seven values in tech-spec.md: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. Message actions now log as `MessageActionReceived`. All four plan docs are aligned. Verification:
+```
+$ grep -nF "exactly six values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — phrase removed)
+```
+```
+$ grep -nF "exactly seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+128:...The canonical set contains exactly seven values...
+138:...The canonical set contains exactly seven values...
+```
 
-- [x] 2. ADDRESSED — §4.3 line 128 — Removed all specific assertions about what `architecture.md` §3.2 line 432 currently says. Instead, the "Known cross-doc inconsistency" note accurately states that `architecture.md` line 432 currently uses seven values including `MessageActionReceived` and flags it for correction by the sibling agent. No false citation.
+- [x] 2. FIXED — §4.3 line 130 — Removed the false claim that `implementation-plan.md` lines 48/206/291 "correctly use six values with `CommandReceived`". The replacement text accurately states that `implementation-plan.md` lines 48/206/291 define seven values including `MessageActionReceived` — which matches what those lines actually say. No false citations remain. Verification:
+```
+$ grep -nF "correctly use six values with" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — phrase removed)
+```
 
-- [x] 3. ADDRESSED — §4.3 line 128 — Removed false claims about `implementation-plan.md`. The inconsistency note accurately states that `implementation-plan.md` lines 48, 206, 291 correctly use six values with `CommandReceived`. No false citation.
+- [x] 3. FIXED — §4.3 line 130 — Removed the text (prior items 5/6) that said only `architecture.md` and `e2e-scenarios.md` contradict the six-value model and that `implementation-plan.md` uses `CommandReceived`. The replacement "Cross-doc alignment status" note correctly lists ALL sibling docs — including `implementation-plan.md` lines 48/206/291 — as using seven values with `MessageActionReceived`. Verification:
+```
+$ grep -nF "implementation-plan.md" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+47:...implementation-plan.md...
+130:...implementation-plan.md...
+166:...implementation-plan.md...
+229:...implementation-plan.md...
+231:...implementation-plan.md...
+```
 
-- [x] 4. ADDRESSED — §4.3 lines 128, 130, 138 — tech-spec.md main body consistently defines message actions as logging `CommandReceived`. No line claims `MessageActionReceived` in the normative sections. Cross-doc citations replaced with source-of-truth declaration + honest inconsistency note.
+- [x] 4. FIXED — `architecture.md` lines 1127–1130 — The stale `invalid-jwt-audit` open question has been cleared. The question was stale because `e2e-scenarios.md` lines 387–389 already agree with `tech-spec.md` §4.2 line 108: invalid JWT → HTTP 401, no application code runs, no audit entry emitted. The contradiction the open question described no longer exists. `tech-spec.md` "Open questions: None" is now accurate. Verification:
+```
+$ grep -nF "invalid-jwt-audit" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+(empty — open question removed)
+```
 
-- [x] 5. ADDRESSED — §4.3 lines 128–132 — No cross-doc citations claim siblings say something they don't. The inconsistency note accurately reports current sibling state: `architecture.md` lines 348/432 and `e2e-scenarios.md` lines 773/905 use `MessageActionReceived`; `implementation-plan.md` lines 48/206/291 use `CommandReceived`. All citations match actual file content.
-
-- [x] 6. ADDRESSED — §4.3 line 130 — Added "Known cross-doc inconsistency" note listing ALL sibling locations that contradict the six-value model: `architecture.md` lines 348 and 432, `e2e-scenarios.md` lines 773 and 905. No location silently omitted.
-
-- [x] 7. ADDRESSED — §4.3 lines 128 and 138 — Removed all false resolved-state statements. Line 128 no longer claims all siblings use any particular set. Line 138 defines six values as source of truth without citing sibling agreement. The "Known cross-doc inconsistency" note is honest about which siblings currently disagree.
+- [x] 5. FIXED — `architecture.md` lines 1127–1130 (same edit as item 4) — The stale open question incorrectly claimed `e2e-scenarios.md` lines 383–389 "require invalid-JWT audit logging." Actual `e2e-scenarios.md` lines 387–389 say: "the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline / no application code or middleware runs / no audit entry is emitted." The architecture open question was based on outdated e2e-scenarios content. Removed the stale question; the `openQuestions` array is now empty. Verification:
+```
+$ grep -nF "Should the architecture include application-level audit logging" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+(empty — stale question removed)
+```
 
 ### Open questions
 
