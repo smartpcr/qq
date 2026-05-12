@@ -886,19 +886,21 @@ Feature: Edge Cases and Error Handling
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Version:** 1.5 — Iteration 5
+**Version:** 1.6 — Iteration 6
+**Byte count:** ~50,128
 
 ### Coverage
 
 - Personal chat task creation (agent ask, agent status, unrecognised commands with Text event)
+- Personal chat text-command approval and rejection (approve, reject as text commands)
 - Proactive messaging — blocking questions via Adaptive Cards
 - Adaptive Card approve/reject/need-more-info actions
 - Card update and delete lifecycle
 - Conversation reference persistence and rehydration
-- Security: tenant validation, RBAC, bot installation checks, Bot Framework token validation
+- Security: tenant validation, unmapped Entra identity rejection, RBAC, bot installation checks, Bot Framework token validation
 - Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, idempotency
 - Performance: P95 < 3s card delivery
-- Compliance: immutable audit trail with canonical EventType values
+- Compliance: immutable audit trail with canonical EventType values; message actions audit as CommandReceived
 - Observability: distributed tracing with CorrelationId
 - Message actions (message extensions)
 - Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes
@@ -906,19 +908,45 @@ Feature: Edge Cases and Error Handling
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §Iteration Summary — The iter-4 resolution block itself contained the phrase from item 1 inside quoted grep commands and descriptions. Replaced the entire prior-feedback-resolution block with this clean version that does not embed prior search terms. The actual scenario content was already clean since iter 4.
+- [x] 1. FIXED — §Adaptive Card Approvals — Added two new scenarios: "User approves via text command in personal chat" (line ~200) and "User rejects via text command in personal chat" (line ~216). These cover successful personal-chat text-command routing for `approve` and `reject`, complementing the existing card-based approval at line ~157 and the RBAC-denied text approve at line ~318. All 7 commands now have successful routing paths: `agent ask` (line 22), `agent status` (line 57), `approve` (text: line 200, card: line 157), `reject` (text: line 216, card: line 173), `escalate` (line ~540), `pause` (line ~550), `resume` (line ~560). Verification:
+```
+$ grep -nF "approves via text command" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+200:  Scenario: User approves via text command in personal chat
+```
+```
+$ grep -nF "rejects via text command" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+216:  Scenario: User rejects via text command in personal chat
+```
 
-- [x] 2. FIXED — §Iteration Summary — Same issue as item 1: the iter-4 resolution block embedded the old search term in its own verification quote. Replaced with this clean block. Additionally, the EventType constraint line now lists the full taxonomy including `Command` as a valid EventType (see item 5 fix).
+- [x] 2. FIXED — §Security — Tenant and User Validation — Added new scenario "Allowed-tenant user with unmapped Entra identity is rejected" (line ~357). The scenario covers the case where tenant ID is in the allow-list but the user's AadObjectId has no mapped internal identity in IIdentityResolver. The bot replies with an Adaptive Card explaining access denial (per tech-spec §4.2 rejection matrix row 3, which defines `UnmappedUserRejected`). Verification:
+```
+$ grep -nF "UnmappedUserRejected" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+371:      | Outcome   | UnmappedUserRejected        |
+```
+```
+$ grep -nF "unmapped Entra identity" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+357:  Scenario: Allowed-tenant user with unmapped Entra identity is rejected
+```
 
-- [x] 3. FIXED — §Iteration Summary — The iter-4 resolution block contained grep output referencing the field. Replaced with this clean block. The field is correctly present in the canonical table at §Correlation and Traceability, which is the intended usage.
+- [x] 3. FIXED — §Personal Chat, unrecognised-command scenario — Changed line 46 from `And a MessengerEvent of type "Text"...` to `Then a MessengerEvent of type "Text"...` so the first assertion after `When` correctly uses `Then` instead of `And`. Verification:
+```
+$ grep -nF "Then a MessengerEvent of type" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+46:    Then a MessengerEvent of type "Text" is enqueued with the raw input as payload
+```
+The old malformed line `And a MessengerEvent of type "Text" is enqueued with the raw input` no longer exists at line 46. The only remaining `And a MessengerEvent of type "Text"` hit is at line 819 in the separate "Bot receives an empty message body" edge-case scenario, which correctly follows a `Then` on line 818.
 
-- [x] 4. FIXED — §Iteration Summary — Same pattern: the iter-4 resolution block embedded the old contradictory phrase in its verification quote. Replaced with this clean block. The actual scenario content was already corrected in iter 4.
-
-- [x] 5. FIXED — §Correlation and Traceability, EventType constraint — Expanded the EventType enum from `AgentTaskRequest, Decision, Text, InstallUpdate, Reaction` to include `Command, Escalation, PauseAgent, ResumeAgent`, aligning with architecture.md §3.1 lines 318-322 and the scenarios at §Escalation (line ~542), §Pause (line ~550), §Resume (line ~559).
-
-- [x] 6. FIXED — §Personal Chat, unrecognised-command scenario — Changed from "no MessengerEvent is enqueued" to enqueuing a MessengerEvent of type "Text" with the raw input as payload, then showing the help card. This aligns with architecture.md §3.1 line 324 which defines `TextEvent`/`Text` for unrecognized free-text input.
-
-- [x] 7. FIXED — §Proactive Messaging — Split the single uninstall scenario into two distinct scenarios: (a) "known uninstall — inactive reference pre-check" where the bot received the installationUpdate remove event, marked the reference inactive, and the ProactiveNotifier skips the Bot Framework call entirely (aligning with tech-spec §4.2 and §Installation lines 626-631); (b) "stale reference — uninstall event was missed" where the reference is still active but the user was removed from the tenant, so Bot Framework returns 403 reactively (aligning with tech-spec §4.2 R-2 stale reference path).
+- [x] 4. FIXED — §Message Actions — Changed audit assertion at line ~773 from generic "an immutable audit record is persisted for the message action" to specific `And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism per tech-spec §4.3)`. This aligns with tech-spec §4.3 lines 128-136 which state message actions must audit as `CommandReceived`. Verification:
+```
+$ grep -nF "immutable audit record is persisted for the message action" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty)
+```
+```
+$ grep -nF "CommandReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+490:      | EventType         | CommandReceived                                     |
+718:      | 1    | CommandReceived       |
+773:    And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism per tech-spec §4.3)
+```
+Line 490 is in the security audit scenario, line 718 is in the full lifecycle audit trail, and line 773 is the fixed message-action audit line — all correct uses.
 
 ### Open questions
 
