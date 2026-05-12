@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 4
+**Status:** Draft — iteration 5
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -226,7 +226,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 | **Type** | Bot Framework middleware (`IMiddleware`) |
 | **Position in pipeline** | After `TenantValidationMiddleware`, before `RateLimitMiddleware` (see §2.3). |
 | **Responsibility** | Suppress duplicate inbound webhook deliveries. Teams and the Bot Connector service may retry an HTTP POST if the initial response times out, resulting in the same logical activity being delivered more than once. This middleware deduplicates by `Activity.Id` (or `Activity.ReplyToId` for invoke activities) per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. |
-| **Store** | `IActivityIdStore` — a lightweight store (in-memory + durable backing) that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes). When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
+| **Store** | `IActivityIdStore` — a lightweight store (in-memory + durable backing) that tracks recently-seen activity IDs with a configurable TTL (default: 24 hours, aligned with `implementation-plan.md` §6.2 `ProcessedMessages` cleanup TTL). When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
 | **Distinction from §2.6 idempotency** | This middleware operates at the **transport level** on raw `Activity.Id`, catching retried HTTP POSTs before any handler runs. The `CardActionHandler` idempotency set (§2.6) operates at the **domain level** on `(QuestionId, UserId)`, catching semantically duplicate card actions that may arrive as distinct activities. Both layers are necessary. |
 
 ---
@@ -387,7 +387,7 @@ Durable outbound message queue entry. Defined in `AgentSwarm.Messaging.Core`.
 | `Destination` | `string` | Serialized routing key: `teams://{tenantId}/{userId}` or `teams://{tenantId}/channel/{channelId}`. |
 | `PayloadType` | `string` | `MessengerMessage` or `AgentQuestion`. |
 | `PayloadJson` | `string` | Serialized payload. |
-| `Status` | `string` | `Pending`, `Delivered`, `Failed`, `DeadLettered`. |
+| `Status` | `string` | `Pending`, `Processing`, `Sent`, `Failed`, `DeadLettered` — aligned with `implementation-plan.md` §6.1 outbox status vocabulary. |
 | `Attempts` | `int` | Delivery attempt count. |
 | `NextRetryAt` | `DateTimeOffset?` | Scheduled next attempt. |
 | `LastError` | `string?` | Last failure reason. |
@@ -403,7 +403,7 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 | `AuditEntryId` | `string` | Yes | Primary key (GUID) — implementation-specific surrogate key. |
 | `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
 | `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
-| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. |
+| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error` — exactly the canonical set from `tech-spec.md` §4.3. Message-action-forwarded commands use `CommandReceived` (the action is a command submission mechanism, not a distinct event category). |
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users (`ActorType = User`), agent ID for agent-originated events (`ActorType = Agent`). |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
@@ -448,8 +448,19 @@ public interface IMessengerConnector
     Task SendMessageAsync(MessengerMessage message, CancellationToken ct);
     Task SendQuestionAsync(AgentQuestion question, CancellationToken ct);
     Task<IReadOnlyList<MessengerEvent>> ReceiveAsync(CancellationToken ct);
+}
+```
 
-    // Update/delete surface for already-sent cards (§6.5 flow)
+`TeamsMessengerConnector` implements this interface. The orchestrator interacts only through `IMessengerConnector` for send/receive operations; it has no knowledge of Teams-specific types. The interface contains exactly `SendMessageAsync`, `SendQuestionAsync`, and `ReceiveAsync` — aligned with `implementation-plan.md` §1.2 line 41.
+
+Card update/delete operations are Teams-specific (they depend on `activityId` and Bot Connector's `UpdateActivityAsync`/`DeleteActivityAsync`). They are exposed through a separate Teams-specific interface:
+
+### 4.1.1 ITeamsCardManager (Teams-specific card update/delete)
+
+```csharp
+// Assembly: AgentSwarm.Messaging.Teams
+public interface ITeamsCardManager
+{
     Task UpdateCardAsync(string questionId, CardUpdateAction action, CancellationToken ct);
     Task DeleteCardAsync(string questionId, CancellationToken ct);
 }
@@ -463,7 +474,7 @@ public enum CardUpdateAction
 }
 ```
 
-`TeamsMessengerConnector` implements this interface. The orchestrator interacts only through `IMessengerConnector`; it has no knowledge of Teams-specific types. The `UpdateCardAsync` and `DeleteCardAsync` methods provide the orchestrator's entry point for the §6.5 update/delete flow — internally, `TeamsMessengerConnector` looks up `TeamsCardState` to find the `activityId` and delegates to `ProactiveNotifier` for the Bot Framework call.
+`TeamsMessengerConnector` implements both `IMessengerConnector` and `ITeamsCardManager`. The orchestrator uses `IMessengerConnector` for platform-agnostic messaging. For the §6.5 update/delete flow, the orchestrator (or a Teams-aware coordinator) resolves `ITeamsCardManager` and calls `UpdateCardAsync`/`DeleteCardAsync`. Internally, `TeamsMessengerConnector` looks up `TeamsCardState` to find the `activityId` and delegates to `ProactiveNotifier` for the Bot Framework call.
 
 ### 4.2 IConversationReferenceStore
 
@@ -505,19 +516,21 @@ public interface ICardStateStore
 }
 ```
 
-### 4.4 IOutboxStore
+### 4.4 IMessageOutbox
 
 ```csharp
 // Assembly: AgentSwarm.Messaging.Core
-public interface IOutboxStore
+// Aligned with implementation-plan.md §1.2 IMessageOutbox contract
+public interface IMessageOutbox
 {
     Task EnqueueAsync(OutboxEntry entry, CancellationToken ct);
-    Task<IReadOnlyList<OutboxEntry>> GetPendingAsync(int batchSize, CancellationToken ct);
-    Task MarkDeliveredAsync(string outboxEntryId, CancellationToken ct);
-    Task MarkFailedAsync(string outboxEntryId, string error, DateTimeOffset nextRetry, CancellationToken ct);
-    Task MoveToDeadLetterAsync(string outboxEntryId, CancellationToken ct);
+    Task<IReadOnlyList<OutboxEntry>> DequeueAsync(int batchSize, CancellationToken ct);
+    Task AcknowledgeAsync(string outboxEntryId, CancellationToken ct);
+    Task DeadLetterAsync(string outboxEntryId, string error, CancellationToken ct);
 }
 ```
+
+> **Method mapping:** `EnqueueAsync` persists a new outbox entry with status `Pending`. `DequeueAsync` atomically selects up to `batchSize` entries with status `Pending` and transitions them to `Processing` (equivalent to the prior `GetPendingAsync`). `AcknowledgeAsync` marks a successfully delivered entry as `Sent` (equivalent to the prior `MarkDeliveredAsync`). `DeadLetterAsync` marks a permanently failed entry as `DeadLettered` after exhausting retries. Transient failure retry scheduling (incrementing `RetryCount`, setting `NextRetryAt`, reverting status to `Pending`) is handled internally by `OutboxRetryEngine` between `DequeueAsync` and `AcknowledgeAsync`/`DeadLetterAsync`.
 
 ### 4.5 IAuditLogger
 
@@ -571,7 +584,7 @@ public interface IActivityIdStore
 }
 ```
 
-`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 10 minutes). For multi-instance deployments, a Redis-backed implementation is recommended.
+`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 24 hours, aligned with `implementation-plan.md` §6.2 `ProcessedMessages` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
 
 ---
 
@@ -851,7 +864,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 3. `TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync` delegates to `MessageExtensionHandler`.
 4. `MessageExtensionHandler` extracts the source message text and metadata, delegates to `CommandParser` to parse the forwarded content (aligned with `e2e-scenarios.md` §Message Actions which expects delegation to `CommandParser`).
 5. A `MessengerEvent` of type `AgentTaskRequest` is built with `Source = MessageAction` (aligned with `e2e-scenarios.md` which expects `MessengerEvent` type `AgentTaskRequest` with `Source = MessageAction`, not `MessageAction` type).
-6. An audit entry of type `MessageActionReceived` is logged.
+6. An audit entry of type `CommandReceived` is logged (message actions are a command submission mechanism; the canonical `EventType` set from `tech-spec.md` §4.3 does not include a separate `MessageActionReceived` value).
 7. A confirmation card is returned to the user ("Message forwarded to agent — tracking ID: {CorrelationId}").
 8. `TeamsMessengerConnector` publishes the `MessengerEvent` to the inbound buffer.
 9. The orchestrator consumes the event and routes the forwarded context to the appropriate agent.

@@ -190,6 +190,24 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Card delete on expiry — Given a question with `ExpiresAt` in the past, When the expiry processor runs, Then the card is deleted via `DeleteActivityAsync`.
 - [ ] Scenario: State store persistence — Given a card is sent and its `ActivityId` is stored, When the service restarts and the store is queried, Then the `ActivityId` is still retrievable.
 
+## Stage 3.4: Message Extension Handler
+
+### Implementation Steps
+- [ ] Create `MessageExtensionHandler` class in `AgentSwarm.Messaging.Teams.Extensions` that handles Teams message-extension action commands (`composeExtension/submitAction`). When a user invokes a message action (e.g., right-clicks a message and selects "Forward to Agent"), the handler extracts the source message content from the invoke payload.
+- [ ] Override `OnTeamsMessagingExtensionSubmitActionAsync` in `TeamsSwarmActivityHandler` to delegate to `MessageExtensionHandler`, passing the `MessagingExtensionAction` data.
+- [ ] Implement message content extraction: parse the `MessagingExtensionAction.MessagePayload` to retrieve the forwarded message text, sender, and timestamp.
+- [ ] Delegate extracted text to `CommandParser` to parse the forwarded message as an agent command and publish a `MessengerEvent` of type `AgentTaskRequest` with `Source = MessageAction` to the inbound buffer (aligned with `architecture.md` §2.15 and `e2e-scenarios.md` §Message Actions).
+- [ ] Return a task-submitted confirmation card to the user via `MessagingExtensionActionResponse` containing a success message and the created task/correlation ID.
+- [ ] Update the Teams app manifest `composeExtensions` entry to set `fetchTask: false` (direct submit) and configure the `commands` array with the action command definition including `id`, `title`, `description`, and `type: "action"`.
+
+### Dependencies
+- phase-adaptive-cards-and-command-processing/stage-command-dispatcher
+
+### Test Scenarios
+- [ ] Scenario: Message action forwarding — Given a user right-clicks a message and selects "Forward to Agent", When the message extension submit action is received, Then `MessageExtensionHandler` extracts the message text and publishes an `AgentTaskRequest` event with `Source = MessageAction`.
+- [ ] Scenario: Confirmation card returned — Given a successful message-extension submit, When `OnTeamsMessagingExtensionSubmitActionAsync` completes, Then a `MessagingExtensionActionResponse` with a confirmation Adaptive Card is returned to the user.
+- [ ] Scenario: Empty message payload — Given a message action invoke with no message payload (e.g., triggered from command box), When `MessageExtensionHandler` processes it, Then a descriptive error card is returned asking the user to select a message first.
+
 # Phase 4: Proactive Messaging and Conversation Reference Management
 
 ## Dependencies

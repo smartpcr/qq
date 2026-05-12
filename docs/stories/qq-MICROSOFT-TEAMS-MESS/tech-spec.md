@@ -124,13 +124,15 @@ Tenant-level and user-level rejections are handled at **different layers** with 
 
 This is the **minimum required** field set for all audit records. Sibling docs (`architecture.md`, `implementation-plan.md`) may add implementation-specific fields (e.g., `Checksum` for tamper detection, surrogate `AuditEntryId` primary key) but **must include all fields listed here** and **must use the canonical `EventType` values** defined in this table.
 
-> All sibling docs (`implementation-plan.md`, `e2e-scenarios.md`, `architecture.md`) have been aligned to use these canonical `EventType` values.
+> All sibling docs (`implementation-plan.md`, `e2e-scenarios.md`, `architecture.md`) have been aligned to use these canonical **audit** `EventType` values.
+>
+> **Important distinction:** The `EventType` field in the canonical **audit record** schema (this table) is a different concept from the `EventType` discriminator on the `MessengerEvent` domain model. The audit `EventType` categorizes audit log entries (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`). The `MessengerEvent.EventType` discriminator identifies the domain event subtype (`Command`, `Decision`, `Reaction`, `InstallUpdate`, `AgentTaskRequest`) as defined in `architecture.md` §3.1 and `e2e-scenarios.md` §Audit Trail compliance scenarios. These are intentionally separate enumerations serving different purposes — audit categorization vs. domain event polymorphism — and are not expected to share values.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
 | `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
-| `EventType` | `string` | Yes | Describes the event category: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`. |
+| `EventType` | `string` | Yes | Describes the event category: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. |
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users, agent ID for agent-originated events. |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
