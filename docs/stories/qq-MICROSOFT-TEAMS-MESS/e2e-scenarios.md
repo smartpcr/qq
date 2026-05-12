@@ -938,13 +938,27 @@ Feature: Edge Cases and Error Handling
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §Iteration Summary and file body — The stale cross-doc alignment note from iteration 11 (which incorrectly referenced implementation-plan.md claiming six values) was removed in iter 12. The prior-feedback resolution block that quoted that phrase has now also been removed (this iteration), eliminating the self-referential grep hit. Verified: zero hits outside this resolution block.
+- [x] 1. FIXED — §Reliability "Duplicate inbound webhook is suppressed" scenario (lines 454–475) — Rewrote as two distinct scenarios: (a) "Duplicate inbound webhook is suppressed at middleware level" where `ActivityDeduplicationMiddleware` short-circuits the second delivery by `Activity.Id` via `IActivityIdStore` before any handler runs, aligned with `architecture.md` §2.16 lines 225–230 and `implementation-plan.md` lines 71–72; (b) "Domain-level duplicate card action is suppressed (double-tap)" where `CardActionHandler` rejects via `(QuestionId, UserId)` processed-action set per `architecture.md` §2.6 line 143. Verification:
+```
+$ grep -nF "TeamsMessengerConnector processes both deliveries" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — phrase removed)
+```
 
-- [x] 2. FIXED — File header (line 4) and §Iteration Summary (line 899) — Both version strings now read "1.13 — Iteration 13". The old version string from iteration 10 was already removed in iter 12; the iter 12 resolution block that quoted it has now also been removed (this iteration), eliminating the self-referential grep hit. Verified: zero hits outside this resolution block.
+- [x] 2. FIXED — §Edge Cases "Bot receives a message exceeding maximum length" scenario (lines 829–838) — Removed the unanchored `Teams:MaxMessageLength` config key, the specific `4,000`-character threshold, and the `truncated_from`/`truncated_to` audit payload fields. The scenario now validates that excessively long inputs are handled (truncated or rejected per configured policy) without inventing config surfaces absent from sibling docs. Verification:
+```
+$ grep -nF "Teams:MaxMessageLength" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — phrase removed)
+$ grep -nF "4,000" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — phrase removed)
+```
 
-- [x] 3. FIXED — §Security scenario "Message from unauthorized tenant is rejected with HTTP 403" (line 342) — Added explicit `| Action | UnauthorizedTenantRejected |` row to the tenant-rejection audit assertion table, aligning with `tech-spec.md` §4.2 line 109 (Rejection Behavior Matrix) and `architecture.md` §3.2 line 445 (which clarifies rejection reason codes belong in `Action`, not `EventType`). Also added explicit audit assertion table to the RBAC rejection scenario (line 356) with `Action: InsufficientRoleRejected`. All three security rejection scenarios now consistently assert both `EventType: SecurityRejection` and the specific `Action` reason code: `UnauthorizedTenantRejected` (tenant), `UnmappedUserRejected` (unmapped identity), `InsufficientRoleRejected` (RBAC). QA will assert the correct field for each value.
+- [x] 3. FIXED — §Edge Cases "Adaptive Card action payload is malformed" scenario (lines 850–863) — Added an immutable audit record assertion with `EventType: Error`, `Action: MalformedCardAction`, `Outcome: Failed`, and `ActorId`, satisfying `tech-spec.md` §4.3 line 121 ("Every… Adaptive Card action callback must produce an append-only audit record") and using the canonical `Error` EventType from `tech-spec.md` §4.3 line 138. Verification:
+```
+$ grep -nF "EventType | Error" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+861:      | EventType | Error                          |
+```
 
-> **Cross-doc alignment status:** All four story documents (e2e-scenarios.md, tech-spec.md, architecture.md, implementation-plan.md) agree on seven canonical audit `EventType` values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. The canonical `Outcome` vocabulary is four values: `Success`, `Rejected`, `Failed`, `DeadLettered`. Rejection reason codes (`UnauthorizedTenantRejected`, `UnmappedUserRejected`, `InsufficientRoleRejected`) are consistently placed in the `Action` field across all docs. The `tech-spec.md` §4.2 Rejection Behavior Matrix column header is `Audit Event` (not `EventType`), and the values there (`UnauthorizedTenantRejected`, `UnmappedUserRejected`, `InsufficientRoleRejected`) map to the `Action` field in the canonical audit schema — this is now unambiguous in e2e-scenarios.md because all three rejection scenarios explicitly assert both `EventType: SecurityRejection` and the specific `Action` reason code.
+> **Cross-doc alignment status:** All four story documents (e2e-scenarios.md, tech-spec.md, architecture.md, implementation-plan.md) agree on seven canonical audit `EventType` values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. The duplicate-webhook suppression scenario now correctly attributes transport-level dedup to `ActivityDeduplicationMiddleware` (aligned with architecture.md §2.16 and implementation-plan.md §1.1). The max-message-length scenario no longer introduces unanchored config surfaces.
 
 ### Open questions
 

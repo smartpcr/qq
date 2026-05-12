@@ -226,7 +226,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 | **Type** | Bot Framework middleware (`IMiddleware`) |
 | **Position in pipeline** | After `TenantValidationMiddleware`, before `RateLimitMiddleware` (see §2.3). |
 | **Responsibility** | Suppress duplicate inbound webhook deliveries. Teams and the Bot Connector service may retry an HTTP POST if the initial response times out, resulting in the same logical activity being delivered more than once. This middleware deduplicates by `Activity.Id` (or `Activity.ReplyToId` for invoke activities) per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 447–454 (duplicate inbound webhook suppression scenario). |
-| **Store** | `IActivityIdStore` — a lightweight store (in-memory + durable backing) that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
+| **Store** | `IActivityIdStore` — a lightweight store that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). The **default implementation is an in-memory `ConcurrentDictionary`** with a background eviction timer — suitable for single-instance deployments. For multi-instance deployments, a **Redis-backed implementation** (`RedisActivityIdStore`) is required to ensure deduplication is consistent across pods. When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
 | **Distinction from §2.6 idempotency** | This middleware operates at the **transport level** on raw `Activity.Id`, catching retried HTTP POSTs before any handler runs. The `CardActionHandler` idempotency set (§2.6) operates at the **domain level** on `(QuestionId, UserId)`, catching semantically duplicate card actions that may arrive as distinct activities. Both layers are necessary. |
 
 ### 2.17 IdentityResolver
@@ -418,7 +418,7 @@ Durable outbound message queue entry. Defined in `AgentSwarm.Messaging.Core`.
 | `PayloadType` | `string` | `MessengerMessage` or `AgentQuestion`. |
 | `PayloadJson` | `string` | Serialized payload. |
 | `Status` | `string` | `Pending`, `Processing`, `Sent`, `Failed`, `DeadLettered` — aligned with `implementation-plan.md` §6.1 outbox status vocabulary. |
-| `Attempts` | `int` | Delivery attempt count. |
+| `RetryCount` | `int` | Delivery attempt count (incremented on each retry). Aligned with `implementation-plan.md` §6.1 which uses `RetryCount` as the column name. |
 | `NextRetryAt` | `DateTimeOffset?` | Scheduled next attempt. |
 | `LastError` | `string?` | Last failure reason. |
 | `CreatedAt` | `DateTimeOffset` | Enqueue time. |
@@ -619,7 +619,7 @@ public interface IActivityIdStore
 }
 ```
 
-`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 447–454 (duplicate inbound webhook suppression scenario). The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
+`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 447–454 (duplicate inbound webhook suppression scenario). The **default implementation is an in-memory `ConcurrentDictionary`** with a background eviction timer (TTL: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). This is sufficient for single-instance deployments. For multi-instance deployments, a Redis-backed implementation (`RedisActivityIdStore`) is required to share seen-activity state across pods and ensure consistent deduplication.
 
 ### 4.9 IIdentityResolver (user identity mapping)
 

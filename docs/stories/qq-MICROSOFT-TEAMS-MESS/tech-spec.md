@@ -286,9 +286,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 
 ---
 
-Iteration 14 — resolving all 6 numbered items from iteration 13 evaluator feedback. All 6 items are "UNVERIFIED CLAIM" issues where the iter 13 prior-feedback block listed incomplete grep results. **Structural fix this iteration:** the old prior-feedback block has been entirely removed and replaced. Each item below runs grep across ALL FOUR sibling docs and lists EVERY hit comprehensively. No normative content changes were needed — the canonical audit model across all docs was already correct and aligned.
 
-- [x] 1. FIXED — No normative content changes needed; all docs already say seven values. The iter 13 prior-feedback block (now removed) contained incomplete grep output that only listed e2e-scenarios.md:775 but omitted tech-spec.md and architecture.md hits. Comprehensive verification across all four docs:
 ```
 $ grep -nF "exactly seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
 128: [normative §4.3 definition — correct]
