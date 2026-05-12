@@ -167,7 +167,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `StatusCommandHandler` that queries the agent swarm orchestrator and returns a status summary card.
 - [ ] Implement `ApproveCommandHandler` and `RejectCommandHandler` that resolve the referenced `AgentQuestion` and emit a `HumanDecisionEvent`.
 - [ ] Implement `EscalateCommandHandler`, `PauseCommandHandler`, and `ResumeCommandHandler` for agent lifecycle management.
-- [ ] Create `CommandDispatcher` that parses message text, resolves the matching `ICommandHandler` from DI, and dispatches with structured logging and correlation.
+- [ ] Create `CommandDispatcher` that first normalizes input text by stripping `@mention` markup (delegating to the same `Activity.RemoveMentionText` normalization applied in `OnMessageActivityAsync`), then parses the cleaned text, resolves the matching `ICommandHandler` from DI, and dispatches with structured logging and correlation.
 - [ ] Implement unrecognized-input handling: when message text does not match any known command pattern, enqueue a `MessengerEvent` of subtype `TextEvent` with `EventType = "Text"` and the raw input as payload (per `architecture.md` §3.1 `TextEvent` row and `e2e-scenarios.md` lines 43-47), then respond with a help card listing all available commands.
 
 ### Dependencies
@@ -177,6 +177,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Ask command parsing — Given message text `agent ask create e2e test scenarios for update service`, When parsed by `CommandDispatcher`, Then `AskCommandHandler` is invoked with prompt `create e2e test scenarios for update service`.
 - [ ] Scenario: Unknown command enqueues TextEvent — Given message text `hello there` that does not match any command pattern, When parsed by `CommandDispatcher`, Then a `MessengerEvent` of subtype `TextEvent` with `EventType = "Text"` is enqueued with the raw input `hello there` as payload, and the dispatcher returns a help card listing all available commands (`agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume`).
 - [ ] Scenario: Approve via card action — Given an Adaptive Card submit action with `actionValue = "approve"` and `questionId = "q-123"`, When handled, Then a `HumanDecisionEvent` with `ActionValue = "approve"` and `QuestionId = "q-123"` is emitted.
+- [ ] Scenario: @mention stripped before dispatch — Given a channel message with text `<at>AgentBot</at> agent status`, When `CommandDispatcher` normalizes and parses the input, Then the `@AgentBot` mention is stripped and `StatusCommandHandler` is invoked with no mention artifacts in the command text.
 
 ## Stage 3.3: Card Update and Delete Operations
 
@@ -223,12 +224,12 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 4.1: Conversation Reference Store Implementation
 
 ### Implementation Steps
-- [ ] Implement `SqlConversationReferenceStore : IConversationReferenceStore` using Entity Framework Core with a `ConversationReferences` table containing: `Id` (PK), `UserId`, `TenantId`, `ChannelId`, `ServiceUrl`, `ConversationJson` (serialized `ConversationReference`), `IsActive` (bool, default `true` — set to `false` by `MarkInactiveAsync` on uninstall), `DeactivatedAt` (DateTimeOffset, nullable — timestamp when marked inactive), `DeactivationReason` (string, nullable — `Uninstalled` or `StaleReference`), `CreatedAt`, `UpdatedAt`.
-- [ ] Create EF Core migration for the `ConversationReferences` table with indexes on `(UserId, TenantId)` (unique), `TenantId`, `ChannelId`, and a filtered index on `IsActive = true` for efficient active-reference queries used by `GetAllActiveAsync` and proactive send pre-checks.
+- [ ] Implement `SqlConversationReferenceStore : IConversationReferenceStore` using Entity Framework Core with a `ConversationReferences` table containing: `Id` (PK), `UserId` (nullable — null for channel-scoped references), `TenantId`, `ChannelId` (nullable — null for personal-chat references), `ServiceUrl`, `ConversationJson` (serialized `ConversationReference`), `IsActive` (bool, default `true` — set to `false` by `MarkInactiveAsync` on uninstall), `DeactivatedAt` (DateTimeOffset, nullable — timestamp when marked inactive), `DeactivationReason` (string, nullable — `Uninstalled` or `StaleReference`), `CreatedAt`, `UpdatedAt`. The table supports two types of references: user-scoped (personal chat, keyed by `UserId + TenantId`) and channel-scoped (team channel, keyed by `ChannelId + TenantId`).
+- [ ] Create EF Core migration for the `ConversationReferences` table with: a unique filtered index on `(UserId, TenantId) WHERE UserId IS NOT NULL` for user-scoped references, a unique filtered index on `(ChannelId, TenantId) WHERE ChannelId IS NOT NULL` for channel-scoped references, a non-clustered index on `TenantId`, and a filtered index on `IsActive = true` for efficient active-reference queries used by `GetAllActiveAsync` and proactive send pre-checks.
 - [ ] Implement `MarkInactiveAsync(string userId, string tenantId)` to set `IsActive = false`, `DeactivatedAt = DateTimeOffset.UtcNow`, and `DeactivationReason = "Uninstalled"` without deleting the row (retained for audit).
 - [ ] Implement `IsActiveAsync(string userId, string tenantId)` to check `IsActive` status before proactive sends, used by `InstallationStateGate` (Stage 5.1) and `ProactiveNotifier` (Stage 4.2) to skip inactive references.
 - [ ] Implement `GetByUserIdAsync` and `GetByChannelIdAsync` query methods returning only active references for targeted proactive messaging.
-- [ ] Implement `SaveOrUpdateAsync` with upsert logic: if a reference arrives for the same `(UserId, TenantId)`, update in place and reset `IsActive = true`, `DeactivatedAt = null` — this handles re-installation after a prior uninstall.
+- [ ] Implement `SaveOrUpdateAsync` with upsert logic supporting both reference types: for user-scoped references, upsert on `(UserId, TenantId)` — if a reference arrives for the same user/tenant, update in place and reset `IsActive = true`, `DeactivatedAt = null` (handles re-installation after uninstall); for channel-scoped references, upsert on `(ChannelId, TenantId)` — if a reference arrives for the same channel/tenant, update in place similarly. The method inspects whether `UserId` or `ChannelId` is populated to determine the upsert key.
 
 ### Dependencies
 - _none — start stage_
@@ -237,6 +238,8 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Save and retrieve — Given a conversation reference for user `user-1` in tenant `tenant-1`, When saved and then retrieved by user ID, Then the deserialized `ConversationReference` matches the original.
 - [ ] Scenario: Upsert on duplicate — Given a reference already exists for `user-1`, When a new reference is saved for the same user, Then only one record exists with the updated `ServiceUrl`.
 - [ ] Scenario: Multi-tenant isolation — Given references for `tenant-1` and `tenant-2`, When queried for `tenant-1`, Then only `tenant-1` references are returned.
+- [ ] Scenario: Channel reference upsert — Given a channel-scoped reference for `channel-general` in `tenant-1` (with null `UserId`), When a new reference arrives for the same `(ChannelId, TenantId)`, Then only one record exists with the updated `ServiceUrl` and the upsert key is `(ChannelId, TenantId)`.
+- [ ] Scenario: User and channel references coexist — Given a user-scoped reference for `user-1` in `tenant-1` and a channel-scoped reference for `channel-general` in `tenant-1`, When both are saved, Then two distinct records exist and each can be retrieved independently via `GetByUserIdAsync` and `GetByChannelIdAsync` respectively.
 
 ## Stage 4.2: Proactive Notification Service
 
@@ -255,6 +258,8 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Proactive question delivery — Given a stored conversation reference for `user-1`, When `SendProactiveQuestionAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the user's personal chat using `AdaptiveCardBuilder` to render the card.
 - [ ] Scenario: Reference not found — Given no conversation reference exists for `user-2`, When `SendProactiveQuestionAsync` is called, Then a `ConversationReferenceNotFoundException` is thrown and the caller logs the failure for later outbox-based retry (available in Phase 6).
 - [ ] Scenario: Direct delivery latency — Given a stored conversation reference and a rendered Adaptive Card, When `SendProactiveQuestionAsync` delivers the card directly via `ContinueConversationAsync`, Then delivery completes within P95 < 3 seconds. Note: this measures direct delivery only; the canonical P95 SLA (< 3 seconds from outbox queue pickup to Bot Connector acknowledgement, per `tech-spec.md` §4.4) is validated in Phase 6 Stage 6.3's `Delivery histogram` test scenario which measures the full outbox-to-acknowledgement path.
+- [ ] Scenario: Channel proactive delivery — Given a stored channel-scoped conversation reference for `channel-general` in `tenant-1`, When `SendToChannelAsync("channel-general", "tenant-1", message)` is called, Then the message is delivered to the team channel (not a personal chat) using the channel's stored `ConversationReference` via `ContinueConversationAsync`.
+- [ ] Scenario: Channel question delivery — Given a stored channel reference, When `SendQuestionToChannelAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the team channel using `AdaptiveCardBuilder` to render the card.
 
 # Phase 5: Security, Identity, and Compliance
 
@@ -313,6 +318,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `Retry-After` header handling: when the Bot Framework returns HTTP 429, parse the `Retry-After` response header and use its value as the minimum delay before the next retry attempt, overriding the computed backoff if `Retry-After` is longer.
 - [ ] Implement token-bucket rate limiter in the outbound pipeline to proactively avoid Bot Framework rate limits (default: 50 msgs/sec per bot, configurable).
 - [ ] Implement dead-letter handling: messages exceeding retry threshold are moved to `DeadLettered` status with the last error recorded.
+- [ ] Wire `TeamsMessengerConnector.SendMessageAsync`, `TeamsMessengerConnector.SendQuestionAsync`, `TeamsProactiveNotifier.SendProactiveAsync`, `TeamsProactiveNotifier.SendProactiveQuestionAsync`, `TeamsProactiveNotifier.SendToChannelAsync`, and `TeamsProactiveNotifier.SendQuestionToChannelAsync` to persist outbound notifications to `IMessageOutbox.EnqueueAsync` BEFORE attempting delivery. The `OutboxRetryEngine` becomes the canonical send path: all outbound messages are first enqueued with `Status = Pending`, then picked up by the engine which calls `ContinueConversationAsync`. Direct sends in Stage 4.2 are replaced by outbox-mediated sends. This ensures no notification is lost even if the process crashes between intent-to-send and actual delivery, satisfying the reliability requirement to persist outbound notifications and retry transient failures.
 
 ### Dependencies
 - _none — start stage_
@@ -321,6 +327,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Successful delivery — Given a message is enqueued with status `Pending`, When `OutboxRetryEngine` runs and delivery succeeds, Then the status is updated to `Sent`.
 - [ ] Scenario: Transient failure retry — Given delivery fails with a transient `HttpRequestException`, When `OutboxRetryEngine` runs, Then `RetryCount` is incremented and `NextRetryAt` is set with exponential backoff.
 - [ ] Scenario: Dead-letter after max retries — Given a message has failed 5 times, When `OutboxRetryEngine` runs, Then the status is set to `DeadLettered` and `LastError` contains the failure reason.
+- [ ] Scenario: Outbox is canonical send path — Given `TeamsProactiveNotifier.SendProactiveAsync` is called with a message for `user-1`, When the method executes, Then the message is first persisted to `OutboxMessages` with `Status = Pending` before any `ContinueConversationAsync` call, and the `OutboxRetryEngine` picks it up for actual delivery.
 
 ## Stage 6.2: Duplicate Suppression and Idempotency
 

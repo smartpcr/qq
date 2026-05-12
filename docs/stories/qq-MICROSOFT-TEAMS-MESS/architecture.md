@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 8
+**Status:** Draft — iteration 9
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -336,7 +336,7 @@ The base record carries the common envelope fields. Each subtype adds a typed pa
 | Subtype (C# record) | `EventType` value | Typed payload | When produced |
 |---|---|---|---|
 | `CommandEvent` | `AgentTaskRequest` | `ParsedCommand` | User sends `agent ask <text>` in chat, channel, or via message-action forward (with `Source = MessageAction`). Aligns with `e2e-scenarios.md` §Personal Chat lines 26, 40. |
-| `CommandEvent` | `Command` | `ParsedCommand` | User sends `agent status`, `approve`, or `reject`. General-purpose command event for non-task-creation commands. Aligns with `e2e-scenarios.md` §Tracing line 680 which lists `Command` as an allowed domain `EventType`. |
+| `CommandEvent` | `Command` | `ParsedCommand` | User sends `agent status`, `approve`, or `reject`. General-purpose command event for non-task-creation commands. Aligns with `e2e-scenarios.md` §Correlation and Traceability lines 723–728 which lists `Command` as an allowed domain `EventType`. |
 | `CommandEvent` | `Escalation` | `ParsedCommand` | User sends `escalate`. Aligns with `e2e-scenarios.md` §Escalation line 543. |
 | `CommandEvent` | `PauseAgent` | `ParsedCommand` | User sends `pause`. Aligns with `e2e-scenarios.md` §Pause line 551. |
 | `CommandEvent` | `ResumeAgent` | `ParsedCommand` | User sends `resume`. Aligns with `e2e-scenarios.md` §Resume line 560. |
@@ -1045,7 +1045,7 @@ services.AddHostedService<OutboxWorker>();
 | Error class | Handling |
 |---|---|
 | Transient (HTTP 429, 500, 502, 503, 504) | Exponential backoff retry via outbox engine per `tech-spec.md` §4.4: base 2 s, 2× multiplier, max 60 s, 5 total attempts, ±25% jitter, `Retry-After` header override for HTTP 429. |
-| Invalid Bot Framework JWT (pre-application) | Handled automatically by Bot Framework `CloudAdapter` authentication pipeline — returns HTTP 401 before any application code or middleware runs. No `SecurityRejection` audit entry is emitted because the request never reaches the bot handler (per `tech-spec.md` §4.2 rejection matrix row 1). |
+| Invalid Bot Framework JWT (pre-application) | Handled automatically by Bot Framework `CloudAdapter` authentication pipeline — returns HTTP 401 before any application code or middleware runs. No `SecurityRejection` audit entry is emitted because the request never reaches the bot handler (per `tech-spec.md` §4.2 rejection matrix row 1). **Sibling-doc conflict:** `e2e-scenarios.md` lines 383–389 state the invalid-JWT attempt should be "logged in the security audit trail" — this contradicts the `tech-spec.md` §4.2 rejection matrix. This architecture follows `tech-spec.md` as the source of truth because the Bot Framework SDK rejects the request at the HTTP layer before any application code runs, making audit logging architecturally infeasible without a custom `HttpModule` or reverse-proxy layer. If the operator requires audit coverage for pre-authentication rejections, an infrastructure-level solution (e.g., Azure Front Door WAF logs, API gateway access logs) is recommended. |
 | Tenant not in allow-list | `TenantValidationMiddleware` rejects with HTTP 403; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 2). |
 | Unmapped user identity | `IIdentityResolver` returns null; handler responds with HTTP 200 + access-denial Adaptive Card; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 3). |
 | Insufficient RBAC role | `IUserAuthorizationService` rejects; handler responds with HTTP 200 + insufficient-permissions Adaptive Card; logs `SecurityRejection` audit entry with `Outcome: Rejected` (per `tech-spec.md` §4.2 rejection matrix row 4). |
