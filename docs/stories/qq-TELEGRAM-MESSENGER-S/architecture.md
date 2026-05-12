@@ -4,7 +4,7 @@
 
 The agent swarm (100+ autonomous agents) requires a Telegram-based human interface so that mobile operators can start tasks, answer blocking questions, approve/reject actions, and receive urgent alerts — all without access to a dashboard or CLI. The Telegram connector must slot into the shared `IMessengerConnector` abstraction planned for the Messenger Gateway epic while meeting Telegram-specific requirements for webhook transport, inline buttons, and the 2-second P95 send-latency target.
 
-**Reliability and performance summary:** The architecture guarantees **at-least-once delivery with dead-letter fallback** — every outbound message is either delivered to Telegram (possibly more than once in narrow crash windows; see §3.1 Gap A) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Under extreme queue depth, Low-severity messages may be backpressure-dead-lettered without a send attempt (see §10.4); Critical, High, and Normal messages are never backpressure-DLQ'd. The **P95 ≤ 2 s send-latency SLO** (measured on `telegram.send.first_attempt_latency_ms` — first-attempt sends that did not receive a Telegram 429 response, per operator answer to `p95-metric-scope`; local token-bucket wait is included) is met in **steady state** (queue depth < 100) across all severities, and extends to **bounded bursts** (≤ 60 Critical+High messages in a 100+ agent burst) via severity-based priority queuing at 30 msg/s throughput with token-bucket burst capacity allowing the first 30 messages to drain without token wait (see §10.4 burst math). The P95 of 60 priority messages (the 57th message) completes enqueue-to-HTTP-200 at approximately 2,000–2,100 ms — at the 2 s boundary. Beyond ~60 Critical+High messages in a single burst, P95 degrades proportionally with queue dwell — this is an accepted capacity trade-off, not a message-loss risk. Sends that receive Telegram 429 responses are excluded from the acceptance gate metric and tracked separately via `telegram.send.all_attempts_latency_ms` for capacity planning. See §10.4 for the full analysis.
+**Reliability and performance summary:** The architecture guarantees **at-least-once delivery with dead-letter fallback** — every outbound message is either delivered to Telegram (possibly more than once in narrow crash windows; see §3.1 Gap A) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Under extreme queue depth, Low-severity messages may be backpressure-dead-lettered without a send attempt (see §10.4); Critical, High, and Normal messages are never backpressure-DLQ'd. The **P95 ≤ 2 s send-latency SLO** (measured on `telegram.send.first_attempt_latency_ms` — first-attempt sends that did not receive a Telegram 429 response, per operator answer to `p95-metric-scope`; local token-bucket wait is included) is met in **steady state** (queue depth < 100) across all severities, and extends to **bounded bursts** (≤ 50 Critical+High messages in a 100+ agent burst) via severity-based priority queuing at 30 msg/s throughput with token-bucket burst capacity allowing the first 30 messages to drain without token wait (see §10.4 burst math). The P95 of 50 priority messages (the 48th message) completes enqueue-to-HTTP-200 at approximately 1,900 ms — safely under 2 s. Between 50 and 60 Critical+High messages, P95 approaches and may exceed 2 s depending on HTTP variance. Beyond ~60, P95 clearly exceeds 2 s — this is an accepted capacity trade-off, not a message-loss risk. Sends that receive Telegram 429 responses are excluded from the acceptance gate metric and tracked separately via `telegram.send.all_attempts_latency_ms` for capacity planning. See §10.4 for the full analysis.
 
 ---
 
@@ -103,24 +103,6 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 
 Links a Telegram identity to the swarm's authorization model. Each row represents one (user, chat, workspace) binding, supporting multi-chat and multi-workspace scenarios described in e2e-scenarios (§Agent Routing and Tenant Mapping).
 
-#### MessengerMessage (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
-
-The common message envelope used by `IMessengerConnector.SendMessageAsync` for all non-question outbound messages (status updates, command acknowledgements, alert notifications). Carries the full metadata required by tech-spec HC-9 and implementation-plan.md Stage 1.2.
-
-| Field | Type | Description |
-|---|---|---|
-| `MessageId` | `string` | Unique message identifier (UUID). |
-| `CorrelationId` | `string` | End-to-end trace/correlation ID. |
-| `AgentId` | `string` | Originating or target agent identifier. Required by tech-spec HC-9. |
-| `TaskId` | `string` | Associated task/work-item identifier. Required by tech-spec HC-9. |
-| `ConversationId` | `string` | Conversation context identifier linking related messages. Required by tech-spec HC-9. |
-| `Timestamp` | `DateTimeOffset` | Message creation time (UTC). Required by tech-spec HC-9. |
-| `Text` | `string` | Message body text. |
-| `Severity` | `MessageSeverity` | Enum: `Critical`, `High`, `Normal`, `Low`. Determines outbound priority queue ordering. |
-| `Metadata` | `Dictionary<string, string>` | Extensible key-value pairs for connector-specific context (e.g., formatting hints, routing overrides). |
-
-> **Cross-doc alignment (MessengerMessage):** Implementation-plan.md Stage 1.2 defines `MessengerMessage` with these exact fields (`MessageId`, `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, `Text`, `Severity`, `Metadata`). Tech-spec HC-9 requires all messages to carry `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, and `Timestamp`. The `OutboundMessage` entity (below) wraps `MessengerMessage` as its serialized `Payload` field, adding queue-specific fields (`IdempotencyKey`, `Status`, `AttemptCount`, etc.) for durable delivery.
-
 | Field | Type | Description |
 |---|---|---|
 | `Id` | `Guid` | Surrogate primary key. |
@@ -138,6 +120,24 @@ The common message envelope used by `IMessengerConnector.SendMessageAsync` for a
 - `UNIQUE (TelegramUserId, TelegramChatId, WorkspaceId)` — prevents duplicate bindings.
 - Composite index on `(TelegramUserId, TelegramChatId)` — used for authorization lookups (validates the chat/user pair).
 - `UNIQUE (OperatorAlias, TenantId)` — ensures alias uniqueness within a tenant. `/handoff @alias` resolution calls `GetByAliasAsync(alias, tenantId)` which uses this index; because the index is tenant-scoped, two tenants may independently use the same alias without collision, and a `/handoff` in one tenant cannot accidentally resolve an operator in a different tenant.
+
+#### MessengerMessage (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
+
+The common message envelope used by `IMessengerConnector.SendMessageAsync` for all non-question outbound messages (status updates, command acknowledgements, alert notifications). Carries the full metadata required by tech-spec HC-9 and implementation-plan.md Stage 1.2.
+
+| Field | Type | Description |
+|---|---|---|
+| `MessageId` | `string` | Unique message identifier (UUID). |
+| `CorrelationId` | `string` | End-to-end trace/correlation ID. |
+| `AgentId` | `string` | Originating or target agent identifier. Required by tech-spec HC-9. |
+| `TaskId` | `string` | Associated task/work-item identifier. Required by tech-spec HC-9. |
+| `ConversationId` | `string` | Conversation context identifier linking related messages. Required by tech-spec HC-9. |
+| `Timestamp` | `DateTimeOffset` | Message creation time (UTC). Required by tech-spec HC-9. |
+| `Text` | `string` | Message body text. |
+| `Severity` | `MessageSeverity` | Enum: `Critical`, `High`, `Normal`, `Low`. Determines outbound priority queue ordering. |
+| `Metadata` | `Dictionary<string, string>` | Extensible key-value pairs for connector-specific context (e.g., formatting hints, routing overrides). |
+
+> **Cross-doc alignment (MessengerMessage):** Implementation-plan.md Stage 1.2 defines `MessengerMessage` with these exact fields (`MessageId`, `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, `Text`, `Severity`, `Metadata`). Tech-spec HC-9 requires all messages to carry `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, and `Timestamp`. The `OutboundMessage` entity (below) wraps `MessengerMessage` as its serialized `Payload` field, adding queue-specific fields (`IdempotencyKey`, `Status`, `AttemptCount`, etc.) for durable delivery.
 
 **Cardinality examples:**
 - 1:1 chat, single workspace: one row per operator.
@@ -181,11 +181,11 @@ The common message envelope used by `IMessengerConnector.SendMessageAsync` for a
 | SourceType | IdempotencyKey formula | Example |
 |---|---|---|
 | `Question` | `q:{AgentId}:{QuestionId}` | `q:build-agent-3:Q-42` |
-| `Alert` | `a:{AgentId}:{CorrelationId}` | `a:monitor-1:trace-abc` |
+| `Alert` | `alert:{AgentId}:{AlertId}` | `alert:monitor-1:alert-77` |
 | `StatusUpdate` | `s:{AgentId}:{CorrelationId}` | `s:deploy-2:trace-def` |
 | `CommandAck` | `c:{CorrelationId}` | `c:trace-ghi` |
 
-The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplicate enqueue regardless of message origin. For question messages, the key includes `QuestionId` so re-delivery of the same agent question is deduplicated. For non-question messages (alerts, acks, status updates), the key is derived from the correlation context, ensuring each distinct event produces exactly one outbound message.
+The `UNIQUE` constraint on `IdempotencyKey` in the outbox table prevents duplicate enqueue regardless of message origin. For question messages, the key includes `QuestionId` so re-delivery of the same agent question is deduplicated. For alert messages, the key includes `AlertId` (the unique identifier from `AgentAlertEvent`) so re-delivery of the same alert event is deduplicated. For acks and status updates, the key is derived from the correlation context, ensuring each distinct event produces exactly one outbound message.
 
 #### AgentQuestion (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -480,7 +480,7 @@ The Telegram connector publishes commands (task creation, approvals, pauses) via
 
 **`AgentAlertEvent` fields:** `AlertId` (string, unique), `AgentId` (string), `TaskId` (string — the task the agent was executing when the alert fired; required for `TaskOversight` routing in §5.6), `Title` (string — short alert headline, e.g., "Build failure"), `Body` (string — detailed alert description), `Severity` (`MessageSeverity`), `WorkspaceId` (string), `TenantId` (string), `CorrelationId` (string), `Timestamp` (DateTimeOffset). The `TaskId` field is always populated because agents execute within a task context; the alert routing in §5.6 depends on this to resolve the oversight operator via `ITaskOversightRepository.GetByTaskIdAsync(taskId)`.
 
-> **Cross-doc alignment (AgentAlertEvent):** Implementation-plan.md Stage 1.3 defines the base `AgentAlertEvent` fields as `AgentId`, `AlertId`, `Title`, `Body`, `Severity`, and `CorrelationId`. This architecture document extends those with routing-required fields (`TaskId`, `WorkspaceId`, `TenantId`, `Timestamp`) that the Telegram connector needs for operator resolution and priority queuing. The field names `Title` and `Body` are aligned with implementation-plan.md; earlier drafts used `AlertType`/`Summary` which have been replaced. Implementation-plan.md should add `TaskId`, `WorkspaceId`, `TenantId`, and `Timestamp` to its `AgentAlertEvent` definition to complete the alignment.
+> **Cross-doc alignment (AgentAlertEvent):** Implementation-plan.md Stage 1.3 defines `AgentAlertEvent` with base fields: `AgentId`, `AlertId`, `Title`, `Body`, `Severity`, and `CorrelationId`. This architecture document specifies four additional routing-required fields (`TaskId`, `WorkspaceId`, `TenantId`, `Timestamp`) that the Telegram connector depends on for operator resolution and priority queuing. The field names `Title` and `Body` are aligned across both documents; earlier drafts used `AlertType`/`Summary` which have been fully retired. **Reconciliation:** the architecture definition (with all ten fields) is the canonical contract for `AgentAlertEvent`; implementation-plan.md Stage 1.3's implementation step already references "per architecture.md §4.6" as the governing specification, so the four routing fields are included at build time even though the implementation-plan's summary line lists only the six base fields. No contradiction exists — the implementation-plan defers to this section for the complete field set.
 
 > **Cross-doc alignment:** Implementation-plan.md Stage 1.3 now defines all four methods on `ISwarmCommandBus`: `PublishCommandAsync`, `QueryStatusAsync`, `QueryAgentsAsync`, and `SubscribeAsync(string tenantId, CancellationToken)` returning `IAsyncEnumerable<SwarmEvent>`. All sibling documents are aligned on this interface contract.
 
@@ -730,7 +730,8 @@ AgentSwarm           ISwarmCommandBus      TelegramConnector    OutboundQueue   
       │  (agentId=build-7,  │                     │                   │                  │                   │
       │   taskId=TASK-42,   │──deliver event─────▶│                   │                  │                   │
       │   severity=Critical,│                     │                   │                  │                   │
-      │   alertType=Error,  │                     │                   │                  │                   │
+      │   title="Build      │                     │                   │                  │                   │
+      │    failure",         │                     │                   │                  │                   │
       │   correlationId=C1) │                     │                   │                  │                   │
       │                    │                     │──resolve tenant────▶                  │                   │
       │                    │                     │  (event.TaskId     │                  │                   │
@@ -758,11 +759,11 @@ AgentSwarm           ISwarmCommandBus      TelegramConnector    OutboundQueue   
 
 1. **Event ingress:** The `TelegramConnector` receives `AgentAlertEvent` via `ISwarmCommandBus.SubscribeAsync(tenantId)` — the same event subscription used for `AgentQuestionEvent` and `AgentStatusUpdateEvent` (see §4.6). The `SwarmEvent` discriminated union routes the event to the alert-handling path.
 2. **Tenant/workspace routing:** `AgentAlertEvent` includes a `TaskId` field (the task the agent was executing when the alert fired — agents always operate in the context of a task). The connector resolves the target operator chat by looking up `AgentAlertEvent.TaskId` → `ITaskOversightRepository.GetByTaskIdAsync(taskId)` (§4.10) → `TaskOversight.OperatorBindingId` → `OperatorBinding.TelegramChatId`. If no `TaskOversight` record exists for that `TaskId`, the alert falls back to the workspace's default operator (the first active `OperatorBinding` for that `WorkspaceId`, resolved via `IOperatorRegistry.GetByWorkspaceAsync`). This ensures alerts are routed even for tasks not currently under explicit oversight. No `AgentId → TaskId` lookup is needed because the event carries both fields.
-3. **Priority queuing:** Alert messages are enqueued to `OutboundMessageQueue` with severity copied from `AgentAlertEvent.Severity` (typically `Critical` or `High`). The priority queue (§10.4) ensures these are dequeued ahead of `Normal`/`Low` messages, meeting the P95 ≤ 2 s SLO for the bounded burst envelope (≤ 60 Critical+High messages).
+3. **Priority queuing:** Alert messages are enqueued to `OutboundMessageQueue` with severity copied from `AgentAlertEvent.Severity` (typically `Critical` or `High`). The priority queue (§10.4) ensures these are dequeued ahead of `Normal`/`Low` messages, meeting the P95 ≤ 2 s SLO for the bounded burst envelope (≤ 50 Critical+High messages; between 50–60, P95 approaches the boundary).
 4. **Message formatting:** Alert messages include a severity badge (🚨 Critical, ⚠️ High), the agent ID, alert title (`AgentAlertEvent.Title`), body text (`AgentAlertEvent.Body`), and `CorrelationId` for traceability. No inline keyboard — alerts are informational, not interactive (operators use `/status TASK-ID` or `/pause AGENT-ID` to act on alerts).
 5. **Idempotency:** The `OutboundMessage.IdempotencyKey` for alerts is `alert:{agentId}:{alertId}`, preventing the same alert from being enqueued twice if the event subscription delivers it more than once.
 6. **Correlation and audit:** The `CorrelationId` from the originating agent event flows through the outbound message to the audit record, enabling end-to-end tracing from agent error → alert event → Telegram delivery → operator visibility.
-7. **Burst behavior:** Under a 100+ agent burst, alert messages compete for priority queue position by severity. With ≤ 60 Critical+High alerts in the burst, P95 send latency stays at/near 2 s (see §10.4 burst math). Normal/Low alerts experience longer dwell times but are never lost.
+7. **Burst behavior:** Under a 100+ agent burst, alert messages compete for priority queue position by severity. With ≤ 50 Critical+High alerts in the burst, P95 send latency stays under 2 s (see §10.4 burst math). Between 50–60, P95 approaches and may exceed 2 s. Beyond ~60, P95 clearly exceeds 2 s. Normal/Low alerts experience longer dwell times but are never lost.
 
 ### 5.7 Command Mapping Table
 
@@ -965,19 +966,20 @@ This document (architecture.md §10.4) is the **single canonical source** for me
 | Condition | P95 ≤ 2 s? | Message loss? |
 |---|---|---|
 | **Steady state** (queue depth < 100, no rate-limiting) | **Yes**, all severities | At-least-once delivered or dead-lettered |
-| **Bounded burst** (≤ 60 Critical+High in a 1000-msg burst) | **Yes**, Critical+High only; Normal/Low exceed 2 s | At-least-once delivered or dead-lettered |
+| **Bounded burst** (≤ 50 Critical+High in a 1000-msg burst) | **Yes**, Critical+High only; Normal/Low exceed 2 s | At-least-once delivered or dead-lettered |
+| **Near-boundary burst** (50–60 Critical+High) | **At risk** — P95 approaches/exceeds 2 s depending on HTTP variance | At-least-once delivered or dead-lettered |
 | **Exceeding burst** (> ~60 Critical+High) | **No guarantee** — queue dwell grows proportionally | At-least-once delivered or dead-lettered |
 | **Rate-limited sends** (Telegram 429) | **Excluded** from acceptance gate metric (tracked by `all_attempts_latency_ms`) | At-least-once delivered or dead-lettered |
 | **Retried sends** | **Excluded** from acceptance gate metric (tracked by `all_attempts_latency_ms`) | At-least-once delivered or dead-lettered |
 
-**In summary:** P95 ≤ 2 s is a **steady-state SLO** that extends to bounded Critical+High bursts (≤ 60 messages). It degrades gracefully beyond that bound. No message is silently discarded — every message is either delivered to Telegram (at-least-once) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Low-severity messages may be backpressure-dead-lettered under extreme queue depth (see below); Critical, High, and Normal messages are never backpressure-DLQ'd. At-least-once delivery implies narrow duplicate-send windows during crash recovery (see §3.1 Gap A).
+**In summary:** P95 ≤ 2 s is a **steady-state SLO** that extends to bounded Critical+High bursts (≤ 50 messages). Between 50–60 Critical+High messages, P95 approaches and may exceed 2 s. Beyond ~60, P95 clearly exceeds 2 s. It degrades gracefully beyond that bound. No message is silently discarded — every message is either delivered to Telegram (at-least-once) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Low-severity messages may be backpressure-dead-lettered under extreme queue depth (see below); Critical, High, and Normal messages are never backpressure-DLQ'd. At-least-once delivery implies narrow duplicate-send windows during crash recovery (see §3.1 Gap A).
 
 The architecture meets the P95 target through:
 
 | Condition | Behavior | Mechanism |
 |---|---|---|
 | **Normal load** (queue depth < 100) | P95 ≤ 2 s across all severities. Queue dwell < 50 ms; Telegram HTTP round-trip ~200–500 ms; total enqueue-to-HTTP-200 well under 2 s. | 10 concurrent workers drain faster than inflow. |
-| **Burst load** (100+ agents, 1000+ messages) | P95 ≤ 2 s for Critical/High when ≤ 60 Critical+High messages (bounded-volume assumption). Not guaranteed beyond ~60. Normal/Low experience longer dwell. | Priority queuing; `queue_dwell_ms` for visibility. |
+| **Burst load** (100+ agents, 1000+ messages) | P95 ≤ 2 s for Critical/High when ≤ 50 Critical+High messages. Between 50–60, at risk. Not guaranteed beyond ~60. Normal/Low experience longer dwell. | Priority queuing; `queue_dwell_ms` for visibility. |
 | **Beyond capacity envelope** (sustained > 30 msg/s) | Low-severity backpressure-DLQ'd when queue depth exceeds `MaxQueueDepth` (5000). Critical/High/Normal always accepted. | Backpressure DLQ + `telegram.messages.backpressure_dlq` counter + operator alert. |
 
 #### Queue Processor Concurrency
@@ -998,9 +1000,11 @@ The outbound queue implements a **severity-based priority order**: `Critical` > 
 - **Phase 1 (messages 1–30):** The burst bucket has 30 pre-filled tokens, so no rate-limit wait. With 10 workers, messages drain in 3 batches: messages 1–10 start at t≈0 ms (complete ~350 ms), messages 11–20 start at t≈350 ms (complete ~700 ms), messages 21–30 start at t≈700 ms (complete ~1 050 ms). All 30 messages complete by ~1 050 ms (median HTTP) or ~1 200 ms (P95 HTTP).
 - **Phase 2 (messages 31–60):** During Phase 1 (~1 050 ms), the bucket refilled ~31 tokens (1 050 ms ÷ 33 ms/token), replenishing the burst capacity. Messages 31–60 therefore also benefit from burst tokens: messages 31–40 start at ~1 050 ms, 41–50 at ~1 400 ms, 51–60 at ~1 750 ms.
 
-The **P95 of 60 messages** is the 57th message (⌈0.95 × 60⌉). Message 57 falls in the final batch (51–60), starting HTTP at ~1 750 ms. With P95 HTTP latency of ~500 ms: enqueue-to-HTTP-200 ≈ 1 750 + 500 = **2 250 ms**. However, this is the P95 of HTTP latency applied to the P95 queue position — a compounding of two P95s. At median HTTP latency (~350 ms), message 57 completes at ~2 100 ms, and the median message in the 51–60 batch completes at ~1 750 + 350 = ~2 100 ms. The **practical P95 across the 60-message set** (accounting for HTTP latency distribution across all positions, not just the worst-position × worst-HTTP compound) is approximately **2 000–2 100 ms** — at the 2 s boundary.
+The **P95 of 50 messages** is the 48th message (⌈0.95 × 50⌉). Message 48 falls in the 41–50 batch, starting HTTP at ~1 400 ms. With P95 HTTP latency of ~500 ms: enqueue-to-HTTP-200 ≈ 1 400 + 500 = **1 900 ms** — safely under 2 s. At median HTTP (~350 ms), message 48 completes at ~1 750 ms. The **P95 across a 50-message set** is comfortably within the 2 s SLO.
 
-We set the bounded-volume claim at **≤ 60 Critical+High messages**, aligned with tech-spec HC-4 ("breaches start around > ~60") and e2e-scenarios.md burst scenarios. This represents the capacity envelope where P95 stays at or near the 2 s target. Beyond ~60 Critical+High messages, queue dwell pushes P95 clearly above 2 s — `telegram.send.queue_dwell_ms` provides visibility for capacity planning.
+For 60 messages, the 57th message (⌈0.95 × 60⌉) falls in the 51–60 batch, starting HTTP at ~1 750 ms. With P95 HTTP latency: ~2 250 ms; at median HTTP: ~2 100 ms. **60 Critical+High messages is at/over the SLO boundary** — the P95 exceeds 2 s under realistic HTTP variance.
+
+We set the bounded-volume claim at **≤ 50 Critical+High messages**, where P95 stays safely under 2 s. Between 50 and 60 messages, P95 approaches and may exceed 2 s depending on HTTP latency variance. Beyond ~60, P95 clearly exceeds 2 s. `telegram.send.queue_dwell_ms` provides visibility for capacity planning at all burst sizes.
 
 #### Rate Limiting Under Burst
 
@@ -1016,9 +1020,9 @@ When the Telegram API returns `429 Too Many Requests`, the sender reads the `ret
 Under a burst of 1 000+ simultaneous agent events:
 
 1. **Enqueue**: Events are written to the durable outbox store immediately (sub-millisecond per insert, batched where possible). Each event is tagged with its severity.
-2. **Priority drain**: The 10 concurrent processor workers dequeue by severity priority. Critical/High messages (typically ≤ 60 per burst — blocking questions, approval requests, urgent alerts) are processed first. The token-bucket rate limiter has burst capacity B=30 with 30 tokens/s refill, creating a two-phase drain: Phase 1 drains messages 1–30 in ~1,050 ms using pre-filled burst tokens; Phase 2 drains messages 31–60 using refilled tokens (see Priority Queuing math above). The P95 of the 60-message set (the 57th message) completes enqueue-to-HTTP-200 at approximately 2,000–2,100 ms, meeting the P95 ≤ 2 s target at the boundary. Beyond ~60 Critical+High, P95 degrades proportionally.
+2. **Priority drain**: The 10 concurrent processor workers dequeue by severity priority. Critical/High messages (typically ≤ 50 per burst — blocking questions, approval requests, urgent alerts) are processed first. The token-bucket rate limiter has burst capacity B=30 with 30 tokens/s refill, creating a two-phase drain: Phase 1 drains messages 1–30 in ~1,050 ms using pre-filled burst tokens; Phase 2 drains messages 31–50 using refilled tokens (see Priority Queuing math above). The P95 of the 50-message set (the 48th message) completes enqueue-to-HTTP-200 at approximately 1,900 ms — safely under the 2 s target. Between 50–60 Critical+High messages, P95 approaches/exceeds 2 s. Beyond ~60, P95 clearly exceeds 2 s.
 3. **Multi-chat fan-out**: In production, 100+ agents typically span multiple tenants/workspaces, routing to multiple operator chats. The per-chat rate limit (20 msg/min) constrains individual operators, but the global rate limit (30 msg/s) applies across all chats. With messages distributed across N operator chats, effective throughput is `min(30, N × 20/60)` msg/s. For 10+ operator chats, the global limit of 30 msg/s is the binding constraint.
-4. **Throughput**: At 30 msg/s sustained, a burst of 1 000 messages drains in ~34 seconds. Priority queuing ensures Critical/High messages are dispatched first, reducing their enqueue-to-HTTP-200 latency relative to Normal/Low. The acceptance metric `telegram.send.first_attempt_latency_ms` (enqueue to HTTP 200, first-attempt, excludes Telegram 429s, includes local token-bucket wait per §10.4) targets P95 ≤ 2 s under **normal load** (steady state, queue depth < 100). Under burst, the first ≤ 60 priority messages meet the P95 target (queue dwell + HTTP latency ≤ ~2 s; see Priority Queuing burst math for the two-phase drain analysis); messages beyond position 60 incur proportionally longer queue dwell. The P95 ≤ 2 s is a steady-state SLO that extends to bounded bursts (≤ 60 Critical+High) and degrades gracefully beyond that while guaranteeing at-least-once delivery (or dead-letter) and priority ordering. Sends that receive Telegram 429 responses are tracked via `telegram.send.all_attempts_latency_ms` (all-inclusive, enqueue to 200) for capacity planning.
+4. **Throughput**: At 30 msg/s sustained, a burst of 1 000 messages drains in ~34 seconds. Priority queuing ensures Critical/High messages are dispatched first, reducing their enqueue-to-HTTP-200 latency relative to Normal/Low. The acceptance metric `telegram.send.first_attempt_latency_ms` (enqueue to HTTP 200, first-attempt, excludes Telegram 429s, includes local token-bucket wait per §10.4) targets P95 ≤ 2 s under **normal load** (steady state, queue depth < 100). Under burst, the first ≤ 50 priority messages meet the P95 target (queue dwell + HTTP latency < 2 s; see Priority Queuing burst math); messages in positions 50–60 are near/over the SLO boundary; messages beyond position 60 incur clearly longer queue dwell. The P95 ≤ 2 s is a steady-state SLO that extends to bounded bursts (≤ 50 Critical+High) and degrades gracefully beyond that while guaranteeing at-least-once delivery (or dead-letter) and priority ordering. Sends that receive Telegram 429 responses are tracked via `telegram.send.all_attempts_latency_ms` (all-inclusive, enqueue to 200) for capacity planning.
 5. **Backpressure**: If queue depth exceeds `MaxQueueDepth`, low-severity messages are dead-lettered immediately with reason `backpressure:queue_depth_exceeded` (see §10.4 table) and a `telegram.messages.backpressure_dlq` counter is incremented. An alert is sent to the ops channel. Critical, High, and Normal messages are always accepted.
 6. **Delivery guarantee**: The story's "without message loss" requirement is satisfied: all messages are either delivered to Telegram (at-least-once) or dead-lettered with a traceable reason and retained for operator-initiated manual replay — no silent discard (per e2e-scenarios burst test). Backpressure dead-lettering of Low-severity messages under extreme queue depth does not constitute message loss because the messages are durably retained and replayable; Critical, High, and Normal messages are never backpressure-DLQ'd. At-least-once delivery implies narrow duplicate-send windows in crash recovery (§3.1 Gap A). See §10.4 for the full reconciliation.
 
