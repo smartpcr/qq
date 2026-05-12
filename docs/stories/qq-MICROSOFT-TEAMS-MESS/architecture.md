@@ -229,6 +229,26 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 | **Store** | `IActivityIdStore` — a lightweight store (in-memory + durable backing) that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
 | **Distinction from §2.6 idempotency** | This middleware operates at the **transport level** on raw `Activity.Id`, catching retried HTTP POSTs before any handler runs. The `CardActionHandler` idempotency set (§2.6) operates at the **domain level** on `(QuestionId, UserId)`, catching semantically duplicate card actions that may arrive as distinct activities. Both layers are necessary. |
 
+### 2.17 IdentityResolver
+
+| Attribute | Value |
+|---|---|
+| **Assembly** | `AgentSwarm.Messaging.Teams` |
+| **Namespace** | `AgentSwarm.Messaging.Teams.Security` |
+| **Interface** | `IIdentityResolver` (defined in `AgentSwarm.Messaging.Teams`) |
+| **Responsibility** | Map the Teams `Activity.From.AadObjectId` (Entra AAD object ID) to an internal user identity record. Returns `null` when the AAD object ID is not mapped, triggering the unmapped-user rejection flow (§6.4.2). Aligned with `implementation-plan.md` §5.1 which defines `IIdentityResolver` with method `ResolveAsync(string aadObjectId)`. |
+| **Invoked by** | `TeamsSwarmActivityHandler` after tenant validation passes. |
+
+### 2.18 UserAuthorizationService
+
+| Attribute | Value |
+|---|---|
+| **Assembly** | `AgentSwarm.Messaging.Teams` |
+| **Namespace** | `AgentSwarm.Messaging.Teams.Security` |
+| **Interface** | `IUserAuthorizationService` (defined in `AgentSwarm.Messaging.Teams`) |
+| **Responsibility** | Enforce RBAC permissions for user commands. Given a tenant ID, user ID, and command, determines whether the user's assigned role permits the command. Role definitions are configured via `RbacOptions` (§5.2). Returns an authorization result indicating success or the specific role required. Aligned with `implementation-plan.md` §5.1 which defines `IUserAuthorizationService` with method `AuthorizeAsync(string tenantId, string userId, string command)`. |
+| **Invoked by** | `TeamsSwarmActivityHandler` after identity resolution succeeds (§6.4.3). |
+
 ---
 
 ## 3. Data Model
@@ -591,6 +611,51 @@ public interface IActivityIdStore
 ```
 
 `ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
+
+### 4.9 IIdentityResolver (user identity mapping)
+
+```csharp
+// Assembly: AgentSwarm.Messaging.Teams
+// Aligned with implementation-plan.md §5.1
+public interface IIdentityResolver
+{
+    /// <summary>
+    /// Maps a Teams AAD object ID to an internal user identity record.
+    /// Returns null if the user is not mapped (triggers unmapped-user rejection per §6.4.2).
+    /// </summary>
+    Task<UserIdentity?> ResolveAsync(string aadObjectId, CancellationToken ct);
+}
+
+public sealed record UserIdentity(
+    string InternalUserId,
+    string AadObjectId,
+    string DisplayName,
+    string Role);
+```
+
+`TeamsSwarmActivityHandler` calls `IIdentityResolver.ResolveAsync` after tenant validation passes. If the result is `null`, the handler logs a `SecurityRejection` audit entry and returns an Adaptive Card explaining access denial (§6.4.2).
+
+### 4.10 IUserAuthorizationService (RBAC enforcement)
+
+```csharp
+// Assembly: AgentSwarm.Messaging.Teams
+// Aligned with implementation-plan.md §5.1
+public interface IUserAuthorizationService
+{
+    /// <summary>
+    /// Checks whether the user's role permits the specified command.
+    /// Returns an authorization result with success/failure and the required role.
+    /// </summary>
+    Task<AuthorizationResult> AuthorizeAsync(string tenantId, string userId, string command, CancellationToken ct);
+}
+
+public sealed record AuthorizationResult(
+    bool IsAuthorized,
+    string? UserRole,
+    string? RequiredRole);
+```
+
+`TeamsSwarmActivityHandler` calls `IUserAuthorizationService.AuthorizeAsync` after identity resolution succeeds. If the result indicates insufficient permissions, the handler logs a `SecurityRejection` audit entry and returns an Adaptive Card explaining the required role (§6.4.3). Role-to-command mappings are defined in §5.2.
 
 ---
 
