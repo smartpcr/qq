@@ -166,13 +166,14 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `ApproveCommandHandler` and `RejectCommandHandler` that resolve the referenced `AgentQuestion` and emit a `HumanDecisionEvent`.
 - [ ] Implement `EscalateCommandHandler`, `PauseCommandHandler`, and `ResumeCommandHandler` for agent lifecycle management.
 - [ ] Create `CommandDispatcher` that parses message text, resolves the matching `ICommandHandler` from DI, and dispatches with structured logging and correlation.
+- [ ] Implement unrecognized-input handling: when message text does not match any known command pattern, enqueue a `MessengerEvent` of subtype `TextEvent` with `EventType = "Text"` and the raw input as payload (per `architecture.md` §3.1 `TextEvent` row and `e2e-scenarios.md` lines 43-47), then respond with a help card listing all available commands.
 
 ### Dependencies
 - phase-adaptive-cards-and-command-processing/stage-adaptive-card-templates
 
 ### Test Scenarios
 - [ ] Scenario: Ask command parsing — Given message text `agent ask create e2e test scenarios for update service`, When parsed by `CommandDispatcher`, Then `AskCommandHandler` is invoked with prompt `create e2e test scenarios for update service`.
-- [ ] Scenario: Unknown command — Given message text `agent deploy`, When parsed, Then the dispatcher returns a help message listing available commands.
+- [ ] Scenario: Unknown command enqueues TextEvent — Given message text `hello there` that does not match any command pattern, When parsed by `CommandDispatcher`, Then a `MessengerEvent` of subtype `TextEvent` with `EventType = "Text"` is enqueued with the raw input `hello there` as payload, and the dispatcher returns a help card listing all available commands (`agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume`).
 - [ ] Scenario: Approve via card action — Given an Adaptive Card submit action with `actionValue = "approve"` and `questionId = "q-123"`, When handled, Then a `HumanDecisionEvent` with `ActionValue = "approve"` and `QuestionId = "q-123"` is emitted.
 
 ## Stage 3.3: Card Update and Delete Operations
