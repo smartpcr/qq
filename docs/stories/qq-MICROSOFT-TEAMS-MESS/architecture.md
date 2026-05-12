@@ -148,7 +148,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Lifecycle` |
-| **Responsibility** | Handle `installationUpdate` and `conversationUpdate` activities. On install/member-add: validate tenant ID against allowlist, extract `ConversationReference`, persist it via `IConversationReferenceStore.SaveAsync`, and send a welcome Adaptive Card. On uninstall: call `IConversationReferenceStore.MarkInactiveAsync` to mark the conversation reference as inactive. |
+| **Responsibility** | Handle `installationUpdate` and `conversationUpdate` activities. On install/member-add: validate tenant ID against allowlist, extract `ConversationReference`, persist it via `IConversationReferenceStore.SaveOrUpdateAsync`, and send a welcome Adaptive Card. On uninstall: call `IConversationReferenceStore.MarkInactiveAsync` to mark the conversation reference as inactive. |
 
 ### 2.8 ConversationReferenceStore
 
@@ -720,12 +720,13 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmAc
 1. Human types `agent ask create e2e test scenarios for update service` in Teams.
 2. Bot Framework delivers the activity to `POST /api/messages`.
 3. `TeamsBotAdapter` runs middleware: tenant validation passes, rate limit check passes.
-4. `TeamsSwarmActivityHandler.OnMessageActivityAsync` delegates to `CommandParser`.
-5. `CommandParser` recognizes `agent ask` prefix, extracts payload, generates `CorrelationId`.
-6. An acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}") is sent back to the user.
-7. `TeamsMessengerConnector` publishes a `CommandEvent` (a `MessengerEvent` subtype with `EventType = AgentTaskRequest`) to the inbound buffer.
-8. The orchestrator consumes the event and dispatches work to agents.
-9. `AuditLogger` records the command with full correlation data.
+4. `TeamsSwarmActivityHandler.OnMessageActivityAsync` extracts the `ConversationReference` from the activity via `Activity.GetConversationReference()` and calls `IConversationReferenceStore.SaveOrUpdateAsync` to persist or update it. This ensures conversation references are captured on every interaction, including first contact (aligned with `implementation-plan.md` §2.2 line 87 and `e2e-scenarios.md` §Conversation Reference Persistence).
+5. Handler delegates to `CommandParser`.
+6. `CommandParser` recognizes `agent ask` prefix, extracts payload, generates `CorrelationId`.
+7. An acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}") is sent back to the user.
+8. `TeamsMessengerConnector` publishes a `CommandEvent` (a `MessengerEvent` subtype with `EventType = AgentTaskRequest`) to the inbound buffer.
+9. The orchestrator consumes the event and dispatches work to agents.
+10. `AuditLogger` records the command with full correlation data.
 
 ### 6.2 Scenario: Agent proactively sends a blocking question
 
@@ -841,7 +842,7 @@ User (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityH
 1. Activity arrives from an allowed tenant. `TenantValidationMiddleware` passes.
 2. `TeamsSwarmActivityHandler` invokes `IIdentityResolver` with `Activity.From.AadObjectId`.
 3. AAD object ID is not mapped to any internal user record.
-4. Handler logs a `SecurityRejection` audit entry with `Outcome: Rejected` and audit event `UnmappedUserRejected`.
+4. Handler logs a `SecurityRejection` audit entry with `Outcome: Rejected` and `Action: UnmappedUserRejected` (the `Action` field carries the rejection reason code from `tech-spec.md` §4.2 rejection matrix; `EventType` remains `SecurityRejection`).
 5. An Adaptive Card is returned to the user explaining the access denial and how to request access.
 
 #### 6.4.3 Allowed tenant, mapped user, insufficient RBAC role
@@ -868,7 +869,7 @@ User (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityH
 1. Activity arrives from an allowed tenant and a mapped user.
 2. `TeamsSwarmActivityHandler` parses the command (e.g., `approve`) and invokes `IUserAuthorizationService` to check whether the user's role permits the command.
 3. The user has `Viewer` role, but `approve` requires `Approver` — authorization fails.
-4. Handler logs a `SecurityRejection` audit entry with `Outcome: Rejected` and audit event `InsufficientRoleRejected`.
+4. Handler logs a `SecurityRejection` audit entry with `Outcome: Rejected` and `Action: InsufficientRoleRejected` (the `Action` field carries the rejection reason code from `tech-spec.md` §4.2 rejection matrix; `EventType` remains `SecurityRejection`).
 5. An Adaptive Card is returned explaining insufficient permissions and which role is required.
 
 ### 6.5 Scenario: Message update/delete for already-sent approval card

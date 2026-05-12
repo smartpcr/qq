@@ -281,3 +281,59 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 ---
 
 *Sibling plan documents in this story folder (`docs/stories/qq-MICROSOFT-TEAMS-MESS/`): `architecture.md`, `implementation-plan.md`, `e2e-scenarios.md`.*
+
+---
+
+## Iteration Summary
+
+**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md`
+**Byte count:** ~31,590
+**Covers:** Problem statement (§1), in/out-of-scope (§2), non-goals (§3), hard constraints (§4 — security, performance, compliance with canonical audit schema), dependencies (§5), risks (§6), assumptions (§7), success metrics (§8), glossary (§9). All sections anchored to story description details: Bot Framework, Entra ID, Teams scopes, Adaptive Cards, proactive messaging, commands, P95 delivery, audit trail.
+
+### Prior feedback resolution
+
+- [x] 1. FIXED — §4.3 lines 128, 130, 136 — Replaced seven-value audit `EventType` set (which included `MessageActionReceived`) with the six-value set (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`) used by all sibling docs. Message actions now log as `CommandReceived` in tech-spec.md, consistent with `architecture.md` line 432 (six values, message actions as `CommandReceived`), `architecture.md` line 943 (`CommandReceived` for message actions), `e2e-scenarios.md` line 773 (`EventType "CommandReceived"`), and `implementation-plan.md` lines 48 and 282 (six values). Verification:
+```
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — phrase removed)
+```
+```
+$ grep -nF "seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — phrase removed)
+```
+```
+$ grep -nF "exactly six values" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+128:...The canonical set contains exactly six values...
+136:...The canonical set contains exactly six values...
+```
+
+- [x] 2. FIXED — §4.3 line 128 — Removed the false assertion that `architecture.md` §3.2 line 432 uses the seven-value set. The new text correctly states that `architecture.md` §3.2 line 432 uses six values with message actions as `CommandReceived`, which matches the actual content of that line. Verification:
+```
+$ grep -nF "seven-value set" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — phrase removed)
+```
+
+- [x] 3. FIXED — §4.3 line 128 — Removed the contradictory claim that sibling docs "already use" the canonical set while simultaneously saying `implementation-plan.md` omits `MessageActionReceived`. The new text states the canonical set is six values, which is exactly what `implementation-plan.md` §1.3 (line 48) and §5.2 (line 282) already list — no update needed to `implementation-plan.md`. Verification:
+```
+$ grep -nF "should be updated to include" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — phrase removed)
+```
+
+- [x] 4. FIXED — §4.3 lines 128, 130, 136 — The previous iteration's `[x] FIXED` claim from a sibling doc was false because `tech-spec.md` still contained `MessageActionReceived` while sibling docs used `CommandReceived`. This is now resolved: tech-spec.md defines exactly six canonical audit `EventType` values (no `MessageActionReceived`), and message actions log as `CommandReceived` — matching `architecture.md` lines 432 and 943, `e2e-scenarios.md` line 773, and `implementation-plan.md` lines 48 and 282. Verification:
+```
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+(empty — phrase removed)
+```
+```
+$ grep -nF "CommandReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
+128:...`CommandReceived`...
+130:...`CommandReceived`...
+136:...`CommandReceived`...
+```
+All three occurrences correctly describe message actions logging as `CommandReceived`, consistent with all sibling docs.
+
+**Sibling doc inconsistency flagged:** `e2e-scenarios.md` line 903 contains "message actions audit as MessageActionReceived (per tech-spec §4.3 line 136)" which is now stale — tech-spec §4.3 line 136 now says `CommandReceived`. This contradicts `e2e-scenarios.md`'s own line 773 which correctly asserts `EventType "CommandReceived"`. The `e2e-scenarios.md` sibling agent should fix line 903 in its next iteration.
+
+### Open questions
+
+None.
