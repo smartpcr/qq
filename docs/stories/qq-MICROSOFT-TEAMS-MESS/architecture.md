@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 6
+**Status:** Draft — iteration 7
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -429,7 +429,7 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 | `AuditEntryId` | `string` | Yes | Primary key (GUID) — implementation-specific surrogate key. |
 | `Timestamp` | `DateTimeOffset` | Yes | UTC time the event occurred. |
 | `CorrelationId` | `string` | Yes | End-to-end trace ID for distributed tracing. |
-| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error` — exactly the canonical set from `tech-spec.md` §4.3. Message-action-forwarded commands use `MessageActionReceived` (distinct from `CommandReceived` to distinguish the submission mechanism). |
+| `EventType` | `string` | Yes | `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error` — exactly the six canonical values from `tech-spec.md` §4.3. Message-action-forwarded commands log as `CommandReceived` (not a separate event type) because the action is a command submission mechanism, consistent with `tech-spec.md` §4.3 line 136. |
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users (`ActorType = User`), agent ID for agent-originated events (`ActorType = Agent`). |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
