@@ -404,3 +404,78 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Happy path E2E — Given a user in an authorized tenant, When they send `agent ask create e2e test scenarios for update service`, Then they receive an acknowledgement card, Then a proactive approval card arrives, Then approving updates the card to show resolution.
 - [ ] Scenario: Unauthorized tenant E2E — Given a user in an unauthorized tenant, When they send any command, Then the request is rejected with HTTP 403 at the middleware layer (no bot response or card is sent) and no command is processed.
 - [ ] Scenario: Restart resilience E2E — Given conversation references are persisted, When the bot service restarts, Then proactive notifications using stored references are delivered successfully.
+
+---
+
+## Iteration Summary
+
+**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md`
+**Byte count:** ~49,219
+**Covers:** All story requirements — Bot Framework/Teams APIs, Entra ID integration, personal chat + team channel scopes, Adaptive Cards, message actions, proactive notifications with channel-capable API, conversation reference persistence (user-scoped and channel-scoped), command handling with @mention normalization, durable outbox as canonical send path, RBAC/tenant enforcement, immutable audit trail with six canonical EventType values per `tech-spec.md` §4.3, message update/delete, P95 delivery SLA, end-to-end acceptance tests.
+
+### Prior feedback resolution
+
+- [x] 1. FIXED — §1.3 line 48, §3.4 line 206, §5.2 line 291 — Replaced `MessageActionReceived` with `CommandReceived` in all four locations. The audit `EventType` set is now exactly six values (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `Error`) consistent with `tech-spec.md` §4.3 lines 128 and 136. Message actions log as `CommandReceived`. Verification:
+```
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+(empty)
+```
+```
+$ grep -nF "exactly six" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+48:...exactly six canonical values: `CommandReceived`, `MessageSent`...
+206:...the canonical set contains exactly six values; message actions are not a separate event type...
+291:...exactly six canonical values: `CommandReceived`, `MessageSent`...
+```
+
+- [x] 2. FIXED — §1.3, §3.4, §5.2 — `implementation-plan.md` no longer uses `MessageActionReceived` anywhere. The stale prior-feedback claims in `tech-spec.md` lines 295-333 (which assert that sibling docs all use six values/no `MessageActionReceived`) are now true for `implementation-plan.md`. Remaining stale references in `architecture.md` (line 432, 947) and `e2e-scenarios.md` (line 773, 903) are owned by those sibling agents — flagged below. Verification:
+```
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+(empty)
+```
+**Sibling inconsistency flagged:** `architecture.md` line 432 lists seven values including `MessageActionReceived` and line 947 logs as `MessageActionReceived`. `e2e-scenarios.md` line 773 asserts `EventType "MessageActionReceived"` and line 903 says "message actions audit as MessageActionReceived". These contradict `tech-spec.md` §4.3 which defines exactly six canonical audit `EventType` values with message actions logging as `CommandReceived`. The `architecture.md` and `e2e-scenarios.md` sibling agents must fix these references in their next iterations.
+
+- [x] 3. FIXED — §2.2 line 87 — `OnMessageActivityAsync` now persists conversation references AFTER identity resolution and authorization checks (not before). The step explicitly states that `IConversationReferenceStore.SaveOrUpdateAsync` is called only after the command dispatcher confirms the user is identity-resolved and authorized. Added test scenario "Unauthorized user reference not persisted" (line 102) verifying that unmapped users do NOT get references stored. Verification:
+```
+$ grep -nF "before dispatching the command, extract the" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+(empty — old phrase removed)
+```
+```
+$ grep -nF "after the command dispatcher confirms the user is identity-resolved and authorized" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+87:...after the command dispatcher confirms the user is identity-resolved and authorized...
+```
+
+- [x] 4. FIXED — §4.2 line 247 — `IProactiveNotifier` now includes `SendToChannelAsync(string channelId, string tenantId, MessengerMessage message, CancellationToken ct)` and `SendQuestionToChannelAsync(string channelId, string tenantId, AgentQuestion question, CancellationToken ct)` in addition to the user-targeted methods. Added test scenarios "Channel proactive delivery" (line 261) and "Channel question delivery" (line 262) verifying channel-targeted sends. Verification:
+```
+$ grep -nF "SendToChannelAsync" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+247:...`SendToChannelAsync(string channelId, string tenantId, MessengerMessage message, CancellationToken ct)`...
+261:...SendToChannelAsync("channel-general", "tenant-1", message)...
+321:...TeamsProactiveNotifier.SendToChannelAsync...
+```
+
+- [x] 5. FIXED — §4.1 lines 227-232 — Added `UserId` as nullable (null for channel-scoped references) and `ChannelId` as nullable (null for personal-chat references). Added a unique filtered index on `(ChannelId, TenantId) WHERE ChannelId IS NOT NULL` alongside the existing `(UserId, TenantId)` index. `SaveOrUpdateAsync` now supports dual upsert paths: `(UserId, TenantId)` for user-scoped and `(ChannelId, TenantId)` for channel-scoped references. Added test scenarios "Channel reference upsert" (line 241) and "User and channel references coexist" (line 242). Verification:
+```
+$ grep -nF "WHERE ChannelId IS NOT NULL" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+228:...unique filtered index on `(ChannelId, TenantId) WHERE ChannelId IS NOT NULL`...
+```
+```
+$ grep -nF "upsert on `(ChannelId, TenantId)`" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+232:...for channel-scoped references, upsert on `(ChannelId, TenantId)`...
+```
+
+- [x] 6. FIXED — §2.2 line 86, §3.2 line 170 — Added explicit @mention normalization step in `OnMessageActivityAsync` using `Activity.RemoveMentionText(Activity.Recipient.Id)` to strip `@AgentBot` markup before parsing commands in channel messages. Also added normalization in `CommandDispatcher` as defense-in-depth. Added test scenarios: "  @mention stripped in channel" (line 103 in Stage 2.2) and "@mention stripped before dispatch" (line 180 in Stage 3.2). Verification:
+```
+$ grep -nF "RemoveMentionText" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+86:...`Activity.RemoveMentionText(Activity.Recipient.Id)`...
+170:...`Activity.RemoveMentionText` normalization...
+```
+
+- [x] 7. FIXED — §6.1 line 321 — Added explicit step that wires `TeamsMessengerConnector` and `TeamsProactiveNotifier` send methods to persist outbound notifications to `IMessageOutbox.EnqueueAsync` BEFORE delivery. The `OutboxRetryEngine` becomes the canonical send path; direct sends from Stage 4.2 are replaced. Added test scenario "Outbox is canonical send path" (line 330). Verification:
+```
+$ grep -nF "canonical send path" docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md
+321:...The `OutboxRetryEngine` becomes the canonical send path...
+330:...Outbox is canonical send path...
+```
+
+### Open questions
+
+None — all seven feedback items resolved within `implementation-plan.md`. Sibling doc misalignments on audit `EventType` vocabulary (`architecture.md` lines 432/947, `e2e-scenarios.md` lines 773/903 still use `MessageActionReceived`) are flagged for their respective sibling agents to fix.
