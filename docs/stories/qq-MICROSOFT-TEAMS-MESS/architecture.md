@@ -154,8 +154,8 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 
 | Attribute | Value |
 |---|---|
-| **Assembly** | `AgentSwarm.Messaging.Persistence` |
-| **Interface** | `IConversationReferenceStore` |
+| **Assembly** | `AgentSwarm.Messaging.Teams` |
+| **Interface** | `IConversationReferenceStore` (defined in `AgentSwarm.Messaging.Teams`) |
 | **Responsibility** | Persist and retrieve Bot Framework `ConversationReference` objects for proactive messaging. Each reference is keyed by `(TenantId, UserId)` for personal chats or `(TenantId, ChannelId)` for team channels. Survives service restarts. |
 | **Storage** | Pluggable — default implementation uses the same durable store as the outbox (e.g., SQL Server, Azure Table Storage, or PostgreSQL). |
 
@@ -394,13 +394,15 @@ public interface IMessengerConnector
 
 ```csharp
 // Assembly: AgentSwarm.Messaging.Teams
+// Aligned with implementation-plan.md §1.2 / §4.1 contract
 public interface IConversationReferenceStore
 {
-    Task UpsertAsync(TeamsConversationReference reference, CancellationToken ct);
-    Task<TeamsConversationReference?> GetByUserAsync(string tenantId, string userId, CancellationToken ct);
-    Task<TeamsConversationReference?> GetByChannelAsync(string tenantId, string channelId, CancellationToken ct);
-    Task<IReadOnlyList<TeamsConversationReference>> GetAllActiveAsync(string tenantId, CancellationToken ct);
-    Task DeactivateAsync(string tenantId, string userId, CancellationToken ct);
+    Task SaveAsync(TeamsConversationReference reference, CancellationToken ct);
+    Task<TeamsConversationReference?> GetByUserIdAsync(string tenantId, string userId, CancellationToken ct);
+    Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct);
+    Task<IReadOnlyList<TeamsConversationReference>> GetAllAsync(string tenantId, CancellationToken ct);
+    Task MarkInactiveAsync(string tenantId, string userId, CancellationToken ct);
+    Task DeleteAsync(string tenantId, string userId, CancellationToken ct);
 }
 ```
 
