@@ -802,6 +802,7 @@ services.AddSingleton<ProactiveNotifier>();
 services.AddSingleton<CommandParser>();
 services.AddSingleton<CardActionHandler>();
 services.AddSingleton<InstallHandler>();
+services.AddSingleton<MessageExtensionHandler>();
 services.AddHostedService<OutboxWorker>();
 ```
 
