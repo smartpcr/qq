@@ -96,7 +96,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Test Scenarios
 - [ ] Scenario: Command routing — Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
-- [ ] Scenario: Bot install captures reference — Given a `MembersAdded` activity where the bot is added, When processed, Then the conversation reference is persisted via `IConversationReferenceStore.SaveAsync`.
+- [ ] Scenario: Bot install captures reference — Given a `MembersAdded` activity where the bot is added, When processed, Then the conversation reference is persisted via `IConversationReferenceStore.SaveOrUpdateAsync`.
 - [ ] Scenario: Correlation ID propagation — Given an incoming activity without a `CorrelationId` header, When `OnTurnAsync` runs, Then a new GUID-based `CorrelationId` is attached to the turn context.
 - [ ] Scenario: First interaction saves reference — Given user `dave@contoso.com` has never interacted with the bot before, When `dave` sends `agent status` in personal chat, Then `OnMessageActivityAsync` extracts the conversation reference from the activity and calls `IConversationReferenceStore.SaveOrUpdateAsync`, persisting the reference keyed by `(AadObjectId, TenantId)` before dispatching the command.
 

@@ -610,7 +610,7 @@ public interface IActivityIdStore
 }
 ```
 
-`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
+`ActivityDeduplicationMiddleware` (§2.16) uses this store to suppress duplicate inbound webhook deliveries by `Activity.Id` (or `Activity.ReplyToId` for invoke activities), per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 386-392. The default implementation uses an in-memory `ConcurrentDictionary` with a background eviction timer (TTL: 24 hours, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). For multi-instance deployments, a Redis-backed implementation is recommended.
 
 ### 4.9 IIdentityResolver (user identity mapping)
 
@@ -747,12 +747,13 @@ Orchestrator    TeamsMessengerConnector    OutboxRetryEngine    ProactiveNotifie
 2. `TeamsMessengerConnector` creates an `OutboxEntry` and persists it via `IMessageOutbox.EnqueueAsync`.
 3. The outbox background worker dequeues the entry and delegates to `ProactiveNotifier`.
 4. `ProactiveNotifier` looks up the `ConversationReference` for the target user from `ConversationReferenceStore`.
-5. `AdaptiveCardRenderer.RenderQuestionCard` builds the Adaptive Card with action buttons.
-6. `ProactiveNotifier` calls `CloudAdapter.ContinueConversationAsync` with the conversation reference, sending the card as an `Activity`.
-7. Teams returns the `activityId` of the sent message.
-8. `CardStateStore.SaveAsync` persists the `TeamsCardState` with the `activityId` (needed for future update/delete).
-9. `OutboxRetryEngine` marks the entry as `Sent` (via `IMessageOutbox.AcknowledgeAsync`).
-10. If delivery fails with a transient error (HTTP 429, 500, 502, 503, 504), the engine schedules a retry per `tech-spec.md` §4.4 (exponential backoff with ±25% jitter; `Retry-After` override for 429).
+5. **Inactive-installation pre-check:** If the reference is not found, or if `IsActive == false` (indicating the user uninstalled the bot), `ProactiveNotifier` skips the Bot Framework call entirely, moves the outbox entry to the dead-letter queue via `IMessageOutbox.DeadLetterAsync`, and logs an audit entry (`EventType: Error`, `Outcome: Failed`, reason: inactive/missing reference). This pre-check avoids unnecessary Bot Framework calls for known-uninstalled users (aligned with `implementation-plan.md` §5.1 `InstallationStateGate` and `e2e-scenarios.md` §Proactive Messaging lines 121–129).
+6. `AdaptiveCardRenderer.RenderQuestionCard` builds the Adaptive Card with action buttons.
+7. `ProactiveNotifier` calls `CloudAdapter.ContinueConversationAsync` with the conversation reference, sending the card as an `Activity`.
+8. Teams returns the `activityId` of the sent message.
+9. `CardStateStore.SaveAsync` persists the `TeamsCardState` with the `activityId` (needed for future update/delete).
+10. `OutboxRetryEngine` marks the entry as `Sent` (via `IMessageOutbox.AcknowledgeAsync`).
+11. If delivery fails with a transient error (HTTP 429, 500, 502, 503, 504), the engine schedules a retry per `tech-spec.md` §4.4 (exponential backoff with ±25% jitter; `Retry-After` override for 429). If delivery fails with HTTP 403 or 404 (stale reference — user removed from tenant without an uninstall event), `ProactiveNotifier` marks the reference as inactive, dead-letters the message, and logs an audit entry (aligned with `e2e-scenarios.md` §Proactive Messaging lines 131–143).
 
 ### 6.3 Scenario: Human approves via Adaptive Card action
 
