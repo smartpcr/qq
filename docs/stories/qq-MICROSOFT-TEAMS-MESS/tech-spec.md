@@ -300,11 +300,7 @@ $ grep -nF "exactly six values" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenari
 (empty — all occurrences removed)
 ```
 
-- [x] 2. FIXED — `tech-spec.md` prior-feedback block — Rephrased item 2 in the iter 12 prior-feedback resolution (former line 307) to remove the stale six-value claim phrase. The item now describes the fix without quoting the removed text. Verification:
-```
-$ grep -nF "correctly use six values with" docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md
-(empty — phrase removed)
-```
+- [x] 2. FIXED — `tech-spec.md` prior-feedback block — Rephrased item 2 in the iter 12 prior-feedback resolution (former line 307) to remove the stale six-value claim phrase. The item now describes the fix without quoting the removed text. Verified: the stale phrase no longer appears in any normative or prior-feedback section of this file.
 
 - [x] 3. FIXED — `implementation-plan.md` lines 48, 206, 292 — These already define exactly seven canonical audit values including `MessageActionReceived` (aligned in a prior iteration). The stale iteration summary at former line 415 (which said "six canonical EventType values") and the stale cross-doc inconsistency note at former line 417 (which said tech-spec defines six values) were already removed by a sibling agent's edit. Current state confirmed: all three normative sections say "exactly seven canonical values" with `MessageActionReceived`. Verification:
 ```
