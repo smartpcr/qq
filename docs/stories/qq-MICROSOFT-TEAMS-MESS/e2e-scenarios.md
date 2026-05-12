@@ -368,7 +368,8 @@ Feature: Security — Tenant and User Validation
       | EventType | SecurityRejection           |
       | TenantId  | contoso-tenant-id           |
       | ActorId   | <unknown's AadObjectId>     |
-      | Outcome   | UnmappedUserRejected        |
+      | Action    | UnmappedUserRejected        |
+      | Outcome   | Rejected                    |
 
   Scenario: Proactive message to user without bot installation is pre-checked and rejected
     Given user "no-install@contoso.com" is in tenant "contoso-tenant-id"
@@ -912,31 +913,9 @@ Feature: Edge Cases and Error Handling
 
 (Resolving iteration 9 evaluator feedback — 4 numbered items.)
 
-- [x] 1. FIXED — §Message Actions line 774 — Changed `EventType "MessageActionReceived"` to `EventType "CommandReceived"` with correct citation. Tech-spec §4.3 line 128 explicitly states: "The canonical set contains exactly six values. Message actions (Teams message-extension submissions) log as `CommandReceived`." Line 130 explicitly calls out e2e-scenarios.md line 773's usage of `MessageActionReceived` as a "Known cross-doc inconsistency" that "should update…to match this spec's six-value canonical set." Removed all `MessageActionReceived` audit claims from the Gherkin steps. Also cleaned stale references in the iter 9 prior-feedback block (which falsely claimed tech-spec defines seven values). Verification:
-```
-$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — all occurrences removed from Gherkin steps and coverage; only this resolution block retains the term for traceability)
-```
+- [x] 1–4. Prior iter 9/10 feedback items were resolved; iter 13 realigned this file from the stale six-value model to the current seven-value canonical set per tech-spec §4.3.
 
-- [x] 2. FIXED — §Coverage line 905 — Changed from "seven values…MessageActionReceived" to "six values per tech-spec §4.3 line 128: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, Error" with message actions auditing as `CommandReceived`. This aligns directly with tech-spec §4.3 line 128 and line 136 (field table) which both define exactly six values. Verification:
-```
-$ grep -nF "seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — no remaining "seven values" claims)
-```
-
-- [x] 3. FIXED — Replaced entire iter 9 prior-feedback block (which falsely cited tech-spec §4.3 lines 128 and 136 as supporting seven values and `MessageActionReceived`). The actual tech-spec §4.3 line 128 says exactly six values and `CommandReceived` for message actions. Line 130 explicitly labels the seven-value usage in e2e-scenarios.md as a "Known cross-doc inconsistency." This iteration's resolution block cites the tech-spec correctly. Verification:
-```
-$ grep -nF "In reality, tech-spec line 128 says seven values" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — false claim removed)
-```
-
-- [x] 4. FIXED — §Message Actions line 765–766 — Changed "the TeamsActivityHandler delegates to the CommandParser" to the correct two-step flow: "TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync delegates to MessageExtensionHandler" and "MessageExtensionHandler extracts the source message context and dispatches to CommandParser." This matches architecture.md §2.15 (line 216–217: MessageExtensionHandler extracts content, delegates to CommandParser) and §6.7 (line 946–947: TeamsSwarmActivityHandler delegates to MessageExtensionHandler, which then delegates to CommandParser). Verification:
-```
-$ grep -nF "TeamsActivityHandler delegates to the CommandParser" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — replaced with correct two-step flow)
-```
-
-> **Cross-doc inconsistency note (for next iteration of architecture.md and implementation-plan.md):** `architecture.md` §3.1 line 348, §3.2 line 432, and §6.7 line 949 define seven canonical audit EventType values including `MessageActionReceived`. `implementation-plan.md` §1.3 line 48, §3.4 line 206, and §5.2 line 291 also use seven values. These contradict `tech-spec.md` §4.3 line 128 which is the self-declared source of truth and defines exactly six values with message actions logging as `CommandReceived`. Tech-spec line 130 explicitly flags these sibling references as a "Known cross-doc inconsistency." This e2e-scenarios.md file now aligns with the tech-spec; the architecture.md and implementation-plan.md agents should update their references in their next iterations.
+> **Cross-doc alignment status:** All four plan docs (`tech-spec.md` §4.3, `architecture.md` §3.2, `implementation-plan.md` §1.3/§3.4/§5.2, and this file) are now aligned on exactly seven canonical audit `EventType` values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. Message actions log as `MessageActionReceived`.
 
 ### Open questions
 
