@@ -1,7 +1,9 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 1
+**Status:** Draft — iteration 2
+
+> **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
 ---
 
@@ -27,7 +29,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 ┌─────────────────────────────────────────────────────────────────────┐
 │  2.2  TeamsWebhookController                                        │
 │  ASP.NET Core controller — receives Bot Framework HTTP POSTs        │
-│  Validates HMAC / JWT bearer tokens from Bot Connector Service      │
+│  Delegates to CloudAdapter; JWT auth handled by Bot Framework SDK   │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
@@ -39,20 +41,20 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  2.4  TeamsActivityHandler                                          │
-│  Extends ActivityHandler; dispatches message, invoke, and           │
-│  installationUpdate activities to domain handlers                   │
-└────┬─────────────┬───────────┬──────────────┬──────────────────────┘
+│  2.4  TeamsSwarmActivityHandler                                     │
+│  Extends SDK TeamsActivityHandler; dispatches message, invoke,      │
+│  installationUpdate, and message-extension activities               │
+└────┬─────────────┬───────────┬──────────────┬───────────────────────┘
      │             │           │              │
      ▼             ▼           ▼              ▼
-┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐
-│ 2.5     │ │ 2.6      │ │ 2.7      │ │ 2.8              │
-│ Command │ │ Card     │ │ Install  │ │ Conversation     │
-│ Parser  │ │ Action   │ │ Handler  │ │ Reference Store  │
-│         │ │ Handler  │ │          │ │                  │
-└────┬────┘ └────┬─────┘ └────┬─────┘ └────────┬─────────┘
-     │           │            │                 │
-     ▼           ▼            ▼                 │
+┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ 2.5     │ │ 2.6      │ │ 2.7      │ │ 2.8              │ │ 2.15             │
+│ Command │ │ Card     │ │ Install  │ │ Conversation     │ │ Message          │
+│ Parser  │ │ Action   │ │ Handler  │ │ Reference Store  │ │ Extension        │
+│         │ │ Handler  │ │          │ │                  │ │ Handler          │
+└────┬────┘ └────┬─────┘ └────┬─────┘ └────────┬─────────┘ └────────┬─────────┘
+     │           │            │                 │                    │
+     ▼           ▼            ▼                 │                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  2.9  TeamsMessengerConnector : IMessengerConnector                  │
 │  Implements the shared abstraction; bridges Teams-specific objects   │
