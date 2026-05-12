@@ -703,20 +703,24 @@ Outbound requests to the Bot Connector service use OAuth 2.0 client credentials 
 ### 6.1 Scenario: Human sends `agent ask create e2e test scenarios for update service`
 
 ```text
-Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    CommandParser    TeamsMessengerConnector    Orchestrator
-     │                        │                       │                    │                     │                    │                      │
-     │── message ────────────>│                       │                    │                     │                    │                      │
-     │                        │── POST /api/messages─>│                    │                     │                    │                      │
-     │                        │                       │── middleware ─────>│                     │                    │                      │
-     │                        │                       │  (tenant ✓, rate)  │                     │                    │                      │
-     │                        │                       │                    │── parse message ───>│                    │                      │
-     │                        │                       │                    │                     │── ParsedCommand ──>│                      │
-     │                        │                       │                    │                     │  {Ask, "create..."}│                      │
-     │                        │                       │                    │<── ack card ────────│                    │                      │
-     │<── "Task submitted" ───│<──────────────────────│<───────────────────│                     │                    │                      │
-     │                        │                       │                    │                     │                    │── CommandEvent ─────>│
-     │                        │                       │                    │                     │                    │  {AgentTaskRequest}  │
-     │                        │                       │                    │                     │                    │                      │── audit log
+Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    CommandParser    IIdentityResolver    IUserAuthorizationService    ConvRefStore    TeamsMessengerConnector    Orchestrator
+     │                        │                       │                    │                     │                  │                      │                        │                    │                      │
+     │── message ────────────>│                       │                    │                     │                  │                      │                        │                    │                      │
+     │                        │── POST /api/messages─>│                    │                     │                  │                      │                        │                    │                      │
+     │                        │                       │── middleware ─────>│                     │                  │                      │                        │                    │                      │
+     │                        │                       │  (tenant ✓, rate)  │                     │                  │                      │                        │                    │                      │
+     │                        │                       │                    │── parse message ───>│                  │                      │                        │                    │                      │
+     │                        │                       │                    │<── ParsedCommand ───│                  │                      │                        │                    │                      │
+     │                        │                       │                    │── resolve identity ───────────────────>│                      │                        │                    │                      │
+     │                        │                       │                    │<── UserIdentity ──────────────────────│                      │                        │                    │                      │
+     │                        │                       │                    │── check RBAC ──────────────────────────────────────────────>│                        │                    │                      │
+     │                        │                       │                    │<── authorized ─────────────────────────────────────────────│                        │                    │                      │
+     │                        │                       │                    │── save ConvRef ──────────────────────────────────────────────────────────────────────>│                    │                      │
+     │                        │                       │                    │<── ack card ────────│                  │                      │                        │                    │                      │
+     │<── "Task submitted" ───│<──────────────────────│<───────────────────│                     │                  │                      │                        │                    │                      │
+     │                        │                       │                    │                     │                  │                      │                        │── CommandEvent ───>│                      │
+     │                        │                       │                    │                     │                  │                      │                        │  {AgentTaskRequest}│                      │
+     │                        │                       │                    │                     │                  │                      │                        │                    │                      │── audit log
 ```
 
 1. Human types `agent ask create e2e test scenarios for update service` in Teams.
