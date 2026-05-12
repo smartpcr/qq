@@ -103,14 +103,14 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | **Responsibility** | Deserialize Bot Framework `Activity` objects, run middleware pipeline, route to `TeamsActivityHandler`. Handles authentication of inbound requests via Bot Framework JWT validation. |
 | **Error handling** | `OnTurnError` logs the exception, sends a user-facing error card, and publishes a dead-letter event to the outbox. |
 
-### 2.4 TeamsActivityHandler
+### 2.4 TeamsSwarmActivityHandler
 
 | Attribute | Value |
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
-| **Base class** | `Microsoft.Bot.Builder.Teams.TeamsActivityHandler` |
-| **Responsibility** | Override `OnMessageActivityAsync`, `OnAdaptiveCardInvokeAsync`, and `OnInstallationUpdateActivityAsync` to dispatch to domain-specific handlers. |
-| **Key overrides** | `OnMessageActivityAsync` → `CommandParser`; `OnAdaptiveCardInvokeAsync` → `CardActionHandler`; `OnInstallationUpdateActivityAsync` / `OnTeamsMembersAddedAsync` → `InstallHandler`. |
+| **Base class** | `Microsoft.Bot.Builder.Teams.TeamsActivityHandler` (SDK base class) |
+| **Responsibility** | Override `OnMessageActivityAsync`, `OnAdaptiveCardInvokeAsync`, `OnInstallationUpdateActivityAsync`, and `OnTeamsMessagingExtensionSubmitActionAsync` to dispatch to domain-specific handlers. The custom name `TeamsSwarmActivityHandler` distinguishes this from the SDK base class. |
+| **Key overrides** | `OnMessageActivityAsync` → `CommandParser`; `OnAdaptiveCardInvokeAsync` → `CardActionHandler`; `OnInstallationUpdateActivityAsync` / `OnTeamsMembersAddedAsync` → `InstallHandler`; `OnTeamsMessagingExtensionSubmitActionAsync` → `MessageExtensionHandler`. |
 
 ### 2.5 CommandParser
 
