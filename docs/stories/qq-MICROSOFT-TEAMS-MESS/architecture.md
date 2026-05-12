@@ -99,7 +99,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Type** | `CloudAdapter` (from `Microsoft.Bot.Builder.Integration.AspNet.Core`) |
-| **Middleware** | `TelemetryMiddleware` → `TenantValidationMiddleware` → `RateLimitMiddleware` |
+| **Middleware** | `TelemetryMiddleware` → `TenantValidationMiddleware` → `ActivityDeduplicationMiddleware` → `RateLimitMiddleware` |
 | **Responsibility** | Deserialize Bot Framework `Activity` objects, run middleware pipeline, route to `TeamsSwarmActivityHandler`. Handles authentication of inbound requests via Bot Framework JWT validation. |
 | **Error handling** | `OnTurnError` logs the exception, sends a user-facing error card, and publishes a dead-letter event to the outbox. |
 
@@ -140,7 +140,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Cards` |
 | **Responsibility** | Process Adaptive Card `Action.Submit` invoke activities. Extracts the `ActionId` and optional comment from `Activity.Value`, resolves the originating `AgentQuestion` via `QuestionId` embedded in card data, produces a `HumanDecisionEvent`, and publishes it to the inbound queue. Updates the original card to reflect the decision (approved/rejected) and disables further actions. |
-| **Idempotency** | Maintains a processed-action set (keyed on `QuestionId + UserId`) to reject duplicate submissions. |
+| **Idempotency** | Maintains a processed-action set (keyed on `QuestionId + UserId`) to reject duplicate card-action submissions. This is a **domain-level** deduplication layer operating on the semantic action. It works in conjunction with the **activity-level** `ActivityDeduplicationMiddleware` (§2.16) which suppresses duplicate webhook deliveries by `Activity.Id` before the activity reaches any handler. Both layers are required: the middleware catches transport-level retries, while the card-action set catches user-initiated double-taps that share the same question context but arrive as distinct activities. |
 
 ### 2.7 InstallHandler
 

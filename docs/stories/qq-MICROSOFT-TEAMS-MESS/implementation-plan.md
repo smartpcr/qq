@@ -238,7 +238,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Implementation Steps
 - [ ] Create `TenantValidationMiddleware` for the Bot Framework pipeline that rejects activities from tenants not in the `AllowedTenantIds` configuration list.
 - [ ] Implement `IUserAuthorizationService` with method `AuthorizeAsync(string tenantId, string userId, string command)` that checks RBAC permissions.
-- [ ] Implement `IIdentityResolver` with method `ResolveAsync(string aadObjectId)` that maps the Teams `Activity.From.AadObjectId` (Entra AAD object ID) to an internal user identity record; reject unmapped users with HTTP 403.
+- [ ] Implement `IIdentityResolver` with method `ResolveAsync(string aadObjectId)` that maps the Teams `Activity.From.AadObjectId` (Entra AAD object ID) to an internal user identity record; reject unmapped users with HTTP 200 + Adaptive Card explaining access denial and how to request access (per the two-tier rejection model in `tech-spec.md` §4.2).
 - [ ] Create `RbacOptions` configuration class mapping Teams user roles to allowed commands (e.g., `Operator` → all commands, `Approver` → `approve`/`reject`/`agent status`, `Viewer` → `agent status` only).
 - [ ] Integrate Entra ID token validation by configuring `BotFrameworkAuthentication` with `AllowedCallers` and tenant restrictions.
 - [ ] Add rejection response: unauthorized users receive a polite card explaining they lack access and how to request it.
@@ -280,7 +280,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `SqlMessageOutbox : IMessageOutbox` with an `OutboxMessages` table containing: `Id`, `Payload` (JSON), `DestinationType` (personal/channel), `DestinationId`, `Status` (Pending/Processing/Sent/Failed/DeadLettered), `RetryCount`, `NextRetryAt`, `CreatedAt`, `LastError`.
 - [ ] Create EF Core migration for the `OutboxMessages` table with index on `Status` and `NextRetryAt`.
 - [ ] Implement `OutboxRetryEngine` as `BackgroundService` that polls for pending messages, attempts delivery, and updates status.
-- [ ] Implement exponential backoff retry: delays of 1s, 2s, 4s, 8s, 16s with jitter, up to `DeadLetterThreshold` (default 5) attempts.
+- [ ] Implement exponential backoff retry: base delay 2s, multiplier 2×, computed delays of 2s, 4s, 8s, 16s with ±25% jitter, max delay cap 60s, up to 4 retries after initial attempt (5 total attempts) per the canonical retry policy in `tech-spec.md` §4.4. Dead-letter after final failed attempt.
 - [ ] Implement `Retry-After` header handling: when the Bot Framework returns HTTP 429, parse the `Retry-After` response header and use its value as the minimum delay before the next retry attempt, overriding the computed backoff if `Retry-After` is longer.
 - [ ] Implement token-bucket rate limiter in the outbound pipeline to proactively avoid Bot Framework rate limits (default: 50 msgs/sec per bot, configurable).
 - [ ] Implement dead-letter handling: messages exceeding retry threshold are moved to `DeadLettered` status with the last error recorded.
@@ -355,7 +355,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Implementation Steps
 - [ ] Create E2E test harness using Bot Framework `TestAdapter` to simulate Teams channel activities without a live Teams environment.
 - [ ] Implement E2E test: user sends `agent ask create e2e test scenarios for update service` → bot acknowledges → agent sends proactive approval question → user approves via card action → card is updated to show approved status.
-- [ ] Implement E2E test: bot rejects message from unauthorized tenant and returns appropriate error card.
+- [ ] Implement E2E test: bot rejects message from unauthorized tenant with HTTP 403 and no bot response/card (tenant-level rejection per the two-tier model in `tech-spec.md` §4.2).
 - [ ] Implement E2E test: service restart → conversation references are reloaded → proactive message succeeds using rehydrated reference.
 - [ ] Implement E2E test: duplicate activity delivery is suppressed and command executes only once.
 - [ ] Implement E2E test: outbox message fails 5 times → dead-lettered → audit entry recorded.
@@ -365,5 +365,5 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Test Scenarios
 - [ ] Scenario: Happy path E2E — Given a user in an authorized tenant, When they send `agent ask create e2e test scenarios for update service`, Then they receive an acknowledgement card, Then a proactive approval card arrives, Then approving updates the card to show resolution.
-- [ ] Scenario: Unauthorized tenant E2E — Given a user in an unauthorized tenant, When they send any command, Then they receive a rejection card and no command is processed.
+- [ ] Scenario: Unauthorized tenant E2E — Given a user in an unauthorized tenant, When they send any command, Then the request is rejected with HTTP 403 at the middleware layer (no bot response or card is sent) and no command is processed.
 - [ ] Scenario: Restart resilience E2E — Given conversation references are persisted, When the bot service restarts, Then proactive notifications using stored references are delivered successfully.
