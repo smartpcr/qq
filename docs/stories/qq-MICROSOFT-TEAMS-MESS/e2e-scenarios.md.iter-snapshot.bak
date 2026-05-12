@@ -320,6 +320,7 @@ Feature: Security — Tenant and User Validation
     And no proactive message attempt is made to Bot Framework
     And the notification is moved directly to the dead-letter queue
     And an audit record is persisted indicating the user has no active installation
+    And the stale reference is not retried (per tech-spec §4.3 R-2)
 
   Scenario: Bot Framework token validation rejects forged activity
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
@@ -587,9 +588,9 @@ Feature: Adaptive Card — Incident Summary and Release Gates
       | Actions          | Acknowledge, Escalate, Need more info|
     And the card is delivered to the configured incident channel
 
-  Scenario: Release gate approval card with multiple approvers
+  Scenario: Release gate approval card with multiple approvers (RequiredApprovals = 2)
     Given agent "release-agent-01" requires approval from 2 approvers
-    And the release gate is configured with a threshold of 2 required approvals
+    And the AgentQuestion has RequiredApprovals = 2
     And the AgentQuestion is sent to both "alice@contoso.com" and "bob@contoso.com"
     When "alice@contoso.com" clicks "Approve"
     Then a HumanDecisionEvent with ActionValue "approve" is created for alice
@@ -666,12 +667,10 @@ Feature: Correlation and Traceability
     Then it contains all fields defined in the canonical MessengerEvent model (architecture.md §3.1):
       | Field          | Constraint                                              |
       | EventId        | Non-empty unique identifier                             |
-      | EventType      | One of: AgentTaskRequest, Decision, Text, InstallUpdate, Reaction |
+      | EventType      | One of: Command, Decision, Reaction, InstallUpdate, AgentTaskRequest |
       | CorrelationId  | Non-empty UUID for end-to-end tracing                   |
       | Messenger      | "Teams"                                                 |
       | ExternalUserId | Non-empty (Teams AAD object ID)                         |
-      | ActivityId     | Nullable — inbound Activity.Id for dedup (per architecture.md §3.1) |
-      | Source         | Nullable — null for DMs, "MessageAction" for forwarded messages     |
       | Payload        | Non-null typed payload                                  |
       | Timestamp      | UTC ISO 8601                                            |
     And the corresponding audit record may additionally contain optional fields:
