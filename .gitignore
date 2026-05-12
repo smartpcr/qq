@@ -1,2 +1,37 @@
 
 .forge-attachments/
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.userprefs
+*.DotSettings.user
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+bld/
+[Oo]ut/
+
+# NuGet
+*.nupkg
+**/packages/*
+!**/packages/build/
+*.snupkg
+
+# Test results
+TestResults/
+coverage/
