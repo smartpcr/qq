@@ -886,8 +886,8 @@ Feature: Edge Cases and Error Handling
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Version:** 1.6 — Iteration 6
-**Byte count:** ~50,128
+**Version:** 1.7 — Iteration 7
+**Byte count:** ~50,200
 
 ### Coverage
 
@@ -900,7 +900,7 @@ Feature: Edge Cases and Error Handling
 - Security: tenant validation, unmapped Entra identity rejection, RBAC, bot installation checks, Bot Framework token validation
 - Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, idempotency
 - Performance: P95 < 3s card delivery
-- Compliance: immutable audit trail with canonical EventType values; message actions audit as MessageActionReceived (per tech-spec §4.3 line 136)
+- Compliance: immutable audit trail with canonical EventType values; message actions audit as MessageActionReceived (per tech-spec §4.3 line 136, distinct from CommandReceived)
 - Observability: distributed tracing with CorrelationId
 - Message actions (message extensions)
 - Edge cases: concurrent approvals, malformed payloads, rate limiting, service URL changes
@@ -908,45 +908,41 @@ Feature: Edge Cases and Error Handling
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §Adaptive Card Approvals — Added two new scenarios: "User approves via text command in personal chat" (line ~200) and "User rejects via text command in personal chat" (line ~216). These cover successful personal-chat text-command routing for `approve` and `reject`, complementing the existing card-based approval at line ~157 and the RBAC-denied text approve at line ~318. All 7 commands now have successful routing paths: `agent ask` (line 22), `agent status` (line 57), `approve` (text: line 200, card: line 157), `reject` (text: line 216, card: line 173), `escalate` (line ~540), `pause` (line ~550), `resume` (line ~560). Verification:
+- [x] 1. FIXED — §Message Actions line 773 and cross-doc alignment — The prior iteration's item 4 claimed `CommandReceived` was the correct audit EventType for message actions, citing tech-spec §4.3 lines 128-136. However, actually reading those lines shows tech-spec §4.3 line 136 states: "Message actions log as `MessageActionReceived` (distinct from `CommandReceived`)". The prior claim was false. This iteration corrects the missed reference by changing line 773 from `EventType "CommandReceived"` to `EventType "MessageActionReceived"`. Also verified that tech-spec.md line 128 lists `MessageActionReceived` as one of the seven canonical audit EventType values. Verification:
 ```
-$ grep -nF "approves via text command" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-200:  Scenario: User approves via text command in personal chat
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+773:    And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions use a dedicated audit EventType distinct from CommandReceived, per tech-spec §4.3 line 136)
 ```
+The old incorrect phrase no longer exists:
 ```
-$ grep -nF "rejects via text command" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-216:  Scenario: User rejects via text command in personal chat
-```
-
-- [x] 2. FIXED — §Security — Tenant and User Validation — Added new scenario "Allowed-tenant user with unmapped Entra identity is rejected" (line ~357). The scenario covers the case where tenant ID is in the allow-list but the user's AadObjectId has no mapped internal identity in IIdentityResolver. The bot replies with an Adaptive Card explaining access denial (per tech-spec §4.2 rejection matrix row 3, which defines `UnmappedUserRejected`). Verification:
-```
-$ grep -nF "UnmappedUserRejected" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-371:      | Outcome   | UnmappedUserRejected        |
-```
-```
-$ grep -nF "unmapped Entra identity" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-357:  Scenario: Allowed-tenant user with unmapped Entra identity is rejected
+$ grep -nF "CommandReceived" (message actions are a command submission mechanism" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — removed)
 ```
 
-- [x] 3. FIXED — §Personal Chat, unrecognised-command scenario — Changed line 46 from `And a MessengerEvent of type "Text"...` to `Then a MessengerEvent of type "Text"...` so the first assertion after `When` correctly uses `Then` instead of `And`. Verification:
+- [x] 2. FIXED — §Message Actions scenario line 773 — Changed from `EventType "CommandReceived"` to `EventType "MessageActionReceived"` to match tech-spec.md line 136 which says message actions log as `MessageActionReceived` (distinct from `CommandReceived`). This is the same edit as item 1; both items pointed to the same line 773 contradiction. Verification (same as item 1):
 ```
-$ grep -nF "Then a MessengerEvent of type" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-46:    Then a MessengerEvent of type "Text" is enqueued with the raw input as payload
+$ grep -nF "MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+773:    And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions use a dedicated audit EventType distinct from CommandReceived, per tech-spec §4.3 line 136)
 ```
-The old malformed line `And a MessengerEvent of type "Text" is enqueued with the raw input` no longer exists at line 46. The only remaining `And a MessengerEvent of type "Text"` hit is at line 819 in the separate "Bot receives an empty message body" edge-case scenario, which correctly follows a `Then` on line 818.
 
-- [x] 4. FIXED — §Message Actions — Changed audit assertion at line ~773 from generic "an immutable audit record is persisted for the message action" to specific `And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism per tech-spec §4.3)`. This aligns with tech-spec §4.3 lines 128-136 which state message actions must audit as `CommandReceived`. Verification:
+- [x] 3. FIXED — §Coverage summary line 903 — Changed from "message actions audit as CommandReceived" to "message actions audit as MessageActionReceived (per tech-spec §4.3 line 136, distinct from CommandReceived)". Verification:
 ```
-$ grep -nF "immutable audit record is persisted for the message action" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty)
+$ grep -nF "message actions audit as MessageActionReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+903:- Compliance: immutable audit trail with canonical EventType values; message actions audit as MessageActionReceived (per tech-spec §4.3 line 136, distinct from CommandReceived)
 ```
+Old incorrect phrase removed:
 ```
-$ grep -nF "CommandReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-490:      | EventType         | CommandReceived                                     |
-718:      | 1    | CommandReceived       |
-773:    And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism per tech-spec §4.3)
+$ grep -nF "message actions audit as CommandReceived" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — removed)
 ```
-Line 490 is in the security audit scenario, line 718 is in the full lifecycle audit trail, and line 773 is the fixed message-action audit line — all correct uses.
+
+- [x] 4. FIXED — §Prior feedback resolution line 938 — The old iteration 6 prior-feedback block contained a false claim that "tech-spec §4.3 lines 128-136 state message actions must audit as `CommandReceived`". Those lines actually require `MessageActionReceived`. The entire iteration 6 prior-feedback block has been replaced with this iteration 7 block, which correctly references `MessageActionReceived` throughout. Verification:
+```
+$ grep -nF "state message actions must audit as" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — old false claim removed)
+```
+
+**Cross-doc note:** `architecture.md` line 432 and line 943 still assert that message-action-forwarded commands log as `CommandReceived`. This contradicts tech-spec.md §4.3 line 136 which defines `MessageActionReceived` as the canonical audit EventType for message actions. The architecture.md sibling doc should be updated in its next iteration to use `MessageActionReceived` for message action audit records, consistent with the tech-spec source of truth.
 
 ### Open questions
 
