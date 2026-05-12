@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.14 — Iteration 14
+**Version:** 1.13 — Iteration 13
 
 ---
 
@@ -451,28 +451,14 @@ Feature: Reliability — Retry and Recovery
     And no notifications are lost
     And connector recovery completes within 30 seconds
 
-  Scenario: Duplicate inbound webhook is suppressed at middleware level
+  Scenario: Duplicate inbound webhook is suppressed
     Given user "alice@contoso.com" sends "approve" for question "Q-801"
-    And the Bot Framework delivers the activity twice (network retry with identical Activity.Id)
-    When the first delivery passes through ActivityDeduplicationMiddleware
-    Then ActivityDeduplicationMiddleware records the Activity.Id in IActivityIdStore
-    And the activity reaches CardActionHandler and creates a HumanDecisionEvent
-    When the second delivery arrives with the same Activity.Id
-    Then ActivityDeduplicationMiddleware detects the duplicate via IActivityIdStore lookup
-    And the middleware short-circuits the request with HTTP 200 before any handler runs
-    And no duplicate HumanDecisionEvent is created
-    And a deduplication event is logged for observability
-
-  Scenario: Domain-level duplicate card action is suppressed (double-tap)
-    Given user "alice@contoso.com" clicks "Approve" twice rapidly for question "Q-801"
-    And each click generates a distinct Activity.Id (not a transport retry)
-    When both activities pass through ActivityDeduplicationMiddleware (distinct IDs — not suppressed)
-    And both reach CardActionHandler
-    Then the first activity creates a HumanDecisionEvent for (QuestionId=Q-801, UserId=alice)
-    And CardActionHandler records the (QuestionId, UserId) pair in its processed-action set
-    And the second activity is rejected as a domain-level duplicate by the (QuestionId, UserId) check
-    And no second HumanDecisionEvent is created
-    And the domain-level duplicate is logged for observability
+    And the Bot Framework delivers the activity twice (network retry)
+    When the TeamsMessengerConnector processes both deliveries
+    Then the first delivery creates a HumanDecisionEvent
+    And the second delivery is detected as a duplicate via the Activity ID
+    And no duplicate event is created
+    And the duplicate is logged for observability
 
   Scenario: Inbound queue preserves ordering per conversation
     Given user "alice@contoso.com" sends the following commands in order:
@@ -840,15 +826,14 @@ Feature: Edge Cases and Error Handling
     Then the bot replies with the help card
     And a MessengerEvent of type "Text" is enqueued with an empty payload
 
-  Scenario: Bot receives a message exceeding reasonable length
-    Given user "alice@contoso.com" sends a message with 10,000 characters
+  Scenario: Bot receives a message exceeding maximum length
+    Given the configured maximum message length is 4,000 characters (configurable via "Teams:MaxMessageLength" app setting)
+    And user "alice@contoso.com" sends a message with 10,000 characters
     When the bot processes the activity
-    Then the bot truncates or rejects the message per the configured length policy
-    And a warning is logged with the original and accepted lengths
-    And an immutable audit record is persisted with EventType "CommandReceived"
-    # Note: The specific configuration key, threshold, and truncation behavior
-    # are implementation details to be defined in tech-spec.md and architecture.md.
-    # This scenario validates that excessively long inputs do not bypass audit or crash the pipeline.
+    Then the message body is truncated to 4,000 characters
+    And a warning is logged with the original length and truncated length
+    And processing continues with the truncated body
+    And an immutable audit record is persisted with EventType "CommandReceived" and Outcome "Success" including a PayloadJson field noting "truncated_from: 10000, truncated_to: 4000"
 
   Scenario: Adaptive Card action payload is malformed
     Given user "alice@contoso.com" submits an Adaptive Card action
@@ -856,12 +841,6 @@ Feature: Edge Cases and Error Handling
     When the bot processes the invoke activity
     Then the bot responds with HTTP 200 and an error card: "Invalid action. Please try again."
     And no HumanDecisionEvent is created
-    And an immutable audit record is persisted with:
-      | Field     | Value                          |
-      | EventType | Error                          |
-      | Action    | MalformedCardAction            |
-      | Outcome   | Failed                         |
-      | ActorId   | <alice's AadObjectId>          |
     And the malformed payload is logged for debugging
 
   Scenario: Service URL changes between interactions
