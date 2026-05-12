@@ -196,7 +196,11 @@ Wraps an `AgentQuestion` with routing and context metadata. The envelope is the 
 
 #### PendingQuestionRecord (to be defined in planned `AgentSwarm.Messaging.Persistence`)
 
-Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a response. Created **after** the Telegram connector successfully sends an `AgentQuestion` as an inline-keyboard message (because `TelegramMessageId` is only available from the API response).
+Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a response. The record lifecycle uses a **two-phase write** to eliminate the crash window between Telegram accepting the message and the record being persisted:
+
+1. **Pre-send phase:** Before calling `TelegramSender.SendMessageAsync`, the connector creates a `PendingQuestionRecord` with `Status = Sending` and `TelegramMessageId = null`. This record is committed to the database so that a crash after Telegram accepts the message but before the connector persists `TelegramMessageId` leaves a recoverable record.
+2. **Post-send phase:** After the Telegram API returns successfully, the connector updates the existing record: sets `TelegramMessageId` to the returned value, sets `Status = Pending`, and sets `StoredAt` to the current timestamp. The question is now fully active for timeout polling and callback matching.
+3. **Recovery:** On startup, `QuestionRecoverySweep` queries for `PendingQuestionRecord` entries with `Status = Sending` (indicating a crash between phases 1 and 2). For each, the sweep checks the outbound queue for the corresponding `OutboundMessage` (matched by `SourceType = Question` and `SourceId = QuestionId`): if the `OutboundMessage` has `Status = Sent` and a non-null `TelegramMessageId`, the sweep backfills the `PendingQuestionRecord` and transitions it to `Pending`; otherwise, the sweep transitions the record to `Failed` and logs a warning for manual review. This ensures no operator-visible button message is left untracked.
 
 | Field | Type | Description |
 |---|---|---|
@@ -206,7 +210,7 @@ Tracks an `AgentQuestion` that has been sent to an operator and is awaiting a re
 | `TelegramMessageId` | `long` | Telegram `message_id` of the sent inline-keyboard message. Typed as `long` to match implementation-plan.md Stage 1.3 `PendingQuestion.TelegramMessageId` and Stage 3.5 `PendingQuestionRecord.TelegramMessageId`. |
 | `DefaultActionId` | `string?` | Denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId` at question-send time. Stored here so that `QuestionTimeoutService` can poll for expired questions and resolve the default via `IDistributedCache` without re-fetching the full envelope. When present, the timeout service resolves the full `HumanAction` and applies it automatically. When `null`, the question expires with `ActionValue = "__timeout__"`. |
 | `ExpiresAt` | `DateTimeOffset` | Copied from `AgentQuestion.ExpiresAt` for efficient timeout polling. |
-| `Status` | `enum` | `Pending`, `AwaitingComment`, `Answered`, `TimedOut`. `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). `TimedOut` is the single canonical enum value for timed-out questions, used consistently across the abstraction DTO (`PendingQuestion.Status` — implementation-plan.md Stage 1.3), the persistence entity (`PendingQuestionRecord.Status` — implementation-plan.md Stage 3.5), and the timeout flow (`QuestionTimeoutService`). |
+| `Status` | `enum` | `Sending`, `Pending`, `AwaitingComment`, `Answered`, `TimedOut`, `Failed`. `Sending` is the initial state written in the pre-send phase (before the Telegram API call); it transitions to `Pending` after the send succeeds and `TelegramMessageId` is backfilled — or to `Failed` if the crash-recovery sweep cannot reconcile the record (see two-phase write above). `AwaitingComment` is set when the operator taps a button whose `HumanAction.RequiresComment = true`; the bot prompts for a text reply and defers `HumanDecisionEvent` emission until the reply arrives (see §5.2). `TimedOut` is the single canonical enum value for timed-out questions, used consistently across the abstraction DTO (`PendingQuestion.Status` — implementation-plan.md Stage 1.3), the persistence entity (`PendingQuestionRecord.Status` — implementation-plan.md Stage 3.5), and the timeout flow (`QuestionTimeoutService`). |
 | `StoredAt` | `DateTimeOffset` | When the record was persisted (after successful Telegram send). |
 | `CorrelationId` | `string` | Trace/correlation ID for end-to-end observability. |
 
@@ -274,6 +278,38 @@ Tracks which operator currently has oversight of which task. Created/updated by 
 | `AssignedBy` | `string` | The operator who initiated the handoff (their `OperatorBinding.Id`). |
 | `CorrelationId` | `string` | Trace ID for the handoff action. |
 
+#### DeadLetterMessage
+
+Records outbound messages that have exhausted all retry attempts. Preserves full message payload, all attempt timestamps, and error details for diagnostics, alerting, and manual replay. Created by `OutboundMessageQueue` when `AttemptCount ≥ MaxRetries` (default 5) or when a non-retryable error (HTTP 400, 403) is encountered.
+
+| Field | Type | Description |
+|---|---|---|
+| `Id` | `Guid` | Primary key. |
+| `OriginalMessageId` | `Guid` | FK to `OutboundMessage.MessageId`. Links back to the original outbox record (which remains in `DeadLettered` status). |
+| `IdempotencyKey` | `string` | Copied from `OutboundMessage.IdempotencyKey` for cross-reference. |
+| `ChatId` | `long` | Target Telegram chat. |
+| `Payload` | `string` | Full serialized message content (MarkdownV2 text + inline keyboard JSON). Preserved verbatim from `OutboundMessage.Payload` for replay. |
+| `Severity` | `enum` | `Critical`, `High`, `Normal`, `Low`. Copied from the original message for priority-based alerting (Critical/High dead-letters trigger immediate ops alerts). |
+| `SourceType` | `enum` | `Question`, `Alert`, `StatusUpdate`, `CommandAck`. Copied from `OutboundMessage.SourceType`. |
+| `SourceId` | `string?` | Copied from `OutboundMessage.SourceId` (e.g., `QuestionId` for question messages). |
+| `CorrelationId` | `string` | End-to-end trace ID for the original message. |
+| `AttemptCount` | `int` | Total number of delivery attempts made before dead-lettering. |
+| `AttemptTimestamps` | `string` | JSON array of `DateTimeOffset` values, one per attempt. Example: `["2026-05-11T18:00:00Z","2026-05-11T18:00:02Z","2026-05-11T18:00:06Z","2026-05-11T18:00:14Z","2026-05-11T18:00:30Z"]`. |
+| `FinalError` | `string` | Error message/exception from the last failed attempt. |
+| `ErrorHistory` | `string` | JSON array of `{ "attempt": int, "timestamp": DateTimeOffset, "error": string, "httpStatus": int? }` objects — one per attempt. Preserves the full failure progression for diagnostics. |
+| `AlertStatus` | `enum` | `Pending`, `Sent`, `Acknowledged`. Tracks whether the ops alert for this dead-letter has been dispatched and acknowledged. |
+| `AlertSentAt` | `DateTimeOffset?` | When the ops alert was sent (null until `AlertStatus` transitions to `Sent`). |
+| `ReplayStatus` | `enum` | `None`, `Queued`, `Succeeded`, `Failed`. Tracks manual replay attempts. `Queued` = re-enqueued to `OutboundMessageQueue`; `Succeeded`/`Failed` = outcome of the replay send. |
+| `ReplayCorrelationId` | `string?` | Correlation ID of the replay attempt (links the replayed `OutboundMessage` back to this dead-letter record). Null until replay is attempted. |
+| `DeadLetteredAt` | `DateTimeOffset` | When the message was moved to dead-letter. |
+| `CreatedAt` | `DateTimeOffset` | Original `OutboundMessage.CreatedAt` — preserves the original enqueue time for latency analysis. |
+
+**Constraints:**
+- `UNIQUE (OriginalMessageId)` — one dead-letter record per outbound message.
+- Index on `(AlertStatus, Severity)` — used by the alerting loop to find un-alerted Critical/High dead-letters.
+- Index on `(ReplayStatus)` — used by operators reviewing replay-eligible messages.
+- Index on `DeadLetteredAt` — used for retention and pruning queries.
+
 ### 3.2 Entity Relationships
 
 ```text
@@ -291,6 +327,9 @@ AuditLogEntry   *──0..1 AgentQuestion      (via AuditLogEntry.CorrelationId;
                                             correlation context, not a direct FK)
 TaskOversight   *──1 OperatorBinding       (via TaskOversight.OperatorBindingId = OperatorBinding.Id;
                                             tracks which operator currently oversees the task)
+DeadLetterMessage 1──1 OutboundMessage     (via DeadLetterMessage.OriginalMessageId = OutboundMessage.MessageId;
+                                            preserves full payload and attempt history for messages
+                                            that exhausted retries or hit non-retryable errors)
 ```
 
 ---
@@ -542,7 +581,7 @@ Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue    
 ```
 
 **Key invariants:**
-1. The question includes `Severity`, `ExpiresAt`, `AllowedActions` rendered as inline keyboard buttons, and the proposed default action (if any). The default action is carried as sidecar metadata in `AgentQuestionEnvelope.ProposedDefaultActionId` (see §3.1). When the connector builds the inline keyboard, it reads `ProposedDefaultActionId` from the envelope and prepares a `PendingQuestionRecord` with `DefaultActionId` denormalized from that field. The `PendingQuestionRecord` is **persisted after the Telegram send succeeds** (once `TelegramMessageId` is available from the API response), not before — because `PendingQuestionRecord.TelegramMessageId` is required for timeout-driven message edits and cannot be known until the send completes.
+1. The question includes `Severity`, `ExpiresAt`, `AllowedActions` rendered as inline keyboard buttons, and the proposed default action (if any). The default action is carried as sidecar metadata in `AgentQuestionEnvelope.ProposedDefaultActionId` (see §3.1). When the connector builds the inline keyboard, it reads `ProposedDefaultActionId` from the envelope and prepares a `PendingQuestionRecord` with `DefaultActionId` denormalized from that field. The `PendingQuestionRecord` uses a **two-phase write** (see §3.1): a `Sending`-status record is persisted **before** the Telegram API call (with `TelegramMessageId = null`), and then updated to `Pending` with the actual `TelegramMessageId` after the send succeeds. This eliminates the crash window where a sent message could be left untracked.
 2. The `callback_data` field carries the format `QuestionId:ActionId` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both `QuestionId` and `ActionId` are constrained to a maximum of 30 characters each, ensuring the combined `callback_data` (including the `:` separator) fits within Telegram's 64-byte limit (max 61 bytes). The server stores the full `HumanAction` payload in `IDistributedCache` keyed by `QuestionId:ActionId`, written when the inline keyboard is built and expiring at `AgentQuestion.ExpiresAt + 5 minutes` (the 5-minute grace window ensures `QuestionTimeoutService` can still resolve the cached `HumanAction` after the timeout fires, avoiding the race condition where the cache entry is evicted simultaneously with or before the timeout poll; aligned with implementation-plan.md Stage 2.3). On callback, the handler parses `QuestionId:ActionId` from the callback data, looks up the full `HumanAction` from cache, retrieves the original `AgentQuestion` from the pending-questions store, and resolves the chosen action.
 3. Button press produces a strongly typed `HumanDecisionEvent` — never a raw string. **However**, when the selected `HumanAction.RequiresComment` is `true` (e.g., the "Need info" action in e2e-scenarios.md), the `HumanDecisionEvent` is **deferred**: the `CallbackQueryHandler` sets `PendingQuestionRecord.Status = AwaitingComment`, sends a prompt to the operator ("Please reply with your comment"), and returns without emitting the event. When the operator's text reply arrives via the inbound pipeline's text-reply handler, it is matched to the `AwaitingComment` record by chat ID, the `HumanDecisionEvent` is then published with both the `ActionValue` (e.g., `"need-info"`) and the `Comment` (the operator's text), and the record transitions to `Answered`. This two-step flow is tested by e2e-scenarios.md "RequiresComment defers decision" and implementation-plan.md Stage 3.5 "RequiresComment flow."
 4. The `answerCallbackQuery` call removes the loading spinner on the operator's device.
@@ -582,7 +621,7 @@ OutboundQueue         TelegramSender         Telegram API         DeadLetterQueu
 - Back-off: exponential (`BaseRetryDelaySeconds` ^ attempt, e.g. 2s, 4s, 8s capped) with jitter (±25%)
 - Retryable errors: HTTP 429 (with `retry_after`), 5xx, network timeouts
 - Non-retryable: HTTP 400 (bad request), 403 (bot blocked) — dead-letter immediately
-- Dead-letter record preserves full message payload, all attempt timestamps, and error details
+- Dead-letter record preserves full message payload, all attempt timestamps, and error details (see `DeadLetterMessage` entity in §3.1 for the complete field model including `AttemptTimestamps`, `ErrorHistory`, `AlertStatus`, and `ReplayStatus`)
 - Alert is sent to a secondary notification channel (ops Telegram group or fallback messenger)
 
 > **Cross-doc retry default alignment:** This architecture, implementation-plan.md (Stage 4.2: `RetryPolicy.MaxAttempts` default `5`), and e2e-scenarios.md (Background: "max 5 attempts", dead-letter scenario: "dead-letter after attempt 5") are **aligned** on `MaxRetries = 5`.
@@ -590,24 +629,27 @@ OutboundQueue         TelegramSender         Telegram API         DeadLetterQueu
 ### 5.4 Scenario: Duplicate webhook delivery (idempotency)
 
 ```text
-Telegram Cloud          Webhook Endpoint        DB (InboundUpdate)
-      │                       │                      │
-      │──POST update_id=999──▶│                      │
-      │                       │──INSERT update 999──▶│
-      │                       │◀──OK (new)──────────│
-      │                       │──validate allowlist──│
-      │◀──200 OK─────────────│                      │
-      │                       │──async: process cmd─▶ ...
-      │                       │                      │
-      │  (Telegram retries — network glitch)         │
-      │──POST update_id=999──▶│                      │
-      │                       │──INSERT update 999──▶│
-      │                       │◀──CONFLICT (dup)────│
-      │◀──200 OK─────────────│──DROP (no-op)        │
+Telegram Cloud          Webhook Endpoint        DB (InboundUpdate)        UpdatePipeline (async)
+      │                       │                      │                          │
+      │──POST update_id=999──▶│                      │                          │
+      │                       │──validate secret─────│                          │
+      │                       │──INSERT update 999──▶│                          │
+      │                       │◀──OK (new)──────────│                          │
+      │◀──200 OK─────────────│                      │                          │
+      │                       │──fire-and-forget─────▶──────────────────────────▶│
+      │                       │                      │    dedup + allowlist ─────▶
+      │                       │                      │    parse + dispatch ─────▶
+      │                       │                      │                          │
+      │  (Telegram retries — network glitch)         │                          │
+      │──POST update_id=999──▶│                      │                          │
+      │                       │──validate secret─────│                          │
+      │                       │──INSERT update 999──▶│                          │
+      │                       │◀──CONFLICT (dup)────│                          │
+      │◀──200 OK─────────────│──DROP (no-op)        │                          │
 ```
 
 **Key invariants:**
-1. Endpoint always returns `200 OK` regardless of duplicate status — prevents Telegram from retrying further.
+1. Endpoint always returns `200 OK` regardless of duplicate status — prevents Telegram from retrying further. The webhook endpoint performs **only** secret-token validation and `InboundUpdate` persistence before responding; allowlist/authorization validation happens asynchronously inside `ITelegramUpdatePipeline.ProcessAsync` (consistent with §2.2, §5.1, and implementation-plan.md Stage 2.2/2.4).
 2. Deduplication uses `update_id` as a natural idempotency key with a `UNIQUE` constraint. The `INSERT` happens **before** `200 OK`, so a crash after Telegram receives `200` does not lose the record.
 3. Webhook deduplication operates in two layers, each with a distinct scope and TTL: **(a) `InboundUpdate` table (persistence-layer, canonical):** The `UNIQUE` constraint on `update_id` provides permanent deduplication for webhook POSTs — no TTL, records are retained for at least 24 hours before pruning, and duplicate `INSERT` attempts are rejected at the database level regardless of age. This is the primary and canonical deduplication mechanism for webhook delivery. **(b) `IDeduplicationService` (pipeline-layer, supplementary):** A sliding-window cache of processed `EventId` values with a configurable TTL (default 1 hour, per implementation-plan Stage 4.3). This provides fast in-pipeline deduplication for the `TelegramUpdatePipeline` processing path — it catches re-deliveries during the same processing session without a database query. The `InboundUpdate` table TTL (24 hours) is intentionally longer than the `IDeduplicationService` TTL (1 hour) to cover edge cases where the pipeline-layer cache has expired but the same `update_id` is re-delivered (e.g., after a long outage recovery). Both layers must agree that an event is new before it is processed; either layer rejecting is sufficient to prevent duplicate execution.
 
@@ -645,6 +687,28 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 > **`TaskOversight` entity:** Defined in §3.1 above. A lightweight entity mapping `(TaskId, OperatorBindingId)` to track which operator currently has oversight of which task. The `/handoff` handler creates or updates this record, and the orchestrator subscription filter reads it to route agent events to the correct operator.
 >
 > **Cross-doc alignment note:** All four sibling documents are now aligned on full oversight transfer as the decided `/handoff` behavior. Implementation-plan.md Stage 3.2 specifies `HandoffCommandHandler` with full oversight transfer including validation, target resolution via `IOperatorRegistry.GetByAliasAsync(alias, tenantId)`, `TaskOversight` record mutation, dual-operator notification, and audit. E2e-scenarios.md tests the full transfer flow. Tech-spec D-4 documents the decision. The `UNIQUE (OperatorAlias, TenantId)` constraint on `OperatorBinding` ensures alias resolution is tenant-scoped, preventing cross-tenant mis-resolution during `/handoff`.
+
+### 5.6 Command Mapping Table
+
+All nine required commands are defined below with their inputs, required authorization role, emitted event or query behavior, and audit semantics.
+
+| Command | Syntax | Required Role | Behavior | Emitted Event / Query | Audit |
+|---|---|---|---|---|---|
+| `/start` | `/start` | None (open) | If user's Telegram ID is in `Telegram:AllowedUserIds`, creates or reactivates `OperatorBinding` from `Telegram:UserTenantMappings`. If not in allowlist, returns "not authorized" reply. | None (local state mutation) | `Action = "start"`, records binding creation or rejection. |
+| `/status` | `/status` or `/status TASK-ID` | `Operator` | Without argument: queries `ISwarmCommandBus` for a summary of active tasks, pending questions, and agent counts for the operator's workspace. With `TASK-ID`: queries the specific task's current state, assigned agent, and last activity. Returns formatted summary via outbound queue. | `SwarmCommand.QueryStatus { TaskId?, WorkspaceId }` — read-only query, no side effects. | `Action = "status"`, records query parameters. |
+| `/agents` | `/agents` or `/agents FILTER` | `Operator` | Lists active agents in the operator's workspace. Optional `FILTER` argument filters by agent name prefix or status (`idle`, `busy`, `error`). Returns formatted agent list via outbound queue. | `SwarmCommand.QueryAgents { WorkspaceId, Filter? }` — read-only query, no side effects. | `Action = "agents"`, records filter if provided. |
+| `/ask` | `/ask <free text>` | `Operator` | Parses free text after `/ask` as a task description. Creates a `SwarmCommand.CreateTask` and publishes via `ISwarmCommandBus`. Returns confirmation with assigned task ID. | `SwarmCommand.CreateTask { Description, OperatorId, WorkspaceId, CorrelationId }` | `Action = "ask"`, records full command text and assigned task ID. |
+| `/approve` | `/approve QUESTION-ID` | `Approver` | Looks up `PendingQuestionRecord` by `QuestionId`, validates it exists and has `Status = Pending`. Produces `HumanDecisionEvent` with `ActionValue = "approve"`. Updates `PendingQuestionRecord.Status = Answered`. | `HumanDecisionEvent { QuestionId, ActionValue = "approve" }` | `Action = "approve"`, records question ID and agent ID. |
+| `/reject` | `/reject QUESTION-ID [reason]` | `Approver` | Same as `/approve` but with `ActionValue = "reject"`. Optional reason text is carried in `HumanDecisionEvent.Comment`. | `HumanDecisionEvent { QuestionId, ActionValue = "reject", Comment? }` | `Action = "reject"`, records question ID, agent ID, and reason if provided. |
+| `/handoff` | `/handoff TASK-ID @alias` | `Operator` | Full oversight transfer (see §5.5 detailed flow above). Validates task ownership, resolves target operator by alias within tenant, updates `TaskOversight`, notifies both operators. | `SwarmCommand.TransferOversight { TaskId, SourceOperatorId, TargetOperatorId }` | `Action = "handoff"`, records task ID, source and target operator, timestamp. |
+| `/pause` | `/pause AGENT-ID` or `/pause all` | `Operator` | Sends a pause directive to a specific agent or all agents in the operator's workspace. The agent suspends autonomous work and enters an idle state until resumed. `all` is a convenience alias scoped to the operator's workspace. | `SwarmCommand.PauseAgent { AgentId?, WorkspaceId, Scope = "single" \| "all" }` | `Action = "pause"`, records agent ID or "all" scope. |
+| `/resume` | `/resume AGENT-ID` or `/resume all` | `Operator` | Sends a resume directive to a previously paused agent or all paused agents in the workspace. The agent resumes autonomous work from its last checkpoint. | `SwarmCommand.ResumeAgent { AgentId?, WorkspaceId, Scope = "single" \| "all" }` | `Action = "resume"`, records agent ID or "all" scope. |
+
+**Common command behaviors:**
+- All commands pass through `ITelegramUpdatePipeline` (deduplication → authorization → dispatch) before reaching their handler.
+- All commands produce an acknowledgement reply enqueued to `OutboundMessageQueue` (never sent inline).
+- All commands write an `AuditEntry` with `MessageId`, `UserId`, `AgentId` (where applicable), `Timestamp`, and `CorrelationId`.
+- Unrecognized commands receive a "Unknown command. Use /start for help." reply.
 
 ---
 
