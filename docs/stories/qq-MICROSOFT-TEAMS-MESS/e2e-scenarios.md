@@ -770,7 +770,7 @@ Feature: Teams Message Actions (Message Extensions)
       | Body           | The deployment pipeline for service-xyz is failing with timeout errors on stage 3. |
       | Source         | MessageAction                                                                     |
     And the bot replies in the channel thread confirming the task was created
-    And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions use a dedicated audit EventType distinct from CommandReceived, per tech-spec §4.3 line 136)
+    And an immutable audit record is persisted with EventType "CommandReceived" (message actions are a command submission mechanism and log as CommandReceived per tech-spec §4.3 line 136, not a separate event type)
 
   Scenario: Message action presents a task form for user input
     Given user "alice@contoso.com" selects a message and invokes the "Forward to Agent" action
@@ -819,11 +819,13 @@ Feature: Edge Cases and Error Handling
     And a MessengerEvent of type "Text" is enqueued with an empty payload
 
   Scenario: Bot receives a message exceeding maximum length
-    Given user "alice@contoso.com" sends a message with 10,000 characters
+    Given the configured maximum message length is 4,000 characters (configurable via "Teams:MaxMessageLength" app setting)
+    And user "alice@contoso.com" sends a message with 10,000 characters
     When the bot processes the activity
-    Then the message body is truncated to the configured maximum
-    And a warning is logged
+    Then the message body is truncated to 4,000 characters
+    And a warning is logged with the original length and truncated length
     And processing continues with the truncated body
+    And an immutable audit record is persisted with EventType "CommandReceived" and Outcome "Success" including a PayloadJson field noting "truncated_from: 10000, truncated_to: 4000"
 
   Scenario: Adaptive Card action payload is malformed
     Given user "alice@contoso.com" submits an Adaptive Card action
