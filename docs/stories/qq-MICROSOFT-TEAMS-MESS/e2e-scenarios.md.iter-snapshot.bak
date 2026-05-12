@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.3 — Iteration 3 (feedback-addressed)
+**Version:** 1.2 — Iteration 2 (feedback-addressed)
 
 ---
 
@@ -426,42 +426,36 @@ Feature: Compliance — Immutable Audit Trail
     Then an immutable audit record is persisted containing:
       | Field             | Value                                              |
       | Timestamp         | <UTC ISO 8601>                                     |
-      | EventType         | CommandReceived                                     |
+      | EventType         | InboundCommand                                     |
       | Messenger         | teams                                              |
       | TenantId          | contoso-tenant-id                                  |
-      | ActorId           | <alice's AadObjectId (Entra OID)>                  |
-      | ActorType         | User                                               |
-      | Action            | agent ask                                          |
-      | PayloadJson       | {"body":"create e2e test scenarios for update service"} |
+      | UserId            | <alice's AadObjectId (Entra OID)>                  |
+      | Command           | agent ask                                          |
+      | Payload           | create e2e test scenarios for update service       |
       | CorrelationId     | <UUID>                                             |
       | ConversationId    | <Teams conversation ID>                            |
-      | Outcome           | Success                                            |
 
   Scenario: All outbound notifications are audit-logged
     When the bot sends an Adaptive Card for question "Q-1001"
     Then an immutable audit record is persisted containing:
       | Field             | Value                     |
-      | EventType         | ProactiveNotification     |
-      | ActorId           | <agent ID>                |
-      | ActorType         | Agent                     |
-      | Action            | send_card                 |
-      | TaskId            | <task ID for Q-1001>      |
-      | PayloadJson       | {"questionId":"Q-1001","targetAadObjectId":"<alice's AadObjectId>","activityId":"<Teams activity ID>"} |
+      | EventType         | OutboundNotification      |
+      | QuestionId        | Q-1001                    |
+      | TargetUserId      | <alice's AadObjectId> |
+      | DeliveryStatus    | Delivered                 |
+      | ActivityId        | <Teams activity ID>       |
       | CorrelationId     | <UUID>                    |
-      | Outcome           | Success                   |
 
   Scenario: Approval decisions are audit-logged with full context
     When user "alice@contoso.com" approves question "Q-1001" with comment "LGTM"
     Then an immutable audit record is persisted containing:
       | Field             | Value             |
-      | EventType         | CardActionReceived |
-      | ActorId           | <alice's AadObjectId> |
-      | ActorType         | User               |
-      | Action            | approve            |
-      | TaskId            | <task ID for Q-1001> |
-      | PayloadJson       | {"questionId":"Q-1001","actionValue":"approve","comment":"LGTM"} |
-      | CorrelationId     | <UUID>             |
-      | Outcome           | Success            |
+      | EventType         | HumanDecision     |
+      | QuestionId        | Q-1001            |
+      | ActionValue       | approve           |
+      | Comment           | LGTM              |
+      | UserId            | <alice's AadObjectId> |
+      | CorrelationId     | <UUID>            |
 
   Scenario: Security rejections are audit-logged
     When an unauthorized tenant attempts to message the bot
