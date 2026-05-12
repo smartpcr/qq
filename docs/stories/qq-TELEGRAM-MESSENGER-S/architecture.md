@@ -90,7 +90,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 | **Operator Registry** | `AgentSwarm.Messaging.Core` (to be created) | Persistent map of `(TelegramUserId, TelegramChatId) → one or more OperatorBinding(TenantId, WorkspaceId, Roles, OperatorAlias)`. Runtime authorization first checks whether any active binding exists for the `(TelegramUserId, TelegramChatId)` pair via `IsAuthorizedAsync`; when multiple bindings exist (the operator is registered in several workspaces for the same chat), `GetBindingsAsync` returns all matching rows and the caller disambiguates workspace via inline keyboard (see §4.3, §7.1). The `UNIQUE` constraint is on `(TelegramUserId, TelegramChatId, WorkspaceId)` to prevent duplicate bindings for the same workspace. Populated via `/start` registration flow and admin configuration. |
 | **Swarm Command Bus** | `AgentSwarm.Messaging.Core` (to be created) | Publishes validated, strongly typed commands to the agent swarm orchestrator. Subscribes to agent-originated events (questions, alerts, status) via `SubscribeAsync` and routes them to the correct outbound connector. Both command publishing and event subscription are on the single `ISwarmCommandBus` interface (see §4.6). |
 | **OutboundMessageQueue** | `AgentSwarm.Messaging.Abstractions` (interface) / `AgentSwarm.Messaging.Core` (implementation) (to be created) | Durable queue for outbound messages backed by a persistent store (database) with an in-memory `Channel<T>` hot buffer for low-latency dequeue. The persistent store is the source of truth; the `Channel<T>` is a read-through acceleration layer, not a standalone queue. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 5 attempts), and dead-letter after exhaustion. |
-| **TelegramSender** | `AgentSwarm.Messaging.Telegram` (to be created) | Concrete `TelegramMessageSender` implementing `IMessageSender` (§4.12, defined in `AgentSwarm.Messaging.Core`). Both methods return `Task<SendResult>` carrying the Telegram-assigned `message_id`. Wraps `ITelegramBotClient` from the `Telegram.Bot` library. **Sole owner of Telegram-specific rendering**: formats messages with MarkdownV2, builds `InlineKeyboardMarkup` for agent questions (rendered at send time from `SourceEnvelopeJson`, not from pre-rendered `Payload`), writes `HumanAction` entries to `IDistributedCache`, and enforces Telegram rate limits. `OutboundQueueProcessor` invokes the sender through the `IMessageSender` abstraction, keeping `AgentSwarm.Messaging.Worker` independent of the Telegram assembly. |
+| **TelegramSender** | `AgentSwarm.Messaging.Telegram` (to be created) | Concrete `TelegramMessageSender` implementing `IMessageSender` (§4.12, defined in `AgentSwarm.Messaging.Core`). Both methods return `Task<SendResult>` carrying the Telegram-assigned `message_id`. Wraps `ITelegramBotClient` from the `Telegram.Bot` library. **Sole owner of question rendering**: builds `InlineKeyboardMarkup`, formats question MarkdownV2 text, writes `HumanAction` entries to `IDistributedCache`, and displays the proposed default — all at send time from `SourceEnvelopeJson`, not from pre-rendered `Payload`. For non-question messages (`Alert`, `StatusUpdate`, `CommandAck`), the sender passes the pre-rendered `Payload` text through to the Telegram API without further rendering (rendering for these types is performed by `TelegramMessengerConnector` at enqueue time — see §3.1 `OutboundMessage.Payload`). Also enforces Telegram rate limits. `OutboundQueueProcessor` invokes the sender through the `IMessageSender` abstraction, keeping `AgentSwarm.Messaging.Worker` independent of the Telegram assembly. |
 | **AuditLogger** | `AgentSwarm.Messaging.Persistence` (to be created) | Writes an immutable audit record for every human response. Includes message ID, user ID, agent ID, timestamp, and correlation ID. Backed by append-only store. |
 | **OutboundQueueProcessor** | `AgentSwarm.Messaging.Worker` (to be created) | `BackgroundService` with configurable concurrency (`OutboundQueue:ProcessorConcurrency`, default 10 workers). Each worker independently dequeues the highest-severity pending `OutboundMessage`, dispatches to `IMessageSender` based on `SourceType` (question → `SendQuestionAsync`; all others → `SendTextAsync` with pre-rendered `Payload`), calls `IOutboundQueue.MarkSentAsync` with the `SendResult.TelegramMessageId`, and for question messages calls `IPendingQuestionStore.StoreAsync` as a post-send hook (§5.2 invariant 1). On failure, increments `AttemptCount` and schedules retry or dead-letters. Depends on `IOutboundQueue`, `IMessageSender`, `IPendingQuestionStore`. See §10.4 for concurrency and burst analysis. |
 | **InboundRecoverySweep** | `AgentSwarm.Messaging.Worker` (to be created) | `BackgroundService` that runs on startup and periodically (configurable interval, default 60 s via `InboundRecovery:SweepIntervalSeconds`). Queries `IInboundUpdateStore` for `InboundUpdate` records with `IdempotencyStatus` in `Received`, `Processing`, or `Failed` where `AttemptCount < MaxRetries` (configurable via `InboundRecovery:MaxRetries`, default 3). Deserializes each record's `RawPayload` as a Telegram `Update`, maps it through `TelegramUpdateMapper` to produce a `MessengerEvent`, then passes the `MessengerEvent` to `ITelegramUpdatePipeline.ProcessAsync` for idempotent re-processing. Increments `AttemptCount` on failure. This component owns the no-command-loss guarantee across process restarts — see §3.1 `InboundUpdate` and §5.1 for the recovery flow. |
@@ -625,7 +625,7 @@ public sealed record SendResult(long TelegramMessageId);
 
 Both methods return `SendResult` containing the `TelegramMessageId` assigned by the Telegram Bot API. The `OutboundQueueProcessor` (§5.2, §10.4) uses `SendResult.TelegramMessageId` for two post-send operations: (1) `IOutboundQueue.MarkSentAsync(messageId, telegramMessageId)` to persist the Telegram message ID on the `OutboundMessage` record, and (2) `IPendingQuestionStore.StoreAsync(envelope, chatId, telegramMessageId)` for question messages to create the `PendingQuestionRecord` with the correct `TelegramMessageId`. `SendResult` is defined in `AgentSwarm.Messaging.Core` alongside `IMessageSender`.
 
-The concrete `TelegramMessageSender` (in `AgentSwarm.Messaging.Telegram`) implements this interface and wraps `ITelegramBotClient` from the `Telegram.Bot` library. It is the **sole owner of Telegram-specific rendering** — it formats messages with MarkdownV2, builds `InlineKeyboardMarkup` for agent questions, writes `HumanAction` entries to `IDistributedCache`, and enforces Telegram rate limits via the dual-layer token-bucket limiter (§10.4). Rendering happens at send time, not at enqueue time — this is the canonical rendering boundary (see §3.1 `OutboundMessage.Payload` for how this interacts with the outbox payload). In component diagrams and sequence flows throughout this document, **`TelegramSender`** refers to this concrete `TelegramMessageSender` implementation.
+The concrete `TelegramMessageSender` (in `AgentSwarm.Messaging.Telegram`) implements this interface and wraps `ITelegramBotClient` from the `Telegram.Bot` library. **Rendering boundary:** `TelegramMessageSender` is the **sole owner of question rendering** — it builds `InlineKeyboardMarkup`, formats question MarkdownV2 text, writes `HumanAction` entries to `IDistributedCache`, and displays the proposed default, all at send time from the deserialized `AgentQuestionEnvelope`. For non-question messages (`Alert`, `StatusUpdate`, `CommandAck`), rendering is performed earlier by `TelegramMessengerConnector` at enqueue time, and `TelegramMessageSender.SendTextAsync` passes the pre-rendered `Payload` through to the Telegram API without further rendering (see §3.1 `OutboundMessage.Payload` for the payload semantics). `TelegramMessageSender` also enforces Telegram rate limits via the dual-layer token-bucket limiter (§10.4). In component diagrams and sequence flows throughout this document, **`TelegramSender`** refers to this concrete `TelegramMessageSender` implementation.
 
 > **Cross-doc alignment (IMessageSender).** This document (§4.12) is the **canonical source** for the `IMessageSender` interface contract. Both methods return `Task<SendResult>` (not bare `Task`), where `SendResult` carries the `TelegramMessageId` assigned by the Bot API. **RESOLVED (iteration 13):** implementation-plan.md Stage 1.4 now specifies `Task<SendResult>` return types for both methods, and Stage 4.1 now specifies that `OutboundQueueProcessor` sends via `IMessageSender` (not the concrete `TelegramMessageSender`), so Core/Worker assemblies do not depend on `AgentSwarm.Messaging.Telegram`. The component table in §2.2 lists `TelegramSender` as the short name for the concrete implementation — this is the same component as implementation-plan.md's `TelegramMessageSender`.
 
@@ -666,33 +666,37 @@ Human (Telegram)                Webhook Endpoint       UpdatePipeline        Com
 ### 5.2 Scenario: Agent asks a blocking question, operator answers via button
 
 ```text
-Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue     TelegramSender      Human (Telegram)
-      │                    │                     │                   │                  │                   │
-      │──AgentQuestion────▶│                     │                   │                  │                   │
-      │  (severity=High,   │──deliver event─────▶│                   │                  │                   │
-      │   timeout=30min)   │                     │──build message────▶                  │                   │
-      │                    │                     │  + InlineKeyboard │                  │                   │
-      │                    │                     │──enqueue──────────▶│                  │                   │
-      │                    │                     │                   │──dequeue────────▶│                   │
-      │                    │                     │                   │                  │──sendMessage──────▶│
-      │                    │                     │                   │                  │  [Approve][Reject] │
-      │                    │                     │                   │◀─markSent────────│                   │
-      │                    │                     │                   │──persist PendingQ│                   │
-      │                    │                     │                   │  (OutboundQueue- │                   │
-      │                    │                     │                   │   Processor hook: │                   │
-      │                    │                     │                   │   StoreAsync with │                   │
-      │                    │                     │                   │   SourceEnvelope) │                   │
-      │                    │                     │                   │                  │                   │
-      │                    │                     │                   │                  │  (operator taps    │
-      │                    │                     │                   │                  │   "Approve")       │
-      │                    │                     │                   │                  │◀──CallbackQuery───│
-      │                    │                     │◀──route callback──│                  │                   │
-      │                    │                     │──parse action─────▶                  │                   │
-      │                    │                     │──HumanDecisionEvent                  │                   │
-      │                    │◀──publish decision──│                   │                  │                   │
-      │◀──deliver decision─│                     │                   │                  │                   │
-      │                    │                     │──audit record──────────────────────────────────────────▶ │
-      │                    │                     │──answerCallback───▶                  │──ack to TG───────▶│
+Orchestrator        SwarmCommandBus       TelegramConnector    OutboundQueue     OutboundQueueProcessor  TelegramSender      Human (Telegram)
+      │                    │                     │                   │                  │                      │                   │
+      │──AgentQuestion────▶│                     │                   │                  │                      │                   │
+      │  (severity=High,   │──deliver event─────▶│                   │                  │                      │                   │
+      │   timeout=30min)   │                     │──enqueue──────────▶│                  │                      │                   │
+      │                    │                     │  (preview Payload + │                  │                      │                   │
+      │                    │                     │   SourceEnvelopeJson)│                 │                      │                   │
+      │                    │                     │                   │──dequeue─────────▶│                      │                   │
+      │                    │                     │                   │                  │──SendQuestionAsync───▶│                   │
+      │                    │                     │                   │                  │  (deserialize envelope │                   │
+      │                    │                     │                   │                  │   build MarkdownV2 +  │                   │
+      │                    │                     │                   │                  │   InlineKeyboard,     │                   │
+      │                    │                     │                   │                  │   write cache)        │──sendMessage──────▶│
+      │                    │                     │                   │                  │                      │  [Approve][Reject] │
+      │                    │                     │                   │                  │◀──SendResult──────────│                   │
+      │                    │                     │                   │◀─markSent────────│                      │                   │
+      │                    │                     │                   │──persist PendingQ│                      │                   │
+      │                    │                     │                   │  (Processor hook: │                      │                   │
+      │                    │                     │                   │   StoreAsync with │                      │                   │
+      │                    │                     │                   │   SourceEnvelope) │                      │                   │
+      │                    │                     │                   │                  │                      │                   │
+      │                    │                     │                   │                  │                      │  (operator taps    │
+      │                    │                     │                   │                  │                      │   "Approve")       │
+      │                    │                     │                   │                  │                      │◀──CallbackQuery───│
+      │                    │                     │◀──route callback──│                  │                      │                   │
+      │                    │                     │──parse action─────▶                  │                      │                   │
+      │                    │                     │──HumanDecisionEvent                  │                      │                   │
+      │                    │◀──publish decision──│                   │                  │                      │                   │
+      │◀──deliver decision─│                     │                   │                  │                      │                   │
+      │                    │                     │──audit record──────────────────────────────────────────────────────────────────▶ │
+      │                    │                     │──answerCallback───▶                  │                      │──ack to TG───────▶│
 ```
 
 **Key invariants:**
@@ -1241,7 +1245,7 @@ All previously outstanding items have been resolved through iteration 16 by upda
 
 10. **`IOutboundQueue` assembly placement — RESOLVED (iteration 10).** Both architecture.md (§4.4, §6 assembly map) and implementation-plan.md (Stage 1.4) now place `IOutboundQueue` in `AgentSwarm.Messaging.Abstractions`.
 
-11. **`IMessageSender` return type — RESOLVED (iteration 13).** Implementation-plan.md Stage 1.4 and Stage 2.3 now specify `Task<SendResult>` return types for both `SendTextAsync` and `SendQuestionAsync`, with `SendResult` carrying `TelegramMessageId` (long) — matching the canonical contract in architecture.md §4.12. The rendering boundary is explicit: `TelegramMessageSender` is the sole owner of Telegram-specific rendering.
+11. **`IMessageSender` return type — RESOLVED (iteration 13).** Implementation-plan.md Stage 1.4 and Stage 2.3 now specify `Task<SendResult>` return types for both `SendTextAsync` and `SendQuestionAsync`, with `SendResult` carrying `TelegramMessageId` (long) — matching the canonical contract in architecture.md §4.12. The rendering boundary is explicit: `TelegramMessageSender` is the sole owner of question rendering; non-question rendering (`Alert`, `StatusUpdate`, `CommandAck`) is performed by `TelegramMessengerConnector` at enqueue time.
 
 12. **`RecordSelectionAsync` signature update — RESOLVED (iteration 13).** Implementation-plan.md Stage 1.3 now specifies `RecordSelectionAsync(string questionId, string selectedActionId, string selectedActionValue, long respondentUserId, CancellationToken)` with the `selectedActionValue` parameter — matching architecture.md §4.7.
 
