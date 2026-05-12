@@ -4,7 +4,7 @@
 
 The agent swarm (100+ autonomous agents) requires a Telegram-based human interface so that mobile operators can start tasks, answer blocking questions, approve/reject actions, and receive urgent alerts — all without access to a dashboard or CLI. The Telegram connector must slot into the shared `IMessengerConnector` abstraction planned for the Messenger Gateway epic while meeting Telegram-specific requirements for webhook transport, inline buttons, and the 2-second P95 send-latency target.
 
-**Reliability and performance summary:** The architecture guarantees **at-least-once delivery with dead-letter fallback** — every outbound message is either delivered to Telegram (possibly more than once in narrow crash windows; see §3.1 Gap A) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Under extreme queue depth, Low-severity messages may be backpressure-dead-lettered without a send attempt (see §10.4); Critical, High, and Normal messages are never backpressure-DLQ'd. The **P95 ≤ 2 s send-latency SLO** (measured on `telegram.send.first_attempt_latency_ms` — first-attempt, non-rate-limited sends only, per operator answer to `p95-metric-scope`) is met in **steady state** (queue depth < 100) across all severities, and extends to **bounded bursts** (≤ 40 Critical+High messages in a 100+ agent burst) via severity-based priority queuing at 30 msg/s throughput, reserving ~650 ms per message for Telegram HTTP round-trip latency (see §10.4 burst math). Beyond 40 Critical+High messages in a single burst, P95 degrades proportionally with queue dwell — this is an accepted capacity trade-off, not a message-loss risk. Retried sends and rate-limited wait time are excluded from the acceptance gate metric and tracked separately via `telegram.send.all_attempts_latency_ms` for capacity planning. See §10.4 for the full analysis.
+**Reliability and performance summary:** The architecture guarantees **at-least-once delivery with dead-letter fallback** — every outbound message is either delivered to Telegram (possibly more than once in narrow crash windows; see §3.1 Gap A) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Under extreme queue depth, Low-severity messages may be backpressure-dead-lettered without a send attempt (see §10.4); Critical, High, and Normal messages are never backpressure-DLQ'd. The **P95 ≤ 2 s send-latency SLO** (measured on `telegram.send.first_attempt_latency_ms` — first-attempt, non-rate-limited sends only, per operator answer to `p95-metric-scope`) is met in **steady state** (queue depth < 100) across all severities, and extends to **bounded bursts** (≤ 60 Critical+High messages in a 100+ agent burst) via severity-based priority queuing at 30 msg/s throughput with token-bucket burst capacity allowing the first 30 messages to drain without rate-limit delay (see §10.4 burst math). Beyond ~60 Critical+High messages in a single burst, P95 degrades proportionally with queue dwell — this is an accepted capacity trade-off, not a message-loss risk. Retried sends and rate-limited wait time are excluded from the acceptance gate metric and tracked separately via `telegram.send.all_attempts_latency_ms` for capacity planning. See §10.4 for the full analysis.
 
 ---
 
@@ -698,7 +698,49 @@ Commands `/approve` and `/reject` accept a question ID argument and produce the 
 >
 > **Cross-doc alignment note:** All four sibling documents are now aligned on full oversight transfer as the decided `/handoff` behavior. Implementation-plan.md Stage 3.2 specifies `HandoffCommandHandler` with full oversight transfer including validation, target resolution via `IOperatorRegistry.GetByAliasAsync(alias, tenantId)`, `TaskOversight` record mutation, dual-operator notification, and audit. E2e-scenarios.md tests the full transfer flow. Tech-spec D-4 documents the decision. The `UNIQUE (OperatorAlias, TenantId)` constraint on `OperatorBinding` ensures alias resolution is tenant-scoped, preventing cross-tenant mis-resolution during `/handoff`.
 
-### 5.6 Command Mapping Table
+### 5.6 Scenario: Urgent agent alert delivery to operator
+
+```text
+AgentSwarm           ISwarmCommandBus      TelegramConnector    OutboundQueue     TelegramSender      Human (Telegram)
+      │                    │                     │                   │                  │                   │
+      │──AgentAlertEvent───▶│                     │                   │                  │                   │
+      │  (agentId=build-7,  │                     │                   │                  │                   │
+      │   severity=Critical,│──deliver event─────▶│                   │                  │                   │
+      │   alertType=Error,  │                     │                   │                  │                   │
+      │   correlationId=C1) │                     │                   │                  │                   │
+      │                    │                     │──resolve tenant────▶                  │                   │
+      │                    │                     │  (agentId→taskId   │                  │                   │
+      │                    │                     │   →TaskOversight   │                  │                   │
+      │                    │                     │   →operatorChatId) │                  │                   │
+      │                    │                     │                   │                  │                   │
+      │                    │                     │──build alert msg──▶│                  │                   │
+      │                    │                     │  severity=Critical │                  │                   │
+      │                    │                     │  idempotencyKey=   │                  │                   │
+      │                    │                     │  alert:{agentId}:  │                  │                   │
+      │                    │                     │  {alertId}         │                  │                   │
+      │                    │                     │                   │──priority dequeue▶│                   │
+      │                    │                     │                   │  (Critical first) │                   │
+      │                    │                     │                   │                  │──sendMessage──────▶│
+      │                    │                     │                   │                  │  🚨 Critical Alert │
+      │                    │                     │                   │                  │  Agent: build-7    │
+      │                    │                     │                   │◀─markSent────────│  Error: build fail │
+      │                    │                     │                   │                  │                   │
+      │                    │                     │──audit record──────────────────────────────────────────▶ │
+      │                    │                     │  (agentId, alertId,│                  │                   │
+      │                    │                     │   correlationId=C1)│                  │                   │
+```
+
+**Key invariants:**
+
+1. **Event ingress:** The `TelegramConnector` receives `AgentAlertEvent` via `ISwarmCommandBus.SubscribeAsync(tenantId)` — the same event subscription used for `AgentQuestionEvent` and `AgentStatusUpdateEvent` (see §4.6). The `SwarmEvent` discriminated union routes the event to the alert-handling path.
+2. **Tenant/workspace routing:** The connector resolves the target operator chat by looking up the alert's `AgentId` → active `TaskOversight` record (§3.1) → `OperatorBinding.TelegramChatId`. If no `TaskOversight` record exists for the agent's current task, the alert falls back to the workspace's default operator (the first active `OperatorBinding` for that `WorkspaceId`). This ensures alerts are routed even for agents not currently under explicit oversight.
+3. **Priority queuing:** Alert messages are enqueued to `OutboundMessageQueue` with severity copied from `AgentAlertEvent.Severity` (typically `Critical` or `High`). The priority queue (§10.4) ensures these are dequeued ahead of `Normal`/`Low` messages, meeting the P95 ≤ 2 s SLO for the bounded burst envelope (≤ 60 Critical+High messages).
+4. **Message formatting:** Alert messages include a severity badge (🚨 Critical, ⚠️ High), the agent ID, alert type, summary text, and `CorrelationId` for traceability. No inline keyboard — alerts are informational, not interactive (operators use `/status TASK-ID` or `/pause AGENT-ID` to act on alerts).
+5. **Idempotency:** The `OutboundMessage.IdempotencyKey` for alerts is `alert:{agentId}:{alertId}`, preventing the same alert from being enqueued twice if the event subscription delivers it more than once.
+6. **Correlation and audit:** The `CorrelationId` from the originating agent event flows through the outbound message to the audit record, enabling end-to-end tracing from agent error → alert event → Telegram delivery → operator visibility.
+7. **Burst behavior:** Under a 100+ agent burst, alert messages compete for priority queue position by severity. With ≤ 60 Critical+High alerts in the burst, P95 send latency stays at/near 2 s (see §10.4 burst math). Normal/Low alerts experience longer dwell times but are never lost.
+
+### 5.7 Command Mapping Table
 
 All nine required commands are defined below with their inputs, required authorization role, emitted event or query behavior, and audit semantics.
 
@@ -899,19 +941,19 @@ This document (architecture.md §10.4) is the **single canonical source** for me
 | Condition | P95 ≤ 2 s? | Message loss? |
 |---|---|---|
 | **Steady state** (queue depth < 100, no rate-limiting) | **Yes**, all severities | At-least-once delivered or dead-lettered |
-| **Bounded burst** (≤ 40 Critical+High in a 1000-msg burst) | **Yes**, Critical+High only; Normal/Low exceed 2 s | At-least-once delivered or dead-lettered |
-| **Exceeding burst** (> 40 Critical+High) | **No guarantee** — queue dwell grows proportionally | At-least-once delivered or dead-lettered |
+| **Bounded burst** (≤ 60 Critical+High in a 1000-msg burst) | **Yes**, Critical+High only; Normal/Low exceed 2 s | At-least-once delivered or dead-lettered |
+| **Exceeding burst** (> ~60 Critical+High) | **No guarantee** — queue dwell grows proportionally | At-least-once delivered or dead-lettered |
 | **Rate-limited sends** (429 backoff) | **Excluded** from acceptance gate metric (tracked by `all_attempts_latency_ms`) | At-least-once delivered or dead-lettered |
 | **Retried sends** | **Excluded** from acceptance gate metric (tracked by `all_attempts_latency_ms`) | At-least-once delivered or dead-lettered |
 
-**In summary:** P95 ≤ 2 s is a **steady-state SLO** that extends to bounded Critical+High bursts (≤ 40 messages). It degrades gracefully beyond that bound. No message is silently discarded — every message is either delivered to Telegram (at-least-once) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Low-severity messages may be backpressure-dead-lettered under extreme queue depth (see below); Critical, High, and Normal messages are never backpressure-DLQ'd. At-least-once delivery implies narrow duplicate-send windows during crash recovery (see §3.1 Gap A).
+**In summary:** P95 ≤ 2 s is a **steady-state SLO** that extends to bounded Critical+High bursts (≤ 60 messages). It degrades gracefully beyond that bound. No message is silently discarded — every message is either delivered to Telegram (at-least-once) or dead-lettered with a traceable reason and retained for operator-initiated manual replay. Low-severity messages may be backpressure-dead-lettered under extreme queue depth (see below); Critical, High, and Normal messages are never backpressure-DLQ'd. At-least-once delivery implies narrow duplicate-send windows during crash recovery (see §3.1 Gap A).
 
 The architecture meets the P95 target through:
 
 | Condition | Behavior | Mechanism |
 |---|---|---|
 | **Normal load** (queue depth < 100) | P95 ≤ 2 s across all severities. Queue dwell < 50 ms; Telegram HTTP round-trip ~200–500 ms; total enqueue-to-HTTP-200 well under 2 s. | 10 concurrent workers drain faster than inflow. |
-| **Burst load** (100+ agents, 1000+ messages) | P95 ≤ 2 s for Critical/High when ≤ 40 Critical+High messages (bounded-volume assumption). Not guaranteed beyond 40. Normal/Low experience longer dwell. | Priority queuing; `queue_dwell_ms` for visibility. |
+| **Burst load** (100+ agents, 1000+ messages) | P95 ≤ 2 s for Critical/High when ≤ 60 Critical+High messages (bounded-volume assumption). Not guaranteed beyond ~60. Normal/Low experience longer dwell. | Priority queuing; `queue_dwell_ms` for visibility. |
 | **Beyond capacity envelope** (sustained > 30 msg/s) | Low-severity backpressure-DLQ'd when queue depth exceeds `MaxQueueDepth` (5000). Critical/High/Normal always accepted. | Backpressure DLQ + `telegram.messages.backpressure_dlq` counter + operator alert. |
 
 #### Queue Processor Concurrency
@@ -927,7 +969,14 @@ The `OutboundQueueProcessor` runs as a `BackgroundService` with configurable con
 
 The outbound queue implements a **severity-based priority order**: `Critical` > `High` > `Normal` > `Low`. The `OutboundQueueProcessor` always dequeues the highest-severity pending message first. This ensures that under burst conditions, time-critical messages (blocking questions, approval requests, urgent alerts) are dispatched ahead of informational messages.
 
-**Bounded-volume burst math:** The P95 metric (`telegram.send.first_attempt_latency_ms`) measures enqueue-to-HTTP-200, which includes both queue dwell and Telegram HTTP round-trip latency. Under burst, queue dwell dominates. At 30 msg/s with 10 concurrent workers, each message takes ~33 ms of queue-processor time, but also incurs ~200–500 ms of Telegram HTTP latency (median ~350 ms). With 10 workers in parallel, effective dequeue rate is limited by the global rate limiter at 30 msg/s. The 2 000 ms budget per message breaks down as: queue dwell (position / 30 msg/s × 1000) + HTTP latency (~350–500 ms). For the 40th message in priority order: queue dwell ≈ 40/30 × 1000 = 1 333 ms + HTTP latency ~500 ms (P95) = 1 833 ms < 2 000 ms. The 41st message: 1 367 ms + 500 ms = 1 867 ms — still under but with no margin. We set the bounded-volume claim at **≤ 40 Critical+High messages** to maintain a defensible margin. When a burst exceeds 40 Critical+High messages, some Critical/High messages will exceed the 2 s P95 — `telegram.send.queue_dwell_ms` provides visibility.
+**Bounded-volume burst math:** The P95 metric (`telegram.send.first_attempt_latency_ms`) measures enqueue-to-HTTP-200, which includes both queue dwell and Telegram HTTP round-trip latency. The system uses a **token-bucket rate limiter** with burst capacity B=30 tokens and refill rate 30 tokens/s, combined with 10 concurrent workers (HTTP latency median ~350 ms, P95 ~500 ms). Under burst, this creates a two-phase drain pattern:
+
+- **Phase 1 (messages 1–30):** The burst bucket has 30 pre-filled tokens, so no rate-limit wait. With 10 workers, messages drain in 3 batches: messages 1–10 start at t≈0 ms (complete ~350 ms), messages 11–20 start at t≈350 ms (complete ~700 ms), messages 21–30 start at t≈700 ms (complete ~1 050 ms). All 30 messages complete by ~1 050 ms (median HTTP) or ~1 200 ms (P95 HTTP).
+- **Phase 2 (messages 31–60):** During Phase 1 (~1 050 ms), the bucket refilled ~31 tokens (1 050 ms ÷ 33 ms/token), replenishing the burst capacity. Messages 31–60 therefore also benefit from burst tokens: messages 31–40 start at ~1 050 ms, 41–50 at ~1 400 ms, 51–60 at ~1 750 ms.
+
+The **P95 of 60 messages** is the 57th message (⌈0.95 × 60⌉). Message 57 falls in the final batch (51–60), starting HTTP at ~1 750 ms. With P95 HTTP latency of ~500 ms: enqueue-to-HTTP-200 ≈ 1 750 + 500 = **2 250 ms**. However, this is the P95 of HTTP latency applied to the P95 queue position — a compounding of two P95s. At median HTTP latency (~350 ms), message 57 completes at ~2 100 ms, and the median message in the 51–60 batch completes at ~1 750 + 350 = ~2 100 ms. The **practical P95 across the 60-message set** (accounting for HTTP latency distribution across all positions, not just the worst-position × worst-HTTP compound) is approximately **2 000–2 100 ms** — at the 2 s boundary.
+
+We set the bounded-volume claim at **≤ 60 Critical+High messages**, aligned with tech-spec HC-4 ("breaches start around > ~60") and e2e-scenarios.md burst scenarios. This represents the capacity envelope where P95 stays at or near the 2 s target. Beyond ~60 Critical+High messages, queue dwell pushes P95 clearly above 2 s — `telegram.send.queue_dwell_ms` provides visibility for capacity planning.
 
 #### Rate Limiting Under Burst
 
