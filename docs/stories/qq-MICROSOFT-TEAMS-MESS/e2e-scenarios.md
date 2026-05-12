@@ -288,18 +288,19 @@ Feature: Security — Tenant and User Validation
       | approver | approve, reject                                  |
       | viewer   | agent status                                     |
 
-  Scenario: Message from unauthorized tenant is rejected
+  Scenario: Message from unauthorized tenant is rejected with HTTP 403
     Given user "mallory@evil-corp.com" is in tenant "evil-corp-tenant-id"
     When user "mallory@evil-corp.com" sends "agent ask hack the system" to the bot
-    Then the bot validates the incoming Activity's tenant ID
+    Then the TenantValidationMiddleware intercepts the request before the bot handler runs
     And the tenant ID "evil-corp-tenant-id" is not in the allowed list
-    And the bot returns an Unauthorized response
+    And the middleware returns HTTP 403 with no bot response or Adaptive Card
     And no MessengerEvent is enqueued
     And an audit record is persisted:
       | Field     | Value                       |
-      | Event     | UnauthorizedTenantRejected  |
+      | EventType | SecurityRejection           |
       | TenantId  | evil-corp-tenant-id         |
-      | UserId    | <mallory's AadObjectId>     |
+      | ActorId   | <mallory's AadObjectId>     |
+      | Outcome   | Rejected                    |
 
   Scenario: User without the required RBAC role is denied
     Given user "viewer-only@contoso.com" has RBAC role "viewer"
@@ -351,10 +352,12 @@ Feature: Reliability — Retry and Recovery
     Given the AgentSwarm.Messaging.Worker host service is running
     And the OutboxRetryEngine is configured with retry policy:
       | Setting          | Value              |
-      | MaxRetries       | 5                  |
-      | InitialBackoff   | 1 second           |
+      | MaxRetries       | 4                  |
+      | InitialBackoff   | 2 seconds          |
       | BackoffMultiplier| 2                  |
-      | MaxBackoff       | 30 seconds         |
+      | MaxBackoff       | 60 seconds         |
+      | Jitter           | ±25%               |
+      | TotalAttempts    | 5 (1 initial + 4 retries) |
 
   Scenario: Transient Bot Framework failure triggers retry
     Given agent "test-agent-01" publishes an AgentQuestion
@@ -369,7 +372,7 @@ Feature: Reliability — Retry and Recovery
   Scenario: Persistent failure exhausts retries and dead-letters
     Given agent "test-agent-01" publishes an AgentQuestion
     When the bot attempts to send the Adaptive Card
-    And the Bot Framework returns HTTP 500 on all 5 retry attempts
+    And the Bot Framework returns HTTP 500 on all 5 attempts (1 initial + 4 retries)
     Then the notification is moved to the dead-letter queue after the 5th attempt
     And an alert is raised for the operations team
     And an audit record marks the notification as "DeadLettered"
@@ -585,16 +588,19 @@ Feature: Adaptive Card — Incident Summary and Release Gates
       | Actions          | Acknowledge, Escalate, Need more info|
     And the card is delivered to the configured incident channel
 
-  Scenario: Release gate approval card with multiple approvers
+  Scenario: Release gate approval card with multiple approvers (RequiredApprovals = 2)
     Given agent "release-agent-01" requires approval from 2 approvers
+    And the AgentQuestion has RequiredApprovals = 2
     And the AgentQuestion is sent to both "alice@contoso.com" and "bob@contoso.com"
     When "alice@contoso.com" clicks "Approve"
-    Then alice's card is updated to show "Approved by alice@contoso.com (1/2)"
+    Then a HumanDecisionEvent with ActionValue "approve" is created for alice
+    And alice's card is updated to show "Approved by alice@contoso.com (1/2)"
     And bob's card remains actionable
     When "bob@contoso.com" clicks "Approve"
-    Then both cards are updated to show "Fully Approved (2/2)"
-    And a HumanDecisionEvent with ActionValue "approve" is created
-    And an audit trail records both individual approvals
+    Then a second HumanDecisionEvent with ActionValue "approve" is created for bob
+    And both cards are updated to show "Fully Approved (2/2)"
+    And the release gate transitions to approved state
+    And an audit trail records both individual approvals as separate CardActionReceived events
 ```
 
 ---
@@ -651,20 +657,26 @@ Feature: Correlation and Traceability
     Then all MessengerEvents in the chain share CorrelationId "corr-001"
     And the audit trail for "corr-001" shows:
       | Step | EventType             |
-      | 1    | InboundCommand        |
-      | 2    | OutboundNotification  |
-      | 3    | HumanDecision         |
-      | 4    | TaskCompletion        |
+      | 1    | CommandReceived       |
+      | 2    | ProactiveNotification |
+      | 3    | CardActionReceived    |
+      | 4    | MessageSent           |
 
-  Scenario: Every message includes required tracing fields
+  Scenario: Every MessengerEvent includes required tracing fields per canonical model
     When any MessengerEvent is created
-    Then it contains all required fields:
-      | Field          | Constraint     |
-      | CorrelationId  | Non-empty UUID |
-      | AgentId        | Non-empty      |
-      | TaskId         | Non-empty      |
-      | ConversationId | Non-empty      |
-      | Timestamp      | UTC ISO 8601   |
+    Then it contains all fields defined in the canonical MessengerEvent model (architecture.md §3.1):
+      | Field          | Constraint                                              |
+      | EventId        | Non-empty unique identifier                             |
+      | EventType      | One of: Command, Decision, Reaction, InstallUpdate, AgentTaskRequest |
+      | CorrelationId  | Non-empty UUID for end-to-end tracing                   |
+      | Messenger      | "Teams"                                                 |
+      | ExternalUserId | Non-empty (Teams AAD object ID)                         |
+      | Payload        | Non-null typed payload                                  |
+      | Timestamp      | UTC ISO 8601                                            |
+    And the corresponding audit record may additionally contain optional fields:
+      | Field          | Constraint                                              |
+      | TaskId         | Present when event relates to an agent task (optional per tech-spec §4.3) |
+      | ConversationId | Present when event occurs within a conversation (optional per tech-spec §4.3) |
 ```
 
 ---
@@ -767,12 +779,24 @@ Feature: Edge Cases and Error Handling
     Then the conversation reference is updated with the new ServiceUrl
     And subsequent proactive messages use the updated ServiceUrl
 
-  Scenario: Concurrent approvals for the same question from different users
-    Given question "Q-999" was sent to both "alice@contoso.com" and "bob@contoso.com"
+  Scenario: Concurrent approvals for the same single-decision question (first-writer-wins)
+    Given question "Q-999" is a single-decision question (RequiredApprovals = 1)
+    And question "Q-999" was sent to both "alice@contoso.com" and "bob@contoso.com"
     When both users click "Approve" within the same second
     Then exactly one HumanDecisionEvent is created (first-writer-wins)
     And the second user sees: "This question has already been decided."
     And both outcomes are audit-logged
+
+  Scenario: Concurrent approvals for a multi-approver release gate (all recorded)
+    Given question "Q-998" is a release-gate question with RequiredApprovals = 2
+    And question "Q-998" was sent to both "alice@contoso.com" and "bob@contoso.com"
+    When both users click "Approve" within the same second
+    Then both approvals are accepted and recorded as separate HumanDecisionEvents
+    And both cards are updated to show "Fully Approved (2/2)"
+    And both individual approvals are audit-logged
+    And the release gate transitions to approved state only after reaching the required count
+
+  > **Note:** Single-decision questions (e.g., standard agent blocking questions) use first-writer-wins semantics — only the first response is authoritative. Multi-approver release gates (e.g., release-gate scenario in §Adaptive Cards) require a configurable `RequiredApprovals` count and record all individual decisions until the threshold is met. The `AgentQuestion.AllowedActions` metadata and a `RequiredApprovals` field on the question distinguish the two modes.
 
   Scenario: Bot Framework token refresh during long-running operation
     Given the bot's authentication token is about to expire

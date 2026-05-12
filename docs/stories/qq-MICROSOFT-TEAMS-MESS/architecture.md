@@ -436,10 +436,22 @@ public interface IMessengerConnector
     Task SendMessageAsync(MessengerMessage message, CancellationToken ct);
     Task SendQuestionAsync(AgentQuestion question, CancellationToken ct);
     Task<IReadOnlyList<MessengerEvent>> ReceiveAsync(CancellationToken ct);
+
+    // Update/delete surface for already-sent cards (§6.5 flow)
+    Task UpdateCardAsync(string questionId, CardUpdateAction action, CancellationToken ct);
+    Task DeleteCardAsync(string questionId, CancellationToken ct);
+}
+
+/// <summary>Describes the update to apply to a previously-sent card.</summary>
+public enum CardUpdateAction
+{
+    MarkAnswered,
+    MarkExpired,
+    MarkCancelled
 }
 ```
 
-`TeamsMessengerConnector` implements this interface. The orchestrator interacts only through `IMessengerConnector`; it has no knowledge of Teams-specific types.
+`TeamsMessengerConnector` implements this interface. The orchestrator interacts only through `IMessengerConnector`; it has no knowledge of Teams-specific types. The `UpdateCardAsync` and `DeleteCardAsync` methods provide the orchestrator's entry point for the §6.5 update/delete flow — internally, `TeamsMessengerConnector` looks up `TeamsCardState` to find the `activityId` and delegates to `ProactiveNotifier` for the Bot Framework call.
 
 ### 4.2 IConversationReferenceStore
 
@@ -449,6 +461,10 @@ public interface IMessengerConnector
 public interface IConversationReferenceStore
 {
     Task SaveAsync(TeamsConversationReference reference, CancellationToken ct);
+
+    // Generic get by primary key (aligned with implementation-plan.md §1.2 GetAsync)
+    Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct);
+
     Task<TeamsConversationReference?> GetByUserIdAsync(string tenantId, string userId, CancellationToken ct);
     Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct);
     Task<IReadOnlyList<TeamsConversationReference>> GetAllAsync(string tenantId, CancellationToken ct);
