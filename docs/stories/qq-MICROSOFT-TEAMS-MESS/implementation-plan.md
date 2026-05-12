@@ -30,7 +30,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Implementation Steps
 - [ ] Define `IMessengerConnector` interface with methods: `SendMessageAsync(MessengerMessage, CancellationToken)`, `SendQuestionAsync(AgentQuestion, CancellationToken)`, `ReceiveAsync(CancellationToken)`.
-- [ ] Define `IConversationReferenceStore` interface with methods: `SaveAsync`, `GetAsync`, `GetAllAsync`, `DeleteAsync` for storing platform-specific conversation references.
+- [ ] Define `IConversationReferenceStore` interface with methods: `SaveAsync`, `GetAsync`, `GetAllAsync`, `GetByUserIdAsync`, `GetByChannelIdAsync`, `MarkInactiveAsync`, `DeleteAsync` for storing platform-specific conversation references.
 - [ ] Define `IMessageOutbox` interface with methods: `EnqueueAsync`, `DequeueAsync`, `AcknowledgeAsync`, `DeadLetterAsync` for durable outbound messaging.
 - [ ] Define `ConnectorOptions` base class with common config: `RetryCount`, `RetryDelayMs`, `MaxConcurrency`, `DeadLetterThreshold`.
 
@@ -84,8 +84,9 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create `TeamsSwarmActivityHandler` extending `TeamsActivityHandler` with DI for `IConversationReferenceStore`, `IAuditLogger`, and `ILogger<TeamsSwarmActivityHandler>`.
 - [ ] Override `OnMessageActivityAsync` to parse incoming text commands (`agent ask`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume`) and route to a command dispatcher.
 - [ ] Override `OnTeamsMembersAddedAsync` to capture and persist the conversation reference on bot installation.
-- [ ] Override `OnTeamsMembersRemovedAsync` to clean up stored conversation references on bot uninstall.
-- [ ] Override `OnInstallationUpdateActivityAsync` to handle Teams app install/uninstall lifecycle and log audit entries.
+- [ ] Override `OnTeamsMembersRemovedAsync` to mark stored conversation references as inactive (retain for audit) on bot uninstall via `IConversationReferenceStore.MarkInactiveAsync`; do not delete references.
+- [ ] Override `OnInstallationUpdateActivityAsync` to handle Teams app install/uninstall lifecycle and log audit entries; on uninstall, mark conversation references inactive rather than removing them.
+- [ ] Override `OnAdaptiveCardInvokeAsync` to process Adaptive Card `Action.Submit` invoke activities, extract `ActionId` and optional comment from `Activity.Value`, resolve the originating `AgentQuestion` via `QuestionId`, produce a `HumanDecisionEvent`, and return an `AdaptiveCardInvokeResponse`.
 - [ ] Implement `OnTurnAsync` to add `CorrelationId` (from activity or new GUID) to the turn context for distributed tracing.
 
 ### Dependencies
@@ -101,7 +102,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Implementation Steps
 - [ ] Implement `TeamsMessengerConnector : IMessengerConnector` with constructor injection of `IBotFrameworkHttpAdapter`, `TeamsMessagingOptions`, `IConversationReferenceStore`.
 - [ ] Implement `SendMessageAsync` to send a text message to the stored conversation reference using `adapter.ContinueConversationAsync`.
-- [ ] Implement `SendQuestionAsync` to render an `AgentQuestion` as an Adaptive Card (delegating to card builder in Phase 3) and send it proactively.
+- [ ] Implement `SendQuestionAsync` to render an `AgentQuestion` as a simple text summary and send it proactively via `ContinueConversationAsync`; Adaptive Card rendering is wired in Phase 3 Stage 3.1 when `AdaptiveCardBuilder` becomes available.
 - [ ] Implement `ReceiveAsync` using an in-memory channel (`System.Threading.Channels.Channel<MessengerEvent>`) fed by the activity handler.
 - [ ] Wire `TeamsMessengerConnector` into DI as `IMessengerConnector` keyed by `"teams"`.
 
@@ -125,6 +126,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement approval card template with: title, body text, severity indicator, action buttons generated from `HumanAction` list, optional comment input for actions where `RequiresComment = true`.
 - [ ] Implement status summary card template showing: agent ID, task ID, current status, last update timestamp, progress percentage.
 - [ ] Implement incident escalation card template with: severity level, affected agents, incident summary, escalate/acknowledge buttons.
+- [ ] Implement release gate card template with: gate name, release version, environment, gate conditions checklist, approve/reject/defer buttons, and gate status indicator.
 - [ ] Create `CardActionMapper` to map Adaptive Card `Action.Submit` data payloads back to `HumanDecisionEvent` records.
 
 ### Dependencies
@@ -196,7 +198,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create `IProactiveNotifier` interface with `SendProactiveAsync(string userId, MessengerMessage message, CancellationToken ct)` and `SendProactiveQuestionAsync(string userId, AgentQuestion question, CancellationToken ct)`.
 - [ ] Implement `TeamsProactiveNotifier : IProactiveNotifier` using `BotAdapter.ContinueConversationAsync` with stored conversation references.
 - [ ] Implement conversation reference rehydration: deserialize stored `ConversationReference` JSON and invoke `ContinueConversationAsync` with the app credentials.
-- [ ] Add proactive message queuing: enqueue notifications in `IMessageOutbox` and process them via a background `IHostedService` to decouple send timing from agent events.
+- [ ] Add proactive message delivery via direct `ContinueConversationAsync` calls; durable outbox queuing is layered on top in Phase 6 Stage 6.1 when `SqlMessageOutbox` becomes available.
 - [ ] Implement notification routing: determine whether to send to personal chat or team channel based on message priority and user preferences.
 
 ### Dependencies

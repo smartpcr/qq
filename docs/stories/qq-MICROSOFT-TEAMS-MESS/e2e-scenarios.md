@@ -663,6 +663,70 @@ Feature: Correlation and Traceability
 
 ---
 
+## Feature: Teams Message Actions (Message Extensions)
+
+Covers the Teams message-extension action commands that allow users to forward selected message context into an agent command, as required by tech-spec.md §2.1 "Message actions".
+
+```gherkin
+Feature: Teams Message Actions (Message Extensions)
+
+  Background:
+    Given the Teams bot manifest includes a composeExtension with type "action"
+    And the action command "forwardToAgent" is defined in the manifest
+    And user "alice@contoso.com" has RBAC role "operator"
+    And the bot is installed for user "alice@contoso.com" in tenant "contoso-tenant-id"
+
+  Scenario: User invokes message action to forward a message to an agent
+    Given user "bob@contoso.com" posted a message in channel "#ops-swarm":
+      """
+      The deployment pipeline for service-xyz is failing with timeout errors on stage 3.
+      """
+    When user "alice@contoso.com" right-clicks (or long-presses) the message and selects "Forward to Agent" from the message actions menu
+    Then the bot receives an invoke activity of type "composeExtension/submitAction"
+    And the activity payload includes the selected message text as context
+    And the TeamsActivityHandler delegates to the CommandParser with the forwarded content
+    And a MessengerEvent of type "AgentTaskRequest" is enqueued with:
+      | Field          | Value                                                                             |
+      | CorrelationId  | <non-empty UUID>                                                                  |
+      | ExternalUserId | <alice's AadObjectId>                                                             |
+      | Body           | The deployment pipeline for service-xyz is failing with timeout errors on stage 3. |
+      | Source         | MessageAction                                                                     |
+    And the bot replies in the channel thread confirming the task was created
+    And an immutable audit record is persisted for the message action
+
+  Scenario: Message action presents a task form for user input
+    Given user "alice@contoso.com" selects a message and invokes the "Forward to Agent" action
+    When the bot receives the composeExtension/fetchTask invoke
+    Then the bot returns an Adaptive Card task module containing:
+      | Field       | Type     | Pre-populated                    |
+      | Context     | readonly | <selected message text>          |
+      | Command     | dropdown | agent ask, escalate              |
+      | Priority    | dropdown | Low, Medium, High, Critical      |
+      | Notes       | text     | <empty>                          |
+    When the user selects command "agent ask", priority "High", and submits
+    Then the bot receives a composeExtension/submitAction invoke with the form data
+    And a MessengerEvent of type "AgentTaskRequest" is enqueued with the selected command and priority
+    And an audit record is persisted
+
+  Scenario: Message action from user without required RBAC role is denied
+    Given user "viewer-only@contoso.com" has RBAC role "viewer"
+    When user "viewer-only@contoso.com" invokes the "Forward to Agent" message action
+    Then the bot validates the user's RBAC role via Activity.From.AadObjectId
+    And the "agent ask" command requires role "operator"
+    And the bot returns an error response in the task module: "You do not have permission to perform this action."
+    And no MessengerEvent is created
+    And an audit record is persisted for the access denial
+
+  Scenario: Message action from unauthorized tenant is rejected
+    Given user "mallory@evil-corp.com" is in tenant "evil-corp-tenant-id"
+    When user "mallory@evil-corp.com" invokes the "Forward to Agent" message action
+    Then the TenantValidationMiddleware rejects the invoke activity
+    And the bot returns HTTP 403
+    And an audit record is persisted with EventType "SecurityRejection"
+```
+
+---
+
 ## Feature: Edge Cases and Error Handling
 
 Covers boundary conditions and failure modes that QA should exercise.
