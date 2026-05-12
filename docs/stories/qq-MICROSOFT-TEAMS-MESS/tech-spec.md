@@ -289,7 +289,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/tech-spec.md`
-**Byte count:** verified post-edit (see below).
+**Byte count:** 35,134 bytes (verified).
 **Covers:** Problem statement (§1), in/out-of-scope (§2), non-goals (§3), hard constraints (§4 — security, performance, compliance with canonical seven-value audit schema), identified risks (§5), dependencies (§6), assumptions (§7), success metrics (§8), glossary (§9). All sections anchored to story description details: Bot Framework, Entra ID, Teams scopes, Adaptive Cards, proactive messaging, commands, P95 delivery, audit trail.
 
 ### Prior feedback resolution
