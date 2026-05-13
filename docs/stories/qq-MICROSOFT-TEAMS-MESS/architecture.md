@@ -36,8 +36,8 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 ┌─────────────────────────────────────────────────────────────────────┐
 │  2.3  TeamsBotAdapter                                               │
 │  Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter         │
-│  Middleware: TelemetryMiddleware → TenantValidationMiddleware →     │
-│  ActivityDeduplicationMiddleware → RateLimitMiddleware (4 stages)   │
+│  Middleware: TelemetryMiddleware → ActivityDeduplicationMiddleware → │
+│  RateLimitMiddleware (3 Bot Framework stages)                       │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
@@ -100,7 +100,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Type** | `CloudAdapter` (from `Microsoft.Bot.Builder.Integration.AspNet.Core`) |
-| **Middleware** | `TelemetryMiddleware` → `TenantValidationMiddleware` → `ActivityDeduplicationMiddleware` → `RateLimitMiddleware` |
+| **Middleware** | `TelemetryMiddleware` → `ActivityDeduplicationMiddleware` → `RateLimitMiddleware` (3 Bot Framework `IMiddleware` stages; `TenantValidationMiddleware` runs upstream as ASP.NET Core HTTP middleware before `CloudAdapter` — see §5.1) |
 | **Responsibility** | Deserialize Bot Framework `Activity` objects, run middleware pipeline, route to `TeamsSwarmActivityHandler`. Handles authentication of inbound requests via Bot Framework JWT validation. |
 | **Error handling** | `OnTurnError` logs the exception, sends a user-facing error card, and publishes a dead-letter event to the outbox. |
 
@@ -230,7 +230,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Middleware` |
 | **Type** | Bot Framework middleware (`IMiddleware`) |
-| **Position in pipeline** | After `TenantValidationMiddleware`, before `RateLimitMiddleware` (see §2.3). |
+| **Position in pipeline** | First in the Bot Framework `IMiddleware` pipeline, before `RateLimitMiddleware` (see §2.3). Note: `TenantValidationMiddleware` runs upstream as ASP.NET Core HTTP middleware before `CloudAdapter` — it is not in this pipeline. |
 | **Responsibility** | Suppress duplicate inbound webhook deliveries. Teams and the Bot Connector service may retry an HTTP POST if the initial response times out, resulting in the same logical activity being delivered more than once. This middleware deduplicates by `Activity.Id` (or `Activity.ReplyToId` for invoke activities) per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 447–454 (duplicate inbound webhook suppression scenario). |
 | **Store** | `IActivityIdStore` — a lightweight store that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). The **default implementation is an in-memory `ConcurrentDictionary`** with a background eviction timer — suitable for single-instance deployments. For multi-instance deployments, a **Redis-backed implementation** (`RedisActivityIdStore`) is required to ensure deduplication is consistent across pods. When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
 | **Distinction from §2.6 idempotency** | This middleware operates at the **transport level** on raw `Activity.Id`, catching retried HTTP POSTs before any handler runs. The `CardActionHandler` idempotency set (§2.6) operates at the **domain level** on `(QuestionId, UserId)`, catching semantically duplicate card actions that may arrive as distinct activities. Both layers are necessary. |
@@ -775,7 +775,7 @@ public interface IAgentQuestionStore
 
 ### 5.1 Tenant Validation
 
-`TenantValidationMiddleware` runs early in the `TeamsBotAdapter` pipeline. It extracts `Activity.ChannelData.Tenant.Id` (or the `tid` claim from the Bot Framework JWT) and validates it against a configured allowlist of Entra ID tenant IDs. Activities from disallowed tenants are rejected with HTTP 403 and an `AuditEntry` of type `SecurityRejection` is logged.
+`TenantValidationMiddleware` is an **ASP.NET Core HTTP middleware** (`Microsoft.AspNetCore.Http.IMiddleware`) registered in the ASP.NET Core request pipeline before `CloudAdapter.ProcessAsync` (via `app.UseMiddleware<TenantValidationMiddleware>()` before `app.MapControllers()`). It reads the raw HTTP request body, deserializes the `Activity` JSON to extract `ChannelData.tenant.id` (or `Conversation.TenantId`), and validates it against a configured allowlist of Entra ID tenant IDs. Activities from disallowed tenants are rejected with **HTTP 403 Forbidden** at the HTTP layer (short-circuiting the pipeline before `CloudAdapter` processes the request) and an `AuditEntry` of type `SecurityRejection` is logged. This HTTP-layer placement gives the middleware direct control over HTTP status codes — Bot Framework `IMiddleware` (which runs inside `CloudAdapter`) cannot set HTTP status codes because `CloudAdapter.ProcessAsync` always returns HTTP 200 for processed activities.
 
 ### 5.2 User Identity
 
