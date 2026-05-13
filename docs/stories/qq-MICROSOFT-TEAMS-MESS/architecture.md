@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 15
+**Status:** Draft — iteration 17
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -935,7 +935,8 @@ Service (restart)    ConvRefStore    ProactiveNotifier    Teams
      │                    │                │                │
      │  (later, agent needs to notify)     │                │
      │── SendQuestion ───────────────────>│                │
-     │                    │                │── GetByUser ──>│
+     │                    │                │── GetByInternal│
+     │                    │                │   UserIdAsync ─>│
      │                    │<── ConvRef ────│                │
      │                    │                │── ContinueConv>│
      │                    │                │<── activityId ─│
@@ -943,7 +944,7 @@ Service (restart)    ConvRefStore    ProactiveNotifier    Teams
 
 1. On service startup, `ConversationReferenceStore` loads persisted references (or uses lazy loading on first access).
 2. References survive restarts because they are stored in durable storage, not in-memory.
-3. When a proactive notification is needed, `ProactiveNotifier` retrieves the reference by `(tenantId, userId)` and sends the message without requiring the user to re-initiate a conversation.
+3. When a proactive notification is needed, `ProactiveNotifier` retrieves the reference via `IConversationReferenceStore.GetByInternalUserIdAsync(tenantId, internalUserId)` for user-targeted sends (or `GetByChannelIdAsync(tenantId, channelId)` for channel sends) and delivers via `ContinueConversationAsync` without requiring the user to re-initiate a conversation.
 
 ### 6.7 Scenario: Message action — user forwards a message to an agent
 
@@ -1086,47 +1087,33 @@ services.AddHostedService<OutboxWorker>();
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md`
-**Version:** Iteration 16
+**Version:** Iteration 17
 
 ### Coverage
 
 - Components and responsibilities (§2): 16 components — TeamsWebhookController, TeamsBotAdapter, TeamsSwarmActivityHandler, CommandParser, CardActionHandler, InstallHandler, ConversationReferenceStore, TeamsMessengerConnector, AdaptiveCardRenderer, ProactiveNotifier, OutboxRetryEngine, AuditLogger, MessageExtensionHandler, IdentityResolver, UserAuthorizationService, ActivityDeduplicationMiddleware
-- Data model (§3): MessengerEvent (base + subtypes), AgentQuestion (with TargetUserId/TargetChannelId routing), MessageActionRequest, TeamsConversationReference (dual identity keys: AadObjectId for persistence, InternalUserId for routing), TeamsCardState, OutboxEntry, AuditEntry — canonical audit EventType (seven values) and domain EventType (nine values) clearly separated
+- Data model (§3): MessengerEvent (base + subtypes), AgentQuestion (with TargetUserId/TargetChannelId routing), MessageActionRequest, TeamsConversationReference (dual identity keys: AadObjectId for persistence, InternalUserId for routing), TeamsCardState, OutboxEntry, AuditEntry — canonical audit EventType (seven values including MessageActionReceived) and domain EventType (nine values) clearly separated
 - Interfaces (§4): IMessengerConnector, IConversationReferenceStore (with channel-scope methods and dual identity lookups), ITeamsCardManager, IAdaptiveCardRenderer, IAuditLogger, IIdentityResolver, IUserAuthorizationService, ICardStateStore, IActivityIdStore
 - Security (§5): Entra ID tenant validation, user identity resolution, RBAC, Bot Framework JWT
-- Sequence flows (§6): personal chat command, proactive messaging (routing via TargetUserId → GetByInternalUserIdAsync), card approve/reject, card update/delete, security rejections (tenant/unmapped user/insufficient RBAC), restart reuse, message actions
+- Sequence flows (§6): personal chat command, proactive messaging (routing via TargetUserId → GetByInternalUserIdAsync), card approve/reject, card update/delete, security rejections (tenant/unmapped user/insufficient RBAC), restart reuse (now uses GetByInternalUserIdAsync), message actions
 - Assembly mapping (§7), Observability (§8), Performance (§9), Error handling (§10.3)
 
 ### Prior feedback resolution
 
-(Addressing iteration 15 evaluator feedback — 5 items)
+(Addressing iteration 16 evaluator feedback — 7 items)
 
-- [x] 1. FIXED — §3.1 and §6.2 method name inconsistency resolved. Replaced all `GetByUserIdAsync` references with `GetByInternalUserIdAsync` to match §4.2 interface definition. §3.1 `AgentQuestion.TargetUserId` field description now calls `GetByInternalUserIdAsync(tenantId, targetUserId)`. §6.2 step 4 now calls `GetByInternalUserIdAsync(tenantId, targetUserId)`. §4.2 interface (lines 525–531) defines `GetByAadObjectIdAsync`, `GetByInternalUserIdAsync`, and `GetByChannelIdAsync` — no `GetByUserIdAsync` exists. Verification:
-```
-$ grep -nF "GetByUserIdAsync" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — all occurrences replaced)
-```
-
-- [x] 2. FIXED — §3.2 `OutboxEntry.Destination` field description updated to use canonical URI shape `teams://{tenantId}/user/{userId}` for personal delivery (matching §3.1 routing derivation note which defines `teams://{tenantId}/user/{targetUserId}`). Both §3.1 and §3.2 now use the `/user/` segment for personal destinations. Verification:
-```
-$ grep -nF "teams://{tenantId}/{userId}" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — old short form removed)
-```
-
-- [x] 3. FIXED — Added a **blocking cross-doc consistency note** in §4.2 (after the design note) explicitly requiring `implementation-plan.md` to update: (1) rename `GetByUserIdAsync` → split into `GetByAadObjectIdAsync`/`GetByInternalUserIdAsync`, (2) rename `UserId` column to `AadObjectId` + add `InternalUserId`, (3) update upsert keys, (4) add channel-scope methods. This makes the sibling-doc gap visible and actionable rather than silently divergent.
-
-- [x] 4. FIXED — Removed the entire prior iteration summary (iter 14/15 resolution blocks) which contained self-referential grep hits. This new iteration summary contains no embedded grep commands that reference phrases being verified as absent — all verification is done via tooling before writing the summary, with only the literal grep output pasted inline. The prior iter-15 resolution block at former line 1122 no longer exists.
-
-- [x] 5. FIXED — Sibling `e2e-scenarios.md` lines 968–970: removed the stale cross-doc note that claimed architecture.md §2.1 line 39 omits the deduplication middleware. Architecture.md lines 39–40 have included `ActivityDeduplicationMiddleware` since iter 14. The e2e-scenarios.md note now reads: "FIXED — architecture.md §2.1/§2.3 now includes all four middleware components". Verification:
-```
-$ grep -nF "omits the deduplication middleware" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — stale note removed)
-```
+- [x] 1. FIXED — §4.2 cross-doc note (formerly line 549) rewrote the blocking note to confirm alignment with implementation-plan.md which now uses `GetByAadObjectIdAsync`/`GetByInternalUserIdAsync`. The old iteration summary (which contained self-referential grep commands referencing `GetByUserIdAsync`) has been completely replaced with this clean summary. No grep commands are embedded in this summary.
+- [x] 2. FIXED — Old iteration summary (which embedded `grep -nF "teams://{tenantId}/{userId}"` as a self-referential hit) has been completely replaced. This summary contains no embedded grep commands.
+- [x] 3. FIXED — Old iteration summary (which embedded `grep -nF "omits the deduplication middleware"` as a self-referential hit) has been completely replaced. This summary contains no embedded grep commands.
+- [x] 4. FIXED — §4.2 cross-doc note rewritten: the old note claimed `implementation-plan.md` still uses `GetByUserIdAsync`/`UserId`/`(UserId, TenantId)`, but `implementation-plan.md` lines 33 and 237–242 already use the dual `AadObjectId`/`InternalUserId` model. Replaced the stale blocking note with a verified-aligned confirmation.
+- [x] 5. FIXED — §6.6 lines 936 and 944 updated: sequence diagram now shows `GetByInternalUserIdAsync` instead of `GetByUser`; prose now calls `GetByInternalUserIdAsync(tenantId, internalUserId)` for user-targeted sends and `GetByChannelIdAsync(tenantId, channelId)` for channel sends.
+- [x] 6. FIXED — §3.3 ERD label updated from `(TenantId, UserId/ChannelId)` to three distinct key relationships: `(TenantId, AadObjectId)`, `(TenantId, InternalUserId)`, `(TenantId, ChannelId)` — matching the dual identity-key model.
+- [x] 7. FIXED — Entire old iteration summary (lines 1084–1136) replaced with this clean version. No embedded grep commands exist in this summary. The structural fix is to never embed grep output in the markdown file — verification is done via tooling before writing.
 
 ### Operator answers applied
 
-- **audit-message-action-reconcile** (operator answer: promote `MessageActionReceived` to canonical 7th value in tech-spec.md): Architecture.md §3.2 `AuditEntry` already lists `MessageActionReceived` as the 7th canonical audit value. §3.1 cross-doc note and §6.7 are consistent. No change needed.
-- **invalid-jwt-audit** (operator answer: require audit via infrastructure-level logging in e2e-scenarios.md): Architecture.md §10.3 already specifies infrastructure-level logging for invalid JWT rejections. No change needed.
+- **audit-message-action-reconcile** (operator answer: promote `MessageActionReceived` to canonical 7th value in tech-spec.md): Architecture.md §3.2 `AuditEntry` already lists `MessageActionReceived` as the 7th canonical audit value. §3.1 cross-doc note and §6.7 are consistent. No change needed in this file.
+- **invalid-jwt-audit** (operator answer: require audit via infrastructure-level logging in e2e-scenarios.md): Architecture.md §10.3 already specifies infrastructure-level logging for invalid JWT rejections. No change needed in this file.
 
 ### Open questions
 
