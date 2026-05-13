@@ -765,10 +765,38 @@ public interface IAgentQuestionStore
     /// returns false if status was already changed (first-writer-wins duplicate).
     /// </summary>
     Task<bool> TryUpdateStatusAsync(string questionId, string expectedStatus, string newStatus, CancellationToken ct);
+
+    /// <summary>
+    /// Sets the ConversationId field on a previously saved AgentQuestion.
+    /// Called by SendQuestionAsync and TeamsProactiveNotifier after proactive send completes.
+    /// Aligned with implementation-plan.md §1.2.
+    /// </summary>
+    Task UpdateConversationIdAsync(string questionId, string conversationId, CancellationToken ct);
+
+    /// <summary>
+    /// Returns the most recently created question with Status = "Open" and matching ConversationId,
+    /// ordered by CreatedAt descending. Used for single-target bare approve/reject resolution.
+    /// Aligned with implementation-plan.md §1.2 and §2.5.
+    /// </summary>
+    Task<AgentQuestion?> GetMostRecentOpenByConversationAsync(string conversationId, CancellationToken ct);
+
+    /// <summary>
+    /// Returns ALL open questions with matching ConversationId, ordered by CreatedAt descending.
+    /// Used by ApproveCommandHandler/RejectCommandHandler for bare approve/reject disambiguation.
+    /// Aligned with implementation-plan.md §1.2.
+    /// </summary>
+    Task<IReadOnlyList<AgentQuestion>> GetOpenByConversationAsync(string conversationId, CancellationToken ct);
+
+    /// <summary>
+    /// Returns up to batchSize questions where Status = "Open" and ExpiresAt &lt; cutoff.
+    /// Used by QuestionExpiryProcessor for batch-scanning expired questions.
+    /// Aligned with implementation-plan.md §1.2.
+    /// </summary>
+    Task<IReadOnlyList<AgentQuestion>> GetOpenExpiredAsync(DateTimeOffset cutoff, int batchSize, CancellationToken ct);
 }
 ```
 
-`CardActionHandler` (§2.6) depends on this interface to resolve the originating `AgentQuestion` by `QuestionId`, validate that the submitted `ActionValue` is in the stored `AllowedActions` list, and check/transition `Status` for durable idempotent duplicate handling (first-writer-wins per `e2e-scenarios.md` §first-writer-wins). `TeamsMessengerConnector.SendQuestionAsync` calls `SaveAsync` to persist the question before rendering and enqueueing the outbox entry. The concrete implementation `SqlAgentQuestionStore` (defined in `implementation-plan.md` §3.3 line 193) is backed by a SQL table with columns `QuestionId` (PK), `AgentId`, `TaskId`, `TenantId`, `TargetUserId`, `TargetChannelId`, `Title`, `Body`, `Severity`, `AllowedActionsJson`, `ExpiresAt`, `CorrelationId`, `Status`, `CreatedAt`, `ResolvedAt`.
+`CardActionHandler` (§2.6) depends on this interface to resolve the originating `AgentQuestion` by `QuestionId`, validate that the submitted `ActionValue` is in the stored `AllowedActions` list, and check/transition `Status` for durable idempotent duplicate handling (first-writer-wins per `e2e-scenarios.md` §first-writer-wins). `TeamsMessengerConnector.SendQuestionAsync` calls `SaveAsync` to persist the question before rendering and enqueueing the outbox entry. The concrete implementation `SqlAgentQuestionStore` (defined in `implementation-plan.md` §3.3) is backed by a SQL table with columns `QuestionId` (PK), `AgentId`, `TaskId`, `TenantId`, `TargetUserId`, `TargetChannelId`, `ConversationId` (string — the Teams conversation ID where the question was sent; populated by `SendQuestionAsync`/`TeamsProactiveNotifier` at card-send time via `UpdateConversationIdAsync`; used by `GetOpenByConversationAsync` to support bare `approve`/`reject` text commands), `Title`, `Body`, `Severity`, `AllowedActionsJson`, `ExpiresAt`, `CorrelationId`, `Status`, `CreatedAt`, `ResolvedAt`. Filtered indexes: `(ConversationId, Status) WHERE Status = 'Open'` for `GetOpenByConversationAsync`; `(Status, ExpiresAt) WHERE Status = 'Open'` for `GetOpenExpiredAsync`.
 
 ---
 
