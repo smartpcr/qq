@@ -157,7 +157,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Interface** | `IConversationReferenceStore` (defined in `AgentSwarm.Messaging.Teams`) |
-| **Responsibility** | Persist and retrieve Bot Framework `ConversationReference` objects for proactive messaging. Each reference is keyed by `(TenantId, AadObjectId)` for personal chats or `(TenantId, ChannelId)` for team channels. An `InternalUserId` field (populated by `IIdentityResolver` on first authorized interaction) enables orchestrator-initiated lookups via `GetByInternalUserIdAsync`. Survives service restarts. |
+| **Responsibility** | Persist and retrieve Bot Framework `ConversationReference` objects for proactive messaging. Each reference has two identity dimensions: (1) **persistence key** — `(TenantId, AadObjectId)` for personal chats or `(TenantId, ChannelId)` for team channels, used for storage and uniqueness; (2) **routing lookup key** — `InternalUserId` (populated by `IIdentityResolver` on first authorized interaction), used by the orchestrator when targeting proactive questions via `AgentQuestion.TargetUserId`. The persistence key is the AAD-native identity captured from `Activity.From.AadObjectId`; the routing lookup key is the platform-agnostic internal user ID mapped by `IIdentityResolver`. Both are stored as separate fields on `TeamsConversationReference` (see §3.2). `GetByAadObjectIdAsync` looks up by persistence key; `GetByInternalUserIdAsync` looks up by routing key. Survives service restarts. |
 | **Storage** | Pluggable — default implementation uses the same durable store as the outbox (e.g., SQL Server, Azure Table Storage, or PostgreSQL). |
 
 ### 2.9 TeamsMessengerConnector
