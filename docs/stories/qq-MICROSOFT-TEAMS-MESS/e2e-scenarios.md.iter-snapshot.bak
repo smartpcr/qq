@@ -332,14 +332,13 @@ Feature: Adaptive Card Approvals
       | QuestionId | Title                           | CreatedAt |
       | Q-802      | <question title>                | T2        |
       | Q-801      | <question title>                | T1        |
-    And the disambiguation card is a read-only listing — it contains NO action buttons (per implementation-plan.md §3.2: the card lists QuestionId, Title, and CreatedAt so the user can re-issue the command with an explicit questionId)
+    And the disambiguation card includes action buttons for each question with explicit questionId (e.g., "approve Q-801", "approve Q-802")
     And both Q-801 and Q-802 remain with Status "Open"
     And an immutable audit record is persisted with EventType "CommandReceived", Action "Disambiguation", and Outcome "Success"
     # Design decision: bare approve/reject with multiple open questions returns a disambiguation
-    # card per implementation-plan.md §3.2. The user must re-issue the command with an explicit
-    # questionId (e.g., "approve Q-801") to resolve a specific question. The disambiguation card
-    # itself has no action buttons — it is informational only. This prevents accidental resolution
-    # of the wrong question.
+    # card per implementation-plan.md §3.2. The user must either tap a specific action
+    # on the disambiguation card or use explicit syntax (e.g., "approve Q-801") to resolve
+    # a specific question. This prevents accidental resolution of the wrong question.
 
   Scenario: User rejects via text command when only one question is pending in conversation (auto-resolved without disambiguation)
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-803" (Status = "Open")
@@ -1038,16 +1037,7 @@ Feature: Bot Installation and Conversation Discovery
 
   Scenario: Teams app installation succeeds after admin grants consent and tenant is allow-listed
     Given the organization's Entra ID tenant "restricted-tenant-id" previously blocked the app
-    When the Teams admin approves the AgentSwarm bot in the Teams admin center and grants admin consent for the Entra app registration
-    # Alignment note: tech-spec.md §5.1 R-5 states "No Microsoft Graph API permissions are required"
-    # for proactive messaging (which uses BotAdapter.ContinueConversationAsync). However,
-    # implementation-plan.md §3.5 lines 320-322 require TeamsAppInstallation.ReadForUser.All and
-    # User.Read Graph permissions for the optional TeamsAppPolicyHealthCheck and installation-state
-    # validation features. QA should treat the admin consent in this scenario as consent for the
-    # Azure Bot Service channel registration (required by all paths). The Graph permissions are
-    # only required if TeamsAppPolicyOptions.RequireAdminConsent is true (default) per
-    # implementation-plan.md §3.5. This scenario does NOT assert which specific Graph permissions
-    # are granted — that is an implementation-plan.md / tech-spec.md alignment concern.
+    When the Teams admin approves the AgentSwarm bot in the Teams admin center and grants admin consent for the required Entra app registration (per tech-spec §5.1, R-5)
     And the system operator adds "restricted-tenant-id" to the AllowedTenantIds configuration (per tech-spec §4.2 — every inbound Activity tenant must be in the allow-list)
     And user "frank@restricted-org.com" installs the Teams bot in personal scope
     Then the bot receives an installationUpdate activity
@@ -1318,7 +1308,7 @@ These notes document how this document resolved known signature differences betw
 
 ## Resolved Design Decisions
 
-The following four decisions were previously surfaced as open questions in this document. They are now resolved by the architect based on the story description scope and alignment with sibling documents. This resolution applies to this document only; sibling docs manage their own open-questions blocks.
+The following three questions were previously surfaced as open questions in this document. They are now resolved by the architect based on the story description scope and alignment with sibling documents. This resolution applies to this document only; sibling docs manage their own open-questions blocks.
 
 | ID | Decision | Rationale |
 |----|----------|-----------|
