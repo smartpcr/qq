@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.18 — Iteration 18 (fix brittle line citation, add auth gate to conv-ref scenario, use TargetUserId for proactive routing)
+**Version:** 1.19 — Iteration 19 (remove self-referential resolution block, add TenantId to proactive scenarios, strengthen invalid-JWT scenario)
 
 ---
 
@@ -85,6 +85,7 @@ Feature: Proactive Messaging — Blocking Questions
       | QuestionId      | Q-501                                      |
       | AgentId         | arch-agent-03                              |
       | TaskId          | TASK-77                                    |
+      | TenantId        | contoso-tenant-id                          |
       | TargetUserId    | <alice's internal user ID>                 |
       | TargetChannelId | <null>                                     |
       | Title           | Database migration strategy                |
@@ -113,6 +114,7 @@ Feature: Proactive Messaging — Blocking Questions
       | QuestionId      | Q-502                          |
       | AgentId         | release-agent-01               |
       | TaskId          | TASK-88                        |
+      | TenantId        | contoso-tenant-id              |
       | TargetUserId    | <null>                         |
       | TargetChannelId | <channel ID for #release-gates>|
       | Title           | Release gate approval          |
