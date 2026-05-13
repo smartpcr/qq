@@ -13,16 +13,14 @@ public sealed record MessengerMessage
 
     /// <summary>
     /// Trace/correlation identifier. Throws <see cref="ArgumentNullException"/>
-    /// when set to <c>null</c>.
+    /// when set to <c>null</c>; throws <see cref="ArgumentException"/> when
+    /// empty or whitespace per the "All messages include trace/correlation
+    /// ID" acceptance criterion.
     /// </summary>
     public required string CorrelationId
     {
         get => _correlationId;
-        init
-        {
-            ArgumentNullException.ThrowIfNull(value, nameof(CorrelationId));
-            _correlationId = value;
-        }
+        init => _correlationId = CorrelationIdValidation.Require(value, nameof(CorrelationId));
     }
 
     public string? AgentId { get; init; }

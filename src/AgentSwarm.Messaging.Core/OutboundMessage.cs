@@ -29,8 +29,18 @@ public enum OutboundMessageStatus
 /// Durable outbox record for outbound Telegram messages.
 /// Matches architecture.md §3.1 OutboundMessage data model.
 /// </summary>
+/// <remarks>
+/// <see cref="CorrelationId"/> is guarded by
+/// <see cref="CorrelationIdValidation.Require"/> at construction time —
+/// the "All messages include trace/correlation ID" acceptance criterion
+/// applies uniformly to every outbound record, not only inbound /
+/// transport-facing ones; an outbox row with an empty trace id would
+/// silently drop the trace at the send boundary.
+/// </remarks>
 public sealed record OutboundMessage
 {
+    private readonly string _correlationId = null!;
+
     /// <summary>Internal unique identifier. Primary key.</summary>
     public required Guid MessageId { get; init; }
 
@@ -77,7 +87,18 @@ public sealed record OutboundMessage
     /// </summary>
     public long? TelegramMessageId { get; init; }
 
-    public required string CorrelationId { get; init; }
+    /// <summary>
+    /// Trace identifier — must be non-null, non-empty, non-whitespace per
+    /// the "All messages include trace/correlation ID" acceptance criterion.
+    /// Validated via <see cref="CorrelationIdValidation.Require"/> at
+    /// construction time so an outbox row cannot reach the send boundary
+    /// with a missing trace.
+    /// </summary>
+    public required string CorrelationId
+    {
+        get => _correlationId;
+        init => _correlationId = CorrelationIdValidation.Require(value, nameof(CorrelationId));
+    }
 
     public string? ErrorDetail { get; init; }
 }
