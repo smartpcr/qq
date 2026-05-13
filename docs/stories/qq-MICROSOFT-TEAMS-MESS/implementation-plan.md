@@ -333,7 +333,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ## Stage 6.1: Outbox Pattern and Retry Engine
 
 ### Implementation Steps
-- [ ] Implement `SqlMessageOutbox : IMessageOutbox` with an `OutboxMessages` table containing: `Id`, `Payload` (JSON), `DestinationType` (personal/channel), `DestinationId`, `Status` (Pending/Processing/Sent/Failed/DeadLettered), `RetryCount`, `NextRetryAt`, `CreatedAt`, `LastError`.
+- [ ] Implement `SqlMessageOutbox : IMessageOutbox` with an `OutboxMessages` table containing: `Id`, `Payload` (JSON), `DestinationType` (personal/channel/CardUpdate/CardDelete — `CardUpdate` and `CardDelete` types are used for Adaptive Card update/delete retry operations wired later in this stage), `DestinationId`, `ActivityId` (nullable — populated for `CardUpdate`/`CardDelete` entries to identify the target card), `ConversationId` (nullable — populated for `CardUpdate`/`CardDelete` entries), `Status` (Pending/Processing/Sent/Failed/DeadLettered), `RetryCount`, `NextRetryAt`, `CreatedAt`, `LastError`.
 - [ ] Create EF Core migration for the `OutboxMessages` table with index on `Status` and `NextRetryAt`.
 - [ ] Implement `OutboxRetryEngine` as `BackgroundService` that polls for pending messages, attempts delivery, and updates status.
 - [ ] Implement exponential backoff retry: base delay 2s, multiplier 2×, computed delays of 2s, 4s, 8s, 16s with ±25% jitter, max delay cap 60s, up to 4 retries after initial attempt (5 total attempts) per the canonical retry policy in `tech-spec.md` §4.4. Dead-letter after final failed attempt.
