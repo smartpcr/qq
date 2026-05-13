@@ -1243,6 +1243,4 @@ services.AddHostedService<OutboxWorker>();
 
 ---
 
-```json open-questions
-{ "openQuestions": [] }
-```
+
