@@ -1290,7 +1290,7 @@ Iteration 51 feedback:
   $ grep -nF "json open-questions" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
   (empty — block removed)
   ```
-- [x] 2. FIXED — Removed the last in-document line-number citation (`lines 289-290` in the concurrent-approval comment). Rewrote the iteration summary to remove self-referential examples that contained the phrase. Verification against e2e-scenarios.md:
+- [x] 2. FIXED — Removed the last in-document line-number citation in the concurrent-approval comment (replaced with section-only reference). Rewrote the iteration summary to remove self-referential examples that contained brittle citations. Verification against e2e-scenarios.md:
   ```
   $ grep -nF "line 79" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
   (empty)
