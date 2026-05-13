@@ -289,11 +289,16 @@ Feature: Adaptive Card Approvals
       | Payload.CommandName     | approve               |
       | Payload.QuestionId      | Q-701                 |
     And a HumanDecisionEvent is created with ActionValue "approve"
+    And the HumanDecisionEvent is wrapped in a MessengerEvent with EventType "Decision" (per architecture.md §3.1 DecisionEvent subtype) carrying the HumanDecisionEvent as typed payload
+    And the MessengerEvent/Decision is enqueued to the inbound queue via IInboundEventPublisher.PublishAsync
     And the original Adaptive Card is updated to show "Approved by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted with EventType "CommandReceived"
     # Note: Text commands audit as "CommandReceived" (per implementation-plan.md §5.1);
     # only Adaptive Card Action.Submit callbacks audit as "CardActionReceived".
+    # Note: Both text-command and Adaptive Card approval paths wrap the HumanDecisionEvent
+    # in a MessengerEvent/Decision envelope before enqueuing, ensuring the orchestrator
+    # receives a consistent DecisionEvent subtype regardless of the input surface.
 
   Scenario: User rejects via text command in personal chat (single pending question in conversation)
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-702"
@@ -312,6 +317,8 @@ Feature: Adaptive Card Approvals
       | Payload.CommandName     | reject                |
       | Payload.QuestionId      | Q-702                 |
     And a HumanDecisionEvent is created with ActionValue "reject" and Comment = null
+    And the HumanDecisionEvent is wrapped in a MessengerEvent with EventType "Decision" (per architecture.md §3.1 DecisionEvent subtype) carrying the HumanDecisionEvent as typed payload
+    And the MessengerEvent/Decision is enqueued to the inbound queue via IInboundEventPublisher.PublishAsync
     And the original Adaptive Card is updated to show "Rejected by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted with EventType "CommandReceived"
@@ -320,6 +327,9 @@ Feature: Adaptive Card Approvals
     # Note: Q-702 has RequiresComment = false, so no comment prompt is shown.
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
+    # Note: Both text-command and Adaptive Card rejection paths wrap the HumanDecisionEvent
+    # in a MessengerEvent/Decision envelope before enqueuing, ensuring the orchestrator
+    # receives a consistent DecisionEvent subtype regardless of the input surface.
 
   Scenario: User sends bare approve with multiple pending questions — disambiguation card returned
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open", CreatedAt = T1)
