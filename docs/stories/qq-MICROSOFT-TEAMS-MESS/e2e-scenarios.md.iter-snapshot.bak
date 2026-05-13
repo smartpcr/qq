@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.26
+**Version:** 1.25
 
 ---
 
@@ -24,14 +24,12 @@ Feature: Personal Chat — Agent Task Creation
     When the user sends the message "agent ask create e2e test scenarios for update service"
     Then the bot acknowledges receipt within 3 seconds
     And a MessengerEvent of type "AgentTaskRequest" is enqueued to the inbound queue
-    And the event contains canonical envelope fields plus typed payload (per architecture.md §3.1):
-      | Field               | Value                                          |
-      | EventType           | AgentTaskRequest                               |
-      | CorrelationId       | <non-empty UUID>                               |
-      | Messenger           | Teams                                          |
-      | ExternalUserId      | <alice's AadObjectId>                          |
-      | Payload.TaskId      | <newly generated>                              |
-      | Payload.Body        | create e2e test scenarios for update service   |
+    And the event contains:
+      | Field          | Value                                          |
+      | CorrelationId  | <non-empty UUID>                               |
+      | ExternalUserId | <alice's AadObjectId>                           |
+      | TaskId         | <newly generated>                              |
+      | Body           | create e2e test scenarios for update service   |
     And an immutable audit record is persisted for the command
 
   Scenario: User creates a task via team channel mention
@@ -46,11 +44,10 @@ Feature: Personal Chat — Agent Task Creation
     And IIdentityResolver.ResolveAsync maps bob's Entra identity to an internal user
     And IUserAuthorizationService.AuthorizeAsync confirms bob's RBAC role
     And a MessengerEvent of type "AgentTaskRequest" is enqueued
-    And the event contains canonical envelope fields plus typed payload:
-      | Field               | Value                                          |
-      | EventType           | AgentTaskRequest                               |
-      | ExternalUserId      | <bob's AadObjectId>                            |
-      | Payload.Body        | design persistence layer                       |
+    And the event contains:
+      | Field          | Value                                          |
+      | ExternalUserId | <bob's AadObjectId>                             |
+      | Body           | design persistence layer                       |
     And the bot replies in a thread under the original message
     And an immutable audit record is persisted for the command
 
@@ -244,13 +241,12 @@ Feature: Adaptive Card Approvals
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "approve" in personal chat
     Then the bot resolves the most recent pending question "Q-701" for the user
-    And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
-      | Field                   | Value                 |
-      | EventType               | Command               |
-      | CorrelationId           | <non-empty UUID>      |
-      | ExternalUserId          | <alice's AadObjectId> |
-      | Payload.CommandName     | approve               |
-      | Payload.QuestionId      | Q-701                 |
+    And a MessengerEvent of type "Command" is enqueued with:
+      | Field          | Value                 |
+      | CorrelationId  | <non-empty UUID>      |
+      | ExternalUserId | <alice's AadObjectId> |
+      | CommandName    | approve               |
+      | QuestionId     | Q-701                 |
     And a HumanDecisionEvent is created with ActionValue "approve"
     And the original Adaptive Card is updated to show "Approved by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
@@ -262,13 +258,12 @@ Feature: Adaptive Card Approvals
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
     Then the bot resolves the most recent pending question "Q-702" for the user
-    And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
-      | Field                   | Value                 |
-      | EventType               | Command               |
-      | CorrelationId           | <non-empty UUID>      |
-      | ExternalUserId          | <alice's AadObjectId> |
-      | Payload.CommandName     | reject                |
-      | Payload.QuestionId      | Q-702                 |
+    And a MessengerEvent of type "Command" is enqueued with:
+      | Field          | Value                 |
+      | CorrelationId  | <non-empty UUID>      |
+      | ExternalUserId | <alice's AadObjectId> |
+      | CommandName    | reject                |
+      | QuestionId     | Q-702                 |
     And a HumanDecisionEvent is created with ActionValue "reject" and Comment = null
     And the original Adaptive Card is updated to show "Rejected by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)

@@ -206,7 +206,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Persistence` |
 | **Namespace** | `AgentSwarm.Messaging.Persistence.Audit` |
-| **Responsibility** | Append-only, immutable audit trail. Logs every inbound command, outbound message, card action, proactive notification, security rejection, and error. Each entry carries all canonical fields from `tech-spec.md` §4.3: `CorrelationId`, `Timestamp`, `ActorId`, `ActorType`, `TenantId`, `AgentId` (first-class field — present on all events tied to an agent task, including human-originated actions; see `tech-spec.md` §4.3 line 139), `TaskId`, `ConversationId`, `EventType`, `Action`, `Outcome`, and `PayloadJson`. Suitable for enterprise compliance review. |
+| **Responsibility** | Append-only, immutable audit trail. Logs every inbound command, outbound message, card action, proactive notification, security rejection, and error. Each entry carries all canonical fields from `tech-spec.md` §4.3: `CorrelationId`, `Timestamp`, `ActorId`, `ActorType`, `TenantId`, `EventType`, `Action`, `Outcome`, and `PayloadJson`. Suitable for enterprise compliance review. |
 | **Storage** | Write-once store — Azure Table Storage (append-only), SQL Server with row-level immutability triggers, or a dedicated audit log service. |
 
 ### 2.14 Agent Swarm Orchestrator (external boundary)
@@ -446,7 +446,6 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users (`ActorType = User`), agent ID for agent-originated events (`ActorType = Agent`). |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
-| `AgentId` | `string?` | No | The agent whose task or question triggered this event. Present on all events tied to an agent task — including human-originated actions such as `approve` or `reject` — so that the associated agent is recorded even when `ActorType = User`. Null for events not associated with a specific agent (e.g., `agent status` queries, security rejections). Aligns with `tech-spec.md` §4.3 canonical audit schema which defines `AgentId` as a first-class field. |
 | `TaskId` | `string?` | No | Agent task/work-item ID (null for security rejection events). |
 | `ConversationId` | `string?` | No | Bot Framework conversation ID (null for events outside a conversation). |
 | `Action` | `string` | Yes | Specific action taken (e.g., `approve`, `reject`, `agent ask`, `send_card`). |
@@ -454,7 +453,7 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 | `Outcome` | `string` | Yes | Result of the action: `Success`, `Rejected`, `Failed`, `DeadLettered`. |
 | `Checksum` | `string` | Yes | SHA-256 hash of the record for tamper detection — implementation addition. |
 
-> **Field mapping note:** `ActorId` identifies *who performed the action* (AAD object ID for users, agent ID for agent-originated events), disambiguated by `ActorType`. `AgentId` identifies *which agent's task/question is involved* — it is a **first-class field** per `tech-spec.md` §4.3 canonical schema, not derived from or replaced by `ActorId`/`ActorType`. For agent-originated events, both `ActorId` and `AgentId` hold the same agent ID. For human actions on an agent's question (e.g., `approve`), `ActorId` = user's AAD object ID, `ActorType = User`, and `AgentId` = the associated agent's ID. This ensures the agent is always recorded regardless of who initiated the action.
+> **Field mapping note:** `ActorId` + `ActorType` replace the previous `AgentId` / `UserId` fields to align with `tech-spec.md` §4.3 canonical schema. When logging a user action, set `ActorId` = AAD object ID and `ActorType` = `User`. When logging an agent-originated event, set `ActorId` = agent ID and `ActorType` = `Agent`.
 >
 > **Outcome field semantics — cross-doc alignment:** The `Outcome` field uses a closed canonical vocabulary of exactly four values: `Success`, `Rejected`, `Failed`, `DeadLettered` (consistent with `tech-spec.md` §4.3 line 144). Rejection reason codes such as `UnmappedUserRejected`, `UnauthorizedTenantRejected`, and `InsufficientRoleRejected` belong in the `Action` field, not in `Outcome`. For example, an unmapped-user rejection produces `EventType: SecurityRejection`, `Outcome: Rejected`, `Action: UnmappedUserRejected`. All sibling docs are now aligned: `e2e-scenarios.md` line 371 uses `Action: UnmappedUserRejected` with `Outcome: Rejected`; `implementation-plan.md` §5.1 line 287 uses the same mapping; `tech-spec.md` §4.3 line 144 defines the canonical four-value Outcome vocabulary.
 
