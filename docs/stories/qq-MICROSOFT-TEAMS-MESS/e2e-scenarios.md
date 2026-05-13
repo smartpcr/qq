@@ -267,8 +267,8 @@ Feature: Adaptive Card Approvals
     And question "Q-702" is the only AgentQuestion with Status == "Open" and ConversationId matching the current personal-chat conversation
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
-    Then RejectCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations)
-    And exactly one open question is found in this conversation, so "Q-702" is resolved without disambiguation
+    Then RejectCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations)
+    And the returned list contains exactly one AgentQuestion ("Q-702"), so "Q-702" is resolved without disambiguation
     And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved") (architecture.md §2.6, §3.1 — first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
@@ -290,7 +290,8 @@ Feature: Adaptive Card Approvals
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open", CreatedAt = T2, where T2 > T1)
     And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler detects that more than one open question exists in the conversation
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId)
+    And the returned list contains two AgentQuestion records (Q-801 and Q-802), so disambiguation is required
     And the handler returns a disambiguation Adaptive Card listing all open questions:
       | QuestionId | Agent              | Title / Summary         | CreatedAt |
       | Q-801      | release-agent-01   | <question Q-801 title>  | T1        |
@@ -309,11 +310,16 @@ Feature: Adaptive Card Approvals
     #    When user sends bare approve, Then ApproveCommandHandler returns a
     #    disambiguation card listing both questions [...] and does NOT resolve either."
     #
-    # STORE METHOD GAP: The current IAgentQuestionStore interface (implementation-plan.md
-    # §1.2) only declares GetMostRecentOpenByConversationAsync returning AgentQuestion?
-    # (single result). To implement disambiguation, a list/count method is needed —
-    # e.g., GetAllOpenByConversationAsync(conversationId) returning IReadOnlyList<AgentQuestion>.
-    # This is raised as Open Question "disambiguation-store-method" below.
+    # RESOLVED DESIGN DECISION (disambiguation-store-method):
+    # The IAgentQuestionStore interface (implementation-plan.md §1.2 line 43) currently
+    # only declares GetMostRecentOpenByConversationAsync returning AgentQuestion? (single).
+    # This scenario requires a list method: GetOpenByConversationAsync(conversationId)
+    # returning IReadOnlyList<AgentQuestion>. This method MUST be added to the interface
+    # in implementation-plan.md §1.2. The concrete SqlAgentQuestionStore (Stage 3.3)
+    # implements it against the AgentQuestions table using the existing filtered index
+    # on (ConversationId, Status) WHERE Status = 'Open', ordered by CreatedAt descending.
+    # GetMostRecentOpenByConversationAsync is retained as a convenience shortcut (returns
+    # the first element of the list or null) for callers that only need the most recent.
     #
     # This scenario also prevents the "Cross-Conversation Consent" attack because the
     # lookup is scoped to the current conversationId, not the user globally.
@@ -322,8 +328,8 @@ Feature: Adaptive Card Approvals
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-803" (Status = "Open")
     And question "Q-803" is the only AgentQuestion with Status == "Open" and ConversationId matching the current conversation
     When user "alice@contoso.com" sends "reject" in personal chat
-    Then RejectCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId)
-    And the single open question "Q-803" in this conversation is resolved without disambiguation
+    Then RejectCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId)
+    And the returned list contains exactly one AgentQuestion ("Q-803"), so it is resolved without disambiguation
     And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved") (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
     And an immutable audit record is persisted with EventType "CardActionReceived"
@@ -334,8 +340,8 @@ Feature: Adaptive Card Approvals
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-810" (Status = "Open") in channel "#ops-swarm" (conversationId = "channel-conv-1")
     And no questions are pending in user "alice@contoso.com"'s personal-chat conversation (conversationId = "personal-conv-alice")
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync("personal-conv-alice")
-    And zero open questions are found in the personal-chat conversation
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync("personal-conv-alice")
+    And the returned list is empty (zero open questions in the personal-chat conversation)
     And the bot replies: "No pending questions in this conversation."
     And question "Q-810" in channel "#ops-swarm" remains with Status "Open"
     And no HumanDecisionEvent is created
@@ -1141,4 +1147,4 @@ Feature: Edge Cases and Error Handling
 
 | ID | Question | Status |
 |----|----------|--------|
-| `disambiguation-store-method` | The `IAgentQuestionStore` interface (implementation-plan.md §1.2) only declares `GetMostRecentOpenByConversationAsync` returning `AgentQuestion?` (single result). Implementation-plan.md §3.2 line 186 specifies that bare `approve`/`reject` with multiple open questions returns a disambiguation card listing all open questions — this requires a list/count method (e.g., `GetAllOpenByConversationAsync(conversationId)` returning `IReadOnlyList<AgentQuestion>`) that does not yet exist on the interface. Should the `IAgentQuestionStore` interface be extended with this method, or should the disambiguation behavior be dropped in favor of always resolving the most recent? | **Unresolved** — requires alignment between implementation-plan.md and architecture.md |
+| `disambiguation-store-method` | The `IAgentQuestionStore` interface (implementation-plan.md §1.2 line 43) only declares `GetMostRecentOpenByConversationAsync` returning `AgentQuestion?` (single result). Implementation-plan.md §3.2 line 186 specifies that bare `approve`/`reject` with multiple open questions returns a disambiguation card listing all open questions — this requires a list method. **Resolved design decision:** Add `GetOpenByConversationAsync(string conversationId, CancellationToken ct)` returning `IReadOnlyList<AgentQuestion>` to `IAgentQuestionStore`. The concrete `SqlAgentQuestionStore` implements this against the `AgentQuestions` table using the existing filtered index on `(ConversationId, Status) WHERE Status = 'Open'`, ordered by `CreatedAt` descending. `GetMostRecentOpenByConversationAsync` is retained as a convenience shortcut (returns first element or null). All bare `approve`/`reject` scenarios in this doc now call `GetOpenByConversationAsync` and branch on `Count`: 0 → "no pending questions", 1 → auto-resolve, >1 → disambiguation card. **Action required:** implementation-plan.md §1.2 must add `GetOpenByConversationAsync` to the `IAgentQuestionStore` interface definition. | **Resolved** — design decision adopted in this doc; sibling doc update required |
