@@ -412,8 +412,10 @@ Feature: Security — Tenant and User Validation
     And the Authorization header contains an invalid JWT token
     When the Bot Framework authentication middleware processes the request
     Then the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline
-    And no application code or middleware runs
-    And no audit entry is emitted (the request never reaches the bot handler — per tech-spec §4.2 Rejection Behavior Matrix, row "Invalid Bot Framework JWT")
+    And no application code, middleware (including TenantValidationMiddleware), or bot handler runs
+    And no MessengerEvent is created
+    And no audit entry is emitted because the request never reaches application-level code — rejection occurs in the Bot Framework SDK authentication layer before any bot handler or custom middleware executes (per tech-spec §4.2 Rejection Behavior Matrix, row "Invalid Bot Framework JWT")
+    And the HTTP 401 response is logged by the hosting infrastructure (ASP.NET Core request pipeline) but not by IAuditLogger
 
   Scenario: Multi-tenant isolation — one tenant cannot see another's data
     Given user "alice@contoso.com" in tenant "contoso-tenant-id" has active tasks
