@@ -359,6 +359,8 @@ Feature: Adaptive Card Approvals
     And the returned list contains exactly one AgentQuestion ("Q-803"), so it is resolved without disambiguation
     And RejectCommandHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved", ct) (architecture.md §4.11 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
+    And the HumanDecisionEvent is wrapped in a MessengerEvent with EventType "Decision" (per architecture.md §3.1 DecisionEvent subtype) carrying the HumanDecisionEvent as typed payload
+    And the MessengerEvent/Decision is enqueued to the inbound queue via IInboundEventPublisher.PublishAsync
     And an immutable audit record is persisted with EventType "CommandReceived"
     # Note: Text commands audit as "CommandReceived"; only Adaptive Card Action.Submit
     # callbacks audit as "CardActionReceived" (per implementation-plan.md §5.1).
@@ -389,6 +391,8 @@ Feature: Adaptive Card Approvals
     And validates that "approve" is in Q-901's AllowedActions list
     And atomically transitions Q-901 Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-901", "Open", "Resolved", ct)
     And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-901"
+    And the HumanDecisionEvent is wrapped in a MessengerEvent with EventType "Decision" (per architecture.md §3.1 DecisionEvent subtype) carrying the HumanDecisionEvent as typed payload
+    And the MessengerEvent/Decision is enqueued to the inbound queue via IInboundEventPublisher.PublishAsync
     And the original Adaptive Card for Q-901 is updated to show "Approved by alice@contoso.com"
     And Q-902 remains with Status "Open" (unaffected)
     And an immutable audit record is persisted with EventType "CommandReceived"
@@ -402,6 +406,8 @@ Feature: Adaptive Card Approvals
     And validates that "reject" is in Q-903's AllowedActions list
     And atomically transitions Q-903 Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-903", "Open", "Resolved", ct)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-903"
+    And the HumanDecisionEvent is wrapped in a MessengerEvent with EventType "Decision" (per architecture.md §3.1 DecisionEvent subtype) carrying the HumanDecisionEvent as typed payload
+    And the MessengerEvent/Decision is enqueued to the inbound queue via IInboundEventPublisher.PublishAsync
     And the original Adaptive Card for Q-903 is updated to show "Rejected by alice@contoso.com"
     And an immutable audit record is persisted with EventType "CommandReceived"
 
@@ -451,7 +457,10 @@ Feature: Message Update and Delete
 
   Scenario: Bot updates an existing approval card after decision
     When user "alice@contoso.com" approves question "Q-701"
-    Then the bot calls UpdateActivityAsync with activity ID "act-901"
+    Then the orchestrator (or Teams-aware coordinator) calls ITeamsCardManager.UpdateCardAsync("Q-701", CardUpdateAction.MarkApproved, ct) (per architecture.md §4.1.1 and §6.5)
+    And TeamsMessengerConnector (which implements ITeamsCardManager) looks up TeamsCardState from ICardStateStore to retrieve the stored activityId "act-901" and conversationId
+    And TeamsMessengerConnector renders a new read-only Adaptive Card via AdaptiveCardRenderer
+    And ProactiveNotifier calls turnContext.UpdateActivityAsync with the stored activityId "act-901" (the internal Bot Framework SDK call within TeamsMessengerConnector)
     And the card is replaced with a read-only summary card showing:
       | Field     | Value                         |
       | Status    | Approved                      |
