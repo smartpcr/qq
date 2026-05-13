@@ -144,7 +144,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | **Namespace** | `AgentSwarm.Messaging.Teams.Cards` |
 | **Responsibility** | Process Adaptive Card `Action.Submit` invoke activities. Extracts the `ActionId` and optional comment from `Activity.Value`, resolves the originating `AgentQuestion` via `IAgentQuestionStore.GetByIdAsync(questionId)` (§4.11) to retrieve the full question including `AllowedActions`, validates that the submitted `ActionValue` is in the question's `AllowedActions` list, produces a `HumanDecisionEvent`, and publishes it to the inbound queue. Updates the original card to reflect the decision (approved/rejected) and disables further actions. This handler processes **all** card action types uniformly — the `AgentQuestion` entity always follows a single-decision, first-writer-wins lifecycle (`Open` → `Resolved`). Multi-approver release gates do **not** use a shared `AgentQuestion`; see §6.3.1 for the release-gate modeling strategy. |
 | **Dependencies** | `IAgentQuestionStore` (§4.11) — retrieves the persisted `AgentQuestion` by `QuestionId` for action validation and status checking. `ICardStateStore` (§4.3) — retrieves the `TeamsCardState` for card update operations. |
-| **Idempotency** | Two-layer idempotency: (1) **Durable status check** — queries `IAgentQuestionStore.GetByIdAsync(questionId)` and rejects the action if `AgentQuestion.Status != Open` (the question is already `Resolved` or `Expired`), then atomically transitions `Status` to `Resolved` via `IAgentQuestionStore.UpdateStatusAsync` on successful processing (first-writer-wins per `e2e-scenarios.md` §first-writer-wins question decisions). This durable check survives service restarts. (2) **In-memory processed-action set** (keyed on `QuestionId + UserId`) — a fast-path deduplication layer for within-session duplicate card-action submissions. Both work in conjunction with the **activity-level** `ActivityDeduplicationMiddleware` (§2.16) which suppresses duplicate webhook deliveries by `Activity.Id` before the activity reaches any handler. All three layers are required: the middleware catches transport-level retries; the in-memory set catches user-initiated double-taps within a session; the durable status check catches cross-restart duplicates and concurrent submissions from different pods. |
+| **Idempotency** | Two-layer idempotency: (1) **Durable status check** — queries `IAgentQuestionStore.GetByIdAsync(questionId)` and rejects the action if `AgentQuestion.Status != Open` (the question is already `Resolved` or `Expired`), then atomically transitions `Status` from `Open` to `Resolved` via `IAgentQuestionStore.TryUpdateStatusAsync(questionId, "Open", "Resolved")` on successful processing (first-writer-wins per `e2e-scenarios.md` §first-writer-wins question decisions). This durable check survives service restarts. (2) **In-memory processed-action set** (keyed on `QuestionId + UserId`) — a fast-path deduplication layer for within-session duplicate card-action submissions. Both work in conjunction with the **activity-level** `ActivityDeduplicationMiddleware` (§2.16) which suppresses duplicate webhook deliveries by `Activity.Id` before the activity reaches any handler. All three layers are required: the middleware catches transport-level retries; the in-memory set catches user-initiated double-taps within a session; the durable status check catches cross-restart duplicates and concurrent submissions from different pods. |
 
 ### 2.7 InstallHandler
 
@@ -759,11 +759,11 @@ public interface IAgentQuestionStore
     Task<AgentQuestion?> GetByIdAsync(string questionId, CancellationToken ct);
 
     /// <summary>
-    /// Atomically transitions question status (Open → Resolved, Open → Expired).
-    /// First-writer-wins: if status is already Resolved/Expired, returns false
-    /// and the caller treats the action as a duplicate.
+    /// Atomically transitions question status using compare-and-set (Open → Resolved, Open → Expired).
+    /// Returns true if expectedStatus matched and transition succeeded;
+    /// returns false if status was already changed (first-writer-wins duplicate).
     /// </summary>
-    Task<bool> UpdateStatusAsync(string questionId, string newStatus, CancellationToken ct);
+    Task<bool> TryUpdateStatusAsync(string questionId, string expectedStatus, string newStatus, CancellationToken ct);
 }
 ```
 
@@ -954,7 +954,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 4. `CardActionHandler` extracts `QuestionId` and `ActionId` from `Activity.Value`.
 5. **Durable idempotency check:** `CardActionHandler` calls `IAgentQuestionStore.GetByIdAsync(questionId)` (§4.11) to retrieve the stored `AgentQuestion`. If `Status != Open` (already `Resolved` or `Expired`), the handler returns a "decision already recorded" response and does not emit a duplicate event (first-writer-wins per `e2e-scenarios.md` §first-writer-wins). The in-memory processed-action set (keyed on `QuestionId + UserId`) provides a fast-path pre-check within the same session, but the durable `Status` field is the authoritative guard that survives restarts and works across pods.
 6. `CardActionHandler` validates that the submitted `ActionValue` is in the stored question's `AllowedActions` list. If not, the action is rejected with an invalid-action response.
-7. `CardActionHandler` atomically transitions `AgentQuestion.Status` from `Open` to `Resolved` via `IAgentQuestionStore.UpdateStatusAsync(questionId, "Resolved")`. If `UpdateStatusAsync` returns `false` (another pod resolved it concurrently), the handler treats this as a duplicate.
+7. `CardActionHandler` atomically transitions `AgentQuestion.Status` from `Open` to `Resolved` via `IAgentQuestionStore.TryUpdateStatusAsync(questionId, "Open", "Resolved")`. If `TryUpdateStatusAsync` returns `false` (another pod resolved it concurrently), the handler treats this as a duplicate.
 8. `CardActionHandler` builds a `HumanDecisionEvent` with the user's AAD object ID, action value, and optional comment.
 9. `CardStateStore` is updated: card status changes from `Pending` to `Answered`.
 10. The original card is updated in Teams via `TurnContext.UpdateActivityAsync` to show "Approved by {user}" with action buttons disabled.
