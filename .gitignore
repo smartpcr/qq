@@ -1,2 +1,27 @@
-
+
 .forge-attachments/
+
+# .NET build output
+[Bb]in/
+[Oo]bj/
+
+# .NET test/coverage artifacts
+[Tt]est[Rr]esults/
+*.coverage
+*.coveragexml
+coverage.*.xml
+coverage.json
+*.trx
+
+# User-specific Visual Studio files
+*.user
+*.suo
+.vs/
+
+# Rider / ReSharper
+.idea/
+*.DotSettings.user
+
+# Misc
+*.swp
+*.swo
