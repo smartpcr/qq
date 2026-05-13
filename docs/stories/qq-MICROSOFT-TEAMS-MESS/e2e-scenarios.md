@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.14 — Iteration 14
+**Version:** 1.15 — Iteration 15
 
 ---
 
@@ -930,48 +930,24 @@ Feature: Edge Cases and Error Handling
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Version:** 1.14 — Iteration 14
+**Version:** 1.15 — Iteration 15
 
 ### Coverage
 
 - Personal chat task creation (agent ask, agent status, unrecognised commands with Text event)
 - Personal chat text-command approval and rejection (approve, reject as text commands)
-- Proactive messaging — blocking questions via Adaptive Cards
+- Proactive messaging — blocking questions via Adaptive Cards (with TargetUserId/TargetChannelId routing per architecture.md §3.1)
 - Adaptive Card approve/reject/need-more-info actions
 - Card update and delete lifecycle
 - Conversation reference persistence and rehydration
 - Security: tenant validation (with explicit `Action: UnauthorizedTenantRejected`), unmapped Entra identity rejection (with explicit `Action: UnmappedUserRejected`), RBAC (with explicit `Action: InsufficientRoleRejected`), bot installation checks, Bot Framework token validation
 - Reliability: outbox retry (canonical policy: 4 retries, 2s base, 60s cap, ±25% jitter), dead-letter, two-layer idempotency (transport-level `ActivityDeduplicationMiddleware` + domain-level `CardActionHandler` processed-action set)
 - Performance: P95 < 3s card delivery
-- Compliance: immutable audit trail with canonical EventType values (seven values per tech-spec §4.3 Canonical Audit Record Schema: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error); message actions audit as MessageActionReceived; malformed card actions audit as Error
+- Compliance: immutable audit trail with TenantId on all records (per tech-spec §4.3); canonical EventType values (seven values: CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error); message actions audit as MessageActionReceived; malformed card actions audit as Error
 - Observability: distributed tracing with CorrelationId
 - Message actions (message extensions)
-- Edge cases: concurrent approvals, malformed payloads (now with Error audit record), rate limiting, service URL changes, max message length (softened — no unanchored config surface)
+- Edge cases: concurrent approvals, malformed payloads (with Error audit record), rate limiting, service URL changes, max message length (truncate at 4,096 chars)
 - Uninstall handling: both known-uninstall (inactive pre-check) and missed-uninstall (stale reference 403)
-
-### Prior feedback resolution
-
-- [x] 1. FIXED — §Reliability "Duplicate inbound webhook is suppressed" scenario (lines 454–475) — Rewrote as two distinct scenarios: (a) "Duplicate inbound webhook is suppressed at middleware level" where `ActivityDeduplicationMiddleware` short-circuits the second delivery by `Activity.Id` via `IActivityIdStore` before any handler runs, aligned with `architecture.md` §2.16 lines 225–230 and `implementation-plan.md` lines 71–72; (b) "Domain-level duplicate card action is suppressed (double-tap)" where `CardActionHandler` rejects via `(QuestionId, UserId)` processed-action set per `architecture.md` §2.6 line 143. Verification:
-```
-$ grep -nF "TeamsMessengerConnector processes both deliveries" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — phrase removed)
-```
-
-- [x] 2. FIXED — §Edge Cases "Bot receives a message exceeding maximum length" scenario (lines 829–838) — Removed the unanchored `Teams:MaxMessageLength` config key, the specific `4,000`-character threshold, and the `truncated_from`/`truncated_to` audit payload fields. The scenario now validates that excessively long inputs are handled (truncated or rejected per configured policy) without inventing config surfaces absent from sibling docs. Verification:
-```
-$ grep -nF "Teams:MaxMessageLength" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — phrase removed)
-$ grep -nF "4,000" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — phrase removed)
-```
-
-- [x] 3. FIXED — §Edge Cases "Adaptive Card action payload is malformed" scenario (lines 850–863) — Added an immutable audit record assertion with `EventType: Error`, `Action: MalformedCardAction`, `Outcome: Failed`, and `ActorId`, satisfying `tech-spec.md` §4.3 line 121 ("Every… Adaptive Card action callback must produce an append-only audit record") and using the canonical `Error` EventType from `tech-spec.md` §4.3 line 138. Verification:
-```
-$ grep -nF "EventType | Error" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-861:      | EventType | Error                          |
-```
-
-> **Cross-doc alignment status:** All four story documents (e2e-scenarios.md, tech-spec.md, architecture.md, implementation-plan.md) agree on seven canonical audit `EventType` values: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. The duplicate-webhook suppression scenario now correctly attributes transport-level dedup to `ActivityDeduplicationMiddleware` (aligned with architecture.md §2.16 and implementation-plan.md §1.1). The max-message-length scenario no longer introduces unanchored config surfaces.
 
 ### Open questions
 
