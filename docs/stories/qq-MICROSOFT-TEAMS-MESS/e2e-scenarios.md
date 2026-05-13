@@ -209,7 +209,14 @@ Feature: Adaptive Card Approvals
       | ExternalUserId    | <alice's AadObjectId> |
       | ExternalMessageId | <Teams activity ID> |
       | CorrelationId     | <original UUID>  |
-    And the event is enqueued to the inbound queue
+    And the event is wrapped in a MessengerEvent with EventType "Decision" (per architecture.md §3.1 DecisionEvent subtype):
+      | Field          | Value                      |
+      | EventType      | Decision                   |
+      | CorrelationId  | <original UUID>            |
+      | Messenger      | Teams                      |
+      | ExternalUserId | <alice's AadObjectId>      |
+      | Payload        | <the HumanDecisionEvent above> |
+    And the MessengerEvent/Decision is enqueued to the inbound queue via IInboundEventPublisher.PublishAsync
     And the original Adaptive Card is updated to show "Approved by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted
@@ -224,6 +231,8 @@ Feature: Adaptive Card Approvals
       | QuestionId  | Q-602                      |
       | ActionValue | reject                     |
       | Comment     | Insufficient test coverage |
+    And the event is wrapped in a MessengerEvent with EventType "Decision" (per architecture.md §3.1 DecisionEvent subtype) carrying the HumanDecisionEvent as typed payload
+    And the MessengerEvent/Decision is enqueued to the inbound queue via IInboundEventPublisher.PublishAsync
     And the original card is updated to show "Rejected by alice@contoso.com: Insufficient test coverage"
     And an immutable audit record is persisted
 
