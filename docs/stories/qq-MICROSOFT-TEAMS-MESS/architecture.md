@@ -1084,51 +1084,47 @@ services.AddHostedService<OutboxWorker>();
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md`
-**Version:** Iteration 15
+**Version:** Iteration 16
 
 ### Coverage
 
 - Components and responsibilities (§2): 16 components — TeamsWebhookController, TeamsBotAdapter, TeamsSwarmActivityHandler, CommandParser, CardActionHandler, InstallHandler, ConversationReferenceStore, TeamsMessengerConnector, AdaptiveCardRenderer, ProactiveNotifier, OutboxRetryEngine, AuditLogger, MessageExtensionHandler, IdentityResolver, UserAuthorizationService, ActivityDeduplicationMiddleware
 - Data model (§3): MessengerEvent (base + subtypes), AgentQuestion (with TargetUserId/TargetChannelId routing), MessageActionRequest, TeamsConversationReference (dual identity keys: AadObjectId for persistence, InternalUserId for routing), TeamsCardState, OutboxEntry, AuditEntry — canonical audit EventType (seven values) and domain EventType (nine values) clearly separated
-- Interfaces (§4): IMessengerConnector, IConversationReferenceStore (with channel-scope methods), ITeamsCardManager, IAdaptiveCardRenderer, IAuditLogger, IIdentityResolver, IUserAuthorizationService, ICardStateStore, IActivityIdStore
+- Interfaces (§4): IMessengerConnector, IConversationReferenceStore (with channel-scope methods and dual identity lookups), ITeamsCardManager, IAdaptiveCardRenderer, IAuditLogger, IIdentityResolver, IUserAuthorizationService, ICardStateStore, IActivityIdStore
 - Security (§5): Entra ID tenant validation, user identity resolution, RBAC, Bot Framework JWT
-- Sequence flows (§6): personal chat command, proactive messaging (routing via TargetUserId), card approve/reject, card update/delete, security rejections (tenant/unmapped user/insufficient RBAC), restart reuse, message actions
+- Sequence flows (§6): personal chat command, proactive messaging (routing via TargetUserId → GetByInternalUserIdAsync), card approve/reject, card update/delete, security rejections (tenant/unmapped user/insufficient RBAC), restart reuse, message actions
 - Assembly mapping (§7), Observability (§8), Performance (§9), Error handling (§10.3)
 
 ### Prior feedback resolution
 
-(Addressing iteration 14 evaluator feedback — 9 items)
+(Addressing iteration 15 evaluator feedback — 5 items)
 
-- [x] 1. FIXED — §2.8 and §3.2 identity-key mismatch resolved. §2.8 `ConversationReferenceStore` (line 160) now explicitly documents two identity dimensions: (1) **persistence key** `(TenantId, AadObjectId)` for storage/uniqueness, (2) **routing lookup key** `InternalUserId` for orchestrator-initiated proactive delivery via `AgentQuestion.TargetUserId`. §3.2 field table (lines 383–384) defines both `AadObjectId` and `InternalUserId` as separate fields. §3.1 routing derivation (line 292) clarifies that `TargetUserId` equals `InternalUserId`, NOT `AadObjectId`. `implementation-plan.md` line 107 says "keyed by `(AadObjectId, TenantId)`" — this refers to the persistence key, consistent with §2.8.
-
-- [x] 2. FIXED — §2.1 component diagram line 39–40. Replaced abbreviated `Telemetry → TenantValidation → Dedup → Rate` with full middleware class names: `TelemetryMiddleware → TenantValidationMiddleware → ActivityDeduplicationMiddleware → RateLimitMiddleware (4 stages)`. Now matches §2.3 line 103 and `implementation-plan.md` Stage 2.1 exactly. Verification:
+- [x] 1. FIXED — §3.1 and §6.2 method name inconsistency resolved. Replaced all `GetByUserIdAsync` references with `GetByInternalUserIdAsync` to match §4.2 interface definition. §3.1 `AgentQuestion.TargetUserId` field description now calls `GetByInternalUserIdAsync(tenantId, targetUserId)`. §6.2 step 4 now calls `GetByInternalUserIdAsync(tenantId, targetUserId)`. §4.2 interface (lines 525–531) defines `GetByAadObjectIdAsync`, `GetByInternalUserIdAsync`, and `GetByChannelIdAsync` — no `GetByUserIdAsync` exists. Verification:
 ```
-$ grep -nF "Telemetry → TenantFilter → RateLimit" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — old abbreviated text removed)
-```
-```
-$ grep -nF "TelemetryMiddleware → TenantValidationMiddleware →" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-40:│  ActivityDeduplicationMiddleware → RateLimitMiddleware (4 stages)   │
+$ grep -nF "GetByUserIdAsync" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+(empty — all occurrences replaced)
 ```
 
-- [x] 3. DEFERRED — Sibling `implementation-plan.md` Stage 1.1 line 16: the evaluator states it lacks `TargetUserId` and `TargetChannelId`, but inspection shows line 16 already includes both fields with full descriptions (`TargetUserId (string?, nullable — internal user ID...)`, `TargetChannelId (string?, nullable — Teams channel ID...)`). No architecture.md change needed; sibling doc is already aligned.
+- [x] 2. FIXED — §3.2 `OutboxEntry.Destination` field description updated to use canonical URI shape `teams://{tenantId}/user/{userId}` for personal delivery (matching §3.1 routing derivation note which defines `teams://{tenantId}/user/{targetUserId}`). Both §3.1 and §3.2 now use the `/user/` segment for personal destinations. Verification:
+```
+$ grep -nF "teams://{tenantId}/{userId}" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+(empty — old short form removed)
+```
 
-- [x] 4. DEFERRED — Sibling `implementation-plan.md` Stage 5.1 line 279: the evaluator states it says `TenantValidationMiddleware` should return an Adaptive Card. Inspection shows line 279 reads "The middleware continues to return HTTP 403 with **no bot response or Adaptive Card**" — already aligned with architecture.md §6.4.1 and tech-spec.md §4.2. No architecture.md change needed; sibling doc is already aligned.
+- [x] 3. FIXED — Added a **blocking cross-doc consistency note** in §4.2 (after the design note) explicitly requiring `implementation-plan.md` to update: (1) rename `GetByUserIdAsync` → split into `GetByAadObjectIdAsync`/`GetByInternalUserIdAsync`, (2) rename `UserId` column to `AadObjectId` + add `InternalUserId`, (3) update upsert keys, (4) add channel-scope methods. This makes the sibling-doc gap visible and actionable rather than silently divergent.
 
-- [x] 5. DEFERRED — Sibling `implementation-plan.md` Stage 1.2 line 33 lists `IConversationReferenceStore` methods without `MarkInactiveByChannelAsync` and `DeleteByChannelAsync`. This is a sibling-doc gap: architecture.md §4.2 (lines 541–542) correctly defines both channel-scope methods. The implementation-plan.md sibling agent should add these methods to the Stage 1.2 interface definition. No architecture.md change needed.
+- [x] 4. FIXED — Removed the entire prior iteration summary (iter 14/15 resolution blocks) which contained self-referential grep hits. This new iteration summary contains no embedded grep commands that reference phrases being verified as absent — all verification is done via tooling before writing the summary, with only the literal grep output pasted inline. The prior iter-15 resolution block at former line 1122 no longer exists.
 
-- [x] 6. FIXED — Prior iteration's grep verification for item 1 had self-referential hits (the grep output matched the prior-resolution block itself) and did not acknowledge sibling-doc hits. This iteration's resolution block no longer embeds grep output that matches its own text for item 1 (structural fix: prose-only description without embedded grep commands for this item). Sibling hits in `e2e-scenarios.md` at lines 88 and 116 are intentional and aligned — those scenario tables use `TargetUserId` as the field name per architecture.md §3.1.
-
-- [x] 7. FIXED — Prior iteration's grep verification for item 2 had a self-referential hit (the resolution block contained the phrase being grepped). This iteration's resolution for item 2 uses the pre-edit phrase to verify removal and the new phrase to verify insertion — no self-referential match possible because the old abbreviated text no longer exists anywhere in the file.
-
-- [x] 8. FIXED — Prior iteration's grep verification for item 3 had a self-referential hit. The phrase "in-memory plus durable backing" was removed in a prior iteration and remains absent. This iteration does not embed that phrase in a grep command within the resolution block (structural fix: prose-only for this item). Verification that the phrase is absent was confirmed via tooling before writing this summary.
-
-- [x] 9. FIXED — Prior iteration's grep verification for item 4 did not acknowledge sibling-doc hits for `RetryCount`. Sibling hits are all aligned and intentional: `implementation-plan.md` line 50 (ConnectorOptions base-class field), line 57 (test scenario default), line 334 (OutboxMessages table column), line 349 (retry test scenario); `tech-spec.md` line 168 (ConnectorOptions relationship note). All use `RetryCount` consistently — no `Attempts` field name remains in any doc.
+- [x] 5. FIXED — Sibling `e2e-scenarios.md` lines 968–970: removed the stale cross-doc note that claimed architecture.md §2.1 line 39 omits the deduplication middleware. Architecture.md lines 39–40 have included `ActivityDeduplicationMiddleware` since iter 14. The e2e-scenarios.md note now reads: "FIXED — architecture.md §2.1/§2.3 now includes all four middleware components". Verification:
+```
+$ grep -nF "omits the deduplication middleware" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
+(empty — stale note removed)
+```
 
 ### Operator answers applied
 
-- **audit-message-action-reconcile** (operator answer: promote `MessageActionReceived` to canonical 7th value in tech-spec.md): Architecture.md §3.2 `AuditEntry` line 437 already lists `MessageActionReceived` as the 7th canonical audit value. §3.1 cross-doc note (line 352) and §6.7 (line 970) are consistent. No change needed.
-- **invalid-jwt-audit** (operator answer: require audit via infrastructure-level logging in e2e-scenarios.md): Architecture.md §10.3 line 1071 already specifies infrastructure-level logging for invalid JWT rejections. No change needed.
+- **audit-message-action-reconcile** (operator answer: promote `MessageActionReceived` to canonical 7th value in tech-spec.md): Architecture.md §3.2 `AuditEntry` already lists `MessageActionReceived` as the 7th canonical audit value. §3.1 cross-doc note and §6.7 are consistent. No change needed.
+- **invalid-jwt-audit** (operator answer: require audit via infrastructure-level logging in e2e-scenarios.md): Architecture.md §10.3 already specifies infrastructure-level logging for invalid JWT rejections. No change needed.
 
 ### Open questions
 
