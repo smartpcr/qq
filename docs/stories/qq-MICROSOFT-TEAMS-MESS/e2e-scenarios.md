@@ -303,7 +303,7 @@ Feature: Adaptive Card Approvals
     When user "alice@contoso.com" sends "reject" in personal chat
     Then RejectCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) to retrieve ALL open questions in the current conversation
     And the returned list contains exactly one AgentQuestion ("Q-702"), so "Q-702" is resolved without disambiguation
-    And RejectCommandHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved", ct) (architecture.md §4.11 line 766 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
+    And RejectCommandHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved", ct) (architecture.md §4.11 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -316,7 +316,7 @@ Feature: Adaptive Card Approvals
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted with EventType "CommandReceived"
     # Note: Text commands audit as "CommandReceived"; only Adaptive Card Action.Submit
-    # callbacks audit as "CardActionReceived" (per implementation-plan.md §5.1 line 348).
+    # callbacks audit as "CardActionReceived" (per implementation-plan.md §5.1).
     # Note: Q-702 has RequiresComment = false, so no comment prompt is shown.
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
@@ -326,7 +326,7 @@ Feature: Adaptive Card Approvals
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open", CreatedAt = T2, where T2 > T1)
     And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler detects multiple open questions in the conversation (per implementation-plan.md §3.2 line 188 — "if more than one are found, the handler returns a disambiguation Adaptive Card")
+    Then ApproveCommandHandler detects multiple open questions in the conversation (per implementation-plan.md §3.2 — "if more than one are found, the handler returns a disambiguation Adaptive Card")
     And the handler does NOT resolve either Q-801 or Q-802
     And the bot returns a disambiguation card listing all open questions in the conversation:
       | QuestionId | Title                           | CreatedAt |
@@ -336,7 +336,7 @@ Feature: Adaptive Card Approvals
     And both Q-801 and Q-802 remain with Status "Open"
     And an immutable audit record is persisted with EventType "CommandReceived", Action "Disambiguation", and Outcome "Success"
     # Design decision: bare approve/reject with multiple open questions returns a disambiguation
-    # card per implementation-plan.md §3.2 line 188. The user must either tap a specific action
+    # card per implementation-plan.md §3.2. The user must either tap a specific action
     # on the disambiguation card or use explicit syntax (e.g., "approve Q-801") to resolve
     # a specific question. This prevents accidental resolution of the wrong question.
 
@@ -346,11 +346,11 @@ Feature: Adaptive Card Approvals
     When user "alice@contoso.com" sends "reject" in personal chat
     Then RejectCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) to retrieve ALL open questions in the current conversation
     And the returned list contains exactly one AgentQuestion ("Q-803"), so it is resolved without disambiguation
-    And RejectCommandHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved", ct) (architecture.md §4.11 line 766 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
+    And RejectCommandHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved", ct) (architecture.md §4.11 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
     And an immutable audit record is persisted with EventType "CommandReceived"
     # Note: Text commands audit as "CommandReceived"; only Adaptive Card Action.Submit
-    # callbacks audit as "CardActionReceived" (per implementation-plan.md §5.1 line 348).
+    # callbacks audit as "CardActionReceived" (per implementation-plan.md §5.1).
     # Note: When exactly one question is pending in the conversation, the bot
     # resolves it unambiguously — no disambiguation prompt is needed.
 
@@ -373,7 +373,7 @@ Feature: Adaptive Card Approvals
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-901" (Status = "Open")
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-902" (Status = "Open")
     When user "alice@contoso.com" sends "approve Q-901" in personal chat
-    Then ApproveCommandHandler parses the explicit questionId "Q-901" from the command text (per implementation-plan.md §3.2 line 188: approve [questionId] explicit form)
+    Then ApproveCommandHandler parses the explicit questionId "Q-901" from the command text (per implementation-plan.md §3.2: approve [questionId] explicit form)
     And ApproveCommandHandler calls IAgentQuestionStore.GetByIdAsync("Q-901") to retrieve the question directly (bypasses GetOpenByConversationAsync)
     And validates that "approve" is in Q-901's AllowedActions list
     And atomically transitions Q-901 Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-901", "Open", "Resolved", ct)
@@ -386,7 +386,7 @@ Feature: Adaptive Card Approvals
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-903" (Status = "Open")
     And question "Q-903" has AllowedAction "Reject" with RequiresComment = false
     When user "alice@contoso.com" sends "reject Q-903" in personal chat
-    Then RejectCommandHandler parses the explicit questionId "Q-903" from the command text (per implementation-plan.md §3.2 line 188: reject [questionId] explicit form)
+    Then RejectCommandHandler parses the explicit questionId "Q-903" from the command text (per implementation-plan.md §3.2: reject [questionId] explicit form)
     And RejectCommandHandler calls IAgentQuestionStore.GetByIdAsync("Q-903") to retrieve the question directly
     And validates that "reject" is in Q-903's AllowedActions list
     And atomically transitions Q-903 Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-903", "Open", "Resolved", ct)
