@@ -810,13 +810,28 @@ Feature: Bot Installation and Conversation Discovery
     And a conversation reference is persisted for "frank@restricted-org.com"
     And user "frank@restricted-org.com" can now send commands and receive proactive messages
 
-  Scenario: Teams app approved by admin but tenant NOT in AllowedTenantIds is still rejected
+  Scenario: Teams app approved by admin but tenant NOT in AllowedTenantIds — installationUpdate is rejected
     Given the organization's Entra ID tenant "approved-but-unlisted-tenant-id" has granted admin consent for the bot
     But "approved-but-unlisted-tenant-id" has NOT been added to AllowedTenantIds
-    When user "eve@approved-but-unlisted.com" installs the bot and sends "agent status"
+    When user "eve@approved-but-unlisted.com" installs the bot in personal scope
+    Then the bot receives an installationUpdate activity
+    And the TenantValidationMiddleware rejects the installationUpdate activity because the tenant is not in AllowedTenantIds
+    And no conversation reference is created for "eve@approved-but-unlisted.com"
+    And the bot returns a 403 response to the installationUpdate activity
+    And an audit record is persisted with EventType "SecurityRejection" containing TenantId "approved-but-unlisted-tenant-id"
+    # Note: Since the installationUpdate itself is rejected at the middleware layer,
+    # no conversation reference is persisted — the install path (architecture §6.1 step 8)
+    # only persists a reference AFTER tenant validation passes. Consequently, no
+    # subsequent commands or proactive messages are possible for this tenant.
+
+  Scenario: Commands from an approved-but-unlisted tenant are also rejected
+    Given the organization's Entra ID tenant "approved-but-unlisted-tenant-id" has granted admin consent for the bot
+    But "approved-but-unlisted-tenant-id" has NOT been added to AllowedTenantIds
+    And the bot has no conversation reference for "eve@approved-but-unlisted.com" (install was rejected)
+    When user "eve@approved-but-unlisted.com" somehow sends "agent status" (e.g., via a Teams deep link or cached app state)
     Then the TenantValidationMiddleware rejects the inbound Activity because the tenant is not in AllowedTenantIds
     And the bot returns a 403 response
-    And an audit record is persisted for the tenant rejection
+    And an audit record is persisted with EventType "SecurityRejection"
 
   Scenario: Proactive message to user whose tenant revoked app consent
     Given user "grace@revoked-org.com" had the bot installed and a conversation reference exists
