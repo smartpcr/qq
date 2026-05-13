@@ -5,6 +5,8 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// </summary>
 public sealed record HumanDecisionEvent
 {
+    private readonly string _correlationId = null!;
+
     public required string QuestionId { get; init; }
 
     public required string ActionValue { get; init; }
@@ -19,5 +21,13 @@ public sealed record HumanDecisionEvent
 
     public required DateTimeOffset ReceivedAt { get; init; }
 
-    public required string CorrelationId { get; init; }
+    /// <summary>
+    /// Trace identifier — must be non-null, non-empty, non-whitespace per
+    /// the "All messages include trace/correlation ID" acceptance criterion.
+    /// </summary>
+    public required string CorrelationId
+    {
+        get => _correlationId;
+        init => _correlationId = CorrelationIdValidation.Require(value, nameof(CorrelationId));
+    }
 }
