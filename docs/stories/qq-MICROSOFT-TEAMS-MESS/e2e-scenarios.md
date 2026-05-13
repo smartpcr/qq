@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.35
+**Version:** 1.36
 
 ---
 
@@ -1134,3 +1134,11 @@ Feature: Edge Cases and Error Handling
 ## Document Scope
 
 **Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle (install path and message path), bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates (modeled as separate AgentQuestion records per architecture §6.3.1), RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty messages).
+
+---
+
+## Open Questions
+
+| ID | Question | Status |
+|----|----------|--------|
+| `disambiguation-store-method` | The `IAgentQuestionStore` interface (implementation-plan.md §1.2) only declares `GetMostRecentOpenByConversationAsync` returning `AgentQuestion?` (single result). Implementation-plan.md §3.2 line 186 specifies that bare `approve`/`reject` with multiple open questions returns a disambiguation card listing all open questions — this requires a list/count method (e.g., `GetAllOpenByConversationAsync(conversationId)` returning `IReadOnlyList<AgentQuestion>`) that does not yet exist on the interface. Should the `IAgentQuestionStore` interface be extended with this method, or should the disambiguation behavior be dropped in favor of always resolving the most recent? | **Unresolved** — requires alignment between implementation-plan.md and architecture.md |
