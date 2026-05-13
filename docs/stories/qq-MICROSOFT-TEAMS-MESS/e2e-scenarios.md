@@ -285,43 +285,38 @@ Feature: Adaptive Card Approvals
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
 
-  Scenario: User sends bare approve with multiple pending questions — disambiguation card shown
-    Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open")
-    And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open")
+  Scenario: User sends bare approve with multiple pending questions — most recent resolved
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open", CreatedAt = T1)
+    And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open", CreatedAt = T2, where T2 > T1)
     And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
     Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation
     # Note: GetMostRecentOpenByConversationAsync returns AgentQuestion? (single result or null)
-    # per implementation-plan.md §1.2 line 42 and §3.2 line 184. It returns the most recently
-    # created open question ordered by CreatedAt descending and returns the first result or null.
-    # When the handler receives a non-null result, it ADDITIONALLY queries for a count of open
-    # questions in the conversation to detect ambiguity. Per implementation-plan.md §3.2 line 186:
-    # "if zero or more than one are found, the handler returns a disambiguation card."
-    And the handler detects more than one open question in this conversation
-    And the bot responds with a disambiguation Adaptive Card listing all open questions:
-      | QuestionId | Agent              | Summary                     |
-      | Q-801      | release-agent-01   | <question text for Q-801>   |
-      | Q-802      | planner-agent-02   | <question text for Q-802>   |
-    And NEITHER question's Status is changed — both remain "Open"
-    And no HumanDecisionEvent is created
-    And an immutable audit record is persisted with EventType "DisambiguationCardSent"
-    # Note: The disambiguation card includes an Action.Submit button per question row.
-    # Each button's data payload contains the explicit questionId, so clicking it
-    # sends "approve Q-801" or "approve Q-802" as a targeted approval command.
-    When user "alice@contoso.com" clicks the "Approve" button for Q-801 on the disambiguation card
-    Then the bot resolves question "Q-801" specifically via IAgentQuestionStore.GetByIdAsync("Q-801")
-    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-801", "Open", "Resolved") (first-writer-wins)
-    And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
-    And the other open question "Q-802" remains with Status "Open"
+    # per implementation-plan.md §1.2 line 43. It returns the most recently created open
+    # question ordered by CreatedAt descending (first result or null). The method cannot
+    # return a count or list — it is a single-result lookup by design.
+    And the method returns question "Q-802" (the most recently created open question)
+    And ApproveCommandHandler calls IAgentQuestionStore.GetByIdAsync("Q-802") to retrieve the full question
+    And CardActionHandler transitions AgentQuestion "Q-802" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-802", "Open", "Resolved") (first-writer-wins)
+    And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-802"
+    And the other open question "Q-801" remains with Status "Open"
+    And the original Adaptive Card for Q-802 is updated to show "Approved by alice@contoso.com"
     And an immutable audit record is persisted with EventType "CardActionReceived"
-    # Cross-doc alignment: implementation-plan.md §3.2 line 186 defines the
-    # disambiguation contract: "if exactly one is found, it is used as the target;
-    # if zero or more than one are found, the handler returns a disambiguation card
-    # listing open questions in the conversation with their QuestionIds."
-    # architecture.md §2.5 (Supported commands table, lines 133-134) describes
-    # `approve` as acting on "the most recent pending approval in context" — when
-    # multiple questions are pending, the disambiguation card fulfills this by
-    # requiring explicit selection before any question is resolved.
+    # Cross-doc alignment: architecture.md §2.5 (Supported commands table, lines 133-134)
+    # describes `approve` as acting on "the most recent pending approval in context."
+    # The GetMostRecentOpenByConversationAsync contract (implementation-plan.md §1.2 line 43
+    # and §3.2 line 187) returns AgentQuestion? — a single result. It cannot distinguish
+    # "exactly one open" from "multiple open" since it only returns the top-1 result.
+    # Therefore bare approve always resolves the most recent open question.
+    #
+    # NOTE ON DISAMBIGUATION GAP: implementation-plan.md §3.2 line 186 says "if zero or
+    # more than one are found, the handler returns a disambiguation card" — but the only
+    # store method is GetMostRecentOpenByConversationAsync returning AgentQuestion?, which
+    # cannot detect "more than one." To implement disambiguation, a list/count method
+    # (e.g., GetAllOpenByConversationAsync) would need to be added to IAgentQuestionStore.
+    # This is raised as Open Question "disambiguation-store-method" below.
+    # Until that method is added, bare approve resolves the most recent open question.
+    #
     # This also prevents the "Cross-Conversation Consent" attack because the
     # lookup is scoped to the current conversationId, not the user globally.
 
@@ -1076,13 +1071,21 @@ Feature: Edge Cases and Error Handling
     Then the conversation reference is updated with the new ServiceUrl
     And subsequent proactive messages use the updated ServiceUrl
 
-  Scenario: Concurrent approvals for the same single-decision question (first-writer-wins)
+  Scenario: Concurrent approvals for the same single-decision channel question (first-writer-wins)
     Given question "Q-999" is a single-decision question (the release gate threshold is 1)
-    And question "Q-999" was sent to both "alice@contoso.com" and "bob@contoso.com"
+    And question "Q-999" was sent to channel "#ops-swarm" (TargetChannelId = "channel-ops-swarm", TargetUserId = null)
+    And both "alice@contoso.com" and "bob@contoso.com" can see and interact with the card in the channel
     When both users click "Approve" within the same second
-    Then exactly one HumanDecisionEvent is created (first-writer-wins)
+    Then exactly one IAgentQuestionStore.TryUpdateStatusAsync("Q-999", "Open", "Resolved") call succeeds (first-writer-wins)
+    And exactly one HumanDecisionEvent is created for the winning user
+    And the second user's TryUpdateStatusAsync returns false (Status already Resolved)
     And the second user sees: "This question has already been decided."
     And both outcomes are audit-logged
+    # Note: Q-999 uses TargetChannelId (not TargetUserId) per the AgentQuestion model
+    # where exactly one of TargetUserId or TargetChannelId must be non-null
+    # (architecture.md §AgentQuestion field table lines 289-290, implementation-plan.md
+    # §1.1 line 16). A channel-scoped card is visible to all channel members,
+    # creating the concurrent-approval scenario naturally.
 
   Scenario: Concurrent approvals for a multi-approver release gate (separate questions, both accepted)
     Given the orchestrator created two separate AgentQuestion records for a release gate:
