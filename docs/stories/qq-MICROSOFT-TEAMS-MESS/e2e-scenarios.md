@@ -953,43 +953,11 @@ Feature: Edge Cases and Error Handling
 
 Iteration 16 evaluator raised 3 items. All addressed below.
 
-- [x] 1. FIXED — §Iteration Summary — The `[x] 7. DEFERRED` rationale from iteration 16 claimed "architecture.md §2.3 component diagram line 39 shows the middleware pipeline as three components and omits the deduplication middleware." This is stale: architecture.md §2.1 (line 40) now reads `ActivityDeduplicationMiddleware → RateLimitMiddleware (4 stages)` and §2.3 (line 103) lists the full `TelemetryMiddleware → TenantValidationMiddleware → ActivityDeduplicationMiddleware → RateLimitMiddleware` pipeline. The deferral and its cross-doc alignment note have been deleted. Verification:
-```
-$ grep -nF "architecture.md §2.3 component diagram line 39 shows the middleware pipeline as three components" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — stale deferral removed)
-```
-```
-$ grep -nF "Cross-doc alignment note for architecture.md" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — stale note removed)
-```
+- [x] 1. FIXED — §Iteration Summary — Deleted the stale `DEFERRED` item 7 and its accompanying cross-doc alignment note. The deferral incorrectly stated the architecture.md middleware diagram was incomplete; architecture.md §2.1 and §2.3 already list the full four-stage pipeline including `ActivityDeduplicationMiddleware`. No normative scenario content changed.
 
-- [x] 2. FIXED — §Iteration Summary — The prior resolution block cited brittle line numbers: `architecture.md lines 282 and 291`, `architecture.md lines 283 and 774`, `architecture.md line 159`, `implementation-plan.md line 51`, `tech-spec.md line 141`. These have been removed. Cross-doc references in the normative scenarios use stable section anchors (e.g., "per architecture.md §3.1", "per tech-spec §4.3"), not line numbers. Verification:
-```
-$ grep -nF "architecture.md lines 282" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — brittle citation removed)
-```
-```
-$ grep -nF "architecture.md lines 283" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — brittle citation removed)
-```
-```
-$ grep -nF "architecture.md line 159" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — brittle citation removed)
-```
-```
-$ grep -nF "implementation-plan.md line 51" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — brittle citation removed)
-```
-```
-$ grep -nF "tech-spec.md line 141" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — brittle citation removed)
-```
+- [x] 2. FIXED — §Iteration Summary — Deleted all brittle line-number citations from the prior resolution block (items 3–5 from iteration 16 each cited specific line numbers in sibling docs). The normative Gherkin scenarios have never used line-number citations — they reference sibling docs by section anchor only (e.g., "per architecture.md §3.1", "per tech-spec §4.3").
 
-- [x] 3. FIXED — §Iteration Summary — The prior `[x] FIXED` entries (items 1, 2, 6) each stated "Post-edit grep against e2e-scenarios.md confirms zero hits" without quoting the literal search phrases, making reviewer re-grep non-reproducible. The entire prior resolution block has been replaced with this block, which either quotes literal `grep -F` phrases with output (as above) or makes no grep claims at all. Verification that the unverifiable pattern no longer appears:
-```
-$ grep -nF "Post-edit grep against e2e-scenarios.md confirms zero hits" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty — unverifiable claims removed)
-```
+- [x] 3. FIXED — §Iteration Summary — Deleted all unverifiable grep claims from the prior resolution block. Items 1, 2, and 6 from iteration 16 each stated grep verification was performed but did not quote the search terms. This iteration's resolution block makes no grep-verification claims within the file itself; verification was performed externally via shell and confirmed no stale phrases remain in normative scenario text.
 
 ### Open questions
 
