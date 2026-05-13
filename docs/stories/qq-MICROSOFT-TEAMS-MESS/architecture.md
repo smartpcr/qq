@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 17
+**Status:** Draft — iteration 18
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -109,7 +109,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | Attribute | Value |
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
-| **Base class** | `Microsoft.Bot.Builder.Teams.TeamsActivityHandler` (SDK base class) |
+| **Base class** | `TeamsActivityHandler` (from `Microsoft.Bot.Builder`; extends `ActivityHandler` with Teams-specific overrides — no separate `Microsoft.Bot.Builder.Teams` package or namespace is required per `tech-spec.md` §2.1 lines 34 and 88) |
 | **Responsibility** | Override `OnMessageActivityAsync`, `OnAdaptiveCardInvokeAsync`, `OnInstallationUpdateActivityAsync`, and `OnTeamsMessagingExtensionSubmitActionAsync` to dispatch to domain-specific handlers. The custom name `TeamsSwarmActivityHandler` distinguishes this from the SDK base class. |
 | **Key overrides** | `OnMessageActivityAsync` → `CommandParser`; `OnAdaptiveCardInvokeAsync` → `CardActionHandler`; `OnInstallationUpdateActivityAsync` / `OnTeamsMembersAddedAsync` → `InstallHandler`; `OnTeamsMessagingExtensionSubmitActionAsync` → `MessageExtensionHandler`. |
 
@@ -140,8 +140,9 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Cards` |
-| **Responsibility** | Process Adaptive Card `Action.Submit` invoke activities. Extracts the `ActionId` and optional comment from `Activity.Value`, resolves the originating `AgentQuestion` via `QuestionId` embedded in card data, produces a `HumanDecisionEvent`, and publishes it to the inbound queue. Updates the original card to reflect the decision (approved/rejected) and disables further actions. |
-| **Idempotency** | Maintains a processed-action set (keyed on `QuestionId + UserId`) to reject duplicate card-action submissions. This is a **domain-level** deduplication layer operating on the semantic action. It works in conjunction with the **activity-level** `ActivityDeduplicationMiddleware` (§2.16) which suppresses duplicate webhook deliveries by `Activity.Id` before the activity reaches any handler. Both layers are required: the middleware catches transport-level retries, while the card-action set catches user-initiated double-taps that share the same question context but arrive as distinct activities. |
+| **Responsibility** | Process Adaptive Card `Action.Submit` invoke activities. Extracts the `ActionId` and optional comment from `Activity.Value`, resolves the originating `AgentQuestion` via `IAgentQuestionStore.GetByIdAsync(questionId)` (§4.11) to retrieve the full question including `AllowedActions`, validates that the submitted `ActionValue` is in the question's `AllowedActions` list, produces a `HumanDecisionEvent`, and publishes it to the inbound queue. Updates the original card to reflect the decision (approved/rejected) and disables further actions. |
+| **Dependencies** | `IAgentQuestionStore` (§4.11) — retrieves the persisted `AgentQuestion` by `QuestionId` for action validation and status checking. `ICardStateStore` (§4.3) — retrieves the `TeamsCardState` for card update operations. |
+| **Idempotency** | Two-layer idempotency: (1) **Durable status check** — queries `IAgentQuestionStore.GetByIdAsync(questionId)` and rejects the action if `AgentQuestion.Status != Open` (the question is already `Resolved` or `Expired`), then atomically transitions `Status` to `Resolved` via `IAgentQuestionStore.UpdateStatusAsync` on successful processing (first-writer-wins per `e2e-scenarios.md` §first-writer-wins question decisions). This durable check survives service restarts. (2) **In-memory processed-action set** (keyed on `QuestionId + UserId`) — a fast-path deduplication layer for within-session duplicate card-action submissions. Both work in conjunction with the **activity-level** `ActivityDeduplicationMiddleware` (§2.16) which suppresses duplicate webhook deliveries by `Activity.Id` before the activity reaches any handler. All three layers are required: the middleware catches transport-level retries; the in-memory set catches user-initiated double-taps within a session; the durable status check catches cross-restart duplicates and concurrent submissions from different pods. |
 
 ### 2.7 InstallHandler
 
@@ -280,8 +281,10 @@ Blocking question from an agent requiring human response. Defined in `AgentSwarm
 | `QuestionId` | `string` | Unique question identifier. |
 | `AgentId` | `string` | Asking agent. |
 | `TaskId` | `string` | Associated task. |
+| `TenantId` | `string` | Entra ID tenant of the target user or channel. Required for all proactive delivery lookups since `IConversationReferenceStore` keys on `(InternalUserId, TenantId)` or `(ChannelId, TenantId)`. Populated by the orchestrator from the task's tenant context when creating the question. Aligned with `implementation-plan.md` §1.1 line 16 which defines `AgentQuestion.TenantId` as a required field. |
 | `TargetUserId` | `string?` | Internal user ID of the intended recipient. The orchestrator sets this when the question targets a specific user (e.g., `alice@contoso.com`'s internal ID). `TeamsMessengerConnector` resolves this to a `TeamsConversationReference` via `IConversationReferenceStore.GetByInternalUserIdAsync(tenantId, targetUserId)`. Null when the question should be broadcast to a channel (in which case `TargetChannelId` must be set). |
 | `TargetChannelId` | `string?` | Teams channel ID for channel-scoped questions. Mutually exclusive with `TargetUserId` — exactly one must be non-null. |
+| `Status` | `string` | Lifecycle state: `Open`, `Resolved`, `Expired`. Managed by `IAgentQuestionStore` (§4.11). Set to `Open` on creation; transitioned to `Resolved` by `CardActionHandler` on first accepted action (first-writer-wins per `e2e-scenarios.md` §first-writer-wins); transitioned to `Expired` by the expiration worker when `ExpiresAt` elapses. The durable status enables idempotent duplicate approval handling (§6.3 step 5): `CardActionHandler` checks `Status == Open` before processing — if already `Resolved` or `Expired`, the action is rejected with a "decision already recorded" response rather than relying solely on the in-memory processed-action set. |
 | `Title` | `string` | Short title for the card header. |
 | `Body` | `string` | Detailed question text. |
 | `Severity` | `string` | `Info`, `Warning`, `Error`, `Critical`. |
@@ -289,7 +292,7 @@ Blocking question from an agent requiring human response. Defined in `AgentSwarm
 | `ExpiresAt` | `DateTimeOffset` | Expiration deadline. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
 
-> **Routing derivation:** When the orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`, `TeamsMessengerConnector` builds an `OutboxEntry` with `Destination` derived from `TargetUserId` or `TargetChannelId`: `teams://{tenantId}/user/{targetUserId}` for personal delivery, `teams://{tenantId}/channel/{targetChannelId}` for channel delivery. The `ProactiveNotifier` then resolves this destination to a stored `ConversationReference` via `IConversationReferenceStore`. For user-targeted questions, the lookup is `GetByInternalUserIdAsync(tenantId, targetUserId)` — this uses the `InternalUserId` field on `TeamsConversationReference`, which was populated when `IIdentityResolver` first mapped the user's `AadObjectId` to an internal identity (§6.1 step 6). The `TargetUserId` is the orchestrator's **internal user ID** (the same value stored in `TeamsConversationReference.InternalUserId`), NOT the AAD object ID (which is stored separately in `TeamsConversationReference.AadObjectId`). The orchestrator is responsible for determining which user should receive each question based on task assignment, escalation policy, or explicit addressing. The e2e scenario at `e2e-scenarios.md` lines 81–96 (agent sends a blocking question to `alice@contoso.com`) exercises this path: the orchestrator sets `TargetUserId` to Alice's internal ID, `TeamsMessengerConnector` resolves it to her stored `ConversationReference` via `InternalUserId`, and `ProactiveNotifier` delivers via `ContinueConversationAsync`.
+> **Routing derivation:** When the orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`, `TeamsMessengerConnector` builds an `OutboxEntry` with `Destination` derived from `AgentQuestion.TenantId` combined with `TargetUserId` or `TargetChannelId`: `teams://{agentQuestion.TenantId}/user/{targetUserId}` for personal delivery, `teams://{agentQuestion.TenantId}/channel/{targetChannelId}` for channel delivery. The `TenantId` field on `AgentQuestion` is required and populated by the orchestrator from the task's tenant context (see field table above). The `ProactiveNotifier` then resolves this destination to a stored `ConversationReference` via `IConversationReferenceStore`. For user-targeted questions, the lookup is `GetByInternalUserIdAsync(agentQuestion.TenantId, targetUserId)` — this uses the `InternalUserId` field on `TeamsConversationReference`, which was populated when `IIdentityResolver` first mapped the user's `AadObjectId` to an internal identity (§6.1 step 6). The `TargetUserId` is the orchestrator's **internal user ID** (the same value stored in `TeamsConversationReference.InternalUserId`), NOT the AAD object ID (which is stored separately in `TeamsConversationReference.AadObjectId`). The orchestrator is responsible for determining which user should receive each question based on task assignment, escalation policy, or explicit addressing. The e2e scenario at `e2e-scenarios.md` lines 81–96 (agent sends a blocking question to `alice@contoso.com`) exercises this path: the orchestrator sets `TargetUserId` to Alice's internal ID, `TeamsMessengerConnector` resolves it to her stored `ConversationReference` via `InternalUserId`, and `ProactiveNotifier` delivers via `ContinueConversationAsync`.
 
 #### HumanAction
 
@@ -679,6 +682,38 @@ public sealed record AuthorizationResult(
 
 `TeamsSwarmActivityHandler` calls `IUserAuthorizationService.AuthorizeAsync` after identity resolution succeeds. If the result indicates insufficient permissions, the handler logs a `SecurityRejection` audit entry and returns an Adaptive Card explaining the required role (§6.4.3). Role-to-command mappings are defined in §5.2.
 
+### 4.11 IAgentQuestionStore (question persistence)
+
+```csharp
+// Assembly: AgentSwarm.Messaging.Abstractions (interface)
+// Implementations: AgentSwarm.Messaging.Persistence (SqlAgentQuestionStore)
+// Aligned with implementation-plan.md §1.2 line 38 (interface) and §3.3 line 193 (SQL implementation)
+public interface IAgentQuestionStore
+{
+    /// <summary>
+    /// Persists a new AgentQuestion with Status = Open.
+    /// Called by TeamsMessengerConnector.SendQuestionAsync before card rendering.
+    /// </summary>
+    Task SaveAsync(AgentQuestion question, CancellationToken ct);
+
+    /// <summary>
+    /// Retrieves the full AgentQuestion including AllowedActions.
+    /// Returns null if not found. Used by CardActionHandler to validate
+    /// submitted ActionValue against AllowedActions and check Status.
+    /// </summary>
+    Task<AgentQuestion?> GetByIdAsync(string questionId, CancellationToken ct);
+
+    /// <summary>
+    /// Atomically transitions question status (Open → Resolved, Open → Expired).
+    /// First-writer-wins: if status is already Resolved/Expired, returns false
+    /// and the caller treats the action as a duplicate.
+    /// </summary>
+    Task<bool> UpdateStatusAsync(string questionId, string newStatus, CancellationToken ct);
+}
+```
+
+`CardActionHandler` (§2.6) depends on this interface to resolve the originating `AgentQuestion` by `QuestionId`, validate that the submitted `ActionValue` is in the stored `AllowedActions` list, and check/transition `Status` for durable idempotent duplicate handling (first-writer-wins per `e2e-scenarios.md` §first-writer-wins). `TeamsMessengerConnector.SendQuestionAsync` calls `SaveAsync` to persist the question before rendering and enqueueing the outbox entry. The concrete implementation `SqlAgentQuestionStore` (defined in `implementation-plan.md` §3.3 line 193) is backed by a SQL table with columns `QuestionId` (PK), `AgentId`, `TaskId`, `TenantId`, `TargetUserId`, `TargetChannelId`, `Title`, `Body`, `Severity`, `AllowedActionsJson`, `ExpiresAt`, `CorrelationId`, `Status`, `CreatedAt`, `ResolvedAt`.
+
 ---
 
 ## 5. Security Architecture
@@ -816,13 +851,15 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 2. Teams sends an `invoke` activity with `type: "adaptiveCard/action"` to the bot.
 3. `TeamsSwarmActivityHandler.OnAdaptiveCardInvokeAsync` delegates to `CardActionHandler`.
 4. `CardActionHandler` extracts `QuestionId` and `ActionId` from `Activity.Value`.
-5. Idempotency check: if this `(QuestionId, UserId)` pair was already processed, return the previous result.
-6. `CardActionHandler` builds a `HumanDecisionEvent` with the user's AAD object ID, action value, and optional comment.
-7. `CardStateStore` is updated: status changes from `Pending` to `Answered`.
-8. The original card is updated in Teams via `TurnContext.UpdateActivityAsync` to show "Approved by {user}" with action buttons disabled.
-9. `TeamsMessengerConnector` publishes the `HumanDecisionEvent` as a `MessengerEvent` to the inbound buffer.
-10. Orchestrator consumes the decision and unblocks the agent.
-11. `AuditLogger` records the approval with full correlation data.
+5. **Durable idempotency check:** `CardActionHandler` calls `IAgentQuestionStore.GetByIdAsync(questionId)` (§4.11) to retrieve the stored `AgentQuestion`. If `Status != Open` (already `Resolved` or `Expired`), the handler returns a "decision already recorded" response and does not emit a duplicate event (first-writer-wins per `e2e-scenarios.md` §first-writer-wins). The in-memory processed-action set (keyed on `QuestionId + UserId`) provides a fast-path pre-check within the same session, but the durable `Status` field is the authoritative guard that survives restarts and works across pods.
+6. `CardActionHandler` validates that the submitted `ActionValue` is in the stored question's `AllowedActions` list. If not, the action is rejected with an invalid-action response.
+7. `CardActionHandler` atomically transitions `AgentQuestion.Status` from `Open` to `Resolved` via `IAgentQuestionStore.UpdateStatusAsync(questionId, "Resolved")`. If `UpdateStatusAsync` returns `false` (another pod resolved it concurrently), the handler treats this as a duplicate.
+8. `CardActionHandler` builds a `HumanDecisionEvent` with the user's AAD object ID, action value, and optional comment.
+9. `CardStateStore` is updated: card status changes from `Pending` to `Answered`.
+10. The original card is updated in Teams via `TurnContext.UpdateActivityAsync` to show "Approved by {user}" with action buttons disabled.
+11. `TeamsMessengerConnector` publishes the `HumanDecisionEvent` as a `MessengerEvent` to the inbound buffer.
+12. Orchestrator consumes the decision and unblocks the agent.
+13. `AuditLogger` records the approval with full correlation data.
 
 ### 6.4 Scenario: Unauthorized tenant/user is rejected
 
@@ -986,9 +1023,9 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 
 | Assembly | Layer | Responsibility |
 |---|---|---|
-| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`), `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult` |
+| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`), `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult`, `IAgentQuestionStore` (interface) |
 | `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IMessageOutbox`, retry policies, deduplication, rate limiting |
-| `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), storage implementations (SQL, Azure Table) |
+| `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), `SqlAgentQuestionStore` (impl of `IAgentQuestionStore`), storage implementations (SQL, Azure Table) |
 | `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore`, `EntraIdentityResolver` (impl of `IIdentityResolver`), `RbacAuthorizationService` (impl of `IUserAuthorizationService`) |
 | `AgentSwarm.Messaging.Worker` | Host | ASP.NET Core worker service hosting the Teams connector, DI registration, health checks, OpenTelemetry configuration |
 | `AgentSwarm.Messaging.Tests` | Test | Unit and integration tests for all assemblies |
@@ -1057,6 +1094,7 @@ Teams connector configuration is bound from `appsettings.json` / environment var
 services.AddSingleton<IMessengerConnector, TeamsMessengerConnector>();
 services.AddSingleton<IConversationReferenceStore, SqlConversationReferenceStore>();
 services.AddSingleton<ICardStateStore, SqlCardStateStore>();
+services.AddSingleton<IAgentQuestionStore, SqlAgentQuestionStore>();
 services.AddSingleton<IActivityIdStore, InMemoryActivityIdStore>();
 services.AddSingleton<IAdaptiveCardRenderer, AdaptiveCardRenderer>();
 services.AddSingleton<ProactiveNotifier>();
