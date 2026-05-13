@@ -156,7 +156,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Interface** | `IConversationReferenceStore` (defined in `AgentSwarm.Messaging.Teams`) |
-| **Responsibility** | Persist and retrieve Bot Framework `ConversationReference` objects for proactive messaging. Each reference is keyed by `(TenantId, UserId)` for personal chats or `(TenantId, ChannelId)` for team channels. Survives service restarts. |
+| **Responsibility** | Persist and retrieve Bot Framework `ConversationReference` objects for proactive messaging. Each reference is keyed by `(TenantId, AadObjectId)` for personal chats or `(TenantId, ChannelId)` for team channels. An `InternalUserId` field (populated by `IIdentityResolver` on first authorized interaction) enables orchestrator-initiated lookups via `GetByInternalUserIdAsync`. Survives service restarts. |
 | **Storage** | Pluggable — default implementation uses the same durable store as the outbox (e.g., SQL Server, Azure Table Storage, or PostgreSQL). |
 
 ### 2.9 TeamsMessengerConnector
@@ -288,7 +288,7 @@ Blocking question from an agent requiring human response. Defined in `AgentSwarm
 | `ExpiresAt` | `DateTimeOffset` | Expiration deadline. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
 
-> **Routing derivation:** When the orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`, `TeamsMessengerConnector` builds an `OutboxEntry` with `Destination` derived from `TargetUserId` or `TargetChannelId`: `teams://{tenantId}/{targetUserId}` for personal delivery, `teams://{tenantId}/channel/{targetChannelId}` for channel delivery. The `ProactiveNotifier` then resolves this destination to a stored `ConversationReference` via `IConversationReferenceStore`. The `TargetUserId` is the orchestrator's internal user ID (the same value stored in `TeamsConversationReference.UserId`); the orchestrator is responsible for determining which user should receive each question based on task assignment, escalation policy, or explicit addressing. The e2e scenario at `e2e-scenarios.md` lines 81–96 (agent sends a blocking question to `alice@contoso.com`) exercises this path: the orchestrator sets `TargetUserId` to Alice's internal ID, `TeamsMessengerConnector` resolves it to her stored `ConversationReference`, and `ProactiveNotifier` delivers via `ContinueConversationAsync`.
+> **Routing derivation:** When the orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`, `TeamsMessengerConnector` builds an `OutboxEntry` with `Destination` derived from `TargetUserId` or `TargetChannelId`: `teams://{tenantId}/user/{targetUserId}` for personal delivery, `teams://{tenantId}/channel/{targetChannelId}` for channel delivery. The `ProactiveNotifier` then resolves this destination to a stored `ConversationReference` via `IConversationReferenceStore`. For user-targeted questions, the lookup is `GetByInternalUserIdAsync(tenantId, targetUserId)` — this uses the `InternalUserId` field on `TeamsConversationReference`, which was populated when `IIdentityResolver` first mapped the user's `AadObjectId` to an internal identity (§6.1 step 6). The `TargetUserId` is the orchestrator's **internal user ID** (the same value stored in `TeamsConversationReference.InternalUserId`), NOT the AAD object ID (which is stored separately in `TeamsConversationReference.AadObjectId`). The orchestrator is responsible for determining which user should receive each question based on task assignment, escalation policy, or explicit addressing. The e2e scenario at `e2e-scenarios.md` lines 81–96 (agent sends a blocking question to `alice@contoso.com`) exercises this path: the orchestrator sets `TargetUserId` to Alice's internal ID, `TeamsMessengerConnector` resolves it to her stored `ConversationReference` via `InternalUserId`, and `ProactiveNotifier` delivers via `ContinueConversationAsync`.
 
 #### HumanAction
 
@@ -521,16 +521,21 @@ public interface IConversationReferenceStore
     // Generic get by primary key (aligned with implementation-plan.md §1.2 GetAsync)
     Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct);
 
-    Task<TeamsConversationReference?> GetByUserIdAsync(string tenantId, string userId, CancellationToken ct);
+    // Lookup by AAD object ID (Teams-native identity key)
+    Task<TeamsConversationReference?> GetByAadObjectIdAsync(string tenantId, string aadObjectId, CancellationToken ct);
+
+    // Lookup by internal user ID (orchestrator identity key — used for proactive routing)
+    Task<TeamsConversationReference?> GetByInternalUserIdAsync(string tenantId, string internalUserId, CancellationToken ct);
+
     Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct);
     Task<IReadOnlyList<TeamsConversationReference>> GetAllActiveAsync(string tenantId, CancellationToken ct);
 
     // Check whether a reference is active (not uninstalled/stale)
-    Task<bool> IsActiveAsync(string tenantId, string userId, CancellationToken ct);
+    Task<bool> IsActiveAsync(string tenantId, string aadObjectId, CancellationToken ct);
 
-    // Personal-scope overloads (keyed by userId)
-    Task MarkInactiveAsync(string tenantId, string userId, CancellationToken ct);
-    Task DeleteAsync(string tenantId, string userId, CancellationToken ct);
+    // Personal-scope overloads (keyed by aadObjectId)
+    Task MarkInactiveAsync(string tenantId, string aadObjectId, CancellationToken ct);
+    Task DeleteAsync(string tenantId, string aadObjectId, CancellationToken ct);
 
     // Channel-scope overloads (keyed by channelId)
     Task MarkInactiveByChannelAsync(string tenantId, string channelId, CancellationToken ct);
