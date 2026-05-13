@@ -111,7 +111,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `OnTurnAsync` to add `CorrelationId` (from activity or new GUID) to the turn context for distributed tracing.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
+- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
 
 ### Test Scenarios
 - [ ] Scenario: Command routing— Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
@@ -148,7 +148,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create `manifest.zip` packaging script that bundles `manifest.json`, `color.png` (192×192), and `outline.png` (32×32) icons for sideloading or admin deployment.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
+- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
 
 ### Test Scenarios
 - [ ] Scenario: Manifest schema validation— Given the generated `manifest.json`, When validated against the Teams manifest schema v1.16, Then no schema errors are reported.
@@ -295,7 +295,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 
 ### Test Scenarios
 - [ ] Scenario: Proactive question delivery — Given a stored conversation reference for `user-1`, When `SendProactiveQuestionAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the user's personal chat using `AdaptiveCardBuilder` to render the card.
-- [ ] Scenario: Reference not found — Given no conversation reference exists for `user-2`, When `SendProactiveQuestionAsync` is called, Then a `ConversationReferenceNotFoundException` is thrown and the caller logs the failure for later outbox-based retry (available in Phase 6).
+- [ ] Scenario: Reference not found — Given no conversation reference exists for `user-2`, When `SendProactiveQuestionAsync` is called, Then a `ConversationReferenceNotFoundException` is thrownand the caller logs the failure for later outbox-based retry (available in Phase 6).
 - [ ] Scenario: Direct delivery latency (INTERIM — replaced by outbox-mediated path in Stage 6.1) — Given a stored conversation reference and a rendered Adaptive Card, When `SendProactiveQuestionAsync` delivers the card directly via `ContinueConversationAsync` (interim direct-send path before Stage 6.1 outbox wiring), Then delivery completes within P95 < 3 seconds. Note: this is an interim-only scenario validating the direct delivery path that exists between Stage 4.2 and Stage 6.1. Once Stage 6.1 wires all sends through the outbox, this direct-send code path is removed and this scenario is superseded by Stage 6.3's `Delivery histogram` test which measures the canonical P95 SLA (< 3 seconds from outbox queue pickup to Bot Connector acknowledgement, per `tech-spec.md` §4.4).
 - [ ] Scenario: Channel proactive delivery — Given a stored channel-scoped conversation reference for `channel-general` in `tenant-1`, When `SendToChannelAsync("tenant-1", "channel-general", message)` is called, Then the message is delivered to the team channel (not a personal chat) using the channel's stored `ConversationReference` via `ContinueConversationAsync`.
 - [ ] Scenario: Channel question delivery — Given a stored channel reference, When `SendQuestionToChannelAsync` is called with an `AgentQuestion`, Then an Adaptive Card is delivered to the team channel using `AdaptiveCardBuilder` to render the card.

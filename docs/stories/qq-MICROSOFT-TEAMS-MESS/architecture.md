@@ -611,7 +611,7 @@ public interface IConversationReferenceStore
 ### 4.3 ICardStateStore
 
 ```csharp
-// Assembly: AgentSwarm.Messaging.Abstractions
+// Assembly: AgentSwarm.Messaging.Teams
 public interface ICardStateStore
 {
     Task SaveAsync(TeamsCardState state, CancellationToken ct);
@@ -1139,7 +1139,7 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 
 | Assembly | Layer | Responsibility |
 |---|---|---|
-| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`), `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult`, `IAgentQuestionStore` (interface), `ICardStateStore` (interface) |
+| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`), `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult`, `IAgentQuestionStore` (interface) |
 | `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IMessageOutbox`, retry policies, deduplication, rate limiting |
 | `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), `SqlAgentQuestionStore` (impl of `IAgentQuestionStore`), storage implementations (SQL, Azure Table) |
 | `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `SqlCardStateStore` (impl of `ICardStateStore`), `ActivityDeduplicationMiddleware`, `IActivityIdStore`, `EntraIdentityResolver` (impl of `IIdentityResolver`), `RbacAuthorizationService` (impl of `IUserAuthorizationService`) |

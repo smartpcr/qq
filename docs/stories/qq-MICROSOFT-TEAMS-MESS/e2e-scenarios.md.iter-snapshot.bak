@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.45
+**Version:** 1.44
 
 ---
 
@@ -268,9 +268,7 @@ Feature: Adaptive Card Approvals
     And a HumanDecisionEvent is created with ActionValue "approve"
     And the original Adaptive Card is updated to show "Approved by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
-    And an immutable audit record is persisted with EventType "CommandReceived"
-    # Note: Text commands audit as "CommandReceived" (per implementation-plan.md §5.1 line 348);
-    # only Adaptive Card Action.Submit callbacks audit as "CardActionReceived".
+    And an immutable audit record is persisted with EventType "CardActionReceived"
 
   Scenario: User rejects via text command in personal chat (single pending question in conversation)
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-702"
@@ -291,9 +289,7 @@ Feature: Adaptive Card Approvals
     And a HumanDecisionEvent is created with ActionValue "reject" and Comment = null
     And the original Adaptive Card is updated to show "Rejected by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
-    And an immutable audit record is persisted with EventType "CommandReceived"
-    # Note: Text commands audit as "CommandReceived"; only Adaptive Card Action.Submit
-    # callbacks audit as "CardActionReceived" (per implementation-plan.md §5.1 line 348).
+    And an immutable audit record is persisted with EventType "CardActionReceived"
     # Note: Q-702 has RequiresComment = false, so no comment prompt is shown.
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
@@ -325,9 +321,7 @@ Feature: Adaptive Card Approvals
     And the returned list contains exactly one AgentQuestion ("Q-803"), so it is resolved without disambiguation
     And RejectCommandHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved", ct) (architecture.md §4.11 line 766 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
-    And an immutable audit record is persisted with EventType "CommandReceived"
-    # Note: Text commands audit as "CommandReceived"; only Adaptive Card Action.Submit
-    # callbacks audit as "CardActionReceived" (per implementation-plan.md §5.1 line 348).
+    And an immutable audit record is persisted with EventType "CardActionReceived"
     # Note: When exactly one question is pending in the conversation, the bot
     # resolves it unambiguously — no disambiguation prompt is needed.
 
@@ -727,13 +721,16 @@ Feature: Performance — Card Delivery SLA
     And the delivery latency for each card is recorded as a metric
     And no cards are lost
 
-  Scenario: Concurrent text-command load does not degrade card delivery SLA
-    Given 20 users are simultaneously sending "agent status" commands
-    And 10 AgentQuestions are published to the outbound queue during the same window
-    When the OutboxRetryEngine processes all 10 notifications concurrently with the 20 text-command responses
-    Then at least 9 of the 10 Adaptive Cards are delivered within 3 seconds of queue pickup (P95 SLA preserved)
-    And all 20 "agent status" responses are returned within 5 seconds
-    And no requests are dropped or return HTTP 429 to the end user
+  Scenario: Concurrent user interactions do not degrade card delivery latency (non-normative — aspirational target)
+    # Note: tech-spec.md §2.1 line 43 only makes P95 Adaptive Card delivery < 3 seconds a hard
+    # requirement; the concurrency target is tentative/unconfirmed (tech-spec.md §7 Assumption 8).
+    # This scenario is aspirational and SHOULD NOT be treated as a hard pass/fail gate until the
+    # sibling spec confirms a concrete concurrency SLA.
+    Given 50 users are simultaneously interacting with the bot
+    When each user sends "agent status"
+    Then responses SHOULD be returned promptly
+    And the bot SHOULD NOT throttle legitimate requests
+    And the P95 Adaptive Card delivery SLA (< 3 seconds) for queued cards is not degraded by concurrent text-command load
 
   Scenario: Large Adaptive Card renders within SLA
     Given an AgentQuestion has a Body of 2000 characters
