@@ -285,12 +285,13 @@ Feature: Adaptive Card Approvals
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
 
-  Scenario: User sends approve with multiple pending questions in personal chat
+  Scenario: User sends approve with multiple pending questions in the same conversation
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open")
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open")
-    And both cards are pending in user "alice@contoso.com"'s personal chat
+    And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then the bot detects more than one pending AgentQuestion (Status == "Open") for the user
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation
+    And more than one open AgentQuestion is found in this conversation
     And the bot does NOT silently resolve "the most recent" question
     And the bot replies with a disambiguation card listing all pending questions:
       | QuestionId | Agent              | Title                        |
@@ -303,30 +304,47 @@ Feature: Adaptive Card Approvals
     And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
     And question "Q-802" remains with Status "Open"
     And an immutable audit record is persisted with EventType "CardActionReceived"
-    # Note: This prevents the "Most Recent Is Consent" attack where a user
-    # unknowingly approves the wrong pending question when multiple cards are
-    # outstanding. Explicit disambiguation (or explicit QuestionId in the command)
-    # is required when more than one question is pending.
+    # Note: This prevents the "Cross-Conversation Consent" attack where a bare
+    # approve in personal chat resolves a question pending in a channel or
+    # another conversation for the same user. Lookup is always scoped to
+    # the current conversationId via GetMostRecentOpenByConversationAsync
+    # (implementation-plan.md §3.2 lines 183-184), NOT to the user globally.
+    # Explicit disambiguation (or explicit QuestionId in the command)
+    # is required when more than one question is pending in the conversation.
     #
     # Cross-doc alignment: architecture.md §2.5 (Supported commands table, lines
     # 133-134) describes `approve` as acting on "the most recent pending approval
-    # in context." That shorthand applies ONLY when exactly one AgentQuestion with
-    # Status == Open exists for the user's conversation context. When multiple
-    # questions are pending, this scenario's disambiguation behavior takes
+    # in context." That "context" is the current conversation (conversationId),
+    # not the user across all conversations. When multiple questions are pending
+    # in the same conversation, this scenario's disambiguation behavior takes
     # precedence — the bot MUST NOT silently resolve "the most recent" question.
-    # The architecture table's "most recent" phrasing is a convenience description
-    # for the single-pending-question case, not a behavioral override.
 
-  Scenario: User rejects via text command when only one question is pending (auto-resolved without disambiguation)
+  Scenario: User rejects via text command when only one question is pending in conversation (auto-resolved without disambiguation)
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-803" (Status = "Open")
-    And no other questions are pending for user "alice@contoso.com"
+    And question "Q-803" is the only AgentQuestion with Status == "Open" and ConversationId matching the current conversation
     When user "alice@contoso.com" sends "reject" in personal chat
-    Then the bot resolves the single pending question "Q-803" without disambiguation
+    Then RejectCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId)
+    And the single open question "Q-803" in this conversation is resolved without disambiguation
     And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
     And an immutable audit record is persisted with EventType "CardActionReceived"
-    # Note: When exactly one question is pending, the bot resolves it
-    # unambiguously — no disambiguation prompt is needed.
+    # Note: When exactly one question is pending in the conversation, the bot
+    # resolves it unambiguously — no disambiguation prompt is needed.
+
+  Scenario: Cross-Conversation Consent attack is prevented (bare approve in personal chat does not resolve channel question)
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-810" (Status = "Open") in channel "#ops-swarm" (conversationId = "channel-conv-1")
+    And no questions are pending in user "alice@contoso.com"'s personal-chat conversation (conversationId = "personal-conv-alice")
+    When user "alice@contoso.com" sends "approve" in personal chat
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync("personal-conv-alice")
+    And zero open questions are found in the personal-chat conversation
+    And the bot replies: "No pending questions in this conversation."
+    And question "Q-810" in channel "#ops-swarm" remains with Status "Open"
+    And no HumanDecisionEvent is created
+    # Note: This scenario explicitly validates Cross-Conversation Consent
+    # prevention: bare approve/reject only resolves questions whose ConversationId
+    # matches the current conversation. A question pending in a different
+    # conversation (channel or another personal chat) is never resolved by a
+    # bare command in an unrelated conversation.
 ```
 
 ---
@@ -1016,11 +1034,11 @@ Feature: Edge Cases and Error Handling
     And a MessengerEvent of type "Text" is enqueued with an empty payload
 
   Scenario: Bot receives a message exceeding the configured maximum inbound payload size
-    Given the system has a configurable MaxInboundMessageLength setting (default: 50,000 characters)
-    And user "alice@contoso.com" sends a message with a text body exceeding MaxInboundMessageLength
+    Given the system has a configurable inbound message length limit (defined in application configuration; no default is specified in this E2E doc — refer to tech-spec.md or implementation-plan.md for the authoritative setting)
+    And user "alice@contoso.com" sends a message with a text body exceeding the configured limit
     When the bot processes the activity
     Then the bot rejects the oversized message and does NOT enqueue it
-    And the bot replies with an error message: "Message exceeds the maximum allowed length of {MaxInboundMessageLength} characters. Please shorten your message."
+    And the bot replies with an error message indicating the message exceeds the configured maximum length
     And a warning is logged noting the rejected payload size
     And an immutable audit record is persisted with:
       | Field     | Value                         |
@@ -1030,12 +1048,13 @@ Feature: Edge Cases and Error Handling
       | ActorId   | <alice's AadObjectId>         |
     # Note: The maximum inbound message length is a system-configured policy
     # (not a Bot Framework platform limit). This prevents unbounded payload
-    # sizes from propagating through the inbound queue. The default of 50,000
-    # characters can be overridden via application configuration.
+    # sizes from propagating through the inbound queue. The exact default
+    # value is defined in application configuration and is NOT specified
+    # here to avoid encoding an unanchored product contract.
 
   Scenario: Bot receives a large but within-limit message
-    Given the system has MaxInboundMessageLength set to 50,000 characters
-    And user "alice@contoso.com" sends a message with a text body of 49,999 characters
+    Given the system has an inbound message length limit configured via application settings
+    And user "alice@contoso.com" sends a message with a text body just under the configured limit
     When the bot processes the activity
     Then the bot enqueues a MessengerEvent containing the full message body
     And a warning is logged noting the unusually large payload size
