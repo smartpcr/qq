@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.16 — Iteration 16
+**Version:** 1.16 — Iteration 16 (structural rewrite of feedback-resolution block)
 
 ---
 
