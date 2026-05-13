@@ -965,9 +965,7 @@ Feature: Edge Cases and Error Handling
 
 - [x] 6. FIXED — Removed the prior resolution block which contained the stale ambiguous-behavior and undefined-policy phrases from iteration 14. The normative max-length scenario at lines 857-864 already specifies concrete truncation behavior. Post-edit grep against e2e-scenarios.md confirms zero hits for the ambiguous phrases.
 
-- [x] 7. DEFERRED — architecture.md §2.3 component diagram line 39 shows the middleware pipeline as three components and omits the deduplication middleware. This is a discrepancy in architecture.md, not in e2e-scenarios.md. The e2e-scenarios.md duplicate-webhook scenario (lines 466-476) correctly references the deduplication middleware, aligned with implementation-plan.md §2.1 lines 71-76. Flagged for the architecture.md sibling architect.
-
-> **Cross-doc alignment note for architecture.md:** The component diagram at architecture.md §2.3 line 39 shows only three middleware components in the pipeline but the canonical pipeline per implementation-plan.md §2.1 has four: telemetry, tenant-validation, activity-deduplication, rate-limit. The architecture.md sibling architect should update the diagram text to reflect all four middleware components.
+- [x] 7. FIXED — architecture.md §2.1/§2.3 now includes all four middleware components (`TelemetryMiddleware → TenantValidationMiddleware → ActivityDeduplicationMiddleware → RateLimitMiddleware`) in the component diagram and pipeline definition. No remaining discrepancy; stale cross-doc note removed.
 
 ### Open questions
 
