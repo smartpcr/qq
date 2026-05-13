@@ -36,7 +36,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 ┌─────────────────────────────────────────────────────────────────────┐
 │  2.3  TeamsBotAdapter                                               │
 │  Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter         │
-│  Middleware pipeline: Telemetry → TenantFilter → RateLimit          │
+│  Middleware pipeline: Telemetry → TenantValidation → Dedup → Rate   │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
@@ -379,7 +379,8 @@ Persisted Bot Framework `ConversationReference` for proactive messaging.
 |---|---|---|
 | `Id` | `string` | Primary key (GUID). |
 | `TenantId` | `string` | Entra ID tenant. |
-| `UserId` | `string?` | AAD object ID. Null for channel-scoped references (where `ChannelId` is set instead). |
+| `AadObjectId` | `string?` | Entra AAD object ID of the user. Null for channel-scoped references (where `ChannelId` is set instead). This is the Teams-native identity key captured from `Activity.From.AadObjectId` at install time (§2.7) and refreshed on message receipt (§6.1 step 8). |
+| `InternalUserId` | `string?` | Internal user ID mapped by `IIdentityResolver`. Populated when identity resolution first succeeds for this AAD object ID (§6.1 step 6). Null until the user's first authorized interaction. The orchestrator uses this value when setting `AgentQuestion.TargetUserId` for proactive delivery. |
 | `ChannelId` | `string?` | Teams channel ID (null for personal chats). |
 | `ServiceUrl` | `string` | Bot Connector endpoint. |
 | `ConversationId` | `string` | Bot Framework conversation ID. |
