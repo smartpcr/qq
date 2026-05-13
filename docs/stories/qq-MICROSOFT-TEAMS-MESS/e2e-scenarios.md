@@ -1039,15 +1039,12 @@ Feature: Bot Installation and Conversation Discovery
   Scenario: Teams app installation succeeds after admin grants consent and tenant is allow-listed
     Given the organization's Entra ID tenant "restricted-tenant-id" previously blocked the app
     When the Teams admin approves the AgentSwarm bot in the Teams admin center and grants admin consent for the Entra app registration
-    # Alignment note: tech-spec.md §5.1 R-5 states "No Microsoft Graph API permissions are required"
-    # for proactive messaging (which uses BotAdapter.ContinueConversationAsync). However,
-    # implementation-plan.md §3.5 lines 320-322 require TeamsAppInstallation.ReadForUser.All and
-    # User.Read Graph permissions for the optional TeamsAppPolicyHealthCheck and installation-state
-    # validation features. QA should treat the admin consent in this scenario as consent for the
-    # Azure Bot Service channel registration (required by all paths). The Graph permissions are
-    # only required if TeamsAppPolicyOptions.RequireAdminConsent is true (default) per
-    # implementation-plan.md §3.5. This scenario does NOT assert which specific Graph permissions
-    # are granted — that is an implementation-plan.md / tech-spec.md alignment concern.
+    # Alignment note: No Microsoft Graph API permissions are required (per implementation-plan.md
+    # §3.5 line 320 and tech-spec.md §5.1 R-5). Proactive messaging uses
+    # BotAdapter.ContinueConversationAsync with the bot's own MicrosoftAppId, not Graph endpoints.
+    # Installation state is tracked locally via InstallationUpdate activities captured by the bot
+    # handler, not by querying Graph. The admin consent in this scenario is consent for the Azure
+    # Bot Service channel registration and Teams app manifest approval only.
     And the system operator adds "restricted-tenant-id" to the AllowedTenantIds configuration (per tech-spec §4.2 — every inbound Activity tenant must be in the allow-list)
     And user "frank@restricted-org.com" installs the Teams bot in personal scope
     Then the bot receives an installationUpdate activity
