@@ -349,6 +349,61 @@ Feature: Adaptive Card Approvals
     # matches the current conversation. A question pending in a different
     # conversation (channel or another personal chat) is never resolved by a
     # bare command in an unrelated conversation.
+
+  Scenario: User approves with explicit question ID via text command
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-901" (Status = "Open")
+    And agent "planner-agent-02" sent an Adaptive Card for question "Q-902" (Status = "Open")
+    When user "alice@contoso.com" sends "approve Q-901" in personal chat
+    Then ApproveCommandHandler parses the explicit questionId "Q-901" from the command text (per implementation-plan.md §3.2 line 188: approve [questionId] explicit form)
+    And ApproveCommandHandler calls IAgentQuestionStore.GetByIdAsync("Q-901") to retrieve the question directly (bypasses GetOpenByConversationAsync)
+    And validates that "approve" is in Q-901's AllowedActions list
+    And atomically transitions Q-901 Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-901", "Open", "Resolved", ct)
+    And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-901"
+    And the original Adaptive Card for Q-901 is updated to show "Approved by alice@contoso.com"
+    And Q-902 remains with Status "Open" (unaffected)
+    And an immutable audit record is persisted with EventType "CommandReceived"
+
+  Scenario: User rejects with explicit question ID via text command
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-903" (Status = "Open")
+    And question "Q-903" has AllowedAction "Reject" with RequiresComment = false
+    When user "alice@contoso.com" sends "reject Q-903" in personal chat
+    Then RejectCommandHandler parses the explicit questionId "Q-903" from the command text (per implementation-plan.md §3.2 line 188: reject [questionId] explicit form)
+    And RejectCommandHandler calls IAgentQuestionStore.GetByIdAsync("Q-903") to retrieve the question directly
+    And validates that "reject" is in Q-903's AllowedActions list
+    And atomically transitions Q-903 Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-903", "Open", "Resolved", ct)
+    And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-903"
+    And the original Adaptive Card for Q-903 is updated to show "Rejected by alice@contoso.com"
+    And an immutable audit record is persisted with EventType "CommandReceived"
+
+  Scenario: User approves with explicit question ID — nonexistent question returns error
+    When user "alice@contoso.com" sends "approve Q-NONEXISTENT" in personal chat
+    Then ApproveCommandHandler parses the explicit questionId "Q-NONEXISTENT"
+    And ApproveCommandHandler calls IAgentQuestionStore.GetByIdAsync("Q-NONEXISTENT")
+    And IAgentQuestionStore returns null (no question found)
+    And the bot replies: "Question Q-NONEXISTENT not found."
+    And no HumanDecisionEvent is created
+    And an immutable audit record is persisted with EventType "CommandReceived" and Outcome "NotFound"
+
+  Scenario: User rejects with explicit question ID — already resolved question returns error
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-904" (Status = "Resolved")
+    When user "alice@contoso.com" sends "reject Q-904" in personal chat
+    Then RejectCommandHandler parses the explicit questionId "Q-904"
+    And RejectCommandHandler calls IAgentQuestionStore.GetByIdAsync("Q-904")
+    And the returned question has Status "Resolved" (not "Open")
+    And the bot replies: "This question has already been resolved."
+    And no HumanDecisionEvent is created
+    And an immutable audit record is persisted with EventType "CommandReceived" and Outcome "AlreadyResolved"
+
+  Scenario: User approves with explicit question ID — unauthorized user is denied
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-905" (Status = "Open")
+    And user "viewer-only@contoso.com" has RBAC role "viewer" (not "approver")
+    When user "viewer-only@contoso.com" sends "approve Q-905" in personal chat
+    Then the bot checks the user's RBAC permissions for the "approve" command
+    And the "approve" command requires role "approver"
+    And the bot replies: "You do not have permission to perform this action."
+    And no HumanDecisionEvent is created
+    And Q-905 remains with Status "Open"
+    And an immutable audit record is persisted with EventType "SecurityRejection" and Outcome "Rejected"
 ```
 
 ---
