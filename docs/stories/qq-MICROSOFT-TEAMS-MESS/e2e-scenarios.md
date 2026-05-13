@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.21 — Iteration 21 (remove self-referential prior-feedback transcript that contained stale strings; align cross-doc claims with verified tech-spec state)
+**Version:** 1.23 — Iteration 23 (remove prior-feedback transcript from production file; add 404 stale-reference variant; add tenant allow-list gate to admin-consent scenario)
 
 ---
 
@@ -142,16 +142,30 @@ Feature: Proactive Messaging — Blocking Questions
     And the notification is moved to the dead-letter queue
     And an audit record is persisted indicating the reference is inactive due to uninstall
 
-  Scenario: Proactive message fails with stale reference (uninstall event was missed)
+  Scenario: Proactive message fails with stale reference — 403 (user removed from tenant)
     Given user "dave@contoso.com" had the bot installed previously
     And a conversation reference exists for "dave@contoso.com" and is still marked active
     But user "dave@contoso.com" was removed from the tenant without the bot receiving an uninstall event
     When agent "planner-agent-01" publishes an AgentQuestion with TargetUserId set to dave's internal user ID
     Then the ProactiveNotifier resolves TargetUserId via IConversationReferenceStore, finds the reference is active, and attempts delivery
-    And the Bot Framework returns a 403/Forbidden error
+    And the Bot Framework returns HTTP 403/Forbidden
     And the notification is moved to the dead-letter queue with reason "stale_reference"
-    And the stored conversation reference is marked as stale
+    And the stored conversation reference is marked as stale (inactive)
+    And a "teams.proactive.reference.stale" metric is emitted (per tech-spec §5.1, R-2)
     And an audit record is persisted indicating delivery failure due to stale reference
+
+  Scenario: Proactive message fails with stale reference — 404 (team deleted or activity not found)
+    Given team "eng-team" had the bot installed and a conversation reference exists for channel "#eng-ops"
+    And the conversation reference for "#eng-ops" is still marked active
+    But the team "eng-team" was deleted from Teams without the bot receiving an uninstall event
+    When agent "planner-agent-01" publishes an AgentQuestion targeting the "#eng-ops" channel
+    Then the ProactiveNotifier resolves the channel to its stored conversation reference, finds it active, and attempts delivery
+    And the Bot Framework returns HTTP 404/NotFound (resource no longer exists)
+    And the notification is moved to the dead-letter queue with reason "stale_reference"
+    And the stored conversation reference is marked as stale (inactive)
+    And a "teams.proactive.reference.stale" metric is emitted (per tech-spec §5.1, R-2)
+    And an audit record is persisted indicating delivery failure due to deleted team/resource not found
+    And no retries are scheduled for this permanently-failed reference
 ```
 
 ---
@@ -749,13 +763,23 @@ Feature: Bot Installation and Conversation Discovery
     And no conversation reference is created for "frank@restricted-org.com"
     And the user sees a Teams-native error indicating the app is blocked by admin policy
 
-  Scenario: Teams app installation succeeds after admin grants consent
+  Scenario: Teams app installation succeeds after admin grants consent and tenant is allow-listed
     Given the organization's Entra ID tenant "restricted-tenant-id" previously blocked the app
     When the Teams admin approves the AgentSwarm bot in the Teams admin center and grants admin consent for the required Entra app registration (per tech-spec §5.1, R-5)
+    And the system operator adds "restricted-tenant-id" to the AllowedTenantIds configuration (per tech-spec §4.2 — every inbound Activity tenant must be in the allow-list)
     And user "frank@restricted-org.com" installs the Teams bot in personal scope
     Then the bot receives an installationUpdate activity
+    And the TenantValidationMiddleware accepts the activity because "restricted-tenant-id" is now in AllowedTenantIds
     And a conversation reference is persisted for "frank@restricted-org.com"
     And user "frank@restricted-org.com" can now send commands and receive proactive messages
+
+  Scenario: Teams app approved by admin but tenant NOT in AllowedTenantIds is still rejected
+    Given the organization's Entra ID tenant "approved-but-unlisted-tenant-id" has granted admin consent for the bot
+    But "approved-but-unlisted-tenant-id" has NOT been added to AllowedTenantIds
+    When user "eve@approved-but-unlisted.com" installs the bot and sends "agent status"
+    Then the TenantValidationMiddleware rejects the inbound Activity because the tenant is not in AllowedTenantIds
+    And the bot returns a 403 response
+    And an audit record is persisted for the tenant rejection
 
   Scenario: Proactive message to user whose tenant revoked app consent
     Given user "grace@revoked-org.com" had the bot installed and a conversation reference exists
@@ -965,14 +989,4 @@ Feature: Edge Cases and Error Handling
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
 
-**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle, bot installation/uninstall, tenant app-policy enforcement, update/delete of sent cards, multi-approver release gates, RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references, rate limiting, service restart, empty/long messages).
-
-### Prior feedback resolution
-
-- [x] 1. FIXED — §Message Actions, scenario "Message action uses direct submit (fetchTask false)" — rewrote the scenario to match implementation-plan.md line 218 which requires `fetchTask: false` (direct submit). The old scenario described a two-step fetchTask/submitAction flow; the new scenario describes a single-step direct submitAction with no prior fetchTask round-trip.
-- [x] 2. FIXED — §Iteration Summary — replaced the entire prior-feedback block wholesale. The old block embedded quoted phrases that grep matched as self-referential hits. This replacement contains no quoted material from prior iterations.
-- [x] 3. FIXED — §Iteration Summary — same structural fix as item 2. The old block's item-4 and item-5 text contained the flagged phrase. The entire block is now replaced with fresh text that does not reference prior iteration content.
-
-### Open questions
-
-None.
+**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle, bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates, RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty/long messages).

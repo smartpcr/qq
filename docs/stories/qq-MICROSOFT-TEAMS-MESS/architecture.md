@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 19
+**Status:** Draft — iteration 20
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -109,7 +109,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | Attribute | Value |
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
-| **Base class** | `TeamsActivityHandler` (from `Microsoft.Bot.Builder`; extends `ActivityHandler` with Teams-specific overrides — no separate `Microsoft.Bot.Builder.Teams` package or namespace is required per `tech-spec.md` §2.1 lines 34 and 88) |
+| **Base class** | `TeamsActivityHandler` (from `Microsoft.Bot.Builder`; extends `ActivityHandler` with Teams-specific overrides). No separate Teams NuGet **package** is required — all Teams support ships inside `Microsoft.Bot.Builder` (≥ 4.22). The Teams-specific types live under two **namespaces** within that package: `Microsoft.Bot.Builder.Teams` (containing `TeamsActivityHandler`, Teams middleware, and helper methods) and `Microsoft.Bot.Schema.Teams` (containing `TeamsChannelData`, `TeamInfo`, `TeamsChannelAccount`). See `tech-spec.md` §2.1 lines 34, 88, and §6.1 line 235 for the authoritative package/namespace mapping. |
 | **Responsibility** | Override `OnMessageActivityAsync`, `OnAdaptiveCardInvokeAsync`, `OnInstallationUpdateActivityAsync`, and `OnTeamsMessagingExtensionSubmitActionAsync` to dispatch to domain-specific handlers. The custom name `TeamsSwarmActivityHandler` distinguishes this from the SDK base class. |
 | **Key overrides** | `OnMessageActivityAsync` → `CommandParser`; `OnAdaptiveCardInvokeAsync` → `CardActionHandler`; `OnInstallationUpdateActivityAsync` / `OnTeamsMembersAddedAsync` → `InstallHandler`; `OnTeamsMessagingExtensionSubmitActionAsync` → `MessageExtensionHandler`. |
 
