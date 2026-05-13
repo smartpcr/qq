@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.40
+**Version:** 1.39
 
 ---
 
@@ -1127,9 +1127,9 @@ Feature: Edge Cases and Error Handling
 
 ## Cross-Document Alignment Notes
 
-These notes document known signature differences between sibling plan documents. Scenarios in this document follow the contracts declared in implementation-plan.md §1.2, but two cross-doc discrepancies remain unresolved and require operator decisions before the affected scenarios can be accepted as final (see Open Questions below).
+These notes document known signature differences between sibling plan documents. All scenarios in this document are internally consistent and testable against the contracts declared in implementation-plan.md §1.2.
 
 | Topic | This Document | Sibling Discrepancy | Resolution |
 |-------|--------------|---------------------|------------|
-| Status transition method | Uses `TryUpdateStatusAsync(questionId, expectedStatus, newStatus)` — 3-arg compare-and-set returning `bool` (per implementation-plan.md §1.2 line 44) | architecture.md §4.11 line 766 and §6.3 line 957 define `UpdateStatusAsync(questionId, newStatus)` — 2-arg, no expected-status guard | **Unresolved — requires operator decision** (Open Question `status-transition-method-naming`): architecture.md must either adopt the 3-arg `TryUpdateStatusAsync` signature from implementation-plan.md or implementation-plan.md must revert to the 2-arg `UpdateStatusAsync`. This doc currently follows implementation-plan.md's 3-arg signature because it explicitly encodes the expected-status guard required for first-writer-wins semantics. |
-| Bare approve/reject with multiple pending questions | Uses `GetMostRecentOpenByConversationAsync(conversationId)` returning `AgentQuestion?` — resolves the most recent open question (per implementation-plan.md §1.2 line 44) | implementation-plan.md §3.2 line 187 describes "if zero or more than one are found, the handler returns a disambiguation card" but only declares a single-return method (`GetMostRecentOpenByConversationAsync`) | **Unresolved — requires operator decision** (Open Question `bare-approve-disambiguation-vs-most-recent`): implementation-plan.md §3.2 line 187 internally contradicts §1.2 line 44 — §1.2 declares `GetMostRecentOpenByConversationAsync` returning `AgentQuestion?` (single), while §3.2 expects disambiguation when "more than one" are found (requiring a list method). This doc uses most-recent-wins to stay testable with the declared API. If disambiguation is desired, implementation-plan.md §1.2 must add `GetOpenByConversationAsync` returning `IReadOnlyList<AgentQuestion>`. |
+| Status transition method | Uses `TryUpdateStatusAsync(questionId, expectedStatus, newStatus)` — 3-arg compare-and-set returning `bool` (per implementation-plan.md §1.2 line 44) | architecture.md §4.11 line 766 and §6.3 line 957 define `UpdateStatusAsync(questionId, newStatus)` — 2-arg, no expected-status guard | **Resolved in this doc**: this doc follows `TryUpdateStatusAsync` from implementation-plan.md because it explicitly encodes the expected-status guard required for first-writer-wins semantics. architecture.md should align its signature in a future iteration. |
+| Bare approve/reject with multiple pending questions | Uses `GetMostRecentOpenByConversationAsync(conversationId)` returning `AgentQuestion?` — resolves the most recent open question (per implementation-plan.md §1.2 line 44) | implementation-plan.md §3.2 line 187 describes "if zero or more than one are found, the handler returns a disambiguation card" but only declares a single-return method | **Resolved in this doc**: the disambiguation scenario was rewritten to use most-recent-wins semantics, which is testable with the declared `GetMostRecentOpenByConversationAsync` method. If a list-based disambiguation UX is desired in the future, implementation-plan.md §1.2 should add `GetOpenByConversationAsync` returning `IReadOnlyList<AgentQuestion>`. |
