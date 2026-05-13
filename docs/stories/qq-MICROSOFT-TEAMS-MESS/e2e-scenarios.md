@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.64
+**Version:** 1.65
 
 ---
 
@@ -457,7 +457,7 @@ Feature: Message Update and Delete
 
   Scenario: Bot updates an existing approval card after decision
     When user "alice@contoso.com" approves question "Q-701"
-    Then the orchestrator (or Teams-aware coordinator) calls ITeamsCardManager.UpdateCardAsync("Q-701", CardUpdateAction.MarkApproved, ct) (per architecture.md §4.1.1 and §6.5)
+    Then the orchestrator (or Teams-aware coordinator) calls ITeamsCardManager.UpdateCardAsync("Q-701", CardUpdateAction.MarkAnswered, ct) (per architecture.md §4.1.1 and §6.5 — CardUpdateAction enum defines MarkAnswered, MarkExpired, MarkCancelled; there is no MarkApproved value)
     And TeamsMessengerConnector (which implements ITeamsCardManager) looks up TeamsCardState from ICardStateStore to retrieve the stored activityId "act-901" and conversationId
     And TeamsMessengerConnector renders a new read-only Adaptive Card via AdaptiveCardRenderer
     And ProactiveNotifier calls turnContext.UpdateActivityAsync with the stored activityId "act-901" (the internal Bot Framework SDK call within TeamsMessengerConnector)
@@ -474,13 +474,13 @@ Feature: Message Update and Delete
     Then TeamsMessengerConnector (which implements ITeamsCardManager) looks up TeamsCardState from ICardStateStore to retrieve the stored activityId "act-901" and conversationId
     And ProactiveNotifier calls turnContext.DeleteActivityAsync with the stored activityId "act-901" (the internal Bot Framework SDK call within TeamsMessengerConnector)
     And the card is removed from the conversation
-    And ICardStateStore.UpdateStatusAsync is called to mark the card state as Deleted
+    And ICardStateStore.UpdateStatusAsync is called to mark the card state as Expired (per implementation-plan.md §3.3 — TeamsCardState.Status allows only Pending/Answered/Expired; DeleteCardAsync updates state to Expired)
     And an audit record is persisted for the deletion
 
   Scenario: Update fails due to expired activity reference
     Given the activity ID "act-901" is no longer valid (e.g., message too old)
     And question "Q-701" was previously resolved with decision "Approved" by user "alice@contoso.com"
-    When the orchestrator calls ITeamsCardManager.UpdateCardAsync("Q-701", CardUpdateAction.MarkApproved, ct) (per architecture.md §4.1.1 and §6.5)
+    When the orchestrator calls ITeamsCardManager.UpdateCardAsync("Q-701", CardUpdateAction.MarkAnswered, ct) (per architecture.md §4.1.1 and §6.5 — CardUpdateAction enum defines MarkAnswered, MarkExpired, MarkCancelled; there is no MarkApproved value)
     And TeamsMessengerConnector looks up TeamsCardState and delegates to ProactiveNotifier
     And ProactiveNotifier's internal turnContext.UpdateActivityAsync call fails because the activityId is no longer valid
     Then the Bot Framework returns an error
