@@ -610,14 +610,14 @@ Feature: Security — Tenant and User Validation
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
     And the Authorization header contains an invalid JWT token
     When the ASP.NET Core request pipeline processes the request
-    Then TenantValidationMiddleware (ASP.NET Core HTTP middleware, runs before CloudAdapter per implementation-plan.md §2.1 line 79) executes first and reads the raw request body to extract the tenant ID
+    Then TenantValidationMiddleware (ASP.NET Core HTTP middleware, runs before CloudAdapter per implementation-plan.md §2.1) executes first and reads the raw request body to extract the tenant ID
     And if the tenant ID is not in AllowedTenantIds, TenantValidationMiddleware short-circuits with HTTP 403 before CloudAdapter runs (forged activity rejected at tenant layer)
     And if the tenant ID happens to be in AllowedTenantIds, TenantValidationMiddleware passes the request to the next middleware
     And CloudAdapter.ProcessAsync then validates the JWT token via the Bot Framework authentication pipeline
     And the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline (per tech-spec §4.2 Rejection Behavior Matrix, row "Invalid Bot Framework JWT")
     And no Bot Framework middleware (TelemetryMiddleware, ActivityDeduplicationMiddleware), bot handler, or CommandDispatcher runs — rejection occurs in the CloudAdapter authentication layer which executes after TenantValidationMiddleware and RateLimitMiddleware (both ASP.NET Core HTTP middleware) but before the Bot Framework IMiddleware pipeline
     And no MessengerEvent is created
-    And no audit entry is emitted by IAuditLogger — the TenantValidationMiddleware logs a structured warning via ILogger for operational visibility but does not call IAuditLogger (per implementation-plan.md §2.1 line 79: formal IAuditLogger integration is added in Stage 5.1)
+    And no audit entry is emitted by IAuditLogger — the TenantValidationMiddleware logs a structured warning via ILogger for operational visibility but does not call IAuditLogger (per implementation-plan.md §2.1: formal IAuditLogger integration is added in Stage 5.1)
     And the HTTP 401 (or 403 if tenant-rejected) response is logged by the hosting infrastructure (ASP.NET Core request pipeline)
 
   Scenario: Multi-tenant isolation — one tenant cannot see another's data
@@ -822,9 +822,9 @@ Feature: Performance — Card Delivery SLA
     Given 100 AgentQuestions are published to the outbound queue in a burst
     When the OutboxRetryEngine processes all 100 notifications
     Then at least 95 of the 100 Adaptive Cards are delivered within 3 seconds of queue pickup
-    And the delivery latency for each card is recorded as OpenTelemetry histogram metric `teams.card.delivery.duration_ms` (per tech-spec.md §4.4 line 259)
-    # Note: architecture.md §7 line 1163 uses `teams.card.delivery_latency_ms`; the canonical name
-    # is `teams.card.delivery.duration_ms` per tech-spec.md §4.4 and implementation-plan.md §5.2 line 406.
+    And the delivery latency for each card is recorded as OpenTelemetry histogram metric `teams.card.delivery.duration_ms` (per tech-spec.md §4.4)
+    # Note: architecture.md §7 uses `teams.card.delivery_latency_ms`; the canonical name
+    # is `teams.card.delivery.duration_ms` per tech-spec.md §4.4 and implementation-plan.md §5.2.
     # QA should implement one histogram under the tech-spec name.
     And no cards are lost
 
@@ -874,7 +874,7 @@ Feature: Escalation, Pause, and Resume Commands
     And an audit record is persisted
 
   Scenario: User pauses the agent bound to the current conversation
-    Given agent "release-agent-01" is the agent bound to the current conversation (per architecture.md §2.5 line 136: pause targets "the agent bound to the current conversation")
+    Given agent "release-agent-01" is the agent bound to the current conversation (per architecture.md §2.5: pause targets "the agent bound to the current conversation")
     When user "alice@contoso.com" sends "pause"
     Then the bot resolves the agent bound to the current conversation context
     And a MessengerEvent of type "PauseAgent" is enqueued for "release-agent-01"
