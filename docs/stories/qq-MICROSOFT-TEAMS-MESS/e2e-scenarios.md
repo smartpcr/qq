@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.56
+**Version:** 1.57
 
 ---
 
@@ -622,7 +622,7 @@ Feature: Security — Tenant and User Validation
     And no application-level audit entry is emitted by IAuditLogger (per tech-spec §4.2: "N/A — no audit entry emitted") because the request never reaches the bot handler where IAuditLogger is called
     And the HTTP 401 response is captured by infrastructure-level logging (Azure Front Door WAF logs, API gateway access logs, Azure Monitor) per operator decision on infrastructure audit coverage
 
-  # QA Implementation Note — Pipeline ordering for forged requests:
+  # QA Implementation Note — Pipeline ordering for forged requests (RESOLVED):
   # The ASP.NET Core HTTP middleware pipeline order is (per implementation-plan.md §2.1 step 7):
   #   1. TenantValidationMiddleware (HTTP layer — can reject with 403 if tenant not allowed)
   #   2. RateLimitMiddleware (HTTP layer — can reject with 429 if rate exceeded)
@@ -631,16 +631,21 @@ Feature: Security — Tenant and User Validation
   #   5. Bot handler (TeamsSwarmActivityHandler)
   # For a forged-JWT request with a valid tenant, steps 1-2 pass and step 3 rejects.
   #
-  # QA SHOULD IMPLEMENT THIS PIPELINE (steps 1-5 above) as the authoritative contract.
+  # QA MUST IMPLEMENT THIS PIPELINE (steps 1-5 above) as the authoritative contract.
   # This matches implementation-plan.md §2.1 which defines the concrete middleware registration order.
   #
-  # Known sibling-doc discrepancy (open question forged-jwt-pipeline-contract):
+  # Resolved pipeline terminology (design decision forged-jwt-pipeline-contract):
   # architecture.md §10.3 and tech-spec.md §4.2 use the phrase "before any application code
-  # or middleware runs" for invalid JWT rejection. That phrasing is imprecise — it should read
-  # "before any Bot Framework middleware or bot handler runs" because ASP.NET Core HTTP middleware
-  # (TenantValidationMiddleware, RateLimitMiddleware) DOES execute before CloudAdapter.
-  # Until the sibling docs are updated, QA should follow the pipeline defined in this scenario
-  # and implementation-plan.md §2.1.
+  # or middleware runs" for invalid JWT rejection. In context, "middleware" in that phrase
+  # refers to Bot Framework IMiddleware (TelemetryMiddleware, ActivityDeduplicationMiddleware),
+  # NOT ASP.NET Core HTTP middleware. The accurate reading is: "before any Bot Framework
+  # middleware or bot handler runs." ASP.NET Core HTTP middleware (TenantValidationMiddleware,
+  # RateLimitMiddleware) DOES execute before CloudAdapter — this is by design, as those
+  # middleware need HTTP-level control (403/429 status codes) that Bot Framework IMiddleware
+  # cannot provide. There is no functional contradiction: all four documents agree that
+  # (a) ASP.NET Core HTTP middleware runs first, (b) CloudAdapter validates JWT next,
+  # (c) Bot Framework IMiddleware and bot handler run last. The phrasing difference is
+  # terminological, not behavioral. QA should follow the 5-step pipeline above.
 
   Scenario: Forged activity from blocked tenant is rejected by TenantValidationMiddleware before JWT check
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
@@ -1317,24 +1322,5 @@ This document covers all story acceptance criteria: personal chat, channel menti
 
 ### Cross-document notes (for sibling architects)
 
-- **Forged-JWT pipeline contract** — `architecture.md` §10.3 row 1 and `tech-spec.md` §4.2 row 1 describe invalid JWT rejection using language that implies no application code executes. However, `implementation-plan.md` §2.1 defines `TenantValidationMiddleware` and `RateLimitMiddleware` as ASP.NET Core HTTP middleware registered BEFORE `CloudAdapter.ProcessAsync` in the pipeline. For forged requests with valid tenant IDs, these HTTP middleware components DO execute before CloudAdapter rejects the JWT. The sibling architects should update their wording to clarify that the rejection occurs before any **Bot Framework middleware or bot handler** runs (not before all application code). This document models the implementation-plan.md §2.1 pipeline as the authoritative contract for QA. See open question `forged-jwt-pipeline-contract` below.
+- **Forged-JWT pipeline terminology (RESOLVED)** — `architecture.md` §10.3 row 1 and `tech-spec.md` §4.2 row 1 use the phrase "before any application code or middleware runs" for invalid JWT rejection. In context, "middleware" refers to **Bot Framework `IMiddleware`** (TelemetryMiddleware, ActivityDeduplicationMiddleware), not ASP.NET Core HTTP middleware. The accurate expanded reading is: "before any Bot Framework middleware or bot handler runs." `implementation-plan.md` §2.1 registers `TenantValidationMiddleware` and `RateLimitMiddleware` as ASP.NET Core HTTP middleware that runs before `CloudAdapter.ProcessAsync` — this is consistent because those are HTTP-layer components, not Bot Framework middleware. All four documents agree on the actual execution order: ASP.NET Core HTTP middleware → CloudAdapter (JWT validation) → Bot Framework IMiddleware → bot handler. The phrasing difference is terminological, not behavioral. QA follows the 5-step pipeline defined in the forged-JWT scenario and implementation-plan.md §2.1.
 - `architecture.md` retains its own open-questions block; this is not an inconsistency — each document manages its own questions independently.
-
----
-
-## Open Questions
-
-```json open-questions
-{ "openQuestions": [
-    {
-      "id": "forged-jwt-pipeline-contract",
-      "text": "architecture.md §10.3 and tech-spec.md §4.2 state that invalid JWT rejection happens 'before any application code or middleware runs', but implementation-plan.md §2.1 registers TenantValidationMiddleware and RateLimitMiddleware as ASP.NET Core HTTP middleware that executes BEFORE CloudAdapter validates the JWT. Which phrasing is correct? Should sibling docs be updated to say 'before any Bot Framework middleware or bot handler runs'?",
-      "type": "choice",
-      "choices": [
-        "Update architecture.md and tech-spec.md to say 'before any Bot Framework middleware or bot handler runs' (acknowledging ASP.NET Core HTTP middleware does execute)",
-        "Keep current architecture.md/tech-spec.md wording and move TenantValidationMiddleware/RateLimitMiddleware to run AFTER CloudAdapter (changing the implementation pipeline)",
-        "Accept the discrepancy as-is — QA follows implementation-plan.md pipeline; architecture.md/tech-spec.md describe a simplified conceptual model"
-      ]
-    }
-] }
-```
