@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.24
+**Version:** 1.23 — Iteration 23 (remove prior-feedback transcript from production file; add 404 stale-reference variant; add tenant allow-list gate to admin-consent scenario)
 
 ---
 
@@ -705,24 +705,17 @@ Feature: Adaptive Card — Incident Summary and Release Gates
       | Actions          | Acknowledge, Escalate, Need more info|
     And the card is delivered to the configured incident channel
 
-  Scenario: Release gate approval with multiple approvers (separate questions per approver)
-    Given agent "release-agent-01" requires approval from 2 approvers for a release gate
-    And the orchestrator creates two separate AgentQuestion records:
-      | QuestionId | TargetUserId           | Status |
-      | Q-gate-a   | alice@contoso.com      | Open   |
-      | Q-gate-b   | bob@contoso.com        | Open   |
-    And each AgentQuestion follows the standard single-decision lifecycle (first-writer-wins per architecture §3.2)
-    And the orchestrator's release-gate workflow tracks the approval threshold (2 required) at the workflow layer
-    When "alice@contoso.com" clicks "Approve" on her card (Q-gate-a)
-    Then Q-gate-a transitions from Open to Resolved (standard CardActionHandler flow)
-    And a HumanDecisionEvent with ActionValue "approve" is created for alice
-    And alice's card is updated to show "Approved by alice@contoso.com"
-    And the orchestrator records 1 of 2 approvals — threshold not yet met
-    When "bob@contoso.com" clicks "Approve" on his card (Q-gate-b)
-    Then Q-gate-b transitions from Open to Resolved (standard CardActionHandler flow)
-    And a HumanDecisionEvent with ActionValue "approve" is created for bob
-    And bob's card is updated to show "Approved by bob@contoso.com"
-    And the orchestrator records 2 of 2 approvals — threshold met
+  Scenario: Release gate approval card with multiple approvers
+    Given agent "release-agent-01" requires approval from 2 approvers
+    And the release gate is configured with a threshold of 2 required approvals
+    And the AgentQuestion is sent to both "alice@contoso.com" and "bob@contoso.com"
+    When "alice@contoso.com" clicks "Approve"
+    Then a HumanDecisionEvent with ActionValue "approve" is created for alice
+    And alice's card is updated to show "Approved by alice@contoso.com (1/2)"
+    And bob's card remains actionable
+    When "bob@contoso.com" clicks "Approve"
+    Then a second HumanDecisionEvent with ActionValue "approve" is created for bob
+    And both cards are updated to show "Fully Approved (2/2)"
     And the release gate transitions to approved state
     And an audit trail records both individual approvals as separate CardActionReceived events
 ```
