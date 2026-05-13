@@ -609,16 +609,12 @@ Feature: Security — Tenant and User Validation
   Scenario: Bot Framework token validation rejects forged activity
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
     And the Authorization header contains an invalid JWT token
-    When the ASP.NET Core request pipeline processes the request
-    Then TenantValidationMiddleware (ASP.NET Core HTTP middleware, runs before CloudAdapter per implementation-plan.md §2.1) executes first and reads the raw request body to extract the tenant ID
-    And if the tenant ID is not in AllowedTenantIds, TenantValidationMiddleware short-circuits with HTTP 403 before CloudAdapter runs (forged activity rejected at tenant layer)
-    And if the tenant ID happens to be in AllowedTenantIds, TenantValidationMiddleware passes the request to the next middleware
-    And CloudAdapter.ProcessAsync then validates the JWT token via the Bot Framework authentication pipeline
-    And the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline (per tech-spec §4.2 Rejection Behavior Matrix, row "Invalid Bot Framework JWT")
-    And no Bot Framework middleware (TelemetryMiddleware, ActivityDeduplicationMiddleware), bot handler, or CommandDispatcher runs — rejection occurs in the CloudAdapter authentication layer which executes after TenantValidationMiddleware and RateLimitMiddleware (both ASP.NET Core HTTP middleware) but before the Bot Framework IMiddleware pipeline
+    When the Bot Framework CloudAdapter authentication pipeline validates the inbound request
+    Then the request is rejected with HTTP 401 by the CloudAdapter JWT validation layer (per tech-spec §4.2 Rejection Behavior Matrix row 1: "Invalid Bot Framework JWT — request never reaches bot handler")
+    And no Bot Framework IMiddleware (TelemetryMiddleware, ActivityDeduplicationMiddleware), bot handler, or domain code executes — the rejection occurs within the CloudAdapter authentication pipeline before any application-level processing
     And no MessengerEvent is created
-    And no audit entry is emitted by IAuditLogger — the TenantValidationMiddleware logs a structured warning via ILogger for operational visibility but does not call IAuditLogger (per implementation-plan.md §2.1: formal IAuditLogger integration is added in Stage 5.1)
-    And the HTTP 401 (or 403 if tenant-rejected) response is logged by the hosting infrastructure (ASP.NET Core request pipeline)
+    And no application-level audit entry is emitted by IAuditLogger (per tech-spec §4.2: "N/A — no audit entry emitted" and architecture.md §10.3: rejection occurs "before any application code or middleware runs")
+    And the HTTP 401 response is captured by infrastructure-level logging (Azure Front Door WAF logs, API gateway access logs, Azure Monitor) per operator decision on infrastructure audit coverage
 
   Scenario: Multi-tenant isolation — one tenant cannot see another's data
     Given user "alice@contoso.com" in tenant "contoso-tenant-id" has active tasks
