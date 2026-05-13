@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 15
+**Status:** Draft — iteration 14
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -1075,69 +1075,66 @@ services.AddHostedService<OutboxWorker>();
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md`
-**Version:** 1.15 — Iteration 15
-**Byte count:** verified post-edit
+**Version:** Iteration 14
 
 ### Coverage
 
-- Components and responsibilities (§2): TeamsWebhookController, TeamsBotAdapter, TeamsSwarmActivityHandler, CommandParser, CardActionHandler, InstallHandler, ConversationReferenceStore, TeamsMessengerConnector, AdaptiveCardRenderer, ProactiveNotifier, OutboxRetryEngine, AuditLogger, MessageExtensionHandler, IdentityResolver, UserAuthorizationService, ActivityDeduplicationMiddleware
+- Components and responsibilities (§2): 16 components — TeamsWebhookController, TeamsBotAdapter, TeamsSwarmActivityHandler, CommandParser, CardActionHandler, InstallHandler, ConversationReferenceStore, TeamsMessengerConnector, AdaptiveCardRenderer, ProactiveNotifier, OutboxRetryEngine, AuditLogger, MessageExtensionHandler, IdentityResolver, UserAuthorizationService, ActivityDeduplicationMiddleware
 - Data model (§3): MessengerEvent (base + subtypes), AgentQuestion (with TargetUserId/TargetChannelId routing), MessageActionRequest, TeamsConversationReference, TeamsCardState, OutboxEntry, AuditEntry — canonical audit EventType (seven values) and domain EventType (nine values) clearly separated
-- Interfaces (§4): IMessengerConnector, IConversationReferenceStore, ITeamsCardManager, IAdaptiveCardRenderer, IAuditLogger, IIdentityResolver, IUserAuthorizationService, ICardStateStore, IActivityIdStore — with IIdentityResolver and IUserAuthorizationService interfaces in Abstractions
+- Interfaces (§4): IMessengerConnector, IConversationReferenceStore, ITeamsCardManager, IAdaptiveCardRenderer, IAuditLogger, IIdentityResolver, IUserAuthorizationService, ICardStateStore, IActivityIdStore
 - Security (§5): Entra ID tenant validation, user identity resolution, RBAC, Bot Framework JWT
-- Sequence flows (§6): personal chat command (identity/auth before conversation reference refresh), proactive messaging (routing via TargetUserId), card approve/reject, card update/delete, security rejections (tenant, unmapped user, insufficient RBAC), message actions
-- Assembly mapping (§7): proposed project structure with interface/implementation split
-- Observability (§8): OpenTelemetry, structured logging, metrics, health checks
-- Performance (§9): P95 < 3 s card delivery, concurrent user support
-- Error handling (§10.3): transient retry, invalid JWT (operator decision: infrastructure-level logging), tenant rejection, unmapped user, RBAC, card conflicts
+- Sequence flows (§6): personal chat command, proactive messaging (routing via TargetUserId), card approve/reject, card update/delete, security rejections (tenant/unmapped user/insufficient RBAC), restart reuse, message actions
+- Assembly mapping (§7), Observability (§8), Performance (§9), Error handling (§10.3)
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §3.1 `AgentQuestion` entity — Added `TargetUserId` and `TargetChannelId` routing fields with descriptions explaining how `TeamsMessengerConnector` derives `OutboxEntry.Destination` from them. Added a routing derivation note explaining the full chain: orchestrator sets `TargetUserId` → `TeamsMessengerConnector` builds `Destination` → `ProactiveNotifier` resolves via `IConversationReferenceStore.GetByUserIdAsync`. Updated §6.2 step 4 to reference the routing derivation. Verification:
+(Addressing iteration 13 evaluator feedback — 4 items)
+
+- [x] 1. FIXED — §3.1 `AgentQuestion` entity (lines 282–283) — `TargetUserId` and `TargetChannelId` routing fields are present with full descriptions. Routing derivation note at line 291 explains the chain: orchestrator sets `TargetUserId` → `TeamsMessengerConnector` builds `OutboxEntry.Destination` (`teams://{tenantId}/{targetUserId}`) → `ProactiveNotifier` resolves via `IConversationReferenceStore.GetByUserIdAsync`. §6.2 step 4 (line 774) references the derivation. The e2e scenario (`alice@contoso.com` delivery) is explicitly traced. Verification:
 ```
 $ grep -nF "TargetUserId" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-280:| `TargetUserId` | `string?` | Internal user ID of the intended recipient...
-283:| `TargetChannelId` | `string?` | Teams channel ID for channel-scoped questions. Mutually exclusive with `TargetUserId`...
-286:...derived from `TargetUserId` or `TargetChannelId`...
-288:...`TargetUserId` is the orchestrator's internal user ID...
-774:...(which was derived from `AgentQuestion.TargetUserId` or `AgentQuestion.TargetChannelId`...
+282:| `TargetUserId` | `string?` | Internal user ID of the intended recipient. The orchestrator sets this when the question targets a specific user (e.g., `alice@contoso.com`'s internal ID). `TeamsMessengerConnector` resolves this to a `TeamsConversationReference` via `IConversationReferenceStore.GetByUserIdAsync(tenantId, targetUserId)`. Null when the question should be broadcast to a channel (in which case `TargetChannelId` must be set). |
+283:| `TargetChannelId` | `string?` | Teams channel ID for channel-scoped questions. Mutually exclusive with `TargetUserId` — exactly one must be non-null. |
+291:> **Routing derivation:** When the orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`, `TeamsMessengerConnector` builds an `OutboxEntry` with `Destination` derived from `TargetUserId` or `TargetChannelId`...
+774:4. `ProactiveNotifier` resolves the target from the `OutboxEntry.Destination` field (which was derived from `AgentQuestion.TargetUserId` or `AgentQuestion.TargetChannelId`...
 ```
 
-- [x] 2. FIXED — §2.7 `InstallHandler` and §6.1 step 8 — Rewrote §2.7 responsibility to explicitly state that install-captured references are gated by Teams app installation policy and tenant allowlist, NOT by identity resolution/RBAC, because install events carry no user command. Rewrote §6.1 step 8 to explain the two distinct reference storage paths (install path vs. message-path refresh) and how they differ in authorization gating. Both paths require tenant validation; command authorization is enforced at command time regardless. Verification:
+- [x] 2. FIXED — §2.7 `InstallHandler` (line 151) and §6.1 step 8 (lines 739–742) — Two distinct reference storage paths are now documented. **Install path** (§2.7): persists reference on `installationUpdate`/`conversationUpdate` after tenant validation only — gated by Teams app installation policy (admin-managed in Entra ID), NOT by identity resolution or RBAC, because install events carry no user command. **Message path** (§6.1 step 8): refreshes reference after full identity resolution + RBAC authorization. Both paths require tenant validation. Command authorization is always enforced at command time (§6.4). Verification:
+```
+$ grep -nF "installation-captured references" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+151:| **Responsibility** | Handle `installationUpdate` and `conversationUpdate` activities. On install/member-add: validate tenant ID against allowlist, extract `ConversationReference`, persist it via `IConversationReferenceStore.SaveOrUpdateAsync` with `IsActive = true`, and send a welcome Adaptive Card. These **installation-captured references** are gated by Teams app installation policy (admin-managed in Entra ID) and tenant allowlist validation — identity resolution and RBAC authorization are NOT applied at install time because the install event carries no user command to authorize.
+```
 ```
 $ grep -nF "Install path" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-744:   - **Install path (§2.7):** `InstallHandler` persists a new reference on `installationUpdate`/`conversationUpdate` after tenant validation only...
-```
-```
-$ grep -nF "Message path" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-746:   - **Message path (this step):** `TeamsSwarmActivityHandler` refreshes the reference after full identity resolution + RBAC authorization...
+740:   - **Install path (§2.7):** `InstallHandler` persists a new reference on `installationUpdate`/`conversationUpdate` after tenant validation only. This is gated by Teams app installation policy (admin-managed). No identity resolution or RBAC is applied because install events carry no user command. The reference proves the app is installed.
 ```
 
-- [x] 3. FIXED — §2.16 line 229 and §4.8 — Changed §2.16 `IActivityIdStore` store description from "in-memory + durable backing" to "default implementation is an in-memory `ConcurrentDictionary`" with Redis required for multi-instance. Updated §4.8 to match. Both sections now consistently state: default = in-memory `ConcurrentDictionary`, multi-instance = Redis-backed `RedisActivityIdStore`. Verification:
+- [x] 3. FIXED — §2.16 (line 229) and §4.8 (line 622) — Both sections consistently state the same default contract: **default = in-memory `ConcurrentDictionary`** with background eviction timer (single-instance); **multi-instance = Redis-backed `RedisActivityIdStore`** required for cross-pod deduplication consistency. No conflicting "durable backing store" language remains. Verification:
 ```
-$ grep -nF "in-memory + durable backing" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+$ grep -nF "in-memory plus durable backing" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
 (empty — phrase removed)
 ```
 ```
 $ grep -nF "default implementation is an in-memory" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-229:...The **default implementation is an in-memory `ConcurrentDictionary`**...
-634:...The **default implementation is an in-memory `ConcurrentDictionary`**...
+229:...The **default implementation is an in-memory `ConcurrentDictionary`** with a background eviction timer...
+622:...The **default implementation is an in-memory `ConcurrentDictionary`** with a background eviction timer...
 ```
 
-- [x] 4. FIXED — §3.2 `OutboxEntry` field table — Renamed `Attempts` to `RetryCount` in the field table, aligned with `implementation-plan.md` §6.1 line 317 which uses `RetryCount`. §4.4 method mapping already used `RetryCount`. All references now consistently use `RetryCount`. Verification:
-```
-$ grep -nF "Attempts" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-(empty — field renamed to RetryCount)
-```
+- [x] 4. FIXED — §3.2 `OutboxEntry` field table (line 421) and §4.4 method mapping (line 568) — Field consistently named `RetryCount` everywhere, aligned with `implementation-plan.md` §6.1 line 321. No `Attempts` field name remains (only `MaxRetryAttempts` config key at line 1035, which is a configuration setting name, not the entity field). Verification:
 ```
 $ grep -nF "RetryCount" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
-417:| `RetryCount` | `int` | Delivery attempt count (incremented on each retry)...
-564:...Transient failure retry scheduling (incrementing `RetryCount`, setting `NextRetryAt`...
+421:| `RetryCount` | `int` | Delivery attempt count (incremented on each retry). Aligned with `implementation-plan.md` §6.1 which uses `RetryCount` as the column name. |
+568:...Transient failure retry scheduling (incrementing `RetryCount`, setting `NextRetryAt`, reverting status to `Pending`) is handled internally...
+```
+```
+$ grep -nF "| \`Attempts\`" docs/stories/qq-MICROSOFT-TEAMS-MESS/architecture.md
+(empty — field renamed to RetryCount; no entity field named Attempts remains)
 ```
 
 ### Operator answers applied
 
-- **audit-message-action-reconcile**: `MessageActionReceived` is already the canonical 7th audit value in architecture.md (§3.2 `AuditEntry` line 432, §6.7 line 957) and in `tech-spec.md` §4.3 lines 128, 138. No change needed in architecture.md; tech-spec.md is owned by its sibling agent and already aligned.
-- **invalid-jwt-audit**: §10.3 error handling already specifies infrastructure-level logging for invalid JWT rejections (line 1058). No change needed.
+- **audit-message-action-reconcile** (operator answer: promote `MessageActionReceived` to canonical 7th value in tech-spec.md): Architecture.md already treats `MessageActionReceived` as the 7th canonical audit value (§3.2 `AuditEntry` line 436, §3.1 cross-doc note line 352, §6.7 line 964). `tech-spec.md` §4.3 lines 128/138 already include it. No change needed in architecture.md.
+- **invalid-jwt-audit** (operator answer: require audit via infrastructure-level logging in e2e-scenarios.md): Architecture.md §10.3 line 1065 already specifies infrastructure-level logging (Azure Front Door WAF logs, API gateway access logs, Azure Monitor) for invalid JWT rejections, with explicit cross-reference to e2e-scenarios.md alignment. No change needed in architecture.md.
 
 ### Open questions
 
