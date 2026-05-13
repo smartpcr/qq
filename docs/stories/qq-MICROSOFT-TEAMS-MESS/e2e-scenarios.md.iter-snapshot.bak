@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.44
+**Version:** 1.43
 
 ---
 
@@ -307,7 +307,7 @@ Feature: Adaptive Card Approvals
       | Q-801      | <question title>                | T1        |
     And the disambiguation card includes action buttons for each question with explicit questionId (e.g., "approve Q-801", "approve Q-802")
     And both Q-801 and Q-802 remain with Status "Open"
-    And an immutable audit record is persisted with EventType "CommandReceived", Action "Disambiguation", and Outcome "Success"
+    And an immutable audit record is persisted with EventType "CommandReceived" and Outcome "Disambiguation"
     # Design decision: bare approve/reject with multiple open questions returns a disambiguation
     # card per implementation-plan.md §3.2 line 187. The user must either tap a specific action
     # on the disambiguation card or use explicit syntax (e.g., "approve Q-801") to resolve
@@ -513,13 +513,12 @@ Feature: Security — Tenant and User Validation
     Then the ProactiveNotifier detects the missing conversation reference before calling Bot Framework
     And no proactive message attempt is made to Bot Framework
     And the notification is moved directly to the dead-letter queue
-    And an audit record is persisted indicating the user has no active installation (aligned with architecture.md §6.2 step 6 and implementation-plan.md §5.1 InstallationStateGate):
+    And an audit record is persisted indicating the user has no active installation:
       | Field        | Value                       |
-      | EventType    | Error                       |
+      | EventType    | ProactiveNotification       |
       | TenantId     | contoso-tenant-id           |
       | TargetUserId | internal-user-no-install    |
-      | Outcome      | Failed                      |
-      | Action       | ProactiveDeliverySkipped    |
+      | Outcome      | DeadLettered                |
       | Reason       | NoConversationReference     |
 
   Scenario: Bot Framework token validation rejects forged activity
@@ -1030,7 +1029,7 @@ Feature: Teams Message Actions (Message Extensions)
     When user "viewer-only@contoso.com" invokes the "Forward to Agent" message action
     Then the bot validates the user's RBAC role via Activity.From.AadObjectId
     And the "agent ask" command requires role "operator"
-    And the bot returns a MessagingExtensionActionResponse containing an error Adaptive Card with text "You do not have permission to perform this action." (consistent with fetchTask=false direct-submit model per architecture.md §2.15 — no task module is involved)
+    And the bot returns an error response in the task module: "You do not have permission to perform this action."
     And no MessengerEvent is created
     And an audit record is persisted for the access denial
 
