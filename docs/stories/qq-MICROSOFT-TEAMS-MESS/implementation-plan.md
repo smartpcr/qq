@@ -394,9 +394,9 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - phase-reliability-and-performance/stage-outbox-pattern-and-retry-engine
 
 ### Test Scenarios
-- [ ] Scenario: Duplicate card action suppressed — Given user `user-1` already approved question `q-1` (recorded in `ProcessedActions` with composite key `(QuestionId="q-1", UserId="user-1")`), When the same user submits `approve` for `q-1` again via a distinct `Activity.Id`, Then the domain-level idempotency check in `CardActionHandler` returns the previous result without re-executing.
-- [ ] Scenario: Non-duplicate card action processed — Given no entry exists in `ProcessedActions` for `(QuestionId="q-2", UserId="user-1")`, When the user submits `approve` for `q-2`, Then the action is processed normally and recorded in `ProcessedActions`.
-- [ ] Scenario: Expired ProcessedActions entries cleaned — Given a `ProcessedActions` entry with `ExpiresAt` older than 24 hours, When the cleanup background job runs, Then the entry is removed from the `ProcessedActions` table.
+- [ ] Scenario: Duplicate card action suppressed — Given user `user-1` already approved question `q-1` (recorded in the in-memory processed-action set with key `(QuestionId="q-1", UserId="user-1")`), When the same user submits `approve` for `q-1` again via a distinct `Activity.Id`, Then the domain-level idempotency check in `CardActionHandler` returns the previous result without re-executing.
+- [ ] Scenario: Non-duplicate card action processed — Given no entry exists in the in-memory processed-action set for `(QuestionId="q-2", UserId="user-1")`, When the user submits `approve` for `q-2`, Then the action is processed normally and recorded in the in-memory processed-action set.
+- [ ] Scenario: Expired processed-action entries cleaned — Given an in-memory processed-action entry with age older than 24 hours, When the cleanup background job runs, Then the entry is removed from the in-memory set.
 - [ ] Scenario: Outbound deduplication — Given a message with `CorrelationId = "c-1"` and `DestinationId = "d-1"` was already sent within the deduplication window, When `SendMessageAsync` is called with the same `CorrelationId` + `DestinationId`, Then the duplicate send is suppressed.
 
 ## Stage 6.3: Performance Monitoring and Health Checks

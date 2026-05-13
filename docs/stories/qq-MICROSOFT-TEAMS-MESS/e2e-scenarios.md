@@ -239,8 +239,11 @@ Feature: Adaptive Card Approvals
 
   Scenario: Adaptive Card action after question has expired
     Given the AgentQuestion "Q-603" has ExpiresAt in the past
+    And QuestionExpiryProcessor (implementation-plan.md §3.3 line 214) has already scanned and transitioned Q-603 from Status "Open" to Status "Expired" via IAgentQuestionStore.TryUpdateStatusAsync("Q-603", "Open", "Expired")
     When user "alice@contoso.com" clicks "Approve" on the expired card
-    Then the bot replies with an error message: "This question has expired."
+    Then CardActionHandler queries IAgentQuestionStore.GetByIdAsync("Q-603") and finds Status == "Expired"
+    And CardActionHandler rejects the action because Status is not "Open" (per implementation-plan.md §3.3 line 211: reject if already Resolved or Expired)
+    And the bot replies with an error message: "This question has expired."
     And no HumanDecisionEvent is created
     And the card is updated to show "Expired"
 
@@ -595,12 +598,25 @@ Feature: Reliability — Retry and Recovery
     And no notifications are lost
     And connector recovery completes within 30 seconds
 
-  Scenario: Duplicate inbound webhook is suppressed at middleware level
-    Given user "alice@contoso.com" sends "approve" for question "Q-801"
-    And the Bot Framework delivers the activity twice (network retry with identical Activity.Id)
+  Scenario: Duplicate inbound webhook is suppressed at middleware level (text-command path)
+    Given user "alice@contoso.com" sends text command "approve" for question "Q-801"
+    And the Bot Framework delivers the message activity twice (network retry with identical Activity.Id)
     When the first delivery passes through ActivityDeduplicationMiddleware
     Then ActivityDeduplicationMiddleware records the Activity.Id in IActivityIdStore
-    And the activity reaches CardActionHandler and creates a HumanDecisionEvent
+    And the message activity reaches CommandDispatcher → ApproveCommandHandler (text commands route through CommandDispatcher, not CardActionHandler)
+    And ApproveCommandHandler resolves the pending question and creates a HumanDecisionEvent
+    When the second delivery arrives with the same Activity.Id
+    Then ActivityDeduplicationMiddleware detects the duplicate via IActivityIdStore lookup
+    And the middleware short-circuits the request with HTTP 200 before any handler runs
+    And no duplicate HumanDecisionEvent is created
+    And a deduplication event is logged for observability
+
+  Scenario: Duplicate inbound webhook is suppressed at middleware level (Adaptive Card action path)
+    Given user "alice@contoso.com" clicks the "Approve" button on the Adaptive Card for question "Q-801"
+    And the Bot Framework delivers the invoke activity twice (network retry with identical Activity.Id)
+    When the first delivery passes through ActivityDeduplicationMiddleware
+    Then ActivityDeduplicationMiddleware records the Activity.Id in IActivityIdStore
+    And the invoke activity reaches CardActionHandler and creates a HumanDecisionEvent
     When the second delivery arrives with the same Activity.Id
     Then ActivityDeduplicationMiddleware detects the duplicate via IActivityIdStore lookup
     And the middleware short-circuits the request with HTTP 200 before any handler runs
