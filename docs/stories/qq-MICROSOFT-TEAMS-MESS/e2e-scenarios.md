@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.34
+**Version:** 1.35
 
 ---
 
@@ -199,7 +199,7 @@ Feature: Adaptive Card Approvals
   Scenario: Human approves through Adaptive Card action
     When user "alice@contoso.com" clicks the "Approve" button on the Adaptive Card
     Then CardActionHandler queries IAgentQuestionStore.GetByIdAsync("Q-601") and confirms Status == "Open"
-    And CardActionHandler atomically transitions AgentQuestion.Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (architecture.md §2.6, §3.1 — first-writer-wins; returns false if another pod resolved concurrently)
+    And CardActionHandler atomically transitions AgentQuestion.Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-601", "Open", "Resolved") (architecture.md §2.6, §3.1 — first-writer-wins; returns false if another pod resolved concurrently)
     And a HumanDecisionEvent is created:
       | Field             | Value            |
       | QuestionId        | Q-601            |
@@ -248,7 +248,7 @@ Feature: Adaptive Card Approvals
     When user "alice@contoso.com" sends "approve" in personal chat
     Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations — per implementation-plan.md §3.2 lines 183-184)
     And exactly one open question is found in this conversation, so "Q-701" is resolved without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (architecture.md §2.6, §3.1 — first-writer-wins)
+    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved") (architecture.md §2.6, §3.1 — first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -269,7 +269,7 @@ Feature: Adaptive Card Approvals
     When user "alice@contoso.com" sends "reject" in personal chat
     Then RejectCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations)
     And exactly one open question is found in this conversation, so "Q-702" is resolved without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (architecture.md §2.6, §3.1 — first-writer-wins)
+    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved") (architecture.md §2.6, §3.1 — first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -310,7 +310,7 @@ Feature: Adaptive Card Approvals
     # sends "approve Q-801" or "approve Q-802" as a targeted approval command.
     When user "alice@contoso.com" clicks the "Approve" button for Q-801 on the disambiguation card
     Then the bot resolves question "Q-801" specifically via IAgentQuestionStore.GetByIdAsync("Q-801")
-    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
+    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-801", "Open", "Resolved") (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
     And the other open question "Q-802" remains with Status "Open"
     And an immutable audit record is persisted with EventType "CardActionReceived"
@@ -331,7 +331,7 @@ Feature: Adaptive Card Approvals
     When user "alice@contoso.com" sends "reject" in personal chat
     Then RejectCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId)
     And the single open question "Q-803" in this conversation is resolved without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
+    And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved") (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
     And an immutable audit record is persisted with EventType "CardActionReceived"
     # Note: When exactly one question is pending in the conversation, the bot
