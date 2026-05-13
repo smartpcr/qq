@@ -36,15 +36,15 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 | **Adaptive Cards** | Card templates for: agent questions, approval gates, release gates, incident summaries. Card actions map to `HumanAction` values. Card update and delete for already-sent cards. |
 | **Proactive messaging** | Store `ConversationReference` per authorized user/channel. Rehydrate after restart. Deliver agent-initiated questions, approval requests, and incident notifications. |
 | **Identity & access** | Validate Entra ID tenant ID on every inbound activity. Map Teams `AadObjectId` to internal user identity. Enforce RBAC (operator, approver, viewer roles). Reject unauthorized tenants/users. |
-| **Teams app manifest** | Manifest v1.16+ defining bot capabilities, personal scope, team scope, and message-extension action commands (fully functional, not stubs — see "Message actions" row below). |
+| **Teams app manifest** | Manifest v1.16+ defining bot capabilities, personal scope, team scope, and message extension stubs. |
 | **Interaction scopes** | Personal (1:1) chat and team channel conversations. |
 | **Message actions** | Teams message-extension action commands to forward context to agents. |
 | **Reliability** | Durable outbound notification queue. Retry transient Bot Connector failures (HTTP 429, 500, 502, 503, 504) per the canonical retry policy (§4.4). Dead-letter after exhausting retries. Connector restart recovery using persisted conversation references. |
-| **Performance** | P95 Adaptive Card delivery < 3 seconds after queue pickup. Connector recovery < 30 seconds. Concurrency target per §7 Assumption 8. |
+| **Performance** | P95 Adaptive Card delivery < 3 seconds after queue pickup. Connector recovery < 30 seconds. Support 1000+ concurrent users. |
 | **Compliance** | Immutable audit trail for all inbound commands and outbound notifications. Include `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, user identity, and action taken. |
 | **Observability** | OpenTelemetry traces and metrics. Structured logging. Health-check endpoint. Latency histograms for card delivery. |
 | **Shared abstractions** | Implement `IMessengerConnector` (planned in `AgentSwarm.Messaging.Abstractions` — to be created as part of the epic-level shared infrastructure; see §6.1) for Teams. Use shared data models: `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage`. |
-| **Teams-specific contracts** | `IConversationReferenceStore` is defined in `AgentSwarm.Messaging.Teams` (not in the shared abstractions) because conversation reference shapes are platform-specific. `implementation-plan.md` Stage 1.2 places the interface definition step in the shared connector-interface stage for convenience of ordering, but the assembly owner is `AgentSwarm.Messaging.Teams`. **Sibling-doc alignment dependency:** `implementation-plan.md` §4.1 still uses `GetByUserIdAsync` / lookup by `(UserId, TenantId)` in some test scenarios, while `architecture.md` §4.2 uses the dual-key model (`GetByAadObjectIdAsync` + `GetByInternalUserIdAsync`). This tech-spec's canonical interface uses the dual-key model; sibling docs require an alignment pass to remove the legacy single-key references (tracked as open question `conv-ref-key-alignment`). |
+| **Teams-specific contracts** | `IConversationReferenceStore` is defined in `AgentSwarm.Messaging.Teams` (not in the shared abstractions) because conversation reference shapes are platform-specific. `implementation-plan.md` Stage 1.2 places the interface definition step in the shared connector-interface stage for convenience of ordering, but the assembly owner is `AgentSwarm.Messaging.Teams`. This is consistent with `architecture.md` §2.8 and §4.2. |
 | **Solution structure** | New project `AgentSwarm.Messaging.Teams` within the recommended solution structure. |
 
 ### 2.2 Out of Scope
@@ -84,9 +84,9 @@ These are non-negotiable requirements drawn from the story description, enterpri
 
 | Constraint | Source |
 |------------|--------|
-| C# / .NET 8+ | Epic-level mandate (story description specifies C# SDKs; .NET 8 is the current LTS release and the team's standard runtime). |
+| C# / .NET 8+ | Epic-level mandate (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Overview: "Implementation language must be C# / .NET 8+") |
 | `Microsoft.Bot.Builder` (≥ 4.22) + `Microsoft.Bot.Builder.Integration.AspNet.Core` (≥ 4.22) | Story description requirement. Provides `ActivityHandler`, `BotAdapter`, ASP.NET Core integration, and Teams-specific functionality including `TeamsActivityHandler` (extends `ActivityHandler` with Teams-specific overrides such as `OnTeamsChannelCreatedAsync`, `OnTeamsMembersAddedAsync`), Teams middleware, and helper methods. No separate `Microsoft.Bot.Builder.Teams` NuGet package is required — all Teams support is bundled in `Microsoft.Bot.Builder`. Aligned with `implementation-plan.md` Stage 2.1. |
-| `Microsoft.Bot.Connector.Teams` (≥ 4.22) | Story description requirement ("Microsoft.Bot.Connector.Teams" listed under required C# libraries). Provides Teams-specific model types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`. |
+| `Microsoft.Bot.Connector.Teams` (≥ 4.22) | Story description requirement (see `.forge-attachments/agent_swarm_messenger_user_stories.md`, §Recommended C# Libraries under MSG-MT-001). Provides Teams-specific model types such as `TeamsChannelData`, `TeamInfo`, and `TeamsChannelAccount`. |
 | ASP.NET Core hosting | Required by Bot Builder Integration package |
 
 ### 4.2 Identity & Security
@@ -153,7 +153,7 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 | **Zero message loss** | Outbound notifications must be durably queued before acknowledgement to the agent. If Bot Connector is unreachable, the message is retried — not dropped. |
 | **Connector recovery** | After crash or restart, the connector must resume processing within 30 seconds using persisted conversation references and durable queues. |
 | **Idempotency** | Duplicate inbound activities (Teams sometimes retries webhook delivery) must be deduplicated using `Activity.Id` or `Activity.ReplyToId`. |
-| **Concurrent users** | The story description does not specify a concurrency requirement. The assumed target of 1000+ concurrent users (see §7 Assumption 8) drives architectural decisions around rate limiting and queue throughput but is not a hard constraint sourced from the operator. |
+| **Concurrent users** | Must support 1000+ concurrent users issuing commands and receiving proactive notifications without degradation. |
 
 #### Canonical Retry Policy (source of truth)
 
@@ -203,7 +203,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|------------|--------|------------|
 | R-6 | **Dead-letter queue growth** — Persistent Bot Framework failures (e.g., app misconfiguration, revoked credentials) cause unbounded DLQ growth. | Medium | Medium — storage cost, alert fatigue | DLQ size metric + alert. Runbook for DLQ drain. Auto-pause outbound after configurable DLQ threshold. |
-| R-7 | **Audit log volume** — At the assumed concurrency target (§7 Assumption 8), concurrent users × 100+ agents can produce high audit log throughput. | Medium | Low — storage cost | Use append-only structured log sink (e.g., Azure Table Storage, dedicated SQL table). Partition by date. |
+| R-7 | **Audit log volume** — 1000+ concurrent users × 100+ agents can produce high audit log throughput. | Medium | Low — storage cost | Use append-only structured log sink (e.g., Azure Table Storage, dedicated SQL table). Partition by date. |
 | R-8 | **Proactive message consent** — Teams requires admin consent or user-initiated conversation before proactive messages. If the app is deployed via policy but users haven't interacted, first proactive send may fail. | Medium | Medium — silent delivery failure for new users | On app-install event (`InstallationUpdate`), capture and store `ConversationReference`. Document that admin-pushed installs trigger the install event. |
 
 ### 5.3 Project Risks
@@ -247,7 +247,6 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 5. The bot will be deployed as a single-tenant app (not multi-tenant SaaS) unless the operator explicitly configures multiple allowed tenant IDs.
 6. Adaptive Cards schema version 1.4 is the minimum supported by the target Teams clients (desktop, web, mobile).
 7. The persistence layer for conversation references and audit logs will be provided by `AgentSwarm.Messaging.Persistence` (planned) and will support the required durability and retention guarantees.
-8. **Concurrency target: 1000+ concurrent users.** The story description does not specify a concurrency requirement. This assumed target (1000+ concurrent users issuing commands and receiving proactive notifications without degradation) is based on typical enterprise Teams deployments and drives architectural decisions around rate limiting, queue throughput, and audit log partitioning. If the operator provides a different target, §4.4 and §5.2 R-7 should be updated accordingly.
 
 ---
 
