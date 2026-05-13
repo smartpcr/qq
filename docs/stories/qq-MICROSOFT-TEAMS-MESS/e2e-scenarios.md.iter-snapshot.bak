@@ -305,15 +305,6 @@ Feature: Adaptive Card Approvals
     # unknowingly approves the wrong pending question when multiple cards are
     # outstanding. Explicit disambiguation (or explicit QuestionId in the command)
     # is required when more than one question is pending.
-    #
-    # Cross-doc alignment: architecture.md §2.5 (Supported commands table, lines
-    # 133-134) describes `approve` as acting on "the most recent pending approval
-    # in context." That shorthand applies ONLY when exactly one AgentQuestion with
-    # Status == Open exists for the user's conversation context. When multiple
-    # questions are pending, this scenario's disambiguation behavior takes
-    # precedence — the bot MUST NOT silently resolve "the most recent" question.
-    # The architecture table's "most recent" phrasing is a convenience description
-    # for the single-pending-question case, not a behavioral override.
 
   Scenario: User rejects with explicit question ID when only one question is pending
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-803" (Status = "Open")
@@ -785,7 +776,7 @@ Feature: Adaptive Card — Incident Summary and Release Gates
       | QuestionId | TargetUserId                     | Status |
       | Q-gate-a   | <alice's internal user ID>       | Open   |
       | Q-gate-b   | <bob's internal user ID>         | Open   |
-    And each AgentQuestion follows the standard single-decision lifecycle (first-writer-wins per architecture §6.3.1)
+    And each AgentQuestion follows the standard single-decision lifecycle (first-writer-wins per architecture §3.2)
     And the orchestrator's release-gate workflow tracks the approval threshold (2 required) at the workflow layer
     When "alice@contoso.com" clicks "Approve" on her card (Q-gate-a)
     Then Q-gate-a transitions from Open to Resolved (standard CardActionHandler flow)
@@ -1081,7 +1072,7 @@ Feature: Edge Cases and Error Handling
     And the orchestrator aggregates both decisions and transitions the release gate to approved
     And both individual approvals are audit-logged
 
-  > **Note:** Multi-approver release gates are modeled as separate `AgentQuestion` records — one per approver — each following the standard single-decision first-writer-wins lifecycle (architecture §6.3.1, §6.3 step 5). The orchestrator's workflow layer tracks the approval threshold and aggregates individual decisions. This avoids contradicting the `AgentQuestion.Status` lifecycle where `CardActionHandler` atomically transitions `Open → Resolved` on the first accepted action and rejects subsequent actions.
+  > **Note:** Multi-approver release gates are modeled as separate `AgentQuestion` records — one per approver — each following the standard single-decision first-writer-wins lifecycle (architecture §3.2, §6.3 step 5). The orchestrator's workflow layer tracks the approval threshold and aggregates individual decisions. This avoids contradicting the `AgentQuestion.Status` lifecycle where `CardActionHandler` atomically transitions `Open → Resolved` on the first accepted action and rejects subsequent actions.
 
   Scenario: Bot Framework token refresh during long-running operation
     Given the bot's authentication token is about to expire
@@ -1110,4 +1101,4 @@ Feature: Edge Cases and Error Handling
 
 ## Document Scope
 
-**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle (install path and message path), bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates (modeled as separate AgentQuestion records per architecture §6.3.1), RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty/long messages).
+**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle (install path and message path), bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates (modeled as separate AgentQuestion records per architecture §3.2), RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty/long messages).
