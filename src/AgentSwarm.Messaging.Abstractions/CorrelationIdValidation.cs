@@ -16,9 +16,8 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// <para>The class is <c>public</c> so the same guard is applied uniformly
 /// across Abstractions records (e.g. <see cref="MessengerMessage"/>,
 /// <see cref="AgentQuestion"/>, <see cref="SwarmCommand"/>,
-/// <see cref="HumanDecisionEvent"/>) and Core records (e.g.
-/// <c>AgentSwarm.Messaging.Core.OutboundMessage</c>,
-/// <c>AgentSwarm.Messaging.Core.TaskOversight</c>) — the
+/// <see cref="HumanDecisionEvent"/>, <see cref="OutboundMessage"/>) and
+/// Core records (e.g. <c>AgentSwarm.Messaging.Core.TaskOversight</c>) — the
 /// "All messages include trace/correlation ID" acceptance criterion is
 /// undermined the moment any single contract lets an empty or whitespace
 /// trace id slip through, so the helper is shared rather than duplicated.</para>

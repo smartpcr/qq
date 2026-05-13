@@ -1393,16 +1393,18 @@ public class ConnectorContractTests
     [Fact]
     public void CorrelationIdValidation_IsPubliclyAccessibleSoCoreContractsCanShareIt()
     {
-        // OutboundMessage and TaskOversight are in Core; AgentQuestion etc.
-        // are in Abstractions. They all need the same guard. Pin the
-        // public visibility so a refactor cannot quietly downgrade it
-        // to internal and split the dialect of "trace-id required."
+        // OutboundMessage now lives in Abstractions (per Stage 1.4); TaskOversight
+        // remains in Core. AgentQuestion etc. are in Abstractions. They all need
+        // the same guard, and at least one cross-assembly consumer (TaskOversight
+        // in Core) still depends on this type being public. Pin the public
+        // visibility so a refactor cannot quietly downgrade it to internal and
+        // split the dialect of "trace-id required."
         var helper = typeof(CorrelationIdValidation);
 
         helper.IsPublic.Should().BeTrue(
-            "Core records (OutboundMessage, TaskOversight) reference this "
-            + "helper across the assembly boundary; making it internal would "
-            + "force Core to duplicate the guard and risk drift.");
+            "Core records (TaskOversight) reference this helper across the "
+            + "assembly boundary; making it internal would force Core to "
+            + "duplicate the guard and risk drift.");
     }
 
     private static AgentQuestion BuildQuestion(
