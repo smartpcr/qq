@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.30
+**Version:** 1.31
 
 ---
 
@@ -205,7 +205,7 @@ Feature: Adaptive Card Approvals
       | QuestionId        | Q-601            |
       | ActionValue       | approve          |
       | Comment           | <null>           |
-      | Messenger         | teams            |
+      | Messenger         | Teams            |
       | ExternalUserId    | <alice's AadObjectId> |
       | ExternalMessageId | <Teams activity ID> |
       | CorrelationId     | <original UUID>  |
@@ -247,7 +247,7 @@ Feature: Adaptive Card Approvals
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "approve" in personal chat
     Then the bot confirms exactly one pending question exists for the user and resolves "Q-701"
-    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved") (architecture.md §2.6, §3.1)
+    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (architecture.md §2.6, §3.1 — first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -267,7 +267,7 @@ Feature: Adaptive Card Approvals
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
     Then the bot confirms exactly one pending question exists for the user and resolves "Q-702"
-    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved") (architecture.md §2.6, §3.1)
+    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (architecture.md §2.6, §3.1 — first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -297,7 +297,7 @@ Feature: Adaptive Card Approvals
     And no HumanDecisionEvent is created until the user disambiguates
     When user "alice@contoso.com" sends "approve Q-801"
     Then the bot resolves question "Q-801" specifically
-    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-801", "Open", "Resolved")
+    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
     And question "Q-802" remains with Status "Open"
     And an immutable audit record is persisted with EventType "CardActionReceived"
@@ -320,7 +320,7 @@ Feature: Adaptive Card Approvals
     And no other questions are pending for user "alice@contoso.com"
     When user "alice@contoso.com" sends "reject" in personal chat
     Then the bot resolves the single pending question "Q-803" without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved")
+    And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
     And an immutable audit record is persisted with EventType "CardActionReceived"
     # Note: When exactly one question is pending, the bot resolves it
@@ -617,7 +617,7 @@ Feature: Compliance — Immutable Audit Trail
       | Field             | Value                                              |
       | Timestamp         | <UTC ISO 8601>                                     |
       | EventType         | CommandReceived                                     |
-      | Messenger         | teams                                              |
+      | Messenger         | Teams                                              |
       | TenantId          | contoso-tenant-id                                  |
       | ActorId           | <alice's AadObjectId (Entra OID)>                  |
       | ActorType         | User                                               |
@@ -1081,7 +1081,12 @@ Feature: Edge Cases and Error Handling
     And the orchestrator aggregates both decisions and transitions the release gate to approved
     And both individual approvals are audit-logged
 
-  > **Note:** Multi-approver release gates are modeled as separate `AgentQuestion` records — one per approver — each following the standard single-decision first-writer-wins lifecycle (architecture §6.3.1, §6.3 step 5). The orchestrator's workflow layer tracks the approval threshold and aggregates individual decisions. This avoids contradicting the `AgentQuestion.Status` lifecycle where `CardActionHandler` atomically transitions `Open → Resolved` on the first accepted action and rejects subsequent actions.
+  # Note: Multi-approver release gates are modeled as separate AgentQuestion records
+  # — one per approver — each following the standard single-decision first-writer-wins
+  # lifecycle (architecture §6.3.1, §6.3 step 5). The orchestrator's workflow layer
+  # tracks the approval threshold and aggregates individual decisions. This avoids
+  # contradicting the AgentQuestion.Status lifecycle where CardActionHandler atomically
+  # transitions Open → Resolved on the first accepted action and rejects subsequent actions.
 
   Scenario: Bot Framework token refresh during long-running operation
     Given the bot's authentication token is about to expire
