@@ -81,16 +81,18 @@ Feature: Proactive Messaging — Blocking Questions
   Scenario: Agent sends a blocking question to a specific user
     Given agent "arch-agent-03" needs human input for task "TASK-77"
     And the agent publishes an AgentQuestion:
-      | Field          | Value                                      |
-      | QuestionId     | Q-501                                      |
-      | AgentId        | arch-agent-03                              |
-      | TaskId         | TASK-77                                    |
-      | Title          | Database migration strategy                |
-      | Body           | Should we use blue-green or rolling deploy? |
-      | Severity       | High                                       |
-      | AllowedActions | Approve, Reject, Need more info            |
-      | ExpiresAt      | <now + 24 hours>                           |
-      | CorrelationId  | <UUID>                                     |
+      | Field           | Value                                      |
+      | QuestionId      | Q-501                                      |
+      | AgentId         | arch-agent-03                              |
+      | TaskId          | TASK-77                                    |
+      | TargetUserId    | <alice's internal user ID>                 |
+      | TargetChannelId | <null>                                     |
+      | Title           | Database migration strategy                |
+      | Body            | Should we use blue-green or rolling deploy? |
+      | Severity        | High                                       |
+      | AllowedActions  | Approve, Reject, Need more info            |
+      | ExpiresAt       | <now + 24 hours>                           |
+      | CorrelationId   | <UUID>                                     |
     When the OutboxRetryEngine picks up the question from the outbound queue
     Then the bot sends a proactive Adaptive Card to "alice@contoso.com" using the stored conversation reference
     And the card is delivered within 3 seconds (P95)
@@ -106,8 +108,18 @@ Feature: Proactive Messaging — Blocking Questions
   Scenario: Agent sends a blocking question to a team channel
     Given agent "release-agent-01" needs approval for task "TASK-88"
     And the bot has a stored conversation reference for channel "#release-gates"
-    When the agent publishes an AgentQuestion targeting channel "#release-gates"
-    Then the bot sends an Adaptive Card to the channel using the stored conversation reference
+    When the agent publishes an AgentQuestion with:
+      | Field           | Value                          |
+      | QuestionId      | Q-502                          |
+      | AgentId         | release-agent-01               |
+      | TaskId          | TASK-88                        |
+      | TargetUserId    | <null>                         |
+      | TargetChannelId | <channel ID for #release-gates>|
+      | Title           | Release gate approval          |
+      | AllowedActions  | Approve, Reject                |
+      | CorrelationId   | <UUID>                         |
+    Then the bot resolves TargetChannelId to the stored conversation reference via IConversationReferenceStore
+    And the bot sends an Adaptive Card to the channel using the stored conversation reference
     And the card is threaded under the original task context if one exists
 
   Scenario: Proactive message delivery after service restart
@@ -526,6 +538,7 @@ Feature: Compliance — Immutable Audit Trail
       | EventType         | ProactiveNotification     |
       | ActorId           | <agent ID>                |
       | ActorType         | Agent                     |
+      | TenantId          | contoso-tenant-id         |
       | Action            | send_card                 |
       | TaskId            | <task ID for Q-1001>      |
       | PayloadJson       | {"questionId":"Q-1001","targetAadObjectId":"<alice's AadObjectId>","activityId":"<Teams activity ID>"} |
@@ -535,10 +548,11 @@ Feature: Compliance — Immutable Audit Trail
   Scenario: Approval decisions are audit-logged with full context
     When user "alice@contoso.com" approves question "Q-1001" with comment "LGTM"
     Then an immutable audit record is persisted containing:
-      | Field             | Value             |
+      | Field             | Value              |
       | EventType         | CardActionReceived |
       | ActorId           | <alice's AadObjectId> |
       | ActorType         | User               |
+      | TenantId          | contoso-tenant-id  |
       | Action            | approve            |
       | TaskId            | <task ID for Q-1001> |
       | PayloadJson       | {"questionId":"Q-1001","actionValue":"approve","comment":"LGTM"} |
@@ -840,15 +854,14 @@ Feature: Edge Cases and Error Handling
     Then the bot replies with the help card
     And a MessengerEvent of type "Text" is enqueued with an empty payload
 
-  Scenario: Bot receives a message exceeding reasonable length
+  Scenario: Bot receives a message exceeding maximum length
     Given user "alice@contoso.com" sends a message with 10,000 characters
     When the bot processes the activity
-    Then the bot truncates or rejects the message per the configured length policy
-    And a warning is logged with the original and accepted lengths
+    Then the bot truncates the message body to the first 4,096 characters
+    And the bot enqueues a MessengerEvent containing the truncated body
+    And a warning is logged with the original length (10,000) and accepted length (4,096)
     And an immutable audit record is persisted with EventType "CommandReceived"
-    # Note: The specific configuration key, threshold, and truncation behavior
-    # are implementation details to be defined in tech-spec.md and architecture.md.
-    # This scenario validates that excessively long inputs do not bypass audit or crash the pipeline.
+    And the audit PayloadJson includes "truncated":true and "originalLength":10000
 
   Scenario: Adaptive Card action payload is malformed
     Given user "alice@contoso.com" submits an Adaptive Card action

@@ -127,7 +127,7 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 
 > The canonical **audit** `EventType` values defined by this spec are: `CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`. The canonical set contains exactly seven values. Message actions (Teams message-extension submissions) log as `MessageActionReceived` — a dedicated audit event type distinct from `CommandReceived` — because message-action submissions arrive through the `composeExtension/submitAction` invoke mechanism rather than direct text commands, and distinguishing them in the audit trail supports compliance filtering and forensic analysis. The `Source` field on the domain `MessengerEvent` additionally marks the origination (`Source = MessageAction`) for downstream processing.
 >
-> **Cross-doc alignment status:** All sibling docs (`architecture.md` §3.2 line 432, `implementation-plan.md` §1.3 line 50 / §3.4 line 208 / §5.2 line 294, `e2e-scenarios.md` line 781 and line 912) define exactly seven canonical audit `EventType` values including `MessageActionReceived`. All four plan docs are now aligned on this seven-value canonical set.
+> **Cross-doc alignment status:** All sibling docs define exactly seven canonical audit `EventType` values including `MessageActionReceived`. Specifically: `architecture.md` §3.2 `AuditEntry` field table (`EventType` row); `implementation-plan.md` §1.3 `IAuditLogger` definition, §3.4 `MessageExtensionHandler` audit step, and §5.2 `SqlAuditLogger` column listing; `e2e-scenarios.md` §Message Actions scenario (`MessageActionReceived` assertion) and §Iteration Summary coverage list (canonical EventType values enumeration). All four plan docs are now aligned on this seven-value canonical set.
 >
 > **Important distinction:** The `EventType` field in the canonical **audit record** schema (this table) is a different concept from the `EventType` discriminator on the `MessengerEvent` domain model. The audit `EventType` categorizes audit log entries (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`). The `MessengerEvent.EventType` discriminator identifies the domain event subtype (`AgentTaskRequest`, `Command`, `Escalation`, `PauseAgent`, `ResumeAgent`, `Decision`, `Text`, `InstallUpdate`, `Reaction`) as defined in `architecture.md` §3.1 and `e2e-scenarios.md` §Audit Trail compliance scenarios. These are intentionally separate enumerations serving different purposes — audit categorization vs. domain event polymorphism — and are not expected to share values.
 
@@ -159,7 +159,7 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 
 #### Canonical Retry Policy (source of truth)
 
-This is the **authoritative retry schedule** for transient Bot Connector failures (HTTP 429, 500, 502, 503, 504). Sibling docs must align to these values.
+This is the **authoritative retry schedule** for transient Bot Connector failures (HTTP 429, 500, 502, 503, 504), including ±25% jitter on each computed delay. Sibling docs must align to these values.
 
 > All sibling docs (`implementation-plan.md`, `e2e-scenarios.md`) have been aligned to this canonical retry schedule.
 >
@@ -263,7 +263,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 | **Connector recovery time** | < 30 seconds | Health-check probe after simulated crash |
 | **Proactive message success rate** | > 99% (excluding permanently-failed references) | `teams.proactive.send.success` / `teams.proactive.send.total` |
 | **Unauthorized request rejection rate** | 100% of invalid-tenant/invalid-user requests rejected | Audit log query + E2E security test |
-| **Audit trail completeness** | 100% of commands and notifications have audit records | Reconciliation check: outbound queue count == audit record count |
+| **Audit trail completeness** | 100% of commands and notifications have audit records | Per-event-class reconciliation: for each canonical `EventType` (`CommandReceived`, `MessageSent`, `CardActionReceived`, `SecurityRejection`, `ProactiveNotification`, `MessageActionReceived`, `Error`), verify that every processed event of that class has a corresponding audit record. Measured by joining inbound command count, outbound notification count, card callback count, security rejection count, and error count against audit records filtered by `EventType`. |
 
 ---
 
