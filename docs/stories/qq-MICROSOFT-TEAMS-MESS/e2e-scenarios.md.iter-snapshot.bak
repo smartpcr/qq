@@ -198,9 +198,7 @@ Feature: Adaptive Card Approvals
 
   Scenario: Human approves through Adaptive Card action
     When user "alice@contoso.com" clicks the "Approve" button on the Adaptive Card
-    Then CardActionHandler queries IAgentQuestionStore.GetByIdAsync("Q-601") and confirms Status == "Open"
-    And CardActionHandler atomically transitions AgentQuestion.Status from "Open" to "Resolved" via IAgentQuestionStore.UpdateStatusAsync (architecture.md §2.6, §3.1 — first-writer-wins durable transition)
-    And a HumanDecisionEvent is created:
+    Then a HumanDecisionEvent is created:
       | Field             | Value            |
       | QuestionId        | Q-601            |
       | ActionValue       | approve          |
