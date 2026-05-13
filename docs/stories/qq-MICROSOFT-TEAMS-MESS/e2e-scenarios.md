@@ -285,29 +285,35 @@ Feature: Adaptive Card Approvals
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
 
-  Scenario: User sends approve with multiple pending questions in the same conversation
+  Scenario: User sends bare approve with multiple pending questions — disambiguation via explicit questionId
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open")
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open")
     And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
     Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation
-    And more than one open AgentQuestion is found in this conversation
-    And the bot does NOT silently resolve "the most recent" question
-    And the bot replies with a disambiguation card listing all pending questions:
-      | QuestionId | Agent              | Title                        |
-      | Q-801      | release-agent-01   | <question Q-801 title>       |
-      | Q-802      | planner-agent-02   | <question Q-802 title>       |
-    And no HumanDecisionEvent is created until the user disambiguates
-    When user "alice@contoso.com" sends "approve Q-801"
-    Then the bot resolves question "Q-801" specifically
+    # Note: GetMostRecentOpenByConversationAsync returns AgentQuestion? (single result or null)
+    # per implementation-plan.md §1.2 line 42 and §3.2 line 184. It returns the most recently
+    # created open question ordered by CreatedAt descending. When multiple open questions exist,
+    # it returns the MOST RECENT one — the handler cannot detect the ambiguity via this method alone.
+    # Therefore, bare approve resolves the most recent open question in the conversation.
+    And the most recently created open question in this conversation is returned (Q-802 if it was created after Q-801)
+    And CardActionHandler transitions the returned AgentQuestion Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
+    And a HumanDecisionEvent is created with ActionValue "approve" and the resolved QuestionId
+    And the other open question remains with Status "Open"
+    And an immutable audit record is persisted with EventType "CardActionReceived"
+    # Note: To approve a specific question when multiple are pending, the user
+    # sends "approve Q-801" with an explicit questionId argument. The handler
+    # calls IAgentQuestionStore.GetByIdAsync("Q-801") directly, bypassing the
+    # most-recent-open lookup. This is the recommended disambiguation path.
+    When user "alice@contoso.com" then sends "approve Q-801"
+    Then the bot resolves question "Q-801" specifically via GetByIdAsync
     And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
-    And question "Q-802" remains with Status "Open"
     And an immutable audit record is persisted with EventType "CardActionReceived"
-    # Note: This prevents the "Cross-Conversation Consent" attack where a bare
-    # approve in personal chat resolves a question pending in a channel or
-    # another conversation for the same user. Lookup is always scoped to
-    # the current conversationId via GetMostRecentOpenByConversationAsync
+    # Note: This prevents the "Cross-Conversation Consent" attack because
+    # GetMostRecentOpenByConversationAsync is scoped to the current conversationId,
+    # not the user across conversations. A bare approve in personal chat cannot
+    # resolve a question pending in a channel or another conversation.
     # (implementation-plan.md §3.2 lines 183-184), NOT to the user globally.
     # Explicit disambiguation (or explicit QuestionId in the command)
     # is required when more than one question is pending in the conversation.
@@ -755,27 +761,27 @@ Feature: Escalation, Pause, and Resume Commands
     And the event includes CorrelationId, AgentId, and severity
     And an audit record is persisted
 
-  Scenario: User pauses an agent
+  Scenario: User pauses the agent bound to the current conversation
+    Given agent "release-agent-01" is the agent bound to the current conversation (per architecture.md §2.5 line 136: pause targets "the agent bound to the current conversation")
     When user "alice@contoso.com" sends "pause"
-    Then the bot presents a list of active agents
-    When the user selects "release-agent-01"
-    Then a MessengerEvent of type "PauseAgent" is enqueued for "release-agent-01"
+    Then the bot resolves the agent bound to the current conversation context
+    And a MessengerEvent of type "PauseAgent" is enqueued for "release-agent-01"
     And the bot confirms: "Agent release-agent-01 has been paused."
     And an audit record is persisted
 
-  Scenario: User resumes a paused agent
-    Given agent "release-agent-01" is in state "Paused"
+  Scenario: User resumes the agent bound to the current conversation
+    Given agent "release-agent-01" is the agent bound to the current conversation
+    And agent "release-agent-01" is in state "Paused"
     When user "alice@contoso.com" sends "resume"
-    Then the bot presents a list of paused agents
-    When the user selects "release-agent-01"
-    Then a MessengerEvent of type "ResumeAgent" is enqueued for "release-agent-01"
+    Then the bot resolves the agent bound to the current conversation context
+    And a MessengerEvent of type "ResumeAgent" is enqueued for "release-agent-01"
     And the bot confirms: "Agent release-agent-01 has been resumed."
     And an audit record is persisted
 
-  Scenario: Pause command with no active agents
-    Given no agents are currently running
+  Scenario: Pause command with no agent bound to the current conversation
+    Given no agent is bound to the current conversation
     When user "alice@contoso.com" sends "pause"
-    Then the bot replies: "No active agents to pause."
+    Then the bot replies: "No agent is bound to this conversation. Use 'agent status' to check active agents."
 ```
 
 ---
@@ -789,7 +795,7 @@ Feature: Adaptive Card — Incident Summary and Release Gates
 
   Scenario: Agent sends an incident summary card
     Given agent "incident-agent-01" has completed incident analysis for task "INC-200"
-    When the agent publishes an IncidentSummary (per architecture.md §3.1 IncidentSummary model) with:
+    When the agent publishes an IncidentSummary (per architecture.md §3.3 IncidentSummary model) with:
       | Field         | Value                                  |
       | IncidentId    | INC-200                                |
       | TaskId        | TASK-INC-200                           |
@@ -799,7 +805,7 @@ Feature: Adaptive Card — Incident Summary and Release Gates
       | Description   | Connection pool saturated at 100/100 active connections causing cascading timeouts in order-service and payment-service |
       | OccurredAt    | <ISO 8601 UTC timestamp>               |
       | CorrelationId | <non-empty UUID>                       |
-    Then the bot renders an Adaptive Card via IAdaptiveCardRenderer.RenderIncidentCard (per architecture.md §3.1):
+    Then the bot renders an Adaptive Card via IAdaptiveCardRenderer.RenderIncidentCard (per architecture.md §3.3):
       | Section          | Content                                     |
       | Header           | 🔴 Critical Incident — INC-200              |
       | Title            | Database connection pool exhaustion          |
@@ -1043,32 +1049,12 @@ Feature: Edge Cases and Error Handling
     Then the bot replies with the help card
     And a MessengerEvent of type "Text" is enqueued with an empty payload
 
-  Scenario: Bot receives a message exceeding the configured maximum inbound payload size
-    Given the system has a configurable inbound message length limit (defined in application configuration; no default is specified in this E2E doc — refer to tech-spec.md or implementation-plan.md for the authoritative setting)
-    And user "alice@contoso.com" sends a message with a text body exceeding the configured limit
-    When the bot processes the activity
-    Then the bot rejects the oversized message and does NOT enqueue it
-    And the bot replies with an error message indicating the message exceeds the configured maximum length
-    And a warning is logged noting the rejected payload size
-    And an immutable audit record is persisted with:
-      | Field     | Value                         |
-      | EventType | Error                         |
-      | Action    | PayloadExceedsMaxLength       |
-      | Outcome   | Rejected                      |
-      | ActorId   | <alice's AadObjectId>         |
-    # Note: The maximum inbound message length is a system-configured policy
-    # (not a Bot Framework platform limit). This prevents unbounded payload
-    # sizes from propagating through the inbound queue. The exact default
-    # value is defined in application configuration and is NOT specified
-    # here to avoid encoding an unanchored product contract.
-
-  Scenario: Bot receives a large but within-limit message
-    Given the system has an inbound message length limit configured via application settings
-    And user "alice@contoso.com" sends a message with a text body just under the configured limit
-    When the bot processes the activity
-    Then the bot enqueues a MessengerEvent containing the full message body
-    And a warning is logged noting the unusually large payload size
-    And an immutable audit record is persisted with EventType "CommandReceived"
+  # Note: Oversized inbound message scenarios were removed because no sibling
+  # plan doc (tech-spec.md, implementation-plan.md, architecture.md) defines
+  # an inbound message length limit config key, default, or owner. Including
+  # such scenarios would encode an invented product contract that QA cannot
+  # validate. If this limit is added to a sibling doc in a future iteration,
+  # corresponding E2E scenarios should be added at that time.
 
   Scenario: Adaptive Card action payload is malformed
     Given user "alice@contoso.com" submits an Adaptive Card action
