@@ -89,7 +89,7 @@ The agent swarm (100+ autonomous agents) requires a Telegram-based human interfa
 | **AuthZ Service** | `AgentSwarm.Messaging.Core` (to be created) | Validates that the Telegram user ID + chat ID pair is in the authorized operator registry. Returns tenant/workspace binding or rejects the request. |
 | **Operator Registry** | `AgentSwarm.Messaging.Core` (to be created) | Persistent map of `(TelegramUserId, TelegramChatId) → one or more OperatorBinding(TenantId, WorkspaceId, Roles, OperatorAlias)`. Runtime authorization first checks whether any active binding exists for the `(TelegramUserId, TelegramChatId)` pair via `IsAuthorizedAsync`; when multiple bindings exist (the operator is registered in several workspaces for the same chat), `GetBindingsAsync` returns all matching rows and the caller disambiguates workspace via inline keyboard (see §4.3, §7.1). The `UNIQUE` constraint is on `(TelegramUserId, TelegramChatId, WorkspaceId)` to prevent duplicate bindings for the same workspace. Populated via `/start` registration flow and admin configuration. |
 | **Swarm Command Bus** | `AgentSwarm.Messaging.Core` (to be created) | Publishes validated, strongly typed commands to the agent swarm orchestrator. Subscribes to agent-originated events (questions, alerts, status) via `SubscribeAsync` and routes them to the correct outbound connector. Both command publishing and event subscription are on the single `ISwarmCommandBus` interface (see §4.6). |
-| **OutboundMessageQueue** | `AgentSwarm.Messaging.Abstractions` (interface) / `AgentSwarm.Messaging.Core` (implementation) (to be created) | Durable queue for outbound messages backed by a persistent store (database) with an in-memory `Channel<T>` hot buffer for low-latency dequeue. The persistent store is the source of truth; the `Channel<T>` is a read-through acceleration layer, not a standalone queue. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 5 attempts), and dead-letter after exhaustion. |
+| **OutboundMessageQueue** | `AgentSwarm.Messaging.Abstractions` (interface — `IOutboundQueue`, with `OutboundMessage`/`OutboundSourceType`/`OutboundMessageStatus` co-located there per the §4.4 layering note) / `AgentSwarm.Messaging.Persistence` (durable `PersistentOutboundQueue` / `OutboundQueueStore` impl, EF Core — see §6 assembly map and implementation-plan.md Stage 4.1 line 402) (to be created) | Durable queue for outbound messages backed by a persistent store (database) with an in-memory `Channel<T>` hot buffer for low-latency dequeue. The persistent store is the source of truth; the `Channel<T>` is a read-through acceleration layer, not a standalone queue. Provides at-least-once delivery, deduplication by idempotency key, severity-based priority ordering (Critical > High > Normal > Low), retry with configurable exponential back-off (default max 5 attempts), and dead-letter after exhaustion. |
 | **TelegramSender** | `AgentSwarm.Messaging.Telegram` (to be created) | Concrete `TelegramMessageSender` implementing `IMessageSender` (§4.12, defined in `AgentSwarm.Messaging.Core`). Both methods return `Task<SendResult>` carrying the Telegram-assigned `message_id`. Wraps `ITelegramBotClient` from the `Telegram.Bot` library. **Sole owner of question rendering**: builds `InlineKeyboardMarkup`, formats question MarkdownV2 text, writes `HumanAction` entries to `IDistributedCache`, and displays the proposed default — all at send time from `SourceEnvelopeJson`, not from pre-rendered `Payload`. For non-question messages (`Alert`, `StatusUpdate`, `CommandAck`), the sender passes the pre-rendered `Payload` text through to the Telegram API without further rendering (rendering for these types is performed by `TelegramMessengerConnector` at enqueue time — see §3.1 `OutboundMessage.Payload`). Also enforces Telegram rate limits. `OutboundQueueProcessor` invokes the sender through the `IMessageSender` abstraction, keeping `AgentSwarm.Messaging.Worker` independent of the Telegram assembly. |
 | **AuditLogger** | `AgentSwarm.Messaging.Persistence` (to be created) | Writes an immutable audit record for every human response. Includes message ID, user ID, agent ID, timestamp, and correlation ID. Backed by append-only store. |
 | **OutboundQueueProcessor** | `AgentSwarm.Messaging.Worker` (to be created) | `BackgroundService` with configurable concurrency (`OutboundQueue:ProcessorConcurrency`, default 10 workers). Each worker independently dequeues the highest-severity pending `OutboundMessage`, dispatches to `IMessageSender` based on `SourceType` (question → `SendQuestionAsync`; all others → `SendTextAsync` with pre-rendered `Payload`), calls `IOutboundQueue.MarkSentAsync` with the `SendResult.TelegramMessageId`, and for question messages calls `IPendingQuestionStore.StoreAsync` as a post-send hook (§5.2 invariant 1). On failure, increments `AttemptCount` and schedules retry or dead-letters. Depends on `IOutboundQueue`, `IMessageSender`, `IPendingQuestionStore`. See §10.4 for concurrency and burst analysis. |
@@ -209,7 +209,7 @@ The shared `AgentQuestion` model represents a blocking question from an agent to
 | `CorrelationId` | `string` | Trace ID. |
 
 **Constraints:**
-- `QuestionId` is constrained to a maximum of **30 characters** to satisfy the Telegram `callback_data` format `QuestionId:ActionId` (see §11 and `HumanAction.ActionId` below). Combined with the `:` separator and `ActionId` (also ≤ 30 characters), the total payload is ≤ 61 bytes, within Telegram's 64-byte `callback_data` limit.
+- `QuestionId` is constrained to **printable ASCII only** with a maximum of **30 characters**. Telegram's `callback_data` budget is **64 UTF-8 bytes**, not 64 characters, so character-count alone is insufficient (a single non-ASCII code point can encode to up to 4 UTF-8 bytes). Enforcing ASCII makes the wire byte count equal to the character count, so a 30-character `QuestionId` is provably ≤ 30 bytes on the wire. Combined with the `:` separator and `ActionId` (also printable ASCII, ≤ 30 characters), the total `QuestionId:ActionId` payload is ≤ 61 bytes — within Telegram's 64-byte `callback_data` limit. `QuestionId` must additionally **not contain `':'`** (the field separator — embedding it would make the parse ambiguous) or **ASCII control characters** (U+0000..U+001F, U+007F — Telegram strips them silently and they leak terminal escape sequences into operator-facing logs). All four constraints are enforced at construction time on `AgentSwarm.Messaging.Abstractions.AgentQuestion.QuestionId` (init accessor) and surfaced via the `MaxQuestionIdLength` constant.
 
 #### HumanAction (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -217,15 +217,15 @@ Represents a single action button that an agent question can offer to a human op
 
 | Field | Type | Description |
 |---|---|---|
-| `ActionId` | `string` | Unique identifier for this action within the question's `AllowedActions` list. Constrained to a maximum of **30 characters** to fit within the Telegram `callback_data` format `QuestionId:ActionId` (≤ 61 bytes total, within Telegram's 64-byte limit). Used as the value in `callback_data`, in `PendingQuestionRecord.SelectedActionId`, and in `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId`). **Not** directly emitted in `HumanDecisionEvent.ActionValue` — the emitted value is always `HumanAction.Value`, whether resolved interactively (button tap / text reply) or via timeout (denormalized as `DefaultActionValue`). See `Value` below. |
-| `Label` | `string` | Human-readable button text displayed on the inline keyboard (e.g., "Approve", "Reject", "Need more info"). Maximum 64 characters (Telegram inline button text limit). |
+| `ActionId` | `string` | Unique identifier for this action within the question's `AllowedActions` list. Constrained to **printable ASCII only**, max **30 characters**, with **no `':'`** (the `QuestionId:ActionId` separator) and **no ASCII control characters**. ASCII enforcement guarantees the UTF-8 byte count equals the character count, so a 30-character `ActionId` is provably ≤ 30 bytes on the wire — keeping the joined `QuestionId:ActionId` payload ≤ 61 bytes within Telegram's 64-byte `callback_data` limit. Used as the value in `callback_data`, in `PendingQuestionRecord.SelectedActionId`, and in `PendingQuestionRecord.DefaultActionId` (denormalized from `AgentQuestionEnvelope.ProposedDefaultActionId`). **Not** directly emitted in `HumanDecisionEvent.ActionValue` — the emitted value is always `HumanAction.Value`, whether resolved interactively (button tap / text reply) or via timeout (denormalized as `DefaultActionValue`). See `Value` below. |
+| `Label` | `string` | Human-readable button text displayed on the inline keyboard (e.g., "Approve", "Reject", "Need more info"). Constrained to **64 UTF-8 bytes** (Telegram's inline-button label budget is byte-oriented, not character-oriented). A 64-character ASCII label fits exactly at the boundary; multi-byte Unicode labels (emoji, accents, CJK) are admitted only up to the byte budget — e.g. 32 × `é` = 64 UTF-8 bytes is the boundary, 33 × `é` is rejected even though 33 < 64. Surfaced via the `MaxLabelByteLength` constant; the legacy `MaxLabelLength` (= 64) char-count constant is retained as a numeric alias for char-oriented callers. |
 | `Value` | `string` | Machine-readable action value carried in `HumanDecisionEvent.ActionValue` when this action is selected. This is the **canonical source** for the `ActionValue` field in the emitted event. When the operator taps an inline button, the `CallbackQueryHandler` parses `ActionId` from the `callback_data`, looks up the full `HumanAction` from `IDistributedCache` (keyed by `QuestionId:ActionId`), and reads `HumanAction.Value` to populate `HumanDecisionEvent.ActionValue`. Typically matches `ActionId` but may differ when the consuming agent expects a different semantic value (e.g., `ActionId = "approve-btn"`, `Value = "approve"`). Consistent with e2e-scenarios.md line 141 which states "ActionValue carries the HumanAction.Value from AllowedActions." |
 | `RequiresComment` | `bool` | When `true`, the `CallbackQueryHandler` defers `HumanDecisionEvent` emission: it sets `PendingQuestionRecord.Status = AwaitingComment`, prompts the operator for a text reply, and emits the event only after the reply arrives (see §5.2). When `false`, the event is emitted immediately on button tap. Default: `false`. |
 
 **Constraints:**
-- `ActionId` must be unique within a single `AgentQuestion.AllowedActions` array.
-- `ActionId` is constrained to ≤ 30 characters (see `AgentQuestion` constraints above and §11).
-- `Label` is constrained to ≤ 64 characters (Telegram inline button text limit).
+- `ActionId` must be unique within a single `AgentQuestion.AllowedActions` array (callback dispatch is keyed on `ActionId`; duplicates would silently shadow each other).
+- `ActionId` is **printable ASCII only**, ≤ 30 characters, with no `':'` separator and no ASCII control characters (see `AgentQuestion.QuestionId` constraints above and §11). The ASCII rule pins UTF-8 byte count == character count so the wire budget is deterministic; the `':'` exclusion keeps the `QuestionId:ActionId` parse unambiguous; the control-character exclusion blocks invisible payload corruption.
+- `Label` is constrained to **64 UTF-8 bytes** (Telegram's inline-button label budget — byte-oriented, not character-oriented). Multi-byte Unicode labels are admitted only up to this byte budget.
 
 #### AgentQuestionEnvelope (shared model — to be defined in planned `AgentSwarm.Messaging.Abstractions`)
 
@@ -288,22 +288,50 @@ This two-gap analysis avoids a pre-send placeholder record (no `Sending` state i
 | `ReceivedAt` | `DateTimeOffset` | UTC receipt time. |
 | `CorrelationId` | `string` | Trace ID. |
 
-#### AuditEntry / AuditLogEntry
+#### AuditEntry / AuditLogEntry / HumanResponseAuditEntry
 
-The abstraction-level entity is `AuditEntry` (defined in the planned `AgentSwarm.Messaging.Abstractions`, per implementation-plan.md Stage 1.3). The persistence-level entity is `AuditLogEntry` (defined in `AgentSwarm.Messaging.Persistence`, per implementation-plan.md Stage 5.3), which extends `AuditEntry` with `TenantId`, `Platform`, and database-specific columns. The `PersistentAuditLogger` maps from the abstraction `AuditEntry` to the persistence `AuditLogEntry` entity.
+The abstraction-level entities are **`AuditEntry`** (general-purpose) and **`HumanResponseAuditEntry`** (strongly-typed for the story brief's audit requirement on human responses), both defined in `AgentSwarm.Messaging.Abstractions` per implementation-plan.md Stage 1.3. The persistence-level entity is `AuditLogEntry` (defined in `AgentSwarm.Messaging.Persistence` per implementation-plan.md Stage 5.3), which extends the abstraction shapes with `TenantId`, `Platform`, and database-specific columns. The `PersistentAuditLogger` maps from each abstraction record to the persistence `AuditLogEntry` entity (and Stage 5.3 must persist **both** general entries via `LogAsync` and human-response entries via `LogHumanResponseAsync`, using a discriminator column or per-shape table to preserve the required-field guarantee end-to-end).
 
-**`AuditEntry` (Abstractions layer — implementation-plan.md Stage 1.3):**
+**Why two abstraction shapes?** The story brief mandates that human responses persist five mandatory fields (message id, user id, agent id, timestamp, correlation id). The general-purpose `AuditEntry` shape leaves `MessageId` and `AgentId` nullable because lifecycle events / unauthorized-rejection notes legitimately have no message or agent context. Forcing all audit writes through the nullable shape would let a buggy human-response code path silently drop one of those required fields. `HumanResponseAuditEntry` marks every story-mandated field `required` so the compiler rejects any human-response write that omits a mandatory field, and `IAuditLogger.LogHumanResponseAsync` is the only path that accepts it.
+
+**`AuditEntry` (Abstractions layer — implementation-plan.md Stage 1.3, general-purpose):**
 
 | Field | Type | Description |
 |---|---|---|
 | `EntryId` | `Guid` | Primary key (generated at creation). |
-| `MessageId` | `string` | Telegram `message_id` or internal ID. |
+| `MessageId` | `string?` | Telegram `message_id` or internal ID. **Nullable** for entries that are not message-scoped (e.g., scheduled lifecycle events). |
 | `UserId` | `string` | External user ID (e.g., Telegram user ID). |
-| `AgentId` | `string?` | Target or source agent. Null for commands that operate without an agent context (e.g., `/start`, `/ask` before work-item creation). |
+| `AgentId` | `string?` | Target or source agent. **Nullable** for commands without an agent context (e.g., `/start`, `/ask` before work-item creation). |
 | `Action` | `string` | Command or decision value. |
 | `Timestamp` | `DateTimeOffset` | UTC. |
-| `CorrelationId` | `string` | Trace ID. |
-| `Details` | `string` | Serialized additional context (JSON). |
+| `CorrelationId` | `string` | Trace ID — non-null, non-empty, non-whitespace (enforced via `CorrelationIdValidation`). |
+| `Details` | `string?` | Serialized additional context (JSON). |
+
+**`HumanResponseAuditEntry` (Abstractions layer — implementation-plan.md Stage 1.3, strongly-typed for story brief audit requirement):**
+
+| Field | Type | Description |
+|---|---|---|
+| `EntryId` | `Guid` | Primary key (generated at creation). |
+| `MessageId` | `string` (required) | Telegram `message_id` or callback-query id of the inbound human reply. **Mandatory** per story brief. |
+| `UserId` | `string` (required) | External messenger user id of the responder. **Mandatory** per story brief. |
+| `AgentId` | `string` (required) | Identifier of the agent whose question is being answered. **Mandatory** per story brief. |
+| `QuestionId` | `string` (required) | Identifier of the question being answered. |
+| `ActionValue` | `string` (required) | Canonical `HumanAction.Value` the operator selected (or `__timeout__` when timed-out). |
+| `Comment` | `string?` | Optional follow-up comment text from the operator (only set when the selected `HumanAction.RequiresComment == true`). |
+| `Timestamp` | `DateTimeOffset` (required) | UTC receipt time. **Mandatory** per story brief. |
+| `CorrelationId` | `string` (required) | Trace ID — non-null, non-empty, non-whitespace (enforced via `CorrelationIdValidation`). **Mandatory** per story brief. |
+
+**`IAuditLogger` interface (Abstractions layer — implementation-plan.md Stage 1.3):**
+
+```csharp
+public interface IAuditLogger
+{
+    Task LogAsync(AuditEntry entry, CancellationToken ct);
+    Task LogHumanResponseAsync(HumanResponseAuditEntry entry, CancellationToken ct);
+}
+```
+
+The two-overload surface is intentional: `LogAsync` handles general-purpose audit writes (lifecycle, command receipts, unauthorized-rejection notes), and `LogHumanResponseAsync` handles human responses where the story brief's required-field set must be enforced at compile time. Stage 5.3 persistence must implement **both** methods.
 
 **`AuditLogEntry` (Persistence layer — implementation-plan.md Stage 5.3):**
 
@@ -312,15 +340,19 @@ The persistence entity maps from `AuditEntry` and adds deployment-context column
 | Field | Type | Description |
 |---|---|---|
 | `Id` | `Guid` | Primary key (mapped from `AuditEntry.EntryId`). |
-| `MessageId` | `string` | From `AuditEntry.MessageId`. |
-| `ExternalUserId` | `string` | From `AuditEntry.UserId`. Named `ExternalUserId` in the persistence schema to distinguish from internal identity. |
-| `AgentId` | `string?` | From `AuditEntry.AgentId` (null when no agent context). |
-| `Action` | `string` | From `AuditEntry.Action`. |
-| `Timestamp` | `DateTimeOffset` | From `AuditEntry.Timestamp`. |
-| `CorrelationId` | `string` | From `AuditEntry.CorrelationId`. |
+| `MessageId` | `string?` | From `AuditEntry.MessageId` (nullable for general entries; **non-null** for entries mapped from `HumanResponseAuditEntry`). |
+| `ExternalUserId` | `string` | From `AuditEntry.UserId` / `HumanResponseAuditEntry.UserId`. Named `ExternalUserId` in the persistence schema to distinguish from internal identity. |
+| `AgentId` | `string?` | From `AuditEntry.AgentId` (nullable); **non-null** for entries mapped from `HumanResponseAuditEntry`. |
+| `QuestionId` | `string?` | Set from `HumanResponseAuditEntry.QuestionId`; null for general `AuditEntry` writes. |
+| `ActionValue` | `string?` | Set from `HumanResponseAuditEntry.ActionValue`; null for general `AuditEntry` writes. |
+| `Comment` | `string?` | Set from `HumanResponseAuditEntry.Comment`; null for general `AuditEntry` writes. |
+| `Action` | `string?` | From `AuditEntry.Action`; null for entries mapped from `HumanResponseAuditEntry` (the canonical action is `ActionValue`). |
+| `Timestamp` | `DateTimeOffset` | From the source record's `Timestamp`. |
+| `CorrelationId` | `string` | From the source record's `CorrelationId`. |
 | `TenantId` | `string` | Operator's tenant (derived from `OperatorBinding` at mapping time). |
-| `Details` | `string` | From `AuditEntry.Details` (JSON). |
+| `Details` | `string?` | From `AuditEntry.Details` (JSON); null for human responses (the structured fields above replace it). |
 | `Platform` | `string` | Always `"Telegram"` for this connector. |
+| `EntryKind` | `string` | Discriminator: `"general"` for `AuditEntry`, `"human-response"` for `HumanResponseAuditEntry` — preserves the required-field shape so a downstream replay can re-hydrate the correct abstraction record. |
 
 #### TaskOversight
 
@@ -466,7 +498,7 @@ The `/start` handler constructs an `OperatorRegistration` from the Telegram `Upd
 
 > **Cross-doc canonical status (IOperatorRegistry).** This document (§4.3) is the **canonical source** for the `IOperatorRegistry` interface contract. The contract has **six** methods: `GetBindingsAsync`, `GetAllBindingsAsync`, `GetByAliasAsync`, `GetByWorkspaceAsync`, `RegisterAsync`, and `IsAuthorizedAsync`. All signatures are specified above in the code block. Implementation-plan.md Stage 2.7 alert fallback routing (line 242) calls `IOperatorRegistry.GetByWorkspaceAsync(event.WorkspaceId)` to resolve the workspace-default operator when no `TaskOversight` record exists. Implementation-plan.md Stage 1.3 defines all six methods with matching signatures — including `GetByWorkspaceAsync(string workspaceId, CancellationToken)` returning `IReadOnlyList<OperatorBinding>` — and Stage 3.4 `PersistentOperatorRegistry` implements it by querying active `OperatorBinding` rows filtered by `WorkspaceId`.
 
-### 4.4 IOutboundQueue (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
+### 4.4 IOutboundQueue (defined in `AgentSwarm.Messaging.Abstractions`)
 
 ```csharp
 public interface IOutboundQueue
@@ -478,6 +510,10 @@ public interface IOutboundQueue
     Task DeadLetterAsync(Guid messageId, CancellationToken ct);
 }
 ```
+
+> **Layering note.** Both `IOutboundQueue` and `OutboundMessage` live in `AgentSwarm.Messaging.Abstractions` (per the Stage 1.4 brief). `OutboundMessage` was relocated from `Core` to `Abstractions` during Stage 1.4 implementation so the interface placement could be honored without forcing an `Abstractions → Core` project reference (which the established layering rule forbids). The record's only non-primitive dependencies (`MessageSeverity`, `CorrelationIdValidation`, `AgentQuestionEnvelope`) are all already in Abstractions, so the relocation introduces no new cross-assembly references.
+
+`DequeueAsync` returns the highest-severity (`Critical > High > Normal > Low`) pending message, oldest-first within a severity, and returns `null` when the queue has no pending work. The `messageId` parameter on `MarkSentAsync` / `MarkFailedAsync` / `DeadLetterAsync` corresponds to `OutboundMessage.MessageId`; `telegramMessageId` is `long` per §3.1's canonical-type convention for Telegram identifiers.
 
 ### 4.5 IAuditLogger
 
@@ -563,12 +599,42 @@ Provides fast in-pipeline deduplication as a supplementary layer above `IInbound
 ```csharp
 public interface IDeduplicationService
 {
+    /// <summary>
+    /// Atomically claims the event id. Returns <c>true</c> on the first
+    /// caller in a concurrent race and <c>false</c> for every subsequent
+    /// caller. This is the single gate against concurrent webhook
+    /// duplicates — there is no time window between "check" and "act"
+    /// during which two pods can both proceed.
+    /// </summary>
+    Task<bool> TryReserveAsync(string eventId, CancellationToken ct);
+
+    /// <summary>
+    /// Read-only check used by replay tooling and tests. NOT safe to use
+    /// as a deduplication gate under concurrency: the check-then-act
+    /// pattern <c>if (!IsProcessedAsync) MarkProcessedAsync()</c> permits
+    /// two concurrent callers to both clear the check. Use
+    /// <see cref="TryReserveAsync"/> for the concurrent path.
+    /// </summary>
     Task<bool> IsProcessedAsync(string eventId, CancellationToken ct);
+
+    /// <summary>
+    /// Writes the post-handler "fully processed" marker, distinct from
+    /// the reservation written by <see cref="TryReserveAsync"/>. A crash
+    /// between <c>TryReserveAsync</c> and <c>MarkProcessedAsync</c>
+    /// leaves the event eligible for reconciliation by the webhook
+    /// recovery sweep (§5.4); see also implementation-plan Stage 2.4.
+    /// </summary>
     Task MarkProcessedAsync(string eventId, CancellationToken ct);
 }
 ```
 
 Backed by a sliding-window cache (e.g., `IDistributedCache`) with a configurable TTL (default 1 hour, per implementation-plan Stage 4.3). This provides fast in-pipeline deduplication for the `TelegramUpdatePipeline` processing path without a database query. The `IInboundUpdateStore` (§4.8) remains the canonical deduplication mechanism; this service is an acceleration layer. Both layers must agree an event is new before it is processed.
+
+Behavioral contract for which method satisfies which guarantee:
+
+- **Concurrent-duplicate suppression** (two webhook deliveries of the same `update_id` racing across two pods): served by `TryReserveAsync`. The atomic claim — typically a SETNX-style write or `INSERT … ON CONFLICT DO NOTHING` — awards exactly one caller and short-circuits all others, with no time window between check and write.
+- **Post-handler "fully processed" marker** (used for replay tooling, observability, and the second layer of the §10.x dedup ladder): written by `MarkProcessedAsync` only after the handler succeeds. This is intentionally separate from the reservation so a crash between reservation and marker can be reconciled by the webhook recovery sweep (§5.4) reading the unprocessed `InboundUpdate` rows.
+- **Read-only probe** (replay scripts, integration tests, dashboards): `IsProcessedAsync`. It must **not** be composed with `MarkProcessedAsync` as a check-then-act deduplication gate — under concurrent delivery the two pods both see "not processed" and both run the handler.
 
 ### 4.10 ITaskOversightRepository (to be defined in planned `AgentSwarm.Messaging.Core`)
 
@@ -585,9 +651,11 @@ public interface ITaskOversightRepository
 
 `GetByTaskIdAsync` returns the current oversight assignment for routing agent questions and alerts to the responsible operator. `UpsertAsync` creates or updates an oversight record binding a task to an operator — used for both initial assignment and `/handoff` reassignment (upsert semantics replace `AssignAsync`/`ReassignAsync` with a single idempotent operation). `GetByOperatorAsync` returns all tasks overseen by a given operator (used by `/status` to show operator-scoped task lists). This interface aligns with implementation-plan.md Stage 1.3 which defines the same three methods. The concrete `PersistentTaskOversightRepository` (implementation-plan Stage 3.2) stores `TaskOversight` entities via EF Core.
 
-### 4.11 IUserAuthorizationService (to be defined in planned `AgentSwarm.Messaging.Abstractions`)
+### 4.11 IUserAuthorizationService (to be defined in planned `AgentSwarm.Messaging.Core`)
 
 Performs two-tier authorization for inbound Telegram commands. Referenced by `TelegramUpdateRouter` (§2.2) and `ITelegramUpdatePipeline.ProcessAsync` (§5.1). The interface contract is defined here; the concrete `TelegramUserAuthorizationService` implementation is specified in implementation-plan.md Stage 4.3.
+
+> **Layering note.** `IUserAuthorizationService` and its companion `AuthorizationResult` record live in `AgentSwarm.Messaging.Core` (not `Abstractions`) because `AuthorizationResult.Bindings` is `IReadOnlyList<OperatorBinding>` and `OperatorBinding` is a Core domain type. `Abstractions` may not reference `Core`, so the authorization port is co-located with `OperatorBinding` in `Core`. Implementation-plan.md Stage 1.3 (lines 68–69) and the implemented files at `src/AgentSwarm.Messaging.Core/IUserAuthorizationService.cs` / `src/AgentSwarm.Messaging.Core/AuthorizationResult.cs` reflect this same split.
 
 ```csharp
 public interface IUserAuthorizationService
@@ -893,11 +961,13 @@ AgentSwarm.Messaging.sln  (to be created)
 │   │                                            MessengerMessage, MessengerEvent,
 │   │                                            AgentQuestionEnvelope,
 │   │                                            ISwarmCommandBus, IAuditLogger (interface),
+│   │                                            IAlertService,
 │   │                                            IUserAuthorizationService,
 │   │                                            AuditEntry, ITelegramUpdatePipeline,
 │   │                                            PipelineResult, IDeduplicationService,
 │   │                                            IPendingQuestionStore, PendingQuestion,
-│   │                                            IOutboundQueue
+│   │                                            IOutboundQueue, OutboundMessage,
+│   │                                            OutboundSourceType, OutboundMessageStatus
 │   │
 │   ├── AgentSwarm.Messaging.Core← IOperatorRegistry,
 │   │                                            IMessageSender, SendResult,
@@ -1182,7 +1252,7 @@ Under a burst of 1 000+ simultaneous agent events:
 | **`update_id` as the deduplication key** | Telegram guarantees `update_id` is unique and monotonically increasing per bot. Using it directly avoids the cost of hashing message content. |
 | **Webhook secret token validation** | Telegram supports a `secret_token` parameter on `setWebhook` (added in Bot API 6.0). This is cheaper and simpler than IP-allowlisting Telegram's data-center ranges. |
 | **Single `ITelegramUpdatePipeline`** | Forces webhook and polling modes through identical logic, eliminating a class of "works in dev, breaks in prod" bugs. |
-| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Encodes `QuestionId:ActionId` directly in `callback_data` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both IDs are constrained to ≤ 30 characters — anchored in the data model: `AgentQuestion.QuestionId` (§3.1, constraints) and `HumanAction.ActionId` (§3.1, `HumanAction` definition) — keeping the combined payload within Telegram's 64-byte `callback_data` limit (max 61 bytes including the `:` separator). The full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, written at inline-keyboard build time with expiry at `AgentQuestion.ExpiresAt + 5 minutes` (the 5-minute grace window ensures `CallbackQueryHandler` can still resolve the cached `HumanAction` for late button taps near the `ExpiresAt` boundary — aligned with implementation-plan.md Stage 2.3 and tech-spec D-3). On cache miss, the handler falls back to deserializing `PendingQuestionRecord.AgentQuestion` JSON (see §5.2 invariant 3). The cache serves interactive button callbacks (which occur before or near `ExpiresAt`); the `QuestionTimeoutService` does not depend on the cache — it uses `DefaultActionValue` (the resolved `HumanAction.Value`) from `PendingQuestionRecord` (see §10.3). On callback, the handler parses the key, resolves the full `HumanAction` from cache or durable fallback, and reads `HumanAction.Value` to populate `HumanDecisionEvent.ActionValue`. |
+| **Inline keyboard `callback_data` format: `QuestionId:ActionId`** | Encodes `QuestionId:ActionId` directly in `callback_data` (aligned with tech-spec D-3 and implementation-plan Stages 2.3/3.3). Both IDs are constrained to **printable ASCII only**, ≤ 30 characters, with no `':'` (the separator) and no ASCII control characters — anchored in the data model: `AgentQuestion.QuestionId` (§3.1, constraints) and `HumanAction.ActionId` (§3.1, `HumanAction` definition). ASCII enforcement guarantees the wire UTF-8 byte count equals the character count, so the joined payload is provably ≤ 61 bytes (30 + 1 + 30) within Telegram's 64-byte `callback_data` limit; rejecting embedded `':'` keeps the parse unambiguous; rejecting control characters blocks invisible payload corruption. The full `HumanAction` payload is stored server-side in `IDistributedCache` keyed by `QuestionId:ActionId`, written at inline-keyboard build time with expiry at `AgentQuestion.ExpiresAt + 5 minutes` (the 5-minute grace window ensures `CallbackQueryHandler` can still resolve the cached `HumanAction` for late button taps near the `ExpiresAt` boundary — aligned with implementation-plan.md Stage 2.3 and tech-spec D-3). On cache miss, the handler falls back to deserializing `PendingQuestionRecord.AgentQuestion` JSON (see §5.2 invariant 3). The cache serves interactive button callbacks (which occur before or near `ExpiresAt`); the `QuestionTimeoutService` does not depend on the cache — it uses `DefaultActionValue` (the resolved `HumanAction.Value`) from `PendingQuestionRecord` (see §10.3). On callback, the handler parses the key, resolves the full `HumanAction` from cache or durable fallback, and reads `HumanAction.Value` to populate `HumanDecisionEvent.ActionValue`. |
 
 ### 11.1 Formal Decision Records (Operator-Directed)
 
@@ -1252,7 +1322,7 @@ _None — all items resolved as of iteration 20._
 
 9. **`IPendingQuestionStore` interface surface — RESOLVED (iteration 10).** Implementation-plan.md Stage 1.3 now includes all eight methods from architecture.md §4.7: `StoreAsync`, `GetAsync`, `GetByTelegramMessageAsync`, `MarkAnsweredAsync`, `MarkAwaitingCommentAsync`, `RecordSelectionAsync`, `GetAwaitingCommentAsync`, and `GetExpiredAsync`.
 
-10. **`IOutboundQueue` assembly placement — RESOLVED (iteration 10).** Both architecture.md (§4.4, §6 assembly map) and implementation-plan.md (Stage 1.4) now place `IOutboundQueue` in `AgentSwarm.Messaging.Abstractions`.
+10. **`IOutboundQueue` assembly placement — RESOLVED (Stage 1.4 implementation).** Architecture.md (§4.4 + §6 assembly map) and implementation-plan.md (Stage 1.4) place `IOutboundQueue` in `AgentSwarm.Messaging.Abstractions` per the Stage 1.4 brief. To avoid a forbidden `Abstractions → Core` project reference (every method on `IOutboundQueue` names `OutboundMessage`), `OutboundMessage` and its companion enums (`OutboundSourceType`, `OutboundMessageStatus`) were relocated from `Core` to `Abstractions` during Stage 1.4 — the record's only dependencies (`MessageSeverity`, `CorrelationIdValidation`, `AgentQuestionEnvelope`) are already in Abstractions, so the relocation introduces no new cross-assembly references. `TaskOversight` and `ITaskOversightRepository` continue to live in `Core` because `OperatorBinding` is a Core type.
 
 11. **`IMessageSender` return type — RESOLVED (iteration 13).** Implementation-plan.md Stage 1.4 and Stage 2.3 now specify `Task<SendResult>` return types for both `SendTextAsync` and `SendQuestionAsync`, with `SendResult` carrying `TelegramMessageId` (long) — matching the canonical contract in architecture.md §4.12. The rendering boundary is explicit: `TelegramMessageSender` is the sole owner of question rendering; non-question rendering (`Alert`, `StatusUpdate`, `CommandAck`) is performed by `TelegramMessengerConnector` at enqueue time.
 
