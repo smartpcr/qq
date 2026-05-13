@@ -36,8 +36,9 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 ┌─────────────────────────────────────────────────────────────────────┐
 │  2.3  TeamsBotAdapter                                               │
 │  Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter         │
-│  Middleware: TelemetryMiddleware → ActivityDeduplicationMiddleware → │
-│  RateLimitMiddleware (3 Bot Framework stages)                       │
+│  Middleware: TelemetryMiddleware → ActivityDeduplicationMiddleware   │
+│  (2 Bot Framework stages; RateLimitMiddleware runs upstream as      │
+│  ASP.NET Core HTTP middleware before CloudAdapter — see §5.1)       │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
@@ -100,7 +101,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Type** | `CloudAdapter` (from `Microsoft.Bot.Builder.Integration.AspNet.Core`) |
-| **Middleware** | `TelemetryMiddleware` → `ActivityDeduplicationMiddleware` → `RateLimitMiddleware` (3 Bot Framework `IMiddleware` stages; `TenantValidationMiddleware` runs upstream as ASP.NET Core HTTP middleware before `CloudAdapter` — see §5.1) |
+| **Middleware** | `TelemetryMiddleware` → `ActivityDeduplicationMiddleware` (2 Bot Framework `IMiddleware` stages). `TenantValidationMiddleware` and `RateLimitMiddleware` both run upstream as ASP.NET Core HTTP middleware before `CloudAdapter` — see §5.1. The full inbound pipeline is: `TenantValidationMiddleware` (HTTP, 403) → `RateLimitMiddleware` (HTTP, 429) → `CloudAdapter.ProcessAsync` → `TelemetryMiddleware` → `ActivityDeduplicationMiddleware` → handler. |
 | **Responsibility** | Deserialize Bot Framework `Activity` objects, run middleware pipeline, route to `TeamsSwarmActivityHandler`. Handles authentication of inbound requests via Bot Framework JWT validation. |
 | **Error handling** | `OnTurnError` logs the exception, sends a user-facing error card, and publishes a dead-letter event to the outbox. |
 
@@ -230,7 +231,7 @@ The orchestrator is outside the scope of this story. It produces `AgentQuestion`
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Middleware` |
 | **Type** | Bot Framework middleware (`IMiddleware`) |
-| **Position in pipeline** | After `TelemetryMiddleware`, before `RateLimitMiddleware` in the Bot Framework `IMiddleware` pipeline (see §2.3). Note: `TenantValidationMiddleware` runs upstream as ASP.NET Core HTTP middleware before `CloudAdapter` — it is not in this pipeline. |
+| **Position in pipeline** | After `TelemetryMiddleware` in the Bot Framework `IMiddleware` pipeline; this is the last Bot Framework middleware before the handler (see §2.3). Note: both `TenantValidationMiddleware` and `RateLimitMiddleware` run upstream as ASP.NET Core HTTP middleware before `CloudAdapter` — they are not in this pipeline. |
 | **Responsibility** | Suppress duplicate inbound webhook deliveries. Teams and the Bot Connector service may retry an HTTP POST if the initial response times out, resulting in the same logical activity being delivered more than once. This middleware deduplicates by `Activity.Id` (or `Activity.ReplyToId` for invoke activities) per `tech-spec.md` §4.4 and `e2e-scenarios.md` §Reliability lines 447–454 (duplicate inbound webhook suppression scenario). |
 | **Store** | `IActivityIdStore` — a lightweight store that tracks recently-seen activity IDs with a configurable TTL (default: 10 minutes, aligned with `implementation-plan.md` §2.1 `ActivityDeduplicationMiddleware` default TTL). The **default implementation is an in-memory `ConcurrentDictionary`** with a background eviction timer — suitable for single-instance deployments. For multi-instance deployments, a **Redis-backed implementation** (`RedisActivityIdStore`) is required to ensure deduplication is consistent across pods. When an `Activity.Id` has already been processed, the middleware short-circuits with HTTP 200 and logs a deduplication event for observability. |
 | **Distinction from §2.6 idempotency** | This middleware operates at the **transport level** on raw `Activity.Id`, catching retried HTTP POSTs before any handler runs. The `CardActionHandler` idempotency set (§2.6) operates at the **domain level** on `(QuestionId, UserId)`, catching semantically duplicate card actions that may arrive as distinct activities. Both layers are necessary. |
