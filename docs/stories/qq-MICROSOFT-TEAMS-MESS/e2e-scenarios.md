@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.46
+**Version:** 1.47
 
 ---
 
@@ -247,12 +247,29 @@ Feature: Adaptive Card Approvals
     And no HumanDecisionEvent is created
     And the card is updated to show "Expired"
 
-  Scenario: Duplicate Adaptive Card action submission
+  Scenario: Duplicate Adaptive Card action — transport retry (identical Activity.Id)
     Given user "alice@contoso.com" already submitted "Approve" for question "Q-601"
-    When user "alice@contoso.com" clicks "Approve" again (e.g., network retry)
-    Then the duplicate submission is suppressed by idempotency checks
+    And the Bot Framework delivers the invoke activity twice with the same Activity.Id (network/transport retry)
+    When the first delivery passes through ActivityDeduplicationMiddleware
+    Then ActivityDeduplicationMiddleware records the Activity.Id in IActivityIdStore
+    And the invoke activity reaches CardActionHandler and creates a HumanDecisionEvent
+    When the second delivery arrives with the same Activity.Id
+    Then ActivityDeduplicationMiddleware detects the duplicate via IActivityIdStore lookup
+    And the middleware short-circuits the request with HTTP 200 before any handler runs
     And no duplicate HumanDecisionEvent is created
-    And the bot responds with the previously recorded decision
+    And a deduplication event is logged for observability
+
+  Scenario: Duplicate Adaptive Card action — domain double-tap (distinct Activity.Id)
+    Given user "alice@contoso.com" clicks "Approve" twice rapidly for question "Q-601"
+    And each click generates a distinct Activity.Id (not a transport retry)
+    When both activities pass through ActivityDeduplicationMiddleware (distinct IDs — not suppressed)
+    And both reach CardActionHandler
+    Then the first activity transitions Q-601 from Status "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync and creates a HumanDecisionEvent
+    And the second activity calls TryUpdateStatusAsync("Q-601", "Open", "Resolved") which returns false because Status is already "Resolved" (first-writer-wins compare-and-set)
+    And CardActionHandler rejects the second activity as a domain-level duplicate
+    And no second HumanDecisionEvent is created
+    And the bot responds to the second click with the previously recorded decision ("You already approved this question.")
+    And the domain-level duplicate is logged for observability
 
   Scenario: User approves via text command in personal chat (single pending question in conversation)
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-701"
@@ -590,12 +607,16 @@ Feature: Security — Tenant and User Validation
   Scenario: Bot Framework token validation rejects forged activity
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
     And the Authorization header contains an invalid JWT token
-    When the Bot Framework authentication middleware processes the request
-    Then the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline
-    And no application code, middleware (including TenantValidationMiddleware), or bot handler runs
+    When the ASP.NET Core request pipeline processes the request
+    Then TenantValidationMiddleware (ASP.NET Core HTTP middleware, runs before CloudAdapter per implementation-plan.md §2.1 line 79) executes first and reads the raw request body to extract the tenant ID
+    And if the tenant ID is not in AllowedTenantIds, TenantValidationMiddleware short-circuits with HTTP 403 before CloudAdapter runs (forged activity rejected at tenant layer)
+    And if the tenant ID happens to be in AllowedTenantIds, TenantValidationMiddleware passes the request to the next middleware
+    And CloudAdapter.ProcessAsync then validates the JWT token via the Bot Framework authentication pipeline
+    And the request is rejected with HTTP 401 by the Bot Framework CloudAdapter authentication pipeline (per tech-spec §4.2 Rejection Behavior Matrix, row "Invalid Bot Framework JWT")
+    And no Bot Framework middleware (TelemetryMiddleware, ActivityDeduplicationMiddleware, RateLimitMiddleware), bot handler, or CommandDispatcher runs — rejection occurs in the CloudAdapter authentication layer which executes after TenantValidationMiddleware but before the Bot Framework IMiddleware pipeline
     And no MessengerEvent is created
-    And no audit entry is emitted because the request never reaches application-level code — rejection occurs in the Bot Framework SDK authentication layer before any bot handler or custom middleware executes (per tech-spec §4.2 Rejection Behavior Matrix, row "Invalid Bot Framework JWT")
-    And the HTTP 401 response is logged by the hosting infrastructure (ASP.NET Core request pipeline) but not by IAuditLogger
+    And no audit entry is emitted by IAuditLogger — the TenantValidationMiddleware logs a structured warning via ILogger for operational visibility but does not call IAuditLogger (per implementation-plan.md §2.1 line 79: formal IAuditLogger integration is added in Stage 5.1)
+    And the HTTP 401 (or 403 if tenant-rejected) response is logged by the hosting infrastructure (ASP.NET Core request pipeline)
 
   Scenario: Multi-tenant isolation — one tenant cannot see another's data
     Given user "alice@contoso.com" in tenant "contoso-tenant-id" has active tasks

@@ -111,10 +111,10 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `OnTurnAsync` to add `CorrelationId` (from activity or new GUID) to the turn context for distributed tracing.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
 
 ### Test Scenarios
-- [ ] Scenario: Command routing— Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
+- [ ] Scenario: Command routing—Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
 - [ ] Scenario: Bot install captures reference — Given a `MembersAdded` activity where the bot is added, When processed, Then the conversation reference is persisted via `IConversationReferenceStore.SaveOrUpdateAsync`.
 - [ ] Scenario: Correlation ID propagation — Given an incoming activity without a `CorrelationId` header, When `OnTurnAsync` runs, Then a new GUID-based `CorrelationId` is attached to the turn context.
 - [ ] Scenario: First interaction saves reference after auth — Given user `dave@contoso.com` has never interacted with the bot before and is identity-resolved and authorized, When `dave` sends `agent status` in personal chat, Then `OnMessageActivityAsync` extracts the conversation reference from the activity and calls `IConversationReferenceStore.SaveOrUpdateAsync`, persisting the reference keyed by `(AadObjectId, TenantId)` with `InternalUserId` populated from identity resolution, after confirming authorization.
@@ -148,10 +148,10 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create `manifest.zip` packaging script that bundles `manifest.json`, `color.png` (192×192), and `outline.png` (32×32) icons for sideloading or admin deployment.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
 
 ### Test Scenarios
-- [ ] Scenario: Manifest schema validation— Given the generated `manifest.json`, When validated against the Teams manifest schema v1.16, Then no schema errors are reported.
+- [ ] Scenario: Manifest schema validation—Given the generated `manifest.json`, When validated against the Teams manifest schema v1.16, Then no schema errors are reported.
 - [ ] Scenario: Required scopes present — Given the manifest, When the `bots[0].scopes` field is inspected, Then it contains both `personal` and `team`.
 - [ ] Scenario: Message extension entry present — Given the manifest, When the `composeExtensions` field is inspected, Then it contains at least one action command entry with all required fields (`id`, `title`, `description`, `type: "action"`, `fetchTask: false`).
 
