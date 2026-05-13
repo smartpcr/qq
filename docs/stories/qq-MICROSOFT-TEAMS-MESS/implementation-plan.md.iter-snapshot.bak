@@ -111,7 +111,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `OnTurnAsync` to add `CorrelationId` (from activity or new GUID) to the turn context for distributed tracing.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
 
 ### Test Scenarios
 - [ ] Scenario: Command routing—Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.

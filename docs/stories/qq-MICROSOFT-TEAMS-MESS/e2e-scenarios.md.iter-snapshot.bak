@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.49
+**Version:** 1.48
 
 ---
 
@@ -706,13 +706,10 @@ Feature: Reliability — Retry and Recovery
     And each click generates a distinct Activity.Id (not a transport retry)
     When both activities pass through ActivityDeduplicationMiddleware (distinct IDs — not suppressed)
     And both reach CardActionHandler
-    Then the first activity calls IAgentQuestionStore.TryUpdateStatusAsync("Q-801", "Open", "Resolved", ct) which returns true (first-writer-wins compare-and-set)
-    And CardActionHandler creates a HumanDecisionEvent for (QuestionId=Q-801, UserId=alice)
-    And CardActionHandler records the (QuestionId, UserId) pair in its in-memory processed-action set as a fast-path optimization
-    And the second activity's in-memory processed-action set check may short-circuit early (fast path), but even if it does not, TryUpdateStatusAsync("Q-801", "Open", "Resolved", ct) returns false because Status is already "Resolved"
-    And CardActionHandler rejects the second activity as a domain-level duplicate
+    Then the first activity creates a HumanDecisionEvent for (QuestionId=Q-801, UserId=alice)
+    And CardActionHandler records the (QuestionId, UserId) pair in its processed-action set
+    And the second activity is rejected as a domain-level duplicate by the (QuestionId, UserId) check
     And no second HumanDecisionEvent is created
-    And the bot responds to the second click with the previously recorded decision ("You already approved this question.")
     And the domain-level duplicate is logged for observability
 
   Scenario: Inbound queue preserves ordering per conversation
