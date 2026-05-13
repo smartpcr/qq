@@ -1277,7 +1277,7 @@ These notes document how this document resolved known signature differences betw
 
 1. **Removed the open-questions block** — all three questions have been resolved with sound rationale (see Resolved Design Decisions below). This removes the hard gate that held the verdict at "iterate."
 
-2. **Fixed the remaining brittle line-number citation** at the concurrent-approval comment (previously `§AgentQuestion field table lines 289-290` → now `§AgentQuestion field table`).
+2. **Fixed the remaining brittle line-number citation** at the concurrent-approval comment (replaced with section-only reference `§AgentQuestion field table`).
 
 3. **Rewrote the Iteration Summary** to eliminate self-referential occurrences of the phrase that the prior verification grep was meant to check, and to provide a clean verification block using literal `grep -F`.
 
@@ -1301,7 +1301,7 @@ Iteration 51 feedback:
   $ grep -nF "lines 289" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
   (empty)
   ```
-  Note: `architecture.md` still contains line-number citations (e.g., `§2.1 lines 34, 88`, `§1.2 line 35`, `§3.1 line 154`, `§4.3 line 139`, etc.). Those are owned by the sibling architecture architect and are outside this document's edit scope. Noted as a cross-doc inconsistency for the architecture architect's next iteration.
+  Note: `architecture.md` still contains brittle line-number citations in its cross-doc references. Those are owned by the sibling architecture architect and are outside this document's edit scope. Noted as a cross-doc inconsistency for the architecture architect's next iteration.
 
 ### Resolved Design Decisions
 
@@ -1319,4 +1319,4 @@ This document covers all story acceptance criteria: personal chat, channel menti
 
 ### Cross-document inconsistency (for sibling architects)
 
-`architecture.md` contains multiple brittle line-number citations referencing `tech-spec.md`, `implementation-plan.md`, and `e2e-scenarios.md` with specific line numbers (e.g., `§2.1 lines 34, 88`, `§6.1 line 235`, `§1.2 line 35`, `§3.1 line 154`, `§4.3 line 139`, `§3.3 line 193`, `§1.2 line 41`, `§1.1 line 16`, `§1.1 line 19`, `§5.1 line 287`, `§4.3 line 130`, `§4.3 line 144`, `§1.2 line 38`). These will drift as documents evolve. The architecture architect should replace them with section-only references in their next iteration.
+`architecture.md` contains multiple brittle line-number citations in its cross-doc references to `tech-spec.md`, `implementation-plan.md`, and `e2e-scenarios.md`. These will drift as documents evolve. The architecture architect should replace them with section-only references in their next iteration.
