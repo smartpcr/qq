@@ -984,19 +984,19 @@ This scenario covers three distinct rejection paths per `tech-spec.md` §4.2 rej
 #### 6.4.1 Unauthorized tenant
 
 ```text
-Attacker (Teams)    TeamsWebhookController    TeamsBotAdapter    TenantValidationMiddleware    AuditLogger
-     │                     │                       │                       │                       │
-     │── message ─────────>│                       │                       │                       │
-     │                     │── POST /api/messages─>│                       │                       │
-     │                     │                       │── check tenant ──────>│                       │
-     │                     │                       │                       │── tenant NOT in list   │
-     │                     │                       │                       │── log rejection ──────>│
-     │                     │                       │<── 403 Forbidden ─────│                       │
-     │<── (no response) ───│<──────────────────────│                       │                       │
+Attacker (Teams)    TenantValidationMiddleware    TeamsWebhookController    TeamsBotAdapter    AuditLogger
+     │                       │                           │                       │                │
+     │── HTTP POST ─────────>│                           │                       │                │
+     │                       │── extract tenant ID       │                       │                │
+     │                       │── tenant NOT in list      │                       │                │
+     │                       │── log rejection ──────────│───────────────────────>│                │
+     │                       │                           │                       │         (audit logged)
+     │<── 403 Forbidden ─────│                           │                       │                │
+     │   (pipeline short-circuited — request never reaches controller or adapter)│                │
 ```
 
 1. Activity arrives from an unrecognized tenant.
-2. `TenantValidationMiddleware` extracts the tenant ID and checks the allowlist.
+2. `TenantValidationMiddleware` (ASP.NET Core HTTP middleware, runs before `CloudAdapter`) extracts the tenant ID and checks the allowlist.
 3. Tenant is not found — middleware short-circuits, logs a `SecurityRejection` audit entry (`EventType: SecurityRejection`, `Outcome: Rejected`), and returns HTTP 403.
 4. The user sees no bot response (Bot Framework does not surface 403 to the user; the message simply goes unprocessed).
 
