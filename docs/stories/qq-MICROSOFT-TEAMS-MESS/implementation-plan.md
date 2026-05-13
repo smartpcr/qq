@@ -459,24 +459,4 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Unauthorized tenant E2E — Given a user in an unauthorized tenant, When they send any command, Then the request is rejected with HTTP 403 at the middleware layer (no bot response or card is sent) and no command is processed.
 - [ ] Scenario: Restart resilience E2E — Given conversation references are persisted, When the bot service restarts, Then proactive notifications using stored references are delivered successfully.
 
-## Iteration Summary
 
-**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/implementation-plan.md` — ~130 KB.
-
-**Coverage:** All story requirements — Bot Framework SDK, personal chat, team channel, message actions, proactive messaging with conversation reference persistence, Adaptive Cards for approve/reject/escalate, command handling (agent ask, agent status, approve, reject, escalate, pause, resume), outbox retry, P95 < 3s delivery SLA, tenant/RBAC enforcement, immutable audit trail, OpenTelemetry observability, E2E acceptance tests.
-
-**Iteration 48 changes:**
-1. Stripped all 61 brittle sibling-doc line-number citations from the plan body, replacing each with its stable section-name-only anchor (§-refs preserved, numeric suffixes removed).
-2. Fixed cross-doc contradiction: updated the Teams-specific contracts row in the tech-spec §2.1 scope table to reference "Stage 2.1" as the canonical location for `IConversationReferenceStore`. Simplified the cross-doc alignment note in this plan's Stage 1.2.
-3. Removed the empty open-questions fenced block from the sibling architecture doc.
-4. Confirmed the sibling e2e-scenarios doc no longer contains self-referential grep verification blocks (cleaned in a prior sibling iteration).
-
-### Prior feedback resolution
-
-- [x] 1. FIXED — Removed the empty open-questions fenced block from the sibling architecture doc (previously at the file's end). The sibling e2e-scenarios doc was already clean. Verified with fixed-string grep across all four plan docs; zero hits remain for the fenced-block delimiter across the entire doc set.
-
-- [x] 2. FIXED — The sibling e2e-scenarios doc no longer contains self-referential verification blocks with quoted grep commands or stale numeric references. Those blocks were replaced by the sibling architect in a prior iteration. Verified with fixed-string grep for each previously-flagged term across the e2e-scenarios doc; zero hits.
-
-- [x] 3. FIXED — Updated the tech-spec §2.1 scope table (Teams-specific contracts row) to read "Stage 2.1 (ASP.NET Core Bot Host)" as the canonical location for the `IConversationReferenceStore` interface definition. The prior text incorrectly said "Stage 1.2." Updated the cross-doc alignment note in this plan's Stage 1.2 to confirm alignment rather than flag a stale pointer. The only remaining "Stage 1.2" mention in the tech-spec (at §4.4 Relationship note) correctly refers to `ConnectorOptions`, not `IConversationReferenceStore`.
-
-- [x] 4. FIXED — Replaced all 61 brittle sibling-doc line-number citations in the plan body with stable section-name-only anchors. Each `§X.Y` section ref is preserved; only the trailing numeric suffix (the fragile part) was stripped. Verified with a systematic regex scan: zero matches remain for the pattern `(sibling-doc).md ... line(s) NNN` anywhere in the plan body (excluding this summary block).
