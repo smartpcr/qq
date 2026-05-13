@@ -585,6 +585,7 @@ Feature: Compliance — Immutable Audit Trail
       | EventType         | ProactiveNotification     |
       | ActorId           | <agent ID>                |
       | ActorType         | Agent                     |
+      | AgentId           | <agent ID>                |
       | TenantId          | contoso-tenant-id         |
       | Action            | send_card                 |
       | TaskId            | <task ID for Q-1001>      |
@@ -599,6 +600,7 @@ Feature: Compliance — Immutable Audit Trail
       | EventType         | CardActionReceived |
       | ActorId           | <alice's AadObjectId> |
       | ActorType         | User               |
+      | AgentId           | <agent ID that owns Q-1001> |
       | TenantId          | contoso-tenant-id  |
       | Action            | approve            |
       | TaskId            | <task ID for Q-1001> |

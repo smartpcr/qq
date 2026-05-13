@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 21
+**Status:** Draft — iteration 22
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -845,6 +845,49 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmAc
 10. `TeamsMessengerConnector` publishes a `CommandEvent` (a `MessengerEvent` subtype with `EventType = AgentTaskRequest`) to the inbound buffer.
 11. The orchestrator consumes the event and dispatches work to agents.
 12. `AuditLogger` records the command with full correlation data.
+
+### 6.1.1 Scenario: User sends a command via team channel @mention
+
+This sequence covers the **team-channel command path** defined in `e2e-scenarios.md` lines 35–52. It differs from the personal-chat flow (§6.1) in two ways: (a) the bot must strip the `@mention` entity from the message text before parsing, and (b) the bot replies in a **thread under the original message** rather than inline.
+
+```text
+Human (Teams Channel)   TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivityHandler    CommandParser    IIdentityResolver    IUserAuthorizationService    ConvRefStore    TeamsMessengerConnector    Orchestrator
+     │                        │                       │                    │                     │                  │                      │                        │                    │                      │
+     │── @AgentBot agent ask  │                       │                    │                     │                  │                      │                        │                    │                      │
+     │   design persistence   │                       │                    │                     │                  │                      │                        │                    │                      │
+     │   layer ──────────────>│                       │                    │                     │                  │                      │                        │                    │                      │
+     │                        │── POST /api/messages─>│                    │                     │                  │                      │                        │                    │                      │
+     │                        │                       │── middleware ─────>│                     │                  │                      │                        │                    │                      │
+     │                        │                       │  (tenant ✓, rate)  │                     │                  │                      │                        │                    │                      │
+     │                        │                       │                    │── strip @mention ──>│                  │                      │                        │                    │                      │
+     │                        │                       │                    │   "agent ask design │                  │                      │                        │                    │                      │
+     │                        │                       │                    │    persistence layer"                  │                      │                        │                    │                      │
+     │                        │                       │                    │<── ParsedCommand ───│                  │                      │                        │                    │                      │
+     │                        │                       │                    │── resolve identity ───────────────────>│                      │                        │                    │                      │
+     │                        │                       │                    │<── UserIdentity ──────────────────────│                      │                        │                    │                      │
+     │                        │                       │                    │── check RBAC ──────────────────────────────────────────────>│                        │                    │                      │
+     │                        │                       │                    │<── authorized ─────────────────────────────────────────────│                        │                    │                      │
+     │                        │                       │                    │── save channel ref ──────────────────────────────────────────────────────────────────>│                    │                      │
+     │<── threaded reply ─────│<──────────────────────│<───────────────────│                     │                  │                      │                        │                    │                      │
+     │  "Task submitted"      │                       │                    │                     │                  │                      │                        │── CommandEvent ───>│                      │
+     │  (under original msg)  │                       │                    │                     │                  │                      │                        │  {AgentTaskRequest}│                      │
+     │                        │                       │                    │                     │                  │                      │                        │                    │                      │── audit log
+```
+
+1. User types `@AgentBot agent ask design persistence layer` in a team channel (e.g., `#ops-swarm`).
+2. Bot Framework delivers the activity to `POST /api/messages`. The `Activity.ChannelData` includes `teamsChannelId` and `teamsTeamId` identifying the channel context.
+3. `TeamsBotAdapter` runs middleware: tenant validation passes (using the user's tenant from the JWT), rate limit check passes.
+4. **@mention stripping:** `TeamsSwarmActivityHandler` detects the channel context (`Activity.Conversation.ConversationType == "channel"`) and calls `Activity.RemoveRecipientMention()` (Bot Framework SDK helper) to strip the `<at>AgentBot</at>` entity from `Activity.Text`, producing the clean command text `agent ask design persistence layer`.
+5. Handler delegates to `CommandParser` with the cleaned text. `CommandParser` recognizes the `agent ask` prefix, extracts the payload, and generates `CorrelationId`.
+6. Handler invokes `IIdentityResolver.ResolveAsync` with `Activity.From.AadObjectId` to map the user's Entra identity. If unmapped, diverts to §6.4.2.
+7. Handler invokes `IUserAuthorizationService.AuthorizeAsync` to check RBAC. If insufficient, diverts to §6.4.3.
+8. Handler saves/updates the channel-scoped `ConversationReference` via `IConversationReferenceStore.SaveOrUpdateAsync`. For channel messages, the reference key includes the `ChannelId` (not a personal user key), enabling proactive messages back to that channel thread.
+9. **Threaded reply:** The bot replies **in a thread under the original message** by setting `Activity.Conversation.Id` to `{channelConversationId};messageid={replyToId}` before calling `TurnContext.SendActivityAsync`. This creates a reply chain under the user's original `@mention` message, keeping the channel tidy per Teams threading conventions. The reply contains an acknowledgment Adaptive Card ("Task submitted — tracking ID: {CorrelationId}").
+10. `TeamsMessengerConnector` publishes a `CommandEvent` (`MessengerEvent` with `EventType = AgentTaskRequest`) to the inbound buffer.
+11. The orchestrator consumes the event and dispatches work to agents.
+12. `AuditLogger` records the command with full correlation data including `teamsChannelId`.
+
+> **Channel vs. personal chat differences:** In personal chat (§6.1), the bot replies inline. In a channel, the bot replies in a thread. The `CommandParser` and identity/RBAC pipeline are identical — the only differences are the @mention stripping step and the reply threading behavior. Proactive follow-up messages to the channel (e.g., agent questions) use `ContinueConversationAsync` with the channel conversation reference and explicitly set the reply thread to maintain context.
 
 ### 6.2 Scenario: Agent proactively sends a blocking question
 
