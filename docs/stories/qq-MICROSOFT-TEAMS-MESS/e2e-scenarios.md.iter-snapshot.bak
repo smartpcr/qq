@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.34
+**Version:** 1.33
 
 ---
 
@@ -285,7 +285,7 @@ Feature: Adaptive Card Approvals
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
 
-  Scenario: User sends bare approve with multiple pending questions — disambiguation card shown
+  Scenario: User sends bare approve with multiple pending questions — disambiguation via explicit questionId
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open")
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open")
     And both questions have ConversationId matching the current personal-chat conversation
@@ -293,37 +293,37 @@ Feature: Adaptive Card Approvals
     Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation
     # Note: GetMostRecentOpenByConversationAsync returns AgentQuestion? (single result or null)
     # per implementation-plan.md §1.2 line 42 and §3.2 line 184. It returns the most recently
-    # created open question ordered by CreatedAt descending and returns the first result or null.
-    # When the handler receives a non-null result, it ADDITIONALLY queries for a count of open
-    # questions in the conversation to detect ambiguity. Per implementation-plan.md §3.2 line 186:
-    # "if zero or more than one are found, the handler returns a disambiguation card."
-    And the handler detects more than one open question in this conversation
-    And the bot responds with a disambiguation Adaptive Card listing all open questions:
-      | QuestionId | Agent              | Summary                     |
-      | Q-801      | release-agent-01   | <question text for Q-801>   |
-      | Q-802      | planner-agent-02   | <question text for Q-802>   |
-    And NEITHER question's Status is changed — both remain "Open"
-    And no HumanDecisionEvent is created
-    And an immutable audit record is persisted with EventType "DisambiguationCardSent"
-    # Note: The disambiguation card includes an Action.Submit button per question row.
-    # Each button's data payload contains the explicit questionId, so clicking it
-    # sends "approve Q-801" or "approve Q-802" as a targeted approval command.
-    When user "alice@contoso.com" clicks the "Approve" button for Q-801 on the disambiguation card
-    Then the bot resolves question "Q-801" specifically via IAgentQuestionStore.GetByIdAsync("Q-801")
+    # created open question ordered by CreatedAt descending. When multiple open questions exist,
+    # it returns the MOST RECENT one — the handler cannot detect the ambiguity via this method alone.
+    # Therefore, bare approve resolves the most recent open question in the conversation.
+    And the most recently created open question in this conversation is returned (Q-802 if it was created after Q-801)
+    And CardActionHandler transitions the returned AgentQuestion Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
+    And a HumanDecisionEvent is created with ActionValue "approve" and the resolved QuestionId
+    And the other open question remains with Status "Open"
+    And an immutable audit record is persisted with EventType "CardActionReceived"
+    # Note: To approve a specific question when multiple are pending, the user
+    # sends "approve Q-801" with an explicit questionId argument. The handler
+    # calls IAgentQuestionStore.GetByIdAsync("Q-801") directly, bypassing the
+    # most-recent-open lookup. This is the recommended disambiguation path.
+    When user "alice@contoso.com" then sends "approve Q-801"
+    Then the bot resolves question "Q-801" specifically via GetByIdAsync
     And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (first-writer-wins)
     And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
-    And the other open question "Q-802" remains with Status "Open"
     And an immutable audit record is persisted with EventType "CardActionReceived"
-    # Cross-doc alignment: implementation-plan.md §3.2 line 186 defines the
-    # disambiguation contract: "if exactly one is found, it is used as the target;
-    # if zero or more than one are found, the handler returns a disambiguation card
-    # listing open questions in the conversation with their QuestionIds."
-    # architecture.md §2.5 (Supported commands table, lines 133-134) describes
-    # `approve` as acting on "the most recent pending approval in context" — when
-    # multiple questions are pending, the disambiguation card fulfills this by
-    # requiring explicit selection before any question is resolved.
-    # This also prevents the "Cross-Conversation Consent" attack because the
-    # lookup is scoped to the current conversationId, not the user globally.
+    # Note: This prevents the "Cross-Conversation Consent" attack because
+    # GetMostRecentOpenByConversationAsync is scoped to the current conversationId,
+    # not the user across conversations. A bare approve in personal chat cannot
+    # resolve a question pending in a channel or another conversation.
+    # (implementation-plan.md §3.2 lines 183-184), NOT to the user globally.
+    # Explicit disambiguation (or explicit QuestionId in the command)
+    # is required when more than one question is pending in the conversation.
+    #
+    # Cross-doc alignment: architecture.md §2.5 (Supported commands table, lines
+    # 133-134) describes `approve` as acting on "the most recent pending approval
+    # in context." That "context" is the current conversation (conversationId),
+    # not the user across all conversations. When multiple questions are pending
+    # in the same conversation, this scenario's disambiguation behavior takes
+    # precedence — the bot MUST NOT silently resolve "the most recent" question.
 
   Scenario: User rejects via text command when only one question is pending in conversation (auto-resolved without disambiguation)
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-803" (Status = "Open")
@@ -1132,4 +1132,4 @@ Feature: Edge Cases and Error Handling
 
 ## Document Scope
 
-**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle (install path and message path), bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates (modeled as separate AgentQuestion records per architecture §6.3.1), RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty messages).
+**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle (install path and message path), bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates (modeled as separate AgentQuestion records per architecture §6.3.1), RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty/long messages).
