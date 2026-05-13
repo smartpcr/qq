@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.17 — Iteration 17 (fix stale deferral, replace line citations with section anchors, add literal grep terms)
+**Version:** 1.17 — Iteration 17 (fix stale deferral, stable section anchors, remove self-referential grep)
 
 ---
 
@@ -930,7 +930,7 @@ Feature: Edge Cases and Error Handling
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Version:** 1.17 — Iteration 17 (fix stale deferral, stable section anchors, literal grep verification)
+**Version:** 1.17 — Iteration 17 (fix stale deferral, stable section anchors, remove self-referential grep)
 
 ### Coverage
 

@@ -249,8 +249,8 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Scenario: Retrieve by internal user ID — Given a conversation reference for AAD object ID `aad-user-1` in tenant `tenant-1` with `InternalUserId = "internal-1"` populated after identity resolution, When retrieved via `GetByInternalUserIdAsync("tenant-1", "internal-1")`, Then the reference matches and contains both `AadObjectId = "aad-user-1"` and `InternalUserId = "internal-1"`.
 - [ ] Scenario: Upsert on duplicate — Given a reference already exists for `aad-user-1`, When a new reference is saved for the same AAD object ID, Then only one record exists with the updated `ServiceUrl`.
 - [ ] Scenario: Multi-tenant isolation — Given references for `tenant-1` and `tenant-2`, When queried for `tenant-1`, Then only `tenant-1` references are returned.
-- [ ] Scenario: Channel reference upsert — Given a channel-scoped reference for `channel-general` in `tenant-1` (with null `UserId`), When a new reference arrives for the same `(ChannelId, TenantId)`, Then only one record exists with the updated `ServiceUrl` and the upsert key is `(ChannelId, TenantId)`.
-- [ ] Scenario: User and channel references coexist — Given a user-scoped reference for `user-1` in `tenant-1` and a channel-scoped reference for `channel-general` in `tenant-1`, When both are saved, Then two distinct records exist and each can be retrieved independently via `GetByUserIdAsync` and `GetByChannelIdAsync` respectively.
+- [ ] Scenario: Channel reference upsert — Given a channel-scoped reference for `channel-general` in `tenant-1` (with null `AadObjectId`), When a new reference arrives for the same `(ChannelId, TenantId)`, Then only one record exists with the updated `ServiceUrl` and the upsert key is `(ChannelId, TenantId)`.
+- [ ] Scenario: User and channel references coexist — Given a user-scoped reference for AAD object ID `aad-user-1` in `tenant-1` and a channel-scoped reference for `channel-general` in `tenant-1`, When both are saved, Then two distinct records exist and each can be retrieved independently via `GetByAadObjectIdAsync` and `GetByChannelIdAsync` respectively.
 
 ## Stage 4.2: Proactive Notification Service
 
