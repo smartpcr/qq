@@ -41,7 +41,7 @@ Feature: Personal Chat — Agent Task Creation
     And IIdentityResolver maps bob's AadObjectId to an internal user identity
     And user "bob@contoso.com" has RBAC role "operator"
     When the user sends "@AgentBot agent ask design persistence layer" in the channel
-    Then the TenantValidationMiddleware (ASP.NET Core HTTP middleware, runs before CloudAdapter per implementation-plan.md §2.1 line 79) validates bob's tenant "contoso-tenant-id" against AllowedTenantIds and passes the request
+    Then the TenantValidationMiddleware (ASP.NET Core HTTP middleware, runs before CloudAdapter per implementation-plan.md §2.1) validates bob's tenant "contoso-tenant-id" against AllowedTenantIds and passes the request
     And CloudAdapter processes the activity and invokes OnMessageActivityAsync in TeamsSwarmActivityHandler
     And the bot handler strips the @mention via Activity.RemoveMentionText and parses "agent ask design persistence layer"
     And IIdentityResolver.ResolveAsync maps bob's Entra identity to an internal user
@@ -202,7 +202,7 @@ Feature: Adaptive Card Approvals
   Scenario: Human approves through Adaptive Card action
     When user "alice@contoso.com" clicks the "Approve" button on the Adaptive Card
     Then CardActionHandler queries IAgentQuestionStore.GetByIdAsync("Q-601") and confirms Status == "Open"
-    And CardActionHandler atomically transitions AgentQuestion.Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-601", "Open", "Resolved", ct) (architecture.md §4.11 line 766 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
+    And CardActionHandler atomically transitions AgentQuestion.Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-601", "Open", "Resolved", ct) (architecture.md §4.11 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
     And a HumanDecisionEvent is created:
       | Field             | Value            |
       | QuestionId        | Q-601            |
@@ -226,7 +226,7 @@ Feature: Adaptive Card Approvals
 
   Scenario: Human rejects with a required comment
     Given the AgentQuestion for "Q-602" has AllowedAction "Reject" with RequiresComment = true
-    And the original Adaptive Card was rendered by AdaptiveCardBuilder with an Input.Text field adjacent to the Reject button (per implementation-plan.md §3.1 line 167 and §3.1 test scenario line 179: when RequiresComment = true, the card includes a pre-rendered Input.Text field)
+    And the original Adaptive Card was rendered by AdaptiveCardBuilder with an Input.Text field adjacent to the Reject button (per implementation-plan.md §3.1: when RequiresComment = true, the card includes a pre-rendered Input.Text field)
     When user "alice@contoso.com" types "Insufficient test coverage" in the Input.Text field and clicks "Reject" on the Adaptive Card (single Action.Submit)
     Then CardActionHandler extracts the actionValue "reject" and comment "Insufficient test coverage" from Activity.Value in a single card submit
     And a HumanDecisionEvent is created with:
@@ -241,10 +241,10 @@ Feature: Adaptive Card Approvals
 
   Scenario: Adaptive Card action after question has expired
     Given the AgentQuestion "Q-603" has ExpiresAt in the past
-    And QuestionExpiryProcessor (implementation-plan.md §3.3 line 214) has already scanned and transitioned Q-603 from Status "Open" to Status "Expired" via IAgentQuestionStore.TryUpdateStatusAsync("Q-603", "Open", "Expired")
+    And QuestionExpiryProcessor (implementation-plan.md §3.3) has already scanned and transitioned Q-603 from Status "Open" to Status "Expired" via IAgentQuestionStore.TryUpdateStatusAsync("Q-603", "Open", "Expired")
     When user "alice@contoso.com" clicks "Approve" on the expired card
     Then CardActionHandler queries IAgentQuestionStore.GetByIdAsync("Q-603") and finds Status == "Expired"
-    And CardActionHandler rejects the action because Status is not "Open" (per implementation-plan.md §3.3 line 211: reject if already Resolved or Expired)
+    And CardActionHandler rejects the action because Status is not "Open" (per implementation-plan.md §3.3: reject if already Resolved or Expired)
     And the bot replies with an error message: "This question has expired."
     And no HumanDecisionEvent is created
     And the card is updated to show "Expired"
@@ -278,9 +278,9 @@ Feature: Adaptive Card Approvals
     And question "Q-701" is the only AgentQuestion with Status == "Open" and ConversationId matching the current personal-chat conversation
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) to retrieve ALL open questions in the current conversation (per implementation-plan.md §1.2 line 40 and §3.2 line 188)
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) to retrieve ALL open questions in the current conversation (per implementation-plan.md §1.2 and §3.2)
     And the returned list contains exactly one AgentQuestion ("Q-701"), so "Q-701" is resolved without disambiguation
-    And ApproveCommandHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved", ct) (architecture.md §4.11 line 766 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
+    And ApproveCommandHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved", ct) (architecture.md §4.11 — compare-and-set; returns false if Status was not "Open", first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -292,7 +292,7 @@ Feature: Adaptive Card Approvals
     And the original Adaptive Card is updated to show "Approved by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted with EventType "CommandReceived"
-    # Note: Text commands audit as "CommandReceived" (per implementation-plan.md §5.1 line 348);
+    # Note: Text commands audit as "CommandReceived" (per implementation-plan.md §5.1);
     # only Adaptive Card Action.Submit callbacks audit as "CardActionReceived".
 
   Scenario: User rejects via text command in personal chat (single pending question in conversation)
