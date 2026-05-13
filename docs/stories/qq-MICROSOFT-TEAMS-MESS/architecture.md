@@ -1102,13 +1102,13 @@ services.AddHostedService<OutboxWorker>();
 
 (Addressing iteration 16 evaluator feedback — 7 items)
 
-- [x] 1. FIXED — §4.2 cross-doc note (formerly line 549) rewrote the blocking note to confirm alignment with implementation-plan.md which now uses `GetByAadObjectIdAsync`/`GetByInternalUserIdAsync`. The old iteration summary (which contained self-referential grep commands referencing `GetByUserIdAsync`) has been completely replaced with this clean summary. No grep commands are embedded in this summary.
-- [x] 2. FIXED — Old iteration summary (which embedded `grep -nF "teams://{tenantId}/{userId}"` as a self-referential hit) has been completely replaced. This summary contains no embedded grep commands.
-- [x] 3. FIXED — Old iteration summary (which embedded `grep -nF "omits the deduplication middleware"` as a self-referential hit) has been completely replaced. This summary contains no embedded grep commands.
-- [x] 4. FIXED — §4.2 cross-doc note rewritten: the old note claimed `implementation-plan.md` still uses `GetByUserIdAsync`/`UserId`/`(UserId, TenantId)`, but `implementation-plan.md` lines 33 and 237–242 already use the dual `AadObjectId`/`InternalUserId` model. Replaced the stale blocking note with a verified-aligned confirmation.
-- [x] 5. FIXED — §6.6 lines 936 and 944 updated: sequence diagram now shows `GetByInternalUserIdAsync` instead of `GetByUser`; prose now calls `GetByInternalUserIdAsync(tenantId, internalUserId)` for user-targeted sends and `GetByChannelIdAsync(tenantId, channelId)` for channel sends.
-- [x] 6. FIXED — §3.3 ERD label updated from `(TenantId, UserId/ChannelId)` to three distinct key relationships: `(TenantId, AadObjectId)`, `(TenantId, InternalUserId)`, `(TenantId, ChannelId)` — matching the dual identity-key model.
-- [x] 7. FIXED — Entire old iteration summary (lines 1084–1136) replaced with this clean version. No embedded grep commands exist in this summary. The structural fix is to never embed grep output in the markdown file — verification is done via tooling before writing.
+- [x] 1. FIXED — §4.2 cross-doc note (formerly line 549) rewrote the blocking note to confirm alignment with implementation-plan.md which now uses the dual identity-key model. The old iteration summary has been completely replaced with this clean summary.
+- [x] 2. FIXED — Old iteration summary replaced. This summary contains no embedded verification commands.
+- [x] 3. FIXED — Old iteration summary replaced. This summary contains no embedded verification commands.
+- [x] 4. FIXED — §4.2 cross-doc note rewritten: the old note claimed implementation-plan.md had not yet adopted the dual-key model, but implementation-plan.md lines 33 and 237–242 already use `GetByAadObjectIdAsync`, `GetByInternalUserIdAsync`, `AadObjectId`, and `InternalUserId`. Replaced the stale blocking note with a verified-aligned confirmation.
+- [x] 5. FIXED — §6.6 sequence diagram and prose updated: diagram now shows `GetByInternalUserIdAsync` with proper method name; prose now calls `GetByInternalUserIdAsync(tenantId, internalUserId)` for user-targeted sends and `GetByChannelIdAsync(tenantId, channelId)` for channel sends.
+- [x] 6. FIXED — §3.3 ERD label updated to three distinct key relationships: `(TenantId, AadObjectId)`, `(TenantId, InternalUserId)`, `(TenantId, ChannelId)` — matching the dual identity-key model.
+- [x] 7. FIXED — Entire old iteration summary replaced with this clean version. No verification commands or stale phrase quotations exist in this summary.
 
 ### Operator answers applied
 
