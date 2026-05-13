@@ -364,10 +364,18 @@ Feature: Message Update and Delete
 
   Scenario: Update fails due to expired activity reference
     Given the activity ID "act-901" is no longer valid (e.g., message too old)
-    When the bot attempts to update the card
+    And question "Q-701" was previously resolved with decision "Approved" by user "alice@contoso.com"
+    When the bot attempts to update the card via UpdateActivityAsync
     Then the Bot Framework returns an error
     And the failure is logged with the CorrelationId
-    And the bot sends a new replacement card to the user instead
+    And the bot sends a new read-only replacement card to the user instead:
+      | Field         | Constraint                                                    |
+      | Status        | Shows the original decision outcome (e.g., "Approved")        |
+      | DecidedBy     | alice@contoso.com                                             |
+      | DecidedAt     | <ISO 8601 timestamp of the original decision>                 |
+      | ActionButtons | None — the replacement card MUST NOT contain any action buttons |
+    And the new replacement card's activity ID is recorded in ICardStateStore for question "Q-701" (replacing the stale "act-901")
+    And ICardStateStore.UpdateStatusAsync is called to mark the card state as Answered (preserving the original decision outcome)
     And the outbound retry policy does not infinitely retry the stale update
 ```
 
@@ -489,14 +497,20 @@ Feature: Security — Tenant and User Validation
       | Outcome   | Rejected                    |
 
   Scenario: Proactive message to user without bot installation is pre-checked and rejected
-    Given user "no-install@contoso.com" is in tenant "contoso-tenant-id"
-    But the Teams bot is not installed for user "no-install@contoso.com"
-    And no conversation reference exists in ConversationReferenceStore for "no-install@contoso.com"
-    When the ProactiveNotifier attempts to send a proactive message to "no-install@contoso.com"
+    Given an AgentQuestion targets a user with TargetUserId "internal-user-no-install" in TenantId "contoso-tenant-id"
+    But the Teams bot is not installed for that user
+    And IConversationReferenceStore.GetByInternalUserIdAsync("contoso-tenant-id", "internal-user-no-install") returns null (no conversation reference stored)
+    When the ProactiveNotifier resolves the OutboxEntry destination "teams://contoso-tenant-id/user/internal-user-no-install" (per architecture.md §3.1 routing derivation)
     Then the ProactiveNotifier detects the missing conversation reference before calling Bot Framework
     And no proactive message attempt is made to Bot Framework
     And the notification is moved directly to the dead-letter queue
-    And an audit record is persisted indicating the user has no active installation
+    And an audit record is persisted indicating the user has no active installation:
+      | Field        | Value                       |
+      | EventType    | ProactiveNotification       |
+      | TenantId     | contoso-tenant-id           |
+      | TargetUserId | internal-user-no-install    |
+      | Outcome      | DeadLettered                |
+      | Reason       | NoConversationReference     |
 
   Scenario: Bot Framework token validation rejects forged activity
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
@@ -697,11 +711,16 @@ Feature: Performance — Card Delivery SLA
     And the delivery latency for each card is recorded as a metric
     And no cards are lost
 
-  Scenario: Concurrent user interactions do not degrade latency
+  Scenario: Concurrent user interactions do not degrade card delivery latency (non-normative — aspirational target)
+    # Note: tech-spec.md §2.1 line 43 only makes P95 Adaptive Card delivery < 3 seconds a hard
+    # requirement; the concurrency target is tentative/unconfirmed (tech-spec.md §7 Assumption 8).
+    # This scenario is aspirational and SHOULD NOT be treated as a hard pass/fail gate until the
+    # sibling spec confirms a concrete concurrency SLA.
     Given 50 users are simultaneously interacting with the bot
     When each user sends "agent status"
-    Then all 50 responses are returned within 3 seconds
-    And the bot does not throttle legitimate requests
+    Then responses SHOULD be returned promptly
+    And the bot SHOULD NOT throttle legitimate requests
+    And the P95 Adaptive Card delivery SLA (< 3 seconds) for queued cards is not degraded by concurrent text-command load
 
   Scenario: Large Adaptive Card renders within SLA
     Given an AgentQuestion has a Body of 2000 characters
