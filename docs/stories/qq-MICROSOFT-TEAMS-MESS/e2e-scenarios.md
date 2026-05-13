@@ -895,13 +895,14 @@ Feature: Teams Message Actions (Message Extensions)
     And the activity payload includes the selected message text as context
     And the custom TeamsSwarmActivityHandler.OnTeamsMessagingExtensionSubmitActionAsync delegates to MessageExtensionHandler
     And MessageExtensionHandler extracts the source message context and dispatches to CommandParser with the forwarded content
-    And a MessengerEvent of type "AgentTaskRequest" is enqueued with:
-      | Field          | Value                                                                             |
-      | CorrelationId  | <non-empty UUID>                                                                  |
-      | ExternalUserId | <alice's AadObjectId>                                                             |
-      | Body           | The deployment pipeline for service-xyz is failing with timeout errors on stage 3. |
-      | Source         | MessageAction                                                                     |
-    And the bot replies in the channel thread confirming the task was created
+    And a MessengerEvent of type "AgentTaskRequest" is enqueued with canonical envelope plus typed payload:
+      | Field               | Value                                                                             |
+      | EventType           | AgentTaskRequest                                                                  |
+      | CorrelationId       | <non-empty UUID>                                                                  |
+      | ExternalUserId      | <alice's AadObjectId>                                                             |
+      | Source              | MessageAction                                                                     |
+      | Payload.Body        | The deployment pipeline for service-xyz is failing with timeout errors on stage 3. |
+    And the bot returns a MessagingExtensionActionResponse containing a task-submitted confirmation Adaptive Card to the invoking user (per architecture.md §2.15 — message extensions return a confirmation card response, not a channel thread reply)
     And an immutable audit record is persisted with EventType "MessageActionReceived" (message actions log as MessageActionReceived per tech-spec §4.3 Canonical Audit Record Schema — the canonical audit set contains exactly seven values; MessageActionReceived is a dedicated audit event type distinct from CommandReceived because message-action submissions arrive through the composeExtension/submitAction invoke mechanism rather than direct text commands)
 
   Scenario: Message action uses direct submit (fetchTask false) to forward a message
