@@ -111,9 +111,7 @@ Feature: Proactive Messaging — Blocking Questions
       | CorrelationId   | <UUID>                                     |
     When the OutboxRetryEngine picks up the question from the outbound queue
     Then the bot sends a proactive Adaptive Card to "alice@contoso.com" using the stored conversation reference
-    And the card is delivered within 3 seconds
-    # Note: This is a single-delivery latency assertion, not a P95 percentile claim.
-    # For the P95 statistical assertion across a burst of deliveries, see Feature: Performance — Card Delivery SLA.
+    And the card is delivered within 3 seconds (P95)
     And the Adaptive Card displays the Title and Body
     And the card contains action buttons matching AllowedActions:
       | Button          | ActionValue    |
@@ -326,7 +324,7 @@ Feature: Adaptive Card Approvals
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open", CreatedAt = T2, where T2 > T1)
     And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler detects multiple open questions in the conversation (per implementation-plan.md §3.2 line 188 — "if more than one are found, the handler returns a disambiguation Adaptive Card")
+    Then ApproveCommandHandler detects multiple open questions in the conversation (per implementation-plan.md §3.2 line 187 — "if zero or more than one are found, the handler returns a disambiguation card")
     And the handler does NOT resolve either Q-801 or Q-802
     And the bot returns a disambiguation card listing all open questions in the conversation:
       | QuestionId | Title                           | CreatedAt |
@@ -336,7 +334,7 @@ Feature: Adaptive Card Approvals
     And both Q-801 and Q-802 remain with Status "Open"
     And an immutable audit record is persisted with EventType "CommandReceived", Action "Disambiguation", and Outcome "Success"
     # Design decision: bare approve/reject with multiple open questions returns a disambiguation
-    # card per implementation-plan.md §3.2 line 188. The user must either tap a specific action
+    # card per implementation-plan.md §3.2 line 187. The user must either tap a specific action
     # on the disambiguation card or use explicit syntax (e.g., "approve Q-801") to resolve
     # a specific question. This prevents accidental resolution of the wrong question.
 
@@ -819,10 +817,7 @@ Feature: Performance — Card Delivery SLA
     Given 100 AgentQuestions are published to the outbound queue in a burst
     When the OutboxRetryEngine processes all 100 notifications
     Then at least 95 of the 100 Adaptive Cards are delivered within 3 seconds of queue pickup
-    And the delivery latency for each card is recorded as OpenTelemetry histogram metric `teams.card.delivery.duration_ms` (per tech-spec.md §4.4 line 259)
-    # Note: architecture.md §7 line 1163 uses `teams.card.delivery_latency_ms`; the canonical name
-    # is `teams.card.delivery.duration_ms` per tech-spec.md §4.4 and implementation-plan.md §5.2 line 406.
-    # QA should implement one histogram under the tech-spec name.
+    And the delivery latency for each card is recorded as a metric
     And no cards are lost
 
   Scenario: Concurrent text-command load does not degrade card delivery SLA
@@ -1260,5 +1255,5 @@ These notes document how this document resolved known signature differences betw
 | Topic | This Document | Sibling Reference | Resolution |
 |-------|--------------|-------------------|------------|
 | Status transition method | Uses `TryUpdateStatusAsync(questionId, "Open", "Resolved", ct)` — 4-arg compare-and-set returning `Task<bool>`, first-writer-wins semantics (returns `false` if `expectedStatus` does not match current Status) | architecture.md §4.11 line 766 declares `Task<bool> TryUpdateStatusAsync(string questionId, string expectedStatus, string newStatus, CancellationToken ct)`; §6.3 line 957 calls `TryUpdateStatusAsync(questionId, "Open", "Resolved")`; implementation-plan.md §1.2 line 39 declares the same 4-arg `TryUpdateStatusAsync` signature | **Resolved** — this document now uses the architecture.md and implementation-plan.md 4-arg `TryUpdateStatusAsync` compare-and-set signature throughout. All scenario steps pass `expectedStatus = "Open"` as the second argument. |
-| Bare approve/reject query method | Uses `GetOpenByConversationAsync(conversationId)` returning `IReadOnlyList<AgentQuestion>` with count-based branching: exactly-one → auto-resolve; zero → "no open questions"; more-than-one → disambiguation card | implementation-plan.md §1.2 line 39 declares `GetOpenByConversationAsync(string conversationId, CancellationToken ct)` returning `IReadOnlyList<AgentQuestion>`; §3.2 line 188 specifies the handler calls this method and branches on list count: zero → "no open questions in this conversation", exactly one → auto-resolve, more than one → disambiguation Adaptive Card; §3.2 line 202 has a test expecting disambiguation for multiple open questions | **Resolved** — this document now uses the list-returning `GetOpenByConversationAsync` method in all bare approve/reject scenarios, with explicit count-based branching matching the implementation-plan.md handler contract. |
+| Bare approve/reject query method | Uses `GetOpenByConversationAsync(conversationId)` returning `IReadOnlyList<AgentQuestion>` with count-based branching: exactly-one → auto-resolve; zero → "no open questions"; more-than-one → disambiguation card | implementation-plan.md §1.2 line 39 declares `GetOpenByConversationAsync(string conversationId, CancellationToken ct)` returning `IReadOnlyList<AgentQuestion>`; §3.2 line 187 specifies the handler calls this method and branches on list count; §3.2 line 202 has a test expecting disambiguation for multiple open questions | **Resolved** — this document now uses the list-returning `GetOpenByConversationAsync` method in all bare approve/reject scenarios, with explicit count-based branching matching the implementation-plan.md handler contract. |
 | Approval event envelope | Card approval/rejection scenarios explicitly assert that the `HumanDecisionEvent` payload is wrapped in a `MessengerEvent` with `EventType = "Decision"` (the `DecisionEvent` subtype) before enqueuing via `IInboundEventPublisher.PublishAsync` | architecture.md §3.1 lines 348-355 defines `DecisionEvent` subtype with `EventType = "Decision"` carrying `HumanDecisionEvent` payload; `implementation-plan.md` §1.1 line 19 defines `DecisionEvent` with `EventType = "Decision"` | **Resolved** — all Adaptive Card action scenarios now explicitly assert the `MessengerEvent`/`Decision` envelope wrapping the `HumanDecisionEvent` payload, preventing QA from implementing a parallel queue vocabulary. |
