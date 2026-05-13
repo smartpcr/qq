@@ -1318,7 +1318,7 @@ These notes document how this document resolved known signature differences betw
 
 ## Resolved Design Decisions
 
-The following four decisions were previously surfaced as open questions in this document. They are now resolved by the architect based on the story description scope and alignment with sibling documents. This resolution applies to this document only; sibling docs manage their own open-questions blocks.
+The following four decisions were previously surfaced as open questions in this document. They are now resolved by the architect based on the story description scope and alignment with sibling documents. This resolution applies to this document only.
 
 | ID | Decision | Rationale |
 |----|----------|-----------|
@@ -1334,4 +1334,4 @@ This document covers all story acceptance criteria: personal chat, channel menti
 ### Cross-document notes (for sibling architects)
 
 - **Forged-JWT pipeline terminology (RESOLVED)** — `architecture.md` §10.3 row 1 and `tech-spec.md` §4.2 row 1 use the phrase "before any application code or middleware runs" for invalid JWT rejection. In context, "middleware" refers to **Bot Framework `IMiddleware`** (TelemetryMiddleware, ActivityDeduplicationMiddleware), not ASP.NET Core HTTP middleware. The accurate expanded reading is: "before any Bot Framework middleware or bot handler runs." `implementation-plan.md` §2.1 registers `TenantValidationMiddleware` and `RateLimitMiddleware` as ASP.NET Core HTTP middleware that runs before `CloudAdapter.ProcessAsync` — this is consistent because those are HTTP-layer components, not Bot Framework middleware. All four documents agree on the actual execution order: ASP.NET Core HTTP middleware → CloudAdapter (JWT validation) → Bot Framework IMiddleware → bot handler. The phrasing difference is terminological, not behavioral. QA follows the 5-step pipeline defined in the forged-JWT scenario and implementation-plan.md §2.1.
-- `architecture.md` retains its own open-questions block; this is not an inconsistency — each document manages its own questions independently.
+
