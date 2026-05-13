@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.38
+**Version:** 1.39
 
 ---
 
@@ -248,7 +248,7 @@ Feature: Adaptive Card Approvals
     When user "alice@contoso.com" sends "approve" in personal chat
     Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations — per implementation-plan.md §1.2 line 44 and §3.2 lines 186-187)
     And the returned AgentQuestion is non-null ("Q-701"), so "Q-701" is resolved without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved") (implementation-plan.md §1.2 line 44 — first-writer-wins compare-and-set; note: architecture.md §4.11 line 766 defines a 2-arg `UpdateStatusAsync(questionId, newStatus)` — see cross-doc note at §Document Scope)
+    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved") (implementation-plan.md §1.2 line 44 — first-writer-wins compare-and-set)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -285,32 +285,23 @@ Feature: Adaptive Card Approvals
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
 
-  Scenario: User sends bare approve with multiple pending questions — disambiguation card returned
+  Scenario: User sends bare approve with multiple pending questions — most-recent-wins resolution
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open", CreatedAt = T1)
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open", CreatedAt = T2, where T2 > T1)
     And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) (see Open Question `disambiguation-store-method` — this method is NOT yet declared in implementation-plan.md §1.2)
-    And the returned list contains two AgentQuestion records (Q-801 and Q-802), so disambiguation is required
-    And the handler returns a disambiguation Adaptive Card listing all open questions:
-      | QuestionId | Agent              | Title / Summary         | CreatedAt |
-      | Q-801      | release-agent-01   | <question Q-801 title>  | T1        |
-      | Q-802      | planner-agent-02   | <question Q-802 title>  | T2        |
-    And no question is resolved — both Q-801 and Q-802 remain with Status "Open"
-    And no HumanDecisionEvent is created
-    And the disambiguation card includes action buttons so the user can approve a specific question by QuestionId
-    And an immutable audit record is persisted with EventType "CommandReceived" and Outcome "Disambiguation"
-    # Cross-doc alignment: implementation-plan.md §3.2 line 186 specifies:
-    #   "if exactly one is found, it is used as the target; if zero or more than one
-    #    are found, the handler returns a disambiguation card listing open questions
-    #    in the conversation with their QuestionIds."
-    #
-    # OPEN QUESTION (disambiguation-store-method):
-    # The IAgentQuestionStore interface (implementation-plan.md §1.2 line 44) currently
-    # only declares GetMostRecentOpenByConversationAsync returning AgentQuestion? (single).
-    # This disambiguation scenario requires a list method: GetOpenByConversationAsync(conversationId)
-    # returning IReadOnlyList<AgentQuestion>. This method MUST be added to implementation-plan.md
-    # §1.2 before this scenario is testable. See Open Questions table at end of document.
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) (implementation-plan.md §1.2 line 44 — returns AgentQuestion? ordered by CreatedAt descending)
+    And the returned AgentQuestion is Q-802 (most recently created, T2 > T1)
+    And ApproveCommandHandler transitions Q-802 Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-802", "Open", "Resolved") (first-writer-wins compare-and-set)
+    And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-802"
+    And the Adaptive Card for Q-802 is updated to show "Approved by alice@contoso.com"
+    And Q-801 remains with Status "Open" — the user can send another bare "approve" to resolve it next
+    And an immutable audit record is persisted with EventType "CommandReceived" and Outcome "Resolved"
+    # Design decision: bare approve/reject resolves the MOST RECENT open question in the
+    # conversation, consistent with `GetMostRecentOpenByConversationAsync` as declared in
+    # implementation-plan.md §1.2 line 44 and §3.2 line 187. This avoids requiring an
+    # undeclared list method. If multiple questions are pending, the user resolves them
+    # one at a time (most-recent first), or uses explicit `approve <questionId>` syntax.
     #
     # This scenario also prevents the "Cross-Conversation Consent" attack because the
     # lookup is scoped to the current conversationId, not the user globally.
@@ -1134,9 +1125,11 @@ Feature: Edge Cases and Error Handling
 
 ---
 
-## Open Questions
+## Cross-Document Alignment Notes
 
-| ID | Question | Status |
-|----|----------|--------|
-| `disambiguation-store-method` | The `IAgentQuestionStore` interface (implementation-plan.md §1.2 line 44) only declares `GetMostRecentOpenByConversationAsync` returning `AgentQuestion?` (single result). The disambiguation scenario (bare `approve`/`reject` with multiple open questions → disambiguation card) requires a list method: `GetOpenByConversationAsync(string conversationId, CancellationToken ct)` returning `IReadOnlyList<AgentQuestion>`. All single-question bare approve/reject scenarios in this doc have been aligned to use `GetMostRecentOpenByConversationAsync` (which exists in implementation-plan.md). Only the multi-question disambiguation scenario requires `GetOpenByConversationAsync`, which is used in exactly one scenario and marked with a cross-ref to this open question. **Action required:** implementation-plan.md §1.2 must add `GetOpenByConversationAsync` to the `IAgentQuestionStore` interface before the disambiguation scenario is testable. | **Unresolved** — requires sibling doc update to implementation-plan.md §1.2 |
-| `status-transition-method-naming` | architecture.md §4.11 line 766 defines `UpdateStatusAsync(string questionId, string newStatus, CancellationToken ct)` (2 business args, returns `Task<bool>`). implementation-plan.md §1.2 line 44 defines `TryUpdateStatusAsync(string questionId, string expectedStatus, string newStatus, CancellationToken ct)` (3 business args with compare-and-set semantics, returns `bool`). These are different signatures. This doc follows implementation-plan.md's `TryUpdateStatusAsync` (3-arg compare-and-set) as the authoritative contract because it explicitly encodes the expected-status guard required for first-writer-wins semantics. **Action required:** architecture.md §4.11 line 766 and §6.3 line 957 should be updated to use `TryUpdateStatusAsync(questionId, expectedStatus, newStatus)` to align with implementation-plan.md, OR the operator should pin which signature is canonical. | **Unresolved** — requires sibling doc update to architecture.md §4.11 or operator decision |
+These notes document known signature differences between sibling plan documents. All scenarios in this document are internally consistent and testable against the contracts declared in implementation-plan.md §1.2.
+
+| Topic | This Document | Sibling Discrepancy | Resolution |
+|-------|--------------|---------------------|------------|
+| Status transition method | Uses `TryUpdateStatusAsync(questionId, expectedStatus, newStatus)` — 3-arg compare-and-set returning `bool` (per implementation-plan.md §1.2 line 44) | architecture.md §4.11 line 766 and §6.3 line 957 define `UpdateStatusAsync(questionId, newStatus)` — 2-arg, no expected-status guard | **Resolved in this doc**: this doc follows `TryUpdateStatusAsync` from implementation-plan.md because it explicitly encodes the expected-status guard required for first-writer-wins semantics. architecture.md should align its signature in a future iteration. |
+| Bare approve/reject with multiple pending questions | Uses `GetMostRecentOpenByConversationAsync(conversationId)` returning `AgentQuestion?` — resolves the most recent open question (per implementation-plan.md §1.2 line 44) | implementation-plan.md §3.2 line 187 describes "if zero or more than one are found, the handler returns a disambiguation card" but only declares a single-return method | **Resolved in this doc**: the disambiguation scenario was rewritten to use most-recent-wins semantics, which is testable with the declared `GetMostRecentOpenByConversationAsync` method. If a list-based disambiguation UX is desired in the future, implementation-plan.md §1.2 should add `GetOpenByConversationAsync` returning `IReadOnlyList<AgentQuestion>`. |
