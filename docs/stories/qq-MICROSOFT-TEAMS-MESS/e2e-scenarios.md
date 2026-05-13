@@ -241,12 +241,13 @@ Feature: Adaptive Card Approvals
     And no duplicate HumanDecisionEvent is created
     And the bot responds with the previously recorded decision
 
-  Scenario: User approves via text command in personal chat (single pending question)
+  Scenario: User approves via text command in personal chat (single pending question in conversation)
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-701"
-    And question "Q-701" is the only pending question (Status == "Open") for user "alice@contoso.com"
+    And question "Q-701" is the only AgentQuestion with Status == "Open" and ConversationId matching the current personal-chat conversation
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then the bot confirms exactly one pending question exists for the user and resolves "Q-701"
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations — per implementation-plan.md §3.2 lines 183-184)
+    And exactly one open question is found in this conversation, so "Q-701" is resolved without disambiguation
     And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (architecture.md §2.6, §3.1 — first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
@@ -260,13 +261,14 @@ Feature: Adaptive Card Approvals
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted with EventType "CardActionReceived"
 
-  Scenario: User rejects via text command in personal chat (single pending question)
+  Scenario: User rejects via text command in personal chat (single pending question in conversation)
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-702"
     And question "Q-702" has AllowedAction "Reject" with RequiresComment = false
-    And question "Q-702" is the only pending question (Status == "Open") for user "alice@contoso.com"
+    And question "Q-702" is the only AgentQuestion with Status == "Open" and ConversationId matching the current personal-chat conversation
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
-    Then the bot confirms exactly one pending question exists for the user and resolves "Q-702"
+    Then RejectCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations)
+    And exactly one open question is found in this conversation, so "Q-702" is resolved without disambiguation
     And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore compare-and-set (architecture.md §2.6, §3.1 — first-writer-wins)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
