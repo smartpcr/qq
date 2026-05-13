@@ -309,8 +309,8 @@ Feature: Conversation Reference Persistence
   Background:
     Given the Teams bot is registered and running
 
-  Scenario: Conversation reference is stored on first interaction (authorized user only)
-    Given user "dave@contoso.com" (AadObjectId "aad-obj-dave-001") has never interacted with the bot before
+  Scenario: Conversation reference is refreshed on first command (message path — full identity/RBAC)
+    Given user "dave@contoso.com" (AadObjectId "aad-obj-dave-001") installed the bot (install-path reference exists)
     And user "dave@contoso.com" belongs to tenant "contoso-tenant-id" which is in the allowed tenant list
     And AadObjectId "aad-obj-dave-001" is mapped to an internal user via IIdentityResolver
     And the mapped user has RBAC role "viewer" (or above) via IUserAuthorizationService
@@ -318,8 +318,8 @@ Feature: Conversation Reference Persistence
     Then the TenantValidationMiddleware passes the request (tenant is allowed)
     And IIdentityResolver resolves AadObjectId "aad-obj-dave-001" to an internal user identity
     And IUserAuthorizationService confirms the user has the required role for "agent status"
-    And only after authorization succeeds, a conversation reference is extracted from the incoming Activity
-    And the reference is persisted to the durable store keyed by AadObjectId "aad-obj-dave-001" and TenantId "contoso-tenant-id"
+    And only after full identity/RBAC authorization succeeds, the conversation reference is refreshed from the incoming Activity
+    And the reference is updated in the durable store keyed by AadObjectId "aad-obj-dave-001" and TenantId "contoso-tenant-id"
     And the reference includes:
       | Field            | Value                  |
       | ServiceUrl       | <Bot Framework URL>    |
@@ -327,6 +327,9 @@ Feature: Conversation Reference Persistence
       | AadObjectId      | aad-obj-dave-001       |
       | TenantId         | contoso-tenant-id      |
       | BotId            | <bot app ID>           |
+    # Note: This is the message path (architecture §6.1 step 8). Unlike the install path
+    # (§Bot Installation — tenant-validation only), the message path performs full identity
+    # resolution and RBAC authorization before refreshing the reference.
 
   Scenario: Conversation reference is updated on subsequent interactions
     Given a conversation reference already exists for user "dave@contoso.com"
@@ -736,11 +739,16 @@ Covers the Teams app lifecycle events that trigger conversation reference creati
 ```gherkin
 Feature: Bot Installation and Conversation Discovery
 
-  Scenario: Bot installed in personal scope
+  Scenario: Bot installed in personal scope (install path — tenant-validation only)
     When user "eve@contoso.com" installs the Teams bot in personal scope
     Then the bot receives an installationUpdate activity
-    And a conversation reference is persisted for "eve@contoso.com"
+    And the TenantValidationMiddleware validates that eve's tenant is in AllowedTenantIds
+    And a conversation reference is persisted for "eve@contoso.com" after tenant validation only
+    And no identity resolution (IIdentityResolver) or RBAC check is performed on the install path
     And the bot sends a welcome Adaptive Card explaining available commands
+    # Note: Install-path references prove the app is installed (per architecture §6.1 step 8).
+    # Full identity/RBAC authorization occurs on the message path when the user sends a command,
+    # at which point the reference is refreshed with updated ServiceUrl/ConversationId.
 
   Scenario: Bot installed in a team
     When an admin installs the bot in team "Platform Engineering"
@@ -956,16 +964,21 @@ Feature: Edge Cases and Error Handling
     And the second user sees: "This question has already been decided."
     And both outcomes are audit-logged
 
-  Scenario: Concurrent approvals for a multi-approver release gate (all recorded)
-    Given question "Q-998" is a release-gate question with a threshold of 2 required approvals
-    And question "Q-998" was sent to both "alice@contoso.com" and "bob@contoso.com"
-    When both users click "Approve" within the same second
-    Then both approvals are accepted and recorded as separate HumanDecisionEvents
-    And both cards are updated to show "Fully Approved (2/2)"
+  Scenario: Concurrent approvals for a multi-approver release gate (separate questions, both accepted)
+    Given the orchestrator created two separate AgentQuestion records for a release gate:
+      | QuestionId | TargetUserId           | Status |
+      | Q-gate-x   | alice@contoso.com      | Open   |
+      | Q-gate-y   | bob@contoso.com        | Open   |
+    And the release-gate workflow requires 2 approvals at the orchestration layer
+    When both users click "Approve" on their respective cards within the same second
+    Then Q-gate-x transitions to Resolved (alice's first-writer-wins on her own question)
+    And Q-gate-y transitions to Resolved (bob's first-writer-wins on his own question)
+    And two separate HumanDecisionEvents are created (one per question)
+    And both cards are updated to show individual approval status
+    And the orchestrator aggregates both decisions and transitions the release gate to approved
     And both individual approvals are audit-logged
-    And the release gate transitions to approved state only after reaching the required count
 
-  > **Note:** Single-decision questions (e.g., standard agent blocking questions) use first-writer-wins semantics — only the first response is authoritative. Multi-approver release gates (e.g., release-gate scenario in §Adaptive Cards) require a configurable approval threshold tracked at the orchestration/workflow layer (not on the `AgentQuestion` record itself, which only defines `AllowedActions`). The orchestrator records all individual decisions until the threshold is met. The `AgentQuestion.AllowedActions` metadata defines available buttons; the release-gate configuration determines how many approvals are needed.
+  > **Note:** Multi-approver release gates are modeled as separate `AgentQuestion` records — one per approver — each following the standard single-decision first-writer-wins lifecycle (architecture §3.2, §6.3 step 5). The orchestrator's workflow layer tracks the approval threshold and aggregates individual decisions. This avoids contradicting the `AgentQuestion.Status` lifecycle where `CardActionHandler` atomically transitions `Open → Resolved` on the first accepted action and rejects subsequent actions.
 
   Scenario: Bot Framework token refresh during long-running operation
     Given the bot's authentication token is about to expire
@@ -992,8 +1005,6 @@ Feature: Edge Cases and Error Handling
 
 ---
 
-## Iteration Summary
+## Document Scope
 
-**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-
-**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle, bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates, RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty/long messages).
+**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle (install path and message path), bot installation/uninstall, tenant app-policy enforcement (including allow-list gate), update/delete of sent cards, multi-approver release gates (modeled as separate AgentQuestion records per architecture §3.2), RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions (direct submit), edge cases (concurrent approvals, stale references 403 and 404, rate limiting, service restart, empty/long messages).
