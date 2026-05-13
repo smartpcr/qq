@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.31
+**Version:** 1.32
 
 ---
 
@@ -789,14 +789,24 @@ Feature: Adaptive Card — Incident Summary and Release Gates
 
   Scenario: Agent sends an incident summary card
     Given agent "incident-agent-01" has completed incident analysis for task "INC-200"
-    When the agent publishes an AgentQuestion with Title "Incident Summary"
-    And the Severity is "Critical"
-    Then the bot sends an Adaptive Card containing:
-      | Section          | Content                              |
-      | Header           | 🔴 Critical Incident — INC-200       |
-      | Root Cause       | <from AgentQuestion.Body>            |
-      | Affected Systems | <parsed from Body>                   |
-      | Actions          | Acknowledge, Escalate, Need more info|
+    When the agent publishes an IncidentSummary (per architecture.md §3.1 IncidentSummary model) with:
+      | Field         | Value                                  |
+      | IncidentId    | INC-200                                |
+      | TaskId        | TASK-INC-200                           |
+      | AgentId       | incident-agent-01                      |
+      | Severity      | Critical                               |
+      | Title         | Database connection pool exhaustion     |
+      | Description   | Connection pool saturated at 100/100 active connections causing cascading timeouts in order-service and payment-service |
+      | OccurredAt    | <ISO 8601 UTC timestamp>               |
+      | CorrelationId | <non-empty UUID>                       |
+    Then the bot renders an Adaptive Card via IAdaptiveCardRenderer.RenderIncidentCard (per architecture.md §3.1):
+      | Section          | Content                                     |
+      | Header           | 🔴 Critical Incident — INC-200              |
+      | Title            | Database connection pool exhaustion          |
+      | Description      | <from IncidentSummary.Description>           |
+      | Severity         | Critical                                     |
+      | OccurredAt       | <from IncidentSummary.OccurredAt>            |
+      | Actions          | Acknowledge, Escalate, Need more info        |
     And the card is delivered to the configured incident channel
 
   Scenario: Release gate approval with multiple approvers (separate questions per approver)
