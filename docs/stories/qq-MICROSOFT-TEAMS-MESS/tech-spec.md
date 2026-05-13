@@ -203,7 +203,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|------------|--------|------------|
 | R-6 | **Dead-letter queue growth** — Persistent Bot Framework failures (e.g., app misconfiguration, revoked credentials) cause unbounded DLQ growth. | Medium | Medium — storage cost, alert fatigue | DLQ size metric + alert. Runbook for DLQ drain. Auto-pause outbound after configurable DLQ threshold. |
-| R-7 | **Audit log volume** — At the assumed concurrency target (§7 Assumption 8), concurrent users × 100+ agents can produce high audit log throughput. | Medium | Low — storage cost | Use append-only structured log sink (e.g., Azure Table Storage, dedicated SQL table). Partition by date. |
+| R-7 | **Audit log volume** — At higher concurrency levels (see §7 Assumption 8 — tentative, unconfirmed), concurrent users × 100+ agents can produce high audit log throughput. | Medium | Low — storage cost | Use append-only structured log sink (e.g., Azure Table Storage, dedicated SQL table). Partition by date. |
 | R-8 | **Proactive message consent** — Teams requires admin consent or user-initiated conversation before proactive messages. If the app is deployed via policy but users haven't interacted, first proactive send may fail. | Medium | Medium — silent delivery failure for new users | On app-install event (`InstallationUpdate`), capture and store `ConversationReference`. Document that admin-pushed installs trigger the install event. |
 
 ### 5.3 Project Risks
@@ -247,7 +247,7 @@ Computed retry delays (before jitter): 2s → 4s → 8s → 16s.
 5. The bot will be deployed as a single-tenant app (not multi-tenant SaaS) unless the operator explicitly configures multiple allowed tenant IDs.
 6. Adaptive Cards schema version 1.4 is the minimum supported by the target Teams clients (desktop, web, mobile).
 7. The persistence layer for conversation references and audit logs will be provided by `AgentSwarm.Messaging.Persistence` (planned) and will support the required durability and retention guarantees.
-8. **Concurrency target: 1000+ concurrent users.** The story description does not specify a concurrency requirement. This assumed target (1000+ concurrent users issuing commands and receiving proactive notifications without degradation) is based on typical enterprise Teams deployments and drives architectural decisions around rate limiting, queue throughput, and audit log partitioning. If the operator provides a different target, §4.4 and §5.2 R-7 should be updated accordingly.
+8. **Concurrency assumption (tentative, unconfirmed): 1000+ concurrent users.** The story description does not specify a concurrency requirement. This is a planning assumption based on typical enterprise Teams deployments — it is **not** a confirmed hard constraint and **must not** be treated as a scope-driving input. It provides a rough sizing target for design considerations around rate limiting, queue throughput, and audit log partitioning. If the operator provides a confirmed target, update §4.4 and §5.2 R-7 accordingly.
 
 ---
 

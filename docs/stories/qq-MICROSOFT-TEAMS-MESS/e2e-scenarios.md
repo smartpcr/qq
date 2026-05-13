@@ -254,6 +254,7 @@ Feature: Adaptive Card Approvals
 
   Scenario: User rejects via text command in personal chat
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-702"
+    And question "Q-702" has AllowedAction "Reject" with RequiresComment = false
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
     Then the bot resolves the most recent pending question "Q-702" for the user
@@ -263,10 +264,13 @@ Feature: Adaptive Card Approvals
       | ExternalUserId | <alice's AadObjectId> |
       | CommandName    | reject                |
       | QuestionId     | Q-702                 |
-    And a HumanDecisionEvent is created with ActionValue "reject"
+    And a HumanDecisionEvent is created with ActionValue "reject" and Comment = null
     And the original Adaptive Card is updated to show "Rejected by alice@contoso.com"
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted with EventType "CardActionReceived"
+    # Note: Q-702 has RequiresComment = false, so no comment prompt is shown.
+    # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
+    # where RequiresComment = true triggers an input field for the rejection reason.
 ```
 
 ---
@@ -937,15 +941,16 @@ Feature: Edge Cases and Error Handling
     Then the bot replies with the help card
     And a MessengerEvent of type "Text" is enqueued with an empty payload
 
-  Scenario: Bot receives a message exceeding the configured maximum length
-    Given the deployment configuration defines a maximum inbound message length (configurable per-environment; no platform-mandated default exists in Bot Framework)
-    And user "alice@contoso.com" sends a message whose text body exceeds the configured limit
+  Scenario: Bot receives a message exceeding a reasonable operational length
+    Given user "alice@contoso.com" sends a message with a text body of 50,000+ characters
     When the bot processes the activity
-    Then the bot truncates the message body to the configured maximum length
-    And the bot enqueues a MessengerEvent containing the truncated body
-    And a warning is logged with the original character count and the configured limit
+    Then the bot enqueues a MessengerEvent containing the full message body (Bot Framework does not enforce a message-length limit)
+    And a warning is logged noting the unusually large payload size
     And an immutable audit record is persisted with EventType "CommandReceived"
-    And the audit PayloadJson includes "truncated":true and "originalLength":<original count>
+    # Note: Neither the sibling tech-spec nor Bot Framework defines a maximum inbound
+    # message length or truncation policy. The bot passes the full body through.
+    # If a future tech-spec revision introduces a configurable length limit with
+    # truncation behavior, this scenario should be updated to match.
 
   Scenario: Adaptive Card action payload is malformed
     Given user "alice@contoso.com" submits an Adaptive Card action

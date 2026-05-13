@@ -457,7 +457,57 @@ Immutable audit record. Defined in `AgentSwarm.Messaging.Persistence`. Fields al
 >
 > **Outcome field semantics — cross-doc alignment:** The `Outcome` field uses a closed canonical vocabulary of exactly four values: `Success`, `Rejected`, `Failed`, `DeadLettered` (consistent with `tech-spec.md` §4.3 line 144). Rejection reason codes such as `UnmappedUserRejected`, `UnauthorizedTenantRejected`, and `InsufficientRoleRejected` belong in the `Action` field, not in `Outcome`. For example, an unmapped-user rejection produces `EventType: SecurityRejection`, `Outcome: Rejected`, `Action: UnmappedUserRejected`. All sibling docs are now aligned: `e2e-scenarios.md` line 371 uses `Action: UnmappedUserRejected` with `Outcome: Rejected`; `implementation-plan.md` §5.1 line 287 uses the same mapping; `tech-spec.md` §4.3 line 144 defines the canonical four-value Outcome vocabulary.
 
-### 3.3 Entity Relationship Diagram
+### 3.3 Card Payload Entities
+
+These entities represent the typed payloads passed to `IAdaptiveCardRenderer` (§4.6) for card rendering. They are defined in `AgentSwarm.Messaging.Teams` because they carry Teams-specific presentation metadata beyond what the platform-agnostic `MessengerMessage` provides.
+
+#### AgentStatusSummary
+
+Summary of agent/swarm status for rendering a status card via `IAdaptiveCardRenderer.RenderStatusCard`.
+
+| Field | Type | Description |
+|---|---|---|
+| `AgentId` | `string` | The agent whose status is being reported. |
+| `TaskId` | `string?` | Associated task (null for swarm-wide status). |
+| `AgentName` | `string` | Human-readable agent display name. |
+| `CurrentState` | `string` | Agent lifecycle state: `Idle`, `Working`, `Blocked`, `Paused`, `Error`. |
+| `ActiveTaskCount` | `int` | Number of tasks currently assigned. |
+| `LastActivityAt` | `DateTimeOffset` | UTC time of the agent's most recent activity. |
+| `Summary` | `string` | Free-text status description from the agent. |
+| `CorrelationId` | `string` | End-to-end trace ID. |
+
+#### IncidentSummary
+
+Summary of an incident for rendering an incident alert card via `IAdaptiveCardRenderer.RenderIncidentCard`.
+
+| Field | Type | Description |
+|---|---|---|
+| `IncidentId` | `string` | Unique incident identifier. |
+| `TaskId` | `string` | Originating task. |
+| `AgentId` | `string` | Agent that raised the incident. |
+| `Severity` | `string` | `Info`, `Warning`, `Error`, `Critical`. |
+| `Title` | `string` | Short incident title for the card header. |
+| `Description` | `string` | Detailed incident description. |
+| `OccurredAt` | `DateTimeOffset` | UTC time the incident was detected. |
+| `CorrelationId` | `string` | End-to-end trace ID. |
+
+#### ReleaseGateRequest
+
+Request to render a release-gate approval card via `IAdaptiveCardRenderer.RenderReleaseGateCard`. This entity carries gate-level metadata that the orchestrator uses to create per-approver `AgentQuestion` records (see §6.3.1 for the multi-approver modeling strategy).
+
+| Field | Type | Description |
+|---|---|---|
+| `GateId` | `string` | Unique release-gate identifier. |
+| `TaskId` | `string` | Associated deployment/release task. |
+| `GateName` | `string` | Human-readable gate name (e.g., "Production Deploy Gate"). |
+| `Environment` | `string` | Target environment: `Staging`, `Production`, etc. |
+| `RequiredApprovals` | `int` | Number of approvals needed to open the gate. |
+| `CurrentApprovals` | `int` | Number of approvals received so far. |
+| `Approvers` | `IReadOnlyList<string>` | Internal user IDs of designated approvers. |
+| `Deadline` | `DateTimeOffset` | Gate expiration deadline. |
+| `CorrelationId` | `string` | End-to-end trace ID. |
+
+### 3.4 Entity Relationship Diagram
 
 ```text
 AgentQuestion 1──────* HumanAction
@@ -868,6 +918,21 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 12. Orchestrator consumes the decision and unblocks the agent.
 13. `AuditLogger` records the approval with full correlation data.
 
+#### 6.3.1 Release-gate approval modeling (multi-approver)
+
+Release gates requiring multiple approvers (e.g., "2 of 3 approvers must approve before deployment proceeds") are **not** modeled as a single shared `AgentQuestion` with a threshold counter. Instead, the orchestrator creates **separate `AgentQuestion` records — one per required approver** — each following the standard single-decision first-writer-wins lifecycle described in §6.3 above. This design avoids contradicting the `AgentQuestion.Status` lifecycle where `CardActionHandler` atomically transitions `Open → Resolved` on the first accepted action.
+
+**How it works:**
+
+1. The orchestrator creates N `AgentQuestion` records (e.g., `Q-gate-x` for Alice, `Q-gate-y` for Bob), each with `Status = Open` and `TargetUserId` set to the respective approver.
+2. `TeamsMessengerConnector.SendQuestionAsync` persists and delivers each question independently — each gets its own Adaptive Card.
+3. When Alice taps "Approve" on her card, `CardActionHandler` transitions `Q-gate-x` from `Open` → `Resolved` (first-writer-wins on her question). Bob's question `Q-gate-y` is unaffected.
+4. When Bob taps "Approve", `Q-gate-y` transitions `Open` → `Resolved` independently.
+5. The orchestrator's workflow layer tracks the approval threshold and **aggregates** individual `HumanDecisionEvent` records. Once the required number of approvals is met, the orchestrator transitions the release gate to approved.
+6. If either approver double-taps their own card, the standard first-writer-wins idempotency rejects the duplicate (same as §6.3 step 5).
+
+This modeling aligns with `e2e-scenarios.md` §Concurrent approvals for a multi-approver release gate (lines 967–981), which explicitly defines separate `AgentQuestion` records per approver with threshold aggregation at the orchestration layer. The `ReleaseGateRequest` entity (§3.3) carries the gate metadata that the orchestrator uses to create and track the per-approver questions.
+
 ### 6.4 Scenario: Unauthorized tenant/user is rejected
 
 This scenario covers three distinct rejection paths per `tech-spec.md` §4.2 rejection behavior matrix.
@@ -1083,10 +1148,10 @@ Teams connector configuration is bound from `appsettings.json` / environment var
 ```json
 {
   "Teams": {
-    "MicrosoftAppId": "<bot-aad-app-id>",
-    "MicrosoftAppPassword": "<from-keyvault>",
-    "MicrosoftAppTenantId": "<single-tenant-id>",
-    "AllowedTenantIds": ["<tenant-1>", "<tenant-2>"],
+    "MicrosoftAppId": "${TEAMS_BOT_APP_ID}",
+    "MicrosoftAppPassword": "${TEAMS_BOT_APP_SECRET}",
+    "MicrosoftAppTenantId": "${TEAMS_BOT_TENANT_ID}",
+    "AllowedTenantIds": ["${TEAMS_ALLOWED_TENANT_1}", "${TEAMS_ALLOWED_TENANT_2}"],
     "OutboxPollingIntervalMs": 500,
     "MaxRetryAttempts": 5,
     "RetryBaseDelaySeconds": 2,
@@ -1094,6 +1159,8 @@ Teams connector configuration is bound from `appsettings.json` / environment var
   }
 }
 ```
+
+> **Configuration binding:** Values use `${ENV_VAR}` notation to indicate they are resolved from environment variables at startup. `TEAMS_BOT_APP_ID` is the bot's AAD application (client) ID. `TEAMS_BOT_APP_SECRET` is the bot's client secret, sourced from Azure Key Vault via a Key Vault reference or secret store CSI driver — never stored in plain text. `TEAMS_BOT_TENANT_ID` is the single-tenant Entra ID tenant for the bot registration. `TEAMS_ALLOWED_TENANT_1` / `TEAMS_ALLOWED_TENANT_2` are the tenant IDs permitted to interact with the bot (add additional entries as needed). In ASP.NET Core, these bind via `IConfiguration` with standard environment variable providers.
 
 ### 10.2 Dependency Injection Registration
 
