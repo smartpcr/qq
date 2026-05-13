@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.37
+**Version:** 1.38
 
 ---
 
@@ -246,9 +246,9 @@ Feature: Adaptive Card Approvals
     And question "Q-701" is the only AgentQuestion with Status == "Open" and ConversationId matching the current personal-chat conversation
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations — per implementation-plan.md §3.2 lines 186-187)
-    And the returned list contains exactly one AgentQuestion ("Q-701"), so "Q-701" is resolved without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved") (architecture.md §2.6, §3.1 — first-writer-wins)
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations — per implementation-plan.md §1.2 line 44 and §3.2 lines 186-187)
+    And the returned AgentQuestion is non-null ("Q-701"), so "Q-701" is resolved without disambiguation
+    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved") (implementation-plan.md §1.2 line 44 — first-writer-wins compare-and-set; note: architecture.md §4.11 line 766 defines a 2-arg `UpdateStatusAsync(questionId, newStatus)` — see cross-doc note at §Document Scope)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -267,9 +267,9 @@ Feature: Adaptive Card Approvals
     And question "Q-702" is the only AgentQuestion with Status == "Open" and ConversationId matching the current personal-chat conversation
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
-    Then RejectCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations)
-    And the returned list contains exactly one AgentQuestion ("Q-702"), so "Q-702" is resolved without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved") (architecture.md §2.6, §3.1 — first-writer-wins)
+    Then RejectCommandHandler calls IAgentQuestionStore.GetMostRecentOpenByConversationAsync(conversationId) scoped to the current conversation (NOT scoped to the user across conversations)
+    And the returned AgentQuestion is non-null ("Q-702"), so "Q-702" is resolved without disambiguation
+    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved") (implementation-plan.md §1.2 line 44 — first-writer-wins compare-and-set)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -290,7 +290,7 @@ Feature: Adaptive Card Approvals
     And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open", CreatedAt = T2, where T2 > T1)
     And both questions have ConversationId matching the current personal-chat conversation
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId)
+    Then ApproveCommandHandler calls IAgentQuestionStore.GetOpenByConversationAsync(conversationId) (see Open Question `disambiguation-store-method` — this method is NOT yet declared in implementation-plan.md §1.2)
     And the returned list contains two AgentQuestion records (Q-801 and Q-802), so disambiguation is required
     And the handler returns a disambiguation Adaptive Card listing all open questions:
       | QuestionId | Agent              | Title / Summary         | CreatedAt |
@@ -304,22 +304,13 @@ Feature: Adaptive Card Approvals
     #   "if exactly one is found, it is used as the target; if zero or more than one
     #    are found, the handler returns a disambiguation card listing open questions
     #    in the conversation with their QuestionIds."
-    # implementation-plan.md §3.2 line 201 test scenario confirms:
-    #   "Bare approve with multiple open questions returns disambiguation — Given
-    #    conversation conv-1 has two open AgentQuestion records (q-100 and q-101),
-    #    When user sends bare approve, Then ApproveCommandHandler returns a
-    #    disambiguation card listing both questions [...] and does NOT resolve either."
     #
-    # RESOLVED DESIGN DECISION (disambiguation-store-method):
-    # The IAgentQuestionStore interface (implementation-plan.md §1.2 line 43) currently
+    # OPEN QUESTION (disambiguation-store-method):
+    # The IAgentQuestionStore interface (implementation-plan.md §1.2 line 44) currently
     # only declares GetMostRecentOpenByConversationAsync returning AgentQuestion? (single).
-    # This scenario requires a list method: GetOpenByConversationAsync(conversationId)
-    # returning IReadOnlyList<AgentQuestion>. This method MUST be added to the interface
-    # in implementation-plan.md §1.2. The concrete SqlAgentQuestionStore (Stage 3.3)
-    # implements it against the AgentQuestions table using the existing filtered index
-    # on (ConversationId, Status) WHERE Status = 'Open', ordered by CreatedAt descending.
-    # GetMostRecentOpenByConversationAsync is retained as a convenience shortcut (returns
-    # the first element of the list or null) for callers that only need the most recent.
+    # This disambiguation scenario requires a list method: GetOpenByConversationAsync(conversationId)
+    # returning IReadOnlyList<AgentQuestion>. This method MUST be added to implementation-plan.md
+    # §1.2 before this scenario is testable. See Open Questions table at end of document.
     #
     # This scenario also prevents the "Cross-Conversation Consent" attack because the
     # lookup is scoped to the current conversationId, not the user globally.
