@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.30
+**Version:** 1.28
 
 ---
 
@@ -199,7 +199,7 @@ Feature: Adaptive Card Approvals
   Scenario: Human approves through Adaptive Card action
     When user "alice@contoso.com" clicks the "Approve" button on the Adaptive Card
     Then CardActionHandler queries IAgentQuestionStore.GetByIdAsync("Q-601") and confirms Status == "Open"
-    And CardActionHandler atomically transitions AgentQuestion.Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync(questionId, "Open", "Resolved") (architecture.md §2.6, §3.1 — first-writer-wins compare-and-set)
+    And CardActionHandler atomically transitions AgentQuestion.Status from "Open" to "Resolved" via IAgentQuestionStore.UpdateStatusAsync (architecture.md §2.6, §3.1 — first-writer-wins durable transition)
     And a HumanDecisionEvent is created:
       | Field             | Value            |
       | QuestionId        | Q-601            |
@@ -247,7 +247,7 @@ Feature: Adaptive Card Approvals
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "approve" in personal chat
     Then the bot confirms exactly one pending question exists for the user and resolves "Q-701"
-    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-701", "Open", "Resolved") (architecture.md §2.6, §3.1)
+    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" (architecture.md §2.6, §3.1)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -267,7 +267,7 @@ Feature: Adaptive Card Approvals
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
     Then the bot confirms exactly one pending question exists for the user and resolves "Q-702"
-    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-702", "Open", "Resolved") (architecture.md §2.6, §3.1)
+    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" (architecture.md §2.6, §3.1)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -297,7 +297,7 @@ Feature: Adaptive Card Approvals
     And no HumanDecisionEvent is created until the user disambiguates
     When user "alice@contoso.com" sends "approve Q-801"
     Then the bot resolves question "Q-801" specifically
-    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-801", "Open", "Resolved")
+    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved"
     And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
     And question "Q-802" remains with Status "Open"
     And an immutable audit record is persisted with EventType "CardActionReceived"
@@ -315,12 +315,12 @@ Feature: Adaptive Card Approvals
     # The architecture table's "most recent" phrasing is a convenience description
     # for the single-pending-question case, not a behavioral override.
 
-  Scenario: User rejects via text command when only one question is pending (auto-resolved without disambiguation)
+  Scenario: User rejects with explicit question ID when only one question is pending
     Given agent "release-agent-01" sent an Adaptive Card for question "Q-803" (Status = "Open")
     And no other questions are pending for user "alice@contoso.com"
     When user "alice@contoso.com" sends "reject" in personal chat
     Then the bot resolves the single pending question "Q-803" without disambiguation
-    And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved" via IAgentQuestionStore.TryUpdateStatusAsync("Q-803", "Open", "Resolved")
+    And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved"
     And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
     And an immutable audit record is persisted with EventType "CardActionReceived"
     # Note: When exactly one question is pending, the bot resolves it
@@ -434,7 +434,7 @@ Feature: Security — Tenant and User Validation
     And RBAC roles are configured:
       | Role     | Permissions                                      |
       | operator | agent ask, agent status, pause, resume, escalate |
-      | approver | approve, reject, agent status                    |
+      | approver | approve, reject                                  |
       | viewer   | agent status                                     |
 
   Scenario: Message from unauthorized tenant is rejected with HTTP 403
