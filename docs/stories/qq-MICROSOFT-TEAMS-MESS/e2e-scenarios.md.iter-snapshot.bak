@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.25
+**Version:** 1.24
 
 ---
 
@@ -35,21 +35,10 @@ Feature: Personal Chat — Agent Task Creation
   Scenario: User creates a task via team channel mention
     Given user "bob@contoso.com" is in team channel "#ops-swarm"
     And the bot is installed in the team
-    And user "bob@contoso.com" belongs to tenant "contoso-tenant-id"
-    And IIdentityResolver maps bob's AadObjectId to an internal user identity
-    And user "bob@contoso.com" has RBAC role "operator"
     When the user sends "@AgentBot agent ask design persistence layer" in the channel
     Then the bot strips the @mention and parses "agent ask design persistence layer"
-    And the bot validates bob's tenant via TenantValidationMiddleware
-    And IIdentityResolver.ResolveAsync maps bob's Entra identity to an internal user
-    And IUserAuthorizationService.AuthorizeAsync confirms bob's RBAC role
     And a MessengerEvent of type "AgentTaskRequest" is enqueued
-    And the event contains:
-      | Field          | Value                                          |
-      | ExternalUserId | <bob's AadObjectId>                             |
-      | Body           | design persistence layer                       |
     And the bot replies in a thread under the original message
-    And an immutable audit record is persisted for the command
 
   Scenario: User sends an unrecognised command
     Given user "alice@contoso.com" opens a personal chat with the Teams bot

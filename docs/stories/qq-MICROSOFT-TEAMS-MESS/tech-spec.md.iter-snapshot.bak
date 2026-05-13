@@ -40,8 +40,8 @@ Today, no Teams integration exists. Agents cannot reach operators inside Teams, 
 | **Interaction scopes** | Personal (1:1) chat and team channel conversations. |
 | **Message actions** | Teams message-extension action commands to forward context to agents. |
 | **Reliability** | Durable outbound notification queue. Retry transient Bot Connector failures (HTTP 429, 500, 502, 503, 504) per the canonical retry policy (§4.4). Dead-letter after exhausting retries. Connector restart recovery using persisted conversation references. |
-| **Performance** | P95 Adaptive Card delivery < 3 seconds after queue pickup. Connector recovery < 30 seconds. See §7 Assumption 8 for tentative concurrency target (unconfirmed — not a hard constraint). |
-| **Compliance** | Immutable audit trail for all inbound commands and outbound notifications. Include `CorrelationId`, `AgentId` (first-class field — not derived from `ActorId`/`ActorType`; see §4.3 canonical schema), `TaskId`, `ConversationId`, `Timestamp`, user identity, and action taken. |
+| **Performance** | P95 Adaptive Card delivery < 3 seconds after queue pickup. Connector recovery < 30 seconds. Concurrency target per §7 Assumption 8. |
+| **Compliance** | Immutable audit trail for all inbound commands and outbound notifications. Include `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`, user identity, and action taken. |
 | **Observability** | OpenTelemetry traces and metrics. Structured logging. Health-check endpoint. Latency histograms for card delivery. |
 | **Shared abstractions** | Implement `IMessengerConnector` (planned in `AgentSwarm.Messaging.Abstractions` — to be created as part of the epic-level shared infrastructure; see §6.1) for Teams. Use shared data models: `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage`. |
 | **Teams-specific contracts** | `IConversationReferenceStore` is defined in `AgentSwarm.Messaging.Teams` (not in the shared abstractions) because conversation reference shapes are platform-specific. `implementation-plan.md` Stage 1.2 places the interface definition step in the shared connector-interface stage for convenience of ordering, but the assembly owner is `AgentSwarm.Messaging.Teams`. All sibling docs use the dual identity-key model with `GetByAadObjectIdAsync` and `GetByInternalUserIdAsync` — see `implementation-plan.md` §1.2 and §4.1, `architecture.md` §4.2 `IConversationReferenceStore` interface definition. |
@@ -136,14 +136,13 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 | `ActorId` | `string` | Yes | Identity of the actor — Entra AAD object ID for users, agent ID for agent-originated events. |
 | `ActorType` | `string` | Yes | `User` or `Agent` — disambiguates `ActorId`. |
 | `TenantId` | `string` | Yes | Entra ID tenant of the actor. |
-| `AgentId` | `string` | No | The agent whose task or question triggered this event. Present on **all** events tied to an agent task — including human-originated actions such as `approve` or `reject` — so that the associated agent is recorded even when `ActorType = User`. Null for events not associated with a specific agent (e.g., `agent status` queries, security rejections). |
 | `TaskId` | `string` | No | Agent task/work-item ID (null for security rejection events). |
 | `ConversationId` | `string` | No | Teams conversation ID (null for events outside a conversation). |
 | `Action` | `string` | Yes | The specific action taken (e.g., `approve`, `reject`, `agent ask`, `send_card`). |
 | `PayloadJson` | `string` | Yes | JSON-serialized event payload (sanitized — no secrets or PII beyond identity). |
 | `Outcome` | `string` | Yes | Result of the action: `Success`, `Rejected`, `Failed`, `DeadLettered`. |
 
-> **Field mapping guidance for sibling docs:** `AgentId` is now a **first-class field** on every audit record (not derived from `ActorId`/`ActorType`). For agent-originated events, `ActorId` holds the agent ID and `ActorType = Agent`, while `AgentId` also holds the same agent ID. For human-originated events tied to an agent task (e.g., `approve`, `reject`), `ActorId` holds the user's AAD object ID, `ActorType = User`, and `AgentId` holds the associated agent's ID — ensuring the agent is always recorded regardless of who initiated the action. `UserId` maps to `ActorId` when `ActorType = User`. `Payload` maps to `PayloadJson`. The architecture doc's `AuditEntryId` is an implementation-specific surrogate key. The implementation plan's `Actor` maps to `ActorId`, `Resource` maps to `TaskId` + `ConversationId`, `Details` maps to `PayloadJson`, and `Checksum` is an implementation addition for tamper detection.
+> **Field mapping guidance for sibling docs:** `AgentId` from the story requirements maps to `ActorId` when `ActorType = Agent`. `UserId` maps to `ActorId` when `ActorType = User`. `Payload` maps to `PayloadJson`. The architecture doc's `AuditEntryId` is an implementation-specific surrogate key. The implementation plan's `Actor` maps to `ActorId`, `Resource` maps to `TaskId` + `ConversationId`, `Details` maps to `PayloadJson`, and `Checksum` is an implementation addition for tamper detection.
 
 ### 4.4 Reliability & Performance
 
@@ -153,7 +152,7 @@ This is the **minimum required** field set for all audit records. Sibling docs (
 | **Zero message loss** | Outbound notifications must be durably queued before acknowledgement to the agent. If Bot Connector is unreachable, the message is retried — not dropped. |
 | **Connector recovery** | After crash or restart, the connector must resume processing within 30 seconds using persisted conversation references and durable queues. |
 | **Idempotency** | Duplicate inbound activities (Teams sometimes retries webhook delivery) must be deduplicated using `Activity.Id` or `Activity.ReplyToId`. |
-| **Concurrent users** | The story description does not specify a concurrency requirement. A tentative assumption of 1000+ concurrent users is recorded in §7 Assumption 8. This assumption informs design considerations for rate limiting and queue throughput but is **not a hard constraint** — the architecture should not treat it as a confirmed requirement. |
+| **Concurrent users** | The story description does not specify a concurrency requirement. The assumed target of 1000+ concurrent users (see §7 Assumption 8) drives architectural decisions around rate limiting and queue throughput but is not a hard constraint sourced from the operator. |
 
 #### Canonical Retry Policy (source of truth)
 

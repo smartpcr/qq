@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 21
+**Status:** Draft — iteration 20
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -142,7 +142,7 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 |---|---|
 | **Assembly** | `AgentSwarm.Messaging.Teams` |
 | **Namespace** | `AgentSwarm.Messaging.Teams.Cards` |
-| **Responsibility** | Process Adaptive Card `Action.Submit` invoke activities. Extracts the `ActionId` and optional comment from `Activity.Value`, resolves the originating `AgentQuestion` via `IAgentQuestionStore.GetByIdAsync(questionId)` (§4.11) to retrieve the full question including `AllowedActions`, validates that the submitted `ActionValue` is in the question's `AllowedActions` list, produces a `HumanDecisionEvent`, and publishes it to the inbound queue. Updates the original card to reflect the decision (approved/rejected) and disables further actions. This handler processes **all** card action types uniformly — the `AgentQuestion` entity always follows a single-decision, first-writer-wins lifecycle (`Open` → `Resolved`). Multi-approver release gates do **not** use a shared `AgentQuestion`; see §6.3.1 for the release-gate modeling strategy. |
+| **Responsibility** | Process Adaptive Card `Action.Submit` invoke activities. Extracts the `ActionId` and optional comment from `Activity.Value`, resolves the originating `AgentQuestion` via `IAgentQuestionStore.GetByIdAsync(questionId)` (§4.11) to retrieve the full question including `AllowedActions`, validates that the submitted `ActionValue` is in the question's `AllowedActions` list, produces a `HumanDecisionEvent`, and publishes it to the inbound queue. Updates the original card to reflect the decision (approved/rejected) and disables further actions. |
 | **Dependencies** | `IAgentQuestionStore` (§4.11) — retrieves the persisted `AgentQuestion` by `QuestionId` for action validation and status checking. `ICardStateStore` (§4.3) — retrieves the `TeamsCardState` for card update operations. |
 | **Idempotency** | Two-layer idempotency: (1) **Durable status check** — queries `IAgentQuestionStore.GetByIdAsync(questionId)` and rejects the action if `AgentQuestion.Status != Open` (the question is already `Resolved` or `Expired`), then atomically transitions `Status` to `Resolved` via `IAgentQuestionStore.UpdateStatusAsync` on successful processing (first-writer-wins per `e2e-scenarios.md` §first-writer-wins question decisions). This durable check survives service restarts. (2) **In-memory processed-action set** (keyed on `QuestionId + UserId`) — a fast-path deduplication layer for within-session duplicate card-action submissions. Both work in conjunction with the **activity-level** `ActivityDeduplicationMiddleware` (§2.16) which suppresses duplicate webhook deliveries by `Activity.Id` before the activity reaches any handler. All three layers are required: the middleware catches transport-level retries; the in-memory set catches user-initiated double-taps within a session; the durable status check catches cross-restart duplicates and concurrent submissions from different pods. |
 
