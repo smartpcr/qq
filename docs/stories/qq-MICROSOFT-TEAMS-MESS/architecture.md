@@ -1,7 +1,7 @@
 # Architecture — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Status:** Draft — iteration 22
+**Status:** Draft — iteration 23
 
 > **Note on project/assembly names:** This repository currently contains only documentation (no source projects). All assembly names, namespaces, and project references in this document are *proposed* target modules aligned with the recommended solution structure in `implementation-plan.md` and the epic-level attachment. They should not be mistaken for existing source code.
 
@@ -611,7 +611,7 @@ public interface IConversationReferenceStore
 ### 4.3 ICardStateStore
 
 ```csharp
-// Assembly: AgentSwarm.Messaging.Teams
+// Assembly: AgentSwarm.Messaging.Abstractions
 public interface ICardStateStore
 {
     Task SaveAsync(TeamsCardState state, CancellationToken ct);
@@ -672,7 +672,7 @@ public interface IAdaptiveCardRenderer
 Components communicate through two internal channels:
 
 1. **Inbound queue** — `TeamsSwarmActivityHandler` → domain handlers → `TeamsMessengerConnector.ReceiveAsync()` buffer. The orchestrator polls `ReceiveAsync` or subscribes to a push-based `IObservable<MessengerEvent>` variant.
-2. **Outbound queue** — Orchestrator calls `SendMessageAsync` / `SendQuestionAsync` (via `IMessengerConnector`) or `UpdateCardAsync` / `DeleteCardAsync` (via `ITeamsCardManager`) → `OutboxRetryEngine` enqueues → background worker dequeues → `ProactiveNotifier` delivers via Bot Framework.
+2. **Outbound queue** — Orchestrator calls `SendMessageAsync` / `SendQuestionAsync` (via `IMessengerConnector`) → `OutboxRetryEngine` enqueues → background worker dequeues → `ProactiveNotifier` delivers via Bot Framework. **Card update/delete** follows a separate direct path: orchestrator calls `UpdateCardAsync` / `DeleteCardAsync` (via `ITeamsCardManager`) → `TeamsMessengerConnector` looks up `TeamsCardState` → `ProactiveNotifier` calls `UpdateActivityAsync` / `DeleteActivityAsync` with inline retry (same exponential-backoff policy as the outbox engine, but executed synchronously within the call rather than via outbox enqueueing). This direct path is used because update/delete target an existing `activityId` that must be acted on promptly — enqueueing would add latency and the outbox's batch-dequeue model is unnecessary for single-activity mutations. See §6.5 for the full sequence.
 
 ### 4.8 IActivityIdStore (webhook deduplication)
 
@@ -1139,10 +1139,10 @@ Human (Teams)    TeamsWebhookController    TeamsBotAdapter    TeamsSwarmActivity
 
 | Assembly | Layer | Responsibility |
 |---|---|---|
-| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`), `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult`, `IAgentQuestionStore` (interface) |
+| `AgentSwarm.Messaging.Abstractions` | Abstraction | `IMessengerConnector`, `MessengerMessage`, `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent` (base + subtypes `CommandEvent`, `DecisionEvent`, `TextEvent`), `IIdentityResolver` (interface), `UserIdentity`, `IUserAuthorizationService` (interface), `AuthorizationResult`, `IAgentQuestionStore` (interface), `ICardStateStore` (interface) |
 | `AgentSwarm.Messaging.Core` | Core | `OutboxRetryEngine`, `IMessageOutbox`, retry policies, deduplication, rate limiting |
 | `AgentSwarm.Messaging.Persistence` | Persistence | `IAuditLogger`, `AuditEntry`, `SqlConversationReferenceStore` (implementation), `SqlAgentQuestionStore` (impl of `IAgentQuestionStore`), storage implementations (SQL, Azure Table) |
-| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `ICardStateStore`, `ActivityDeduplicationMiddleware`, `IActivityIdStore`, `EntraIdentityResolver` (impl of `IIdentityResolver`), `RbacAuthorizationService` (impl of `IUserAuthorizationService`) |
+| `AgentSwarm.Messaging.Teams` | Teams Connector | `TeamsWebhookController`, `TeamsBotAdapter`, `TeamsSwarmActivityHandler`, `CommandParser`, `CardActionHandler`, `InstallHandler`, `IConversationReferenceStore` (interface), `ITeamsCardManager` (interface), `CardUpdateAction` (enum), `TeamsMessengerConnector`, `AdaptiveCardRenderer`, `ProactiveNotifier`, `MessageExtensionHandler`, `TeamsCardState`, `SqlCardStateStore` (impl of `ICardStateStore`), `ActivityDeduplicationMiddleware`, `IActivityIdStore`, `EntraIdentityResolver` (impl of `IIdentityResolver`), `RbacAuthorizationService` (impl of `IUserAuthorizationService`) |
 | `AgentSwarm.Messaging.Worker` | Host | ASP.NET Core worker service hosting the Teams connector, DI registration, health checks, OpenTelemetry configuration |
 | `AgentSwarm.Messaging.Tests` | Test | Unit and integration tests for all assemblies |
 
@@ -1209,7 +1209,9 @@ Teams connector configuration is bound from `appsettings.json` / environment var
 ### 10.2 Dependency Injection Registration
 
 ```csharp
-services.AddSingleton<IMessengerConnector, TeamsMessengerConnector>();
+services.AddSingleton<TeamsMessengerConnector>();
+services.AddSingleton<IMessengerConnector>(sp => sp.GetRequiredService<TeamsMessengerConnector>());
+services.AddSingleton<ITeamsCardManager>(sp => sp.GetRequiredService<TeamsMessengerConnector>());
 services.AddSingleton<IConversationReferenceStore, SqlConversationReferenceStore>();
 services.AddSingleton<ICardStateStore, SqlCardStateStore>();
 services.AddSingleton<IAgentQuestionStore, SqlAgentQuestionStore>();

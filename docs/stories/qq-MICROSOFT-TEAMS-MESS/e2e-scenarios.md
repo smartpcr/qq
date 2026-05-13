@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.26
+**Version:** 1.27
 
 ---
 
@@ -241,11 +241,13 @@ Feature: Adaptive Card Approvals
     And no duplicate HumanDecisionEvent is created
     And the bot responds with the previously recorded decision
 
-  Scenario: User approves via text command in personal chat
+  Scenario: User approves via text command in personal chat (single pending question)
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-701"
+    And question "Q-701" is the only pending question (Status == "Open") for user "alice@contoso.com"
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "approve" in personal chat
-    Then the bot resolves the most recent pending question "Q-701" for the user
+    Then the bot confirms exactly one pending question exists for the user and resolves "Q-701"
+    And CardActionHandler transitions AgentQuestion "Q-701" Status from "Open" to "Resolved" (architecture.md §2.6, §3.1)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -258,12 +260,14 @@ Feature: Adaptive Card Approvals
     And the card action buttons are disabled (card replaced with read-only version)
     And an immutable audit record is persisted with EventType "CardActionReceived"
 
-  Scenario: User rejects via text command in personal chat
+  Scenario: User rejects via text command in personal chat (single pending question)
     Given agent "release-agent-01" previously sent an Adaptive Card for question "Q-702"
     And question "Q-702" has AllowedAction "Reject" with RequiresComment = false
+    And question "Q-702" is the only pending question (Status == "Open") for user "alice@contoso.com"
     And the card is pending in user "alice@contoso.com"'s personal chat
     When user "alice@contoso.com" sends "reject" in personal chat
-    Then the bot resolves the most recent pending question "Q-702" for the user
+    Then the bot confirms exactly one pending question exists for the user and resolves "Q-702"
+    And CardActionHandler transitions AgentQuestion "Q-702" Status from "Open" to "Resolved" (architecture.md §2.6, §3.1)
     And a MessengerEvent of type "Command" is enqueued with canonical envelope plus typed payload:
       | Field                   | Value                 |
       | EventType               | Command               |
@@ -278,6 +282,40 @@ Feature: Adaptive Card Approvals
     # Note: Q-702 has RequiresComment = false, so no comment prompt is shown.
     # Contrast with the Adaptive Card rejection scenario for Q-602 (above),
     # where RequiresComment = true triggers an input field for the rejection reason.
+
+  Scenario: User sends approve with multiple pending questions in personal chat
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-801" (Status = "Open")
+    And agent "planner-agent-02" sent an Adaptive Card for question "Q-802" (Status = "Open")
+    And both cards are pending in user "alice@contoso.com"'s personal chat
+    When user "alice@contoso.com" sends "approve" in personal chat
+    Then the bot detects more than one pending AgentQuestion (Status == "Open") for the user
+    And the bot does NOT silently resolve "the most recent" question
+    And the bot replies with a disambiguation card listing all pending questions:
+      | QuestionId | Agent              | Title                        |
+      | Q-801      | release-agent-01   | <question Q-801 title>       |
+      | Q-802      | planner-agent-02   | <question Q-802 title>       |
+    And no HumanDecisionEvent is created until the user disambiguates
+    When user "alice@contoso.com" sends "approve Q-801"
+    Then the bot resolves question "Q-801" specifically
+    And CardActionHandler transitions AgentQuestion "Q-801" Status from "Open" to "Resolved"
+    And a HumanDecisionEvent is created with ActionValue "approve" and QuestionId "Q-801"
+    And question "Q-802" remains with Status "Open"
+    And an immutable audit record is persisted with EventType "CardActionReceived"
+    # Note: This prevents the "Most Recent Is Consent" attack where a user
+    # unknowingly approves the wrong pending question when multiple cards are
+    # outstanding. Explicit disambiguation (or explicit QuestionId in the command)
+    # is required when more than one question is pending.
+
+  Scenario: User rejects with explicit question ID when only one question is pending
+    Given agent "release-agent-01" sent an Adaptive Card for question "Q-803" (Status = "Open")
+    And no other questions are pending for user "alice@contoso.com"
+    When user "alice@contoso.com" sends "reject" in personal chat
+    Then the bot resolves the single pending question "Q-803" without disambiguation
+    And CardActionHandler transitions AgentQuestion "Q-803" Status from "Open" to "Resolved"
+    And a HumanDecisionEvent is created with ActionValue "reject" and QuestionId "Q-803"
+    And an immutable audit record is persisted with EventType "CardActionReceived"
+    # Note: When exactly one question is pending, the bot resolves it
+    # unambiguously — no disambiguation prompt is needed.
 ```
 
 ---
@@ -966,16 +1004,30 @@ Feature: Edge Cases and Error Handling
     Then the bot replies with the help card
     And a MessengerEvent of type "Text" is enqueued with an empty payload
 
-  Scenario: Bot receives a message exceeding a reasonable operational length
-    Given user "alice@contoso.com" sends a message with a text body of 50,000+ characters
+  Scenario: Bot receives a message exceeding the configured maximum inbound payload size
+    Given the system has a configurable MaxInboundMessageLength setting (default: 50,000 characters)
+    And user "alice@contoso.com" sends a message with a text body exceeding MaxInboundMessageLength
     When the bot processes the activity
-    Then the bot enqueues a MessengerEvent containing the full message body (Bot Framework does not enforce a message-length limit)
+    Then the bot rejects the oversized message and does NOT enqueue it
+    And the bot replies with an error message: "Message exceeds the maximum allowed length of {MaxInboundMessageLength} characters. Please shorten your message."
+    And a warning is logged noting the rejected payload size
+    And an immutable audit record is persisted with:
+      | Field     | Value                         |
+      | EventType | MessageRejected               |
+      | Reason    | PayloadExceedsMaxLength       |
+      | ActorId   | <alice's AadObjectId>         |
+    # Note: The maximum inbound message length is a system-configured policy
+    # (not a Bot Framework platform limit). This prevents unbounded payload
+    # sizes from propagating through the inbound queue. The default of 50,000
+    # characters can be overridden via application configuration.
+
+  Scenario: Bot receives a large but within-limit message
+    Given the system has MaxInboundMessageLength set to 50,000 characters
+    And user "alice@contoso.com" sends a message with a text body of 49,999 characters
+    When the bot processes the activity
+    Then the bot enqueues a MessengerEvent containing the full message body
     And a warning is logged noting the unusually large payload size
     And an immutable audit record is persisted with EventType "CommandReceived"
-    # Note: Neither the sibling tech-spec nor Bot Framework defines a maximum inbound
-    # message length or truncation policy. The bot passes the full body through.
-    # If a future tech-spec revision introduces a configurable length limit with
-    # truncation behavior, this scenario should be updated to match.
 
   Scenario: Adaptive Card action payload is malformed
     Given user "alice@contoso.com" submits an Adaptive Card action
