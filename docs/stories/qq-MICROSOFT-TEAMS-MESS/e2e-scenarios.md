@@ -1133,3 +1133,33 @@ These notes document known signature differences between sibling plan documents.
 |-------|--------------|---------------------|------------|
 | Status transition method | Uses `TryUpdateStatusAsync(questionId, expectedStatus, newStatus)` — 3-arg compare-and-set returning `bool` (per implementation-plan.md §1.2 line 44) | architecture.md §4.11 line 766 and §6.3 line 957 define `UpdateStatusAsync(questionId, newStatus)` — 2-arg, no expected-status guard | **Unresolved — requires operator decision** (Open Question `status-transition-method-naming`): architecture.md must either adopt the 3-arg `TryUpdateStatusAsync` signature from implementation-plan.md or implementation-plan.md must revert to the 2-arg `UpdateStatusAsync`. This doc currently follows implementation-plan.md's 3-arg signature because it explicitly encodes the expected-status guard required for first-writer-wins semantics. |
 | Bare approve/reject with multiple pending questions | Uses `GetMostRecentOpenByConversationAsync(conversationId)` returning `AgentQuestion?` — resolves the most recent open question (per implementation-plan.md §1.2 line 44) | implementation-plan.md §3.2 line 187 describes "if zero or more than one are found, the handler returns a disambiguation card" but only declares a single-return method (`GetMostRecentOpenByConversationAsync`) | **Unresolved — requires operator decision** (Open Question `bare-approve-disambiguation-vs-most-recent`): implementation-plan.md §3.2 line 187 internally contradicts §1.2 line 44 — §1.2 declares `GetMostRecentOpenByConversationAsync` returning `AgentQuestion?` (single), while §3.2 expects disambiguation when "more than one" are found (requiring a list method). This doc uses most-recent-wins to stay testable with the declared API. If disambiguation is desired, implementation-plan.md §1.2 must add `GetOpenByConversationAsync` returning `IReadOnlyList<AgentQuestion>`. |
+
+---
+
+## Open Questions
+
+These unresolved cross-document discrepancies block final acceptance of the affected scenarios. Operator decisions are required to align the sibling documents.
+
+```json open-questions
+{ "openQuestions": [
+    {
+      "id": "status-transition-method-naming",
+      "text": "architecture.md defines UpdateStatusAsync(questionId, newStatus) (2-arg) while implementation-plan.md defines TryUpdateStatusAsync(questionId, expectedStatus, newStatus) (3-arg with compare-and-set). Which signature should all documents use?",
+      "type": "choice",
+      "choices": [
+        "TryUpdateStatusAsync (3-arg, compare-and-set) — align architecture.md to implementation-plan.md",
+        "UpdateStatusAsync (2-arg) — align implementation-plan.md to architecture.md, with internal compare-and-set hidden in implementation",
+        "Both: keep UpdateStatusAsync as the interface name but change its signature to 3-arg compare-and-set"
+      ]
+    },
+    {
+      "id": "bare-approve-disambiguation-vs-most-recent",
+      "text": "When a user sends bare 'approve' and multiple questions are open in the conversation, should the handler: (A) resolve the most recent open question (most-recent-wins, testable with the declared GetMostRecentOpenByConversationAsync returning AgentQuestion?), or (B) return a disambiguation card listing all open questions (requires adding GetOpenByConversationAsync returning IReadOnlyList<AgentQuestion> to IAgentQuestionStore)?",
+      "type": "choice",
+      "choices": [
+        "Most-recent-wins — bare approve resolves the most recently created open question; user resolves older questions one at a time or with explicit questionId",
+        "Disambiguation card — bare approve with multiple open questions returns a card listing all; requires adding GetOpenByConversationAsync to the store interface"
+      ]
+    }
+] }
+```
