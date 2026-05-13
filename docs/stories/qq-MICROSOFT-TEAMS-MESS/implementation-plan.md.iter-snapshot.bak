@@ -111,7 +111,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Implement `OnTurnAsync` to add `CorrelationId` (from activity or new GUID) to the turn context for distributed tracing.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
 
 ### Test Scenarios
 - [ ] Scenario: Command routing— Given a message activity with text `agent ask create e2e test scenarios for update service`, When processed by `OnMessageActivityAsync`, Then the command dispatcher receives an `AskCommand` with prompt `create e2e test scenarios for update service`.
@@ -148,7 +148,7 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 - [ ] Create `manifest.zip` packaging script that bundles `manifest.json`, `color.png` (192×192), and `outline.png` (32×32) icons for sideloading or admin deployment.
 
 ### Dependencies
-- phase-teams-bot-framework-core/stage-asp-net-core-bot-host
+- phase-teams-bot-framework-core/stage-aspnet-core-bot-host
 
 ### Test Scenarios
 - [ ] Scenario: Manifest schema validation— Given the generated `manifest.json`, When validated against the Teams manifest schema v1.16, Then no schema errors are reported.
