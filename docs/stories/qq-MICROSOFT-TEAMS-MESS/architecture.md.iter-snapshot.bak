@@ -122,8 +122,6 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | **Responsibility** | Parse free-text messages into structured commands. Teams does not use slash-command prefixes; the parser recognizes `agent ask <payload>`, `agent status`, `approve`, `reject`, `escalate`, `pause`, `resume` as command triggers. Falls back to echo/help for unrecognized input. |
 | **Output** | `ParsedCommand` record containing `CommandType`, `Payload`, `CorrelationId`. |
 
-> **Cross-doc naming — `CommandParser` (architecture) vs `ICommandDispatcher` / `CommandDispatcher` (implementation-plan):** This architecture models the parsing concern as `CommandParser` — a focused component that converts raw text into a `ParsedCommand`. The sibling `implementation-plan.md` §1.2 line 35 defines `ICommandDispatcher` / `CommandDispatcher` which combines parsing with handler routing (resolve the matching `ICommandHandler` from DI and invoke it). These are the **same logical component at different granularities**: this architecture separates parsing from dispatch to clarify the data flow, while the implementation plan merges them into a single dispatcher class for implementation convenience. At implementation time, `CommandDispatcher` will contain a `CommandParser` internally (or inline the parsing logic) and add the handler-routing step. The `TeamsSwarmActivityHandler` key-override at §2.4 maps `OnMessageActivityAsync` → `CommandParser`; in implementation this call site becomes `ICommandDispatcher.DispatchAsync`, which parses first, then routes.
-
 #### Supported commands
 
 | Input pattern | CommandType | Description |
@@ -179,8 +177,6 @@ The design conforms to the shared `IMessengerConnector` abstraction defined in `
 | **Namespace** | `AgentSwarm.Messaging.Teams.Cards` |
 | **Responsibility** | Build Adaptive Card JSON payloads for each interaction type: agent questions (with action buttons), approval requests, status summaries, incident alerts, and release gates. Embeds `QuestionId`, `ActionId`, and `CorrelationId` in card data for round-trip correlation. |
 | **Card types** | `AgentQuestionCard`, `ApprovalCard`, `StatusCard`, `IncidentCard`, `ReleaseGateCard`. |
-
-> **Cross-doc naming — `AdaptiveCardRenderer` / `IAdaptiveCardRenderer` (architecture) vs `AdaptiveCardBuilder` (implementation-plan):** This architecture uses the name `AdaptiveCardRenderer` (and interface `IAdaptiveCardRenderer` at §4.6) for the component that builds Adaptive Card JSON. The sibling `implementation-plan.md` §3.1 line 154 calls the same component `AdaptiveCardBuilder`. These refer to the **same component** — a single class that renders `AgentQuestion` and other domain objects to Adaptive Card JSON using the AdaptiveCards NuGet package. At implementation time, either name may be used; if the team adopts `AdaptiveCardBuilder` (the implementation plan's name), the DI registration at §10.2 becomes `services.AddSingleton<IAdaptiveCardRenderer, AdaptiveCardBuilder>()` — the interface `IAdaptiveCardRenderer` remains the contract surface regardless of the concrete class name.
 
 ### 2.11 ProactiveNotifier
 
@@ -798,40 +794,37 @@ Human (Teams)          TeamsWebhookController    TeamsBotAdapter    TeamsSwarmAc
 ### 6.2 Scenario: Agent proactively sends a blocking question
 
 ```text
-Orchestrator    TeamsMessengerConnector    AgentQuestionStore    OutboxRetryEngine    ProactiveNotifier    ConvRefStore    AdaptiveCardRenderer    CardStateStore    Teams
-     │                    │                      │                     │                     │                  │                  │                    │              │
-     │── SendQuestion ───>│                      │                     │                     │                  │                  │                    │              │
-     │   (AgentQuestion)  │── SaveAsync ────────>│                     │                     │                  │                  │                    │              │
-     │                    │<── persisted (Open) ──│                     │                     │                  │                  │                    │              │
-     │                    │── enqueue ───────────────────────────────>│                     │                  │                  │                    │              │
-     │                    │                      │                     │── dequeue ─────────>│                  │                  │                    │              │
-     │                    │                      │                     │                     │── lookup ref ───>│                  │                    │              │
-     │                    │                      │                     │                     │<── ConvRef ──────│                  │                    │              │
-     │                    │                      │                     │                     │── check IsActive │                  │                    │              │
-     │                    │                      │                     │                     │   (if inactive:  │                  │                    │              │
-     │                    │                      │                     │                     │    dead-letter,  │                  │                    │              │
-     │                    │                      │                     │                     │    audit, STOP)  │                  │                    │              │
-     │                    │                      │                     │                     │── render card ──────────────────────>│                    │              │
-     │                    │                      │                     │                     │<── Attachment ──────────────────────│                    │              │
-     │                    │                      │                     │                     │── ContinueConversationAsync ───────────────────────────────────────────>│
-     │                    │                      │                     │                     │<── activityId ─────────────────────────────────────────────────────────│
-     │                    │                      │                     │                     │── save card state ──────────────────────────────────────>│              │
-     │                    │                      │                     │<── mark delivered ──│                  │                  │                    │              │
-     │                    │                      │                     │                     │                  │                  │                    │── card ─────>│
+Orchestrator    TeamsMessengerConnector    OutboxRetryEngine    ProactiveNotifier    ConvRefStore    AdaptiveCardRenderer    CardStateStore    Teams
+     │                    │                      │                     │                  │                  │                    │              │
+     │── SendQuestion ───>│                      │                     │                  │                  │                    │              │
+     │   (AgentQuestion)  │── enqueue ──────────>│                     │                  │                  │                    │              │
+     │                    │                      │── dequeue ─────────>│                  │                  │                    │              │
+     │                    │                      │                     │── lookup ref ───>│                  │                    │              │
+     │                    │                      │                     │<── ConvRef ──────│                  │                    │              │
+     │                    │                      │                     │── check IsActive │                  │                    │              │
+     │                    │                      │                     │   (if inactive:  │                  │                    │              │
+     │                    │                      │                     │    dead-letter,  │                  │                    │              │
+     │                    │                      │                     │    audit, STOP)  │                  │                    │              │
+     │                    │                      │                     │── render card ──────────────────────>│                    │              │
+     │                    │                      │                     │<── Attachment ──────────────────────│                    │              │
+     │                    │                      │                     │── ContinueConversationAsync ───────────────────────────────────────────>│
+     │                    │                      │                     │<── activityId ─────────────────────────────────────────────────────────│
+     │                    │                      │                     │── save card state ──────────────────────────────────────>│              │
+     │                    │                      │<── mark delivered ──│                  │                  │                    │              │
+     │                    │                      │                     │                  │                  │                    │── card ─────>│
 ```
 
 1. Orchestrator calls `IMessengerConnector.SendQuestionAsync(agentQuestion)`.
-2. `TeamsMessengerConnector` calls `IAgentQuestionStore.SaveAsync(agentQuestion)` to persist the question with `Status = Open` before any rendering or enqueueing. This ensures the question is durably stored so that subsequent card actions (§6.3) can resolve it via `GetByIdAsync` for action validation and idempotent duplicate handling.
-3. `TeamsMessengerConnector` creates an `OutboxEntry` and persists it via `IMessageOutbox.EnqueueAsync`.
-4. The outbox background worker dequeues the entry and delegates to `ProactiveNotifier`.
-5. `ProactiveNotifier` resolves the target from the `OutboxEntry.Destination` field (which was derived from `AgentQuestion.TargetUserId` or `AgentQuestion.TargetChannelId` — see §3.1 routing derivation note). It looks up the `ConversationReference` for the target user via `IConversationReferenceStore.GetByInternalUserIdAsync(tenantId, targetUserId)` (or `GetByChannelIdAsync` for channel-scoped questions).
-6. **Inactive-installation pre-check:** If the reference is not found, or if `IsActive == false` (indicating the user uninstalled the bot), `ProactiveNotifier` skips the Bot Framework call entirely, moves the outbox entry to the dead-letter queue via `IMessageOutbox.DeadLetterAsync`, and logs an audit entry (`EventType: Error`, `Outcome: Failed`, reason: inactive/missing reference). This pre-check avoids unnecessary Bot Framework calls for known-uninstalled users (aligned with `implementation-plan.md` §5.1 `InstallationStateGate` and `e2e-scenarios.md` §Proactive Messaging lines 121–129).
-7. `AdaptiveCardRenderer.RenderQuestionCard` builds the Adaptive Card with action buttons.
-8. `ProactiveNotifier` calls `CloudAdapter.ContinueConversationAsync` with the conversation reference, sending the card as an `Activity`.
-9. Teams returns the `activityId` of the sent message.
-10. `CardStateStore.SaveAsync` persists the `TeamsCardState` with the `activityId` (needed for future update/delete).
-11. `OutboxRetryEngine` marks the entry as `Sent` (via `IMessageOutbox.AcknowledgeAsync`).
-12. If delivery fails with a transient error (HTTP 429, 500, 502, 503, 504), the engine schedules a retry per `tech-spec.md` §4.4 (exponential backoff with ±25% jitter; `Retry-After` override for 429). If delivery fails with HTTP 403 or 404 (stale reference — user removed from tenant without an uninstall event), `ProactiveNotifier` marks the reference as inactive, dead-letters the message, and logs an audit entry (aligned with `e2e-scenarios.md` §Proactive Messaging lines 131–143).
+2. `TeamsMessengerConnector` creates an `OutboxEntry` and persists it via `IMessageOutbox.EnqueueAsync`.
+3. The outbox background worker dequeues the entry and delegates to `ProactiveNotifier`.
+4. `ProactiveNotifier` resolves the target from the `OutboxEntry.Destination` field (which was derived from `AgentQuestion.TargetUserId` or `AgentQuestion.TargetChannelId` — see §3.1 routing derivation note). It looks up the `ConversationReference` for the target user via `IConversationReferenceStore.GetByInternalUserIdAsync(tenantId, targetUserId)` (or `GetByChannelIdAsync` for channel-scoped questions).
+5. **Inactive-installation pre-check:** If the reference is not found, or if `IsActive == false` (indicating the user uninstalled the bot), `ProactiveNotifier` skips the Bot Framework call entirely, moves the outbox entry to the dead-letter queue via `IMessageOutbox.DeadLetterAsync`, and logs an audit entry (`EventType: Error`, `Outcome: Failed`, reason: inactive/missing reference). This pre-check avoids unnecessary Bot Framework calls for known-uninstalled users (aligned with `implementation-plan.md` §5.1 `InstallationStateGate` and `e2e-scenarios.md` §Proactive Messaging lines 121–129).
+6. `AdaptiveCardRenderer.RenderQuestionCard` builds the Adaptive Card with action buttons.
+7. `ProactiveNotifier` calls `CloudAdapter.ContinueConversationAsync` with the conversation reference, sending the card as an `Activity`.
+8. Teams returns the `activityId` of the sent message.
+9. `CardStateStore.SaveAsync` persists the `TeamsCardState` with the `activityId` (needed for future update/delete).
+10. `OutboxRetryEngine` marks the entry as `Sent` (via `IMessageOutbox.AcknowledgeAsync`).
+11. If delivery fails with a transient error (HTTP 429, 500, 502, 503, 504), the engine schedules a retry per `tech-spec.md` §4.4 (exponential backoff with ±25% jitter; `Retry-After` override for 429). If delivery fails with HTTP 403 or 404 (stale reference — user removed from tenant without an uninstall event), `ProactiveNotifier` marks the reference as inactive, dead-letters the message, and logs an audit entry (aligned with `e2e-scenarios.md` §Proactive Messaging lines 131–143).
 
 ### 6.3 Scenario: Human approves via Adaptive Card action
 

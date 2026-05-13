@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.20 — Iteration 20 (add admin-consent/app-policy scenario, remove invented 4096 limit, note stale tech-spec conv-ref key alignment)
+**Version:** 1.21 — Iteration 21 (remove self-referential prior-feedback transcript that contained stale strings; align cross-doc claims with verified tech-spec state)
 
 ---
 
@@ -967,32 +967,22 @@ Feature: Edge Cases and Error Handling
 
 ## Iteration Summary
 
-**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md` — ~966 lines, ~54 KB
+**File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md` — ~970 lines, ~51 KB
 
-**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle, bot installation/uninstall, admin-consent/app-installation-policy gating, update/delete of sent cards, multi-approver release gates, RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions, edge cases (concurrent approvals, stale references, rate limiting, service restart, empty/long messages).
+**Coverage:** Personal chat, channel mention, proactive blocking questions, Adaptive Card approvals/rejections, conversation reference lifecycle, bot installation/uninstall, admin-consent/app-policy gating, update/delete of sent cards, multi-approver release gates, RBAC/tenant security, retry/dead-letter, audit trail, performance (P95), message actions, edge cases (concurrent approvals, stale references, rate limiting, service restart, empty/long messages).
 
 ### Prior feedback resolution
 
-- [x] 1. FIXED — §Bot Installation and Conversation Discovery (lines 743–770 area) — Added four new scenarios: (a) app installation blocked by Entra admin-consent / Teams app installation policy, (b) installation succeeds after admin grants consent (anchored to tech-spec §5.1 R-5), (c) proactive message fails after tenant revokes app consent, (d) proactive pre-check with no installation. These validate the deployment-blocker behavior called out at tech-spec §5.1 R-5. Verification:
-```
-$ grep -nF "app installation policy" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-743:  Scenario: Teams app installation blocked by Entra admin-consent / app installation policy
-744:    Given the organization's Entra ID tenant "restricted-tenant-id" has a Teams app installation policy that blocks sideloaded or unapproved apps
-747:    Then the Teams client rejects the installation per the tenant's app installation policy
-```
+- [x] 1. ADDRESSED — The evaluator noted that the iter-20 verification block embedded literal occurrences of the searched phrase inside the e2e file itself (lines 976–982 of the old transcript), creating self-referential grep hits. The structural fix this iteration is removing the entire self-referential transcript block. The actual scenario content at lines 743–747 correctly covers admin-consent and Entra-based app-policy gating. Sibling docs (architecture.md §2.7, tech-spec.md §5.1 R-5) legitimately use the same phrase in their own context — those are not contradictions; they are consistent cross-doc references to the same deployment-blocker behavior.
 
-- [x] 2. FIXED — §Edge Cases (line 895 area) — Removed the invented "4,096 characters" truncation limit. The scenario now states the limit is configurable per-environment with no hardcoded default, so QA does not enforce an unowned product limit. Verification:
-```
-$ grep -nF "4,096" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty)
-```
+- [x] 2. ADDRESSED — Same root cause as item 1: the old verification transcript at lines 984–987 embedded the literal four-digit number in a quoted grep command and output description. The actual scenario body (line 895) was already fixed in iter 20 to use a configurable-per-environment limit with no hardcoded default. This iteration removes the stale transcript so the file no longer contains any occurrence of that number.
 
-- [x] 3. FIXED — §cross-doc note — The contradiction lives in `tech-spec.md:47`, which still references `GetByUserIdAsync` and tracks open question `conv-ref-key-alignment`. This e2e doc already uses the correct `IConversationReferenceStore` dual-key model (`TargetUserId`/`TargetChannelId` routing) consistently. The stale reference is in tech-spec.md, not in this file — the tech-spec sibling architect must remove the legacy `GetByUserIdAsync` phrasing on their next iteration. Verification that this doc has no stale references:
-```
-$ grep -nF "GetByUserIdAsync" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-(empty)
-```
+- [x] 3. ADDRESSED — Same root cause: the old transcript at lines 990–993 embedded the legacy method name in a quoted grep command. The actual scenario body has never used that method name — it uses `IConversationReferenceStore` with `TargetUserId`/`TargetChannelId` routing consistently. This iteration removes the stale transcript.
+
+- [x] 4. ADDRESSED — The iter-20 transcript at line 990 claimed tech-spec.md still contained a legacy method reference and tracked an open alignment question. This was stale: tech-spec.md §2.1 (line 47) now states cross-doc alignment is verified and no legacy single-key references remain. The contradictory claim has been removed with the transcript.
+
+- [x] 5. ADDRESSED — The iter-20 Open Questions section (lines 996–998) said "None" while line 990 simultaneously claimed tech-spec tracked an open alignment question. Both the stale claim and the inconsistent "None" are removed. The current state is consistent: tech-spec.md confirms alignment is verified, so no open question exists.
 
 ### Open questions
 
-None — all three feedback items are resolved or noted for sibling-doc alignment.
+None — all sibling docs confirm cross-doc alignment on the dual identity-key model. No unresolved contradictions remain.
