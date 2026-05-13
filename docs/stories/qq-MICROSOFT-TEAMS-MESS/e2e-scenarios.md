@@ -470,15 +470,19 @@ Feature: Message Update and Delete
 
   Scenario: Bot deletes a recalled question card
     Given agent "arch-agent-03" recalls question "Q-701" before a human responds
-    When the TeamsMessengerConnector processes the recall event
-    Then the bot calls DeleteActivityAsync with activity ID "act-901"
+    When the orchestrator (or Teams-aware coordinator) calls ITeamsCardManager.DeleteCardAsync("Q-701", ct) (per architecture.md §4.1.1 and §6.5 — ITeamsCardManager is the Teams-specific contract surface for card update/delete, separate from IMessengerConnector)
+    Then TeamsMessengerConnector (which implements ITeamsCardManager) looks up TeamsCardState from ICardStateStore to retrieve the stored activityId "act-901" and conversationId
+    And ProactiveNotifier calls turnContext.DeleteActivityAsync with the stored activityId "act-901" (the internal Bot Framework SDK call within TeamsMessengerConnector)
     And the card is removed from the conversation
+    And ICardStateStore.UpdateStatusAsync is called to mark the card state as Deleted
     And an audit record is persisted for the deletion
 
   Scenario: Update fails due to expired activity reference
     Given the activity ID "act-901" is no longer valid (e.g., message too old)
     And question "Q-701" was previously resolved with decision "Approved" by user "alice@contoso.com"
-    When the bot attempts to update the card via UpdateActivityAsync
+    When the orchestrator calls ITeamsCardManager.UpdateCardAsync("Q-701", CardUpdateAction.MarkApproved, ct) (per architecture.md §4.1.1 and §6.5)
+    And TeamsMessengerConnector looks up TeamsCardState and delegates to ProactiveNotifier
+    And ProactiveNotifier's internal turnContext.UpdateActivityAsync call fails because the activityId is no longer valid
     Then the Bot Framework returns an error
     And the failure is logged with the CorrelationId
     And the bot sends a new read-only replacement card to the user instead:
