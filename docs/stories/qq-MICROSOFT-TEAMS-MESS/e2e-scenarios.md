@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.55
+**Version:** 1.56
 
 ---
 
@@ -622,7 +622,7 @@ Feature: Security — Tenant and User Validation
     And no application-level audit entry is emitted by IAuditLogger (per tech-spec §4.2: "N/A — no audit entry emitted") because the request never reaches the bot handler where IAuditLogger is called
     And the HTTP 401 response is captured by infrastructure-level logging (Azure Front Door WAF logs, API gateway access logs, Azure Monitor) per operator decision on infrastructure audit coverage
 
-  # Note on pipeline ordering for forged requests:
+  # QA Implementation Note — Pipeline ordering for forged requests:
   # The ASP.NET Core HTTP middleware pipeline order is (per implementation-plan.md §2.1 step 7):
   #   1. TenantValidationMiddleware (HTTP layer — can reject with 403 if tenant not allowed)
   #   2. RateLimitMiddleware (HTTP layer — can reject with 429 if rate exceeded)
@@ -630,11 +630,17 @@ Feature: Security — Tenant and User Validation
   #   4. Bot Framework IMiddleware pipeline (TelemetryMiddleware → ActivityDeduplicationMiddleware)
   #   5. Bot handler (TeamsSwarmActivityHandler)
   # For a forged-JWT request with a valid tenant, steps 1-2 pass and step 3 rejects.
-  # TenantValidationMiddleware and RateLimitMiddleware DO execute for forged requests —
-  # they are application-level ASP.NET Core middleware that run before CloudAdapter.
-  # The phrase "before any application code or middleware runs" in architecture.md §10.3
-  # is imprecise; it should read "before any Bot Framework middleware or bot handler runs."
-  # This scenario models the precise execution path; see Cross-document notes at end of file.
+  #
+  # QA SHOULD IMPLEMENT THIS PIPELINE (steps 1-5 above) as the authoritative contract.
+  # This matches implementation-plan.md §2.1 which defines the concrete middleware registration order.
+  #
+  # Known sibling-doc discrepancy (open question forged-jwt-pipeline-contract):
+  # architecture.md §10.3 and tech-spec.md §4.2 use the phrase "before any application code
+  # or middleware runs" for invalid JWT rejection. That phrasing is imprecise — it should read
+  # "before any Bot Framework middleware or bot handler runs" because ASP.NET Core HTTP middleware
+  # (TenantValidationMiddleware, RateLimitMiddleware) DOES execute before CloudAdapter.
+  # Until the sibling docs are updated, QA should follow the pipeline defined in this scenario
+  # and implementation-plan.md §2.1.
 
   Scenario: Forged activity from blocked tenant is rejected by TenantValidationMiddleware before JWT check
     Given an attacker sends a forged HTTP POST to the bot's messaging endpoint
