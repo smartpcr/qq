@@ -1298,29 +1298,27 @@ These notes document how this document resolved known signature differences betw
 ## Iteration Summary
 
 **File:** `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md`
-**Version:** 1.54 (iteration 54)
+**Version:** 1.55 (iteration 55)
 
 ### Changes this iteration
 
-1. **Structurally rewrote forged-token scenario to reconcile security pipeline contradiction** — The prior scenario stated JWT rejection occurs "before any application-level processing," which contradicted implementation-plan.md §2.1 where TenantValidationMiddleware and RateLimitMiddleware are ASP.NET Core HTTP middleware that execute BEFORE CloudAdapter.ProcessAsync and deserialize the raw Activity body. The rewritten scenario now explicitly models the full pipeline execution path: TenantValidationMiddleware runs first (reads body, checks tenant), RateLimitMiddleware runs second (checks rate), CloudAdapter runs third (validates JWT — rejects with 401 for forged tokens). This aligns with the canonical pipeline order defined in implementation-plan.md §2.1 step 7.
+1. **Removed self-referential phrases from iteration summary** — The prior iteration summary (lines 1305, 1315) quoted the exact old scenario text verbatim, causing grep verification to find the phrases in the changelog rather than in scenario content. This iteration replaces the entire summary section with clean text that describes changes without quoting removed phrases.
 
-2. **Added companion scenario for forged activity from blocked tenant** — A new scenario covers the case where a forged activity's tenant is NOT in the allow-list, showing that TenantValidationMiddleware rejects with HTTP 403 before CloudAdapter ever checks the JWT. This makes the two-path security model explicit and testable by QA.
+2. **Removed embedded grep transcripts** — The prior iteration summary embedded literal `grep -nF` command lines (lines 1317, 1321) as document content. These grep commands themselves contained the phrases being verified as removed, creating a paradox where grep always found a hit. All grep transcript blocks have been removed from the document.
 
-3. **Added inline pipeline ordering comment** — A Gherkin comment block in the security feature documents the canonical five-step pipeline order with cross-references to implementation-plan.md, and notes that architecture.md §10.3's language is imprecise.
+3. **Cross-document pipeline inconsistency documented as open question** — The forged-token scenario (lines 609-623) correctly models TenantValidationMiddleware → RateLimitMiddleware → CloudAdapter per implementation-plan.md §2.1. However, architecture.md §10.3 (line 1236) and tech-spec.md §4.2 (line 107) still use language implying no application code runs for invalid JWTs. Since this e2e-scenarios document cannot edit sibling docs, this is surfaced as an open question for the operator to pin a decision or direct sibling architects to align.
 
 ### Prior feedback resolution
 
-Iteration 53 feedback:
+Iteration 54 feedback:
 
-- [x] 1. FIXED — §Security/RBAC forged-token scenario structurally rewritten to reconcile the pipeline contradiction. The scenario now explicitly models TenantValidationMiddleware and RateLimitMiddleware executing as ASP.NET Core HTTP middleware BEFORE CloudAdapter.ProcessAsync (per implementation-plan.md §2.1 steps 5 and 7). CloudAdapter JWT validation is modeled as step 3 in the pipeline, not as "before any application-level processing." A companion scenario covers the blocked-tenant path where TenantValidationMiddleware rejects with 403 before JWT validation. The cross-document note flags architecture.md §10.3's imprecise language for the architecture architect. Verification:
-  ```
-  $ grep -nF "before any application-level processing" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-  (empty — phrase removed)
-  ```
-  ```
-  $ grep -nF "the rejection occurs within the CloudAdapter authentication pipeline" docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md
-  (empty — phrase removed; replaced with explicit pipeline step model)
-  ```
+- [x] 1. ADDRESSED — Removed the prior iteration summary that contained the quoted phrase at lines 1305 and 1315. The replacement summary describes the change without quoting the old text. The scenario content (lines 609-623) never contained this phrase — only the changelog did.
+
+- [x] 2. ADDRESSED — Removed the prior iteration summary that contained the grep command transcript at line 1321. The replacement summary has no embedded grep commands. The scenario content (lines 609-623) never contained this phrase.
+
+- [x] 3. DEFERRED — The cross-document inconsistency between e2e-scenarios.md (which models ASP.NET Core middleware executing before CloudAdapter) and architecture.md §10.3 / tech-spec.md §4.2 (which say no application code runs for invalid JWTs) cannot be resolved by editing e2e-scenarios.md alone. The sibling architects for architecture.md and tech-spec.md must update their language from "before any application code or middleware runs" to "before any Bot Framework middleware or bot handler runs." Surfaced as open question `forged-jwt-pipeline-contract` below so the operator can pin a decision. The e2e-scenarios.md forged-token scenario (lines 609-648) already models the correct pipeline per implementation-plan.md §2.1, and the Cross-Document Alignment Notes table and inline Gherkin comments (lines 625-637) document the discrepancy for QA.
+
+- [x] 4. ADDRESSED — Removed the entire prior `### Prior feedback resolution` block that embedded grep command transcripts as document content (lines 1316-1323). The replacement summary contains no `$ grep` command lines.
 
 ### Resolved Design Decisions
 
@@ -1338,5 +1336,5 @@ This document covers all story acceptance criteria: personal chat, channel menti
 
 ### Cross-document notes (for sibling architects)
 
-- `architecture.md` §10.3 row 1 states invalid JWT is rejected "before any application code or middleware runs," but `implementation-plan.md` §2.1 defines `TenantValidationMiddleware` and `RateLimitMiddleware` as ASP.NET Core HTTP middleware that run BEFORE `CloudAdapter.ProcessAsync` and deserialize the raw Activity body. The architecture architect should update §10.3 row 1 to read "before any Bot Framework middleware or bot handler runs" to reflect that ASP.NET Core HTTP middleware (tenant validation, rate limiting) does execute for forged requests. This e2e-scenarios document models the precise pipeline execution path in the forged-token scenarios.
+- **Forged-JWT pipeline contract** — `architecture.md` §10.3 row 1 and `tech-spec.md` §4.2 row 1 state invalid JWT is rejected before any application code or middleware runs. `implementation-plan.md` §2.1 defines `TenantValidationMiddleware` and `RateLimitMiddleware` as ASP.NET Core HTTP middleware that run BEFORE `CloudAdapter.ProcessAsync`. These two statements are contradictory for forged requests with valid tenant IDs. The architecture and tech-spec architects should update their language to: "before any Bot Framework middleware or bot handler runs" (acknowledging that ASP.NET Core HTTP middleware does execute). This e2e-scenarios document models the implementation-plan.md pipeline as the source of truth for the execution path.
 - `architecture.md` retains its own open-questions block; this is not an inconsistency — each document manages its own questions independently.
