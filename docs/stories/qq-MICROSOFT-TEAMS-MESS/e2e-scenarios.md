@@ -41,8 +41,9 @@ Feature: Personal Chat — Agent Task Creation
     And IIdentityResolver maps bob's AadObjectId to an internal user identity
     And user "bob@contoso.com" has RBAC role "operator"
     When the user sends "@AgentBot agent ask design persistence layer" in the channel
-    Then the bot strips the @mention and parses "agent ask design persistence layer"
-    And the bot validates bob's tenant via TenantValidationMiddleware
+    Then the TenantValidationMiddleware (ASP.NET Core HTTP middleware, runs before CloudAdapter per implementation-plan.md §2.1 line 79) validates bob's tenant "contoso-tenant-id" against AllowedTenantIds and passes the request
+    And CloudAdapter processes the activity and invokes OnMessageActivityAsync in TeamsSwarmActivityHandler
+    And the bot handler strips the @mention via Activity.RemoveMentionText and parses "agent ask design persistence layer"
     And IIdentityResolver.ResolveAsync maps bob's Entra identity to an internal user
     And IUserAuthorizationService.AuthorizeAsync confirms bob's RBAC role
     And a MessengerEvent of type "AgentTaskRequest" is enqueued
@@ -223,10 +224,10 @@ Feature: Adaptive Card Approvals
 
   Scenario: Human rejects with a required comment
     Given the AgentQuestion for "Q-602" has AllowedAction "Reject" with RequiresComment = true
-    When user "alice@contoso.com" clicks "Reject" on the Adaptive Card
-    Then the bot presents an input field for the rejection reason
-    When the user submits the comment "Insufficient test coverage"
-    Then a HumanDecisionEvent is created with:
+    And the original Adaptive Card was rendered by AdaptiveCardBuilder with an Input.Text field adjacent to the Reject button (per implementation-plan.md §3.1 line 167 and §3.1 test scenario line 179: when RequiresComment = true, the card includes a pre-rendered Input.Text field)
+    When user "alice@contoso.com" types "Insufficient test coverage" in the Input.Text field and clicks "Reject" on the Adaptive Card (single Action.Submit)
+    Then CardActionHandler extracts the actionValue "reject" and comment "Insufficient test coverage" from Activity.Value in a single card submit
+    And a HumanDecisionEvent is created with:
       | Field       | Value                      |
       | QuestionId  | Q-602                      |
       | ActionValue | reject                     |
