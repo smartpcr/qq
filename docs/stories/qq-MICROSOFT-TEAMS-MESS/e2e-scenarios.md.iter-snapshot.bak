@@ -1,7 +1,7 @@
 # E2E Test Scenarios — Microsoft Teams Messenger Support
 
 **Story:** `qq:MICROSOFT-TEAMS-MESS`
-**Version:** 1.28
+**Version:** 1.27
 
 ---
 
@@ -773,9 +773,9 @@ Feature: Adaptive Card — Incident Summary and Release Gates
   Scenario: Release gate approval with multiple approvers (separate questions per approver)
     Given agent "release-agent-01" requires approval from 2 approvers for a release gate
     And the orchestrator creates two separate AgentQuestion records:
-      | QuestionId | TargetUserId                     | Status |
-      | Q-gate-a   | <alice's internal user ID>       | Open   |
-      | Q-gate-b   | <bob's internal user ID>         | Open   |
+      | QuestionId | TargetUserId           | Status |
+      | Q-gate-a   | alice@contoso.com      | Open   |
+      | Q-gate-b   | bob@contoso.com        | Open   |
     And each AgentQuestion follows the standard single-decision lifecycle (first-writer-wins per architecture §3.2)
     And the orchestrator's release-gate workflow tracks the approval threshold (2 required) at the workflow layer
     When "alice@contoso.com" clicks "Approve" on her card (Q-gate-a)
@@ -1013,9 +1013,8 @@ Feature: Edge Cases and Error Handling
     And a warning is logged noting the rejected payload size
     And an immutable audit record is persisted with:
       | Field     | Value                         |
-      | EventType | Error                         |
-      | Action    | PayloadExceedsMaxLength       |
-      | Outcome   | Rejected                      |
+      | EventType | MessageRejected               |
+      | Reason    | PayloadExceedsMaxLength       |
       | ActorId   | <alice's AadObjectId>         |
     # Note: The maximum inbound message length is a system-configured policy
     # (not a Bot Framework platform limit). This prevents unbounded payload
@@ -1060,9 +1059,9 @@ Feature: Edge Cases and Error Handling
 
   Scenario: Concurrent approvals for a multi-approver release gate (separate questions, both accepted)
     Given the orchestrator created two separate AgentQuestion records for a release gate:
-      | QuestionId | TargetUserId                     | Status |
-      | Q-gate-x   | <alice's internal user ID>       | Open   |
-      | Q-gate-y   | <bob's internal user ID>         | Open   |
+      | QuestionId | TargetUserId           | Status |
+      | Q-gate-x   | alice@contoso.com      | Open   |
+      | Q-gate-y   | bob@contoso.com        | Open   |
     And the release-gate workflow requires 2 approvals at the orchestration layer
     When both users click "Approve" on their respective cards within the same second
     Then Q-gate-x transitions to Resolved (alice's first-writer-wins on her own question)
