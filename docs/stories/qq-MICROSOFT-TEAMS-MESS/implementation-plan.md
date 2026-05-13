@@ -13,7 +13,19 @@ storyId: "qq:MICROSOFT-TEAMS-MESS"
 ### Implementation Steps
 - [ ] Create solution file `AgentSwarm.Messaging.sln` and project `AgentSwarm.Messaging.Abstractions` targeting .NET 8.
 - [ ] Define `MessengerMessage` record with fields: `MessageId`, `ConversationId`, `AgentId`, `TaskId`, `CorrelationId`, `Body`, `Timestamp`, `Severity`.
-- [ ] Define `AgentQuestion` record with fields: `QuestionId`, `AgentId`, `TaskId`, `TargetUserId` (string?, nullable — internal user ID of the intended recipient; null when the question targets a channel), `TargetChannelId` (string?, nullable — Teams channel ID for channel-scoped questions; mutually exclusive with `TargetUserId` — exactly one must be non-null, per `architecture.md` §AgentQuestion and `e2e-scenarios.md` §Proactive Blocking Question), `Title`, `Body`, `Severity`, `AllowedActions` (list of `HumanAction`), `ExpiresAt`, `CorrelationId`.
+- [ ] Define `AgentQuestion` record with the following fields (aligned with `architecture.md` §AgentQuestion field table lines 277-289 and `e2e-scenarios.md` §Proactive Blocking Question lines 85-95):
+  - `QuestionId` (string) — unique question identifier
+  - `AgentId` (string) — asking agent
+  - `TaskId` (string) — associated task
+  - `TargetUserId` (string?, nullable) — internal user ID of the intended recipient for proactive delivery; null when the question targets a channel
+  - `TargetChannelId` (string?, nullable) — Teams channel ID for channel-scoped questions; null when the question targets a specific user
+  - Routing constraint: exactly one of `TargetUserId` or `TargetChannelId` must be non-null (mutually exclusive); `TeamsMessengerConnector` resolves the populated field to a `ConversationReference` via `IConversationReferenceStore`
+  - `Title` (string) — short title for card header
+  - `Body` (string) — detailed question text
+  - `Severity` (string) — `Info`, `Warning`, `Error`, `Critical`
+  - `AllowedActions` (IReadOnlyList&lt;HumanAction&gt;) — buttons the human can press
+  - `ExpiresAt` (DateTimeOffset) — expiration deadline
+  - `CorrelationId` (string) — end-to-end trace ID
 - [ ] Define `HumanAction` record with fields: `ActionId`, `Label`, `Value`, `RequiresComment`.
 - [ ] Define `HumanDecisionEvent` record with fields: `QuestionId`, `ActionValue`, `Comment`, `Messenger`, `ExternalUserId`, `ExternalMessageId`, `ReceivedAt`, `CorrelationId`.
 - [ ] Define `MessengerEvent` base record and subtypes: `CommandEvent`, `DecisionEvent`, `TextEvent`.
