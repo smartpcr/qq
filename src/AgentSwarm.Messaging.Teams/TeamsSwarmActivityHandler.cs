@@ -694,17 +694,24 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             return "{}";
         }
 
-        try
-        {
-            return JsonSerializer.Serialize(reference, PayloadJsonOptions);
-        }
-        catch (NotSupportedException)
-        {
-            // Fall back to an empty document if the SDK type carries types that
-            // System.Text.Json refuses (extremely unlikely with current Bot Framework
-            // models, but the catch keeps the handler robust to SDK churn).
-            return "{}";
-        }
+        // `Microsoft.Bot.Schema.ConversationReference` — like the rest of the Bot Framework
+        // schema — is authored against Newtonsoft.Json: members carry
+        // `[JsonProperty(PropertyName = "serviceUrl")]`-style attributes for the canonical
+        // camelCase wire names, the inheritance hierarchy uses `[JsonExtensionData]` for
+        // property bags, and several members are typed `JObject`. `System.Text.Json`
+        // ignores ALL of those attributes — it would emit PascalCase property names
+        // (`ServiceUrl`, `Conversation`), drop extension data, and either throw
+        // `NotSupportedException` on `JObject` members (previously caught here, silently
+        // turning the stored value into `"{}"` and breaking proactive messaging) or emit
+        // structurally incorrect JSON.
+        //
+        // Persisted `ReferenceJson` must round-trip through
+        // `JsonConvert.DeserializeObject<ConversationReference>(...)` on the background
+        // proactive-messaging worker, so we serialize with the same Newtonsoft.Json
+        // contract here. Any unexpected serializer failure is allowed to propagate so the
+        // caller (and ops dashboards) see the issue rather than silently storing an empty
+        // document.
+        return Newtonsoft.Json.JsonConvert.SerializeObject(reference);
     }
 
     private async Task LogSecurityRejectionAsync(
