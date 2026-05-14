@@ -1,32 +1,34 @@
-# Iter notes — Stage 1.3 (Persistence Abstractions)
+# Iter notes — Stage 2.2 (Teams Activity Handler)
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Persistence/AgentSwarm.Messaging.Persistence.csproj` — new .NET 8 project, refs Abstractions, same warning/doc settings as the sibling project.
-- `src/AgentSwarm.Messaging.Persistence/AuditEventTypes.cs` — seven canonical audit `EventType` constants + `All` / `IsValid`.
-- `src/AgentSwarm.Messaging.Persistence/AuditActorTypes.cs` — `User` / `Agent` constants.
-- `src/AgentSwarm.Messaging.Persistence/AuditOutcomes.cs` — `Success` / `Rejected` / `Failed` / `DeadLettered`.
-- `src/AgentSwarm.Messaging.Persistence/MessageDirections.cs` — `Inbound` / `Outbound`.
-- `src/AgentSwarm.Messaging.Persistence/PersistedMessage.cs` — envelope record returned by `GetByCorrelationIdAsync`.
-- `src/AgentSwarm.Messaging.Persistence/AuditEntry.cs` — immutable record with all 12 canonical fields + `Checksum`; `ComputeChecksum` helper (SHA-256 over `|`-delimited canonical fields).
-- `src/AgentSwarm.Messaging.Persistence/IAuditLogger.cs` — `LogAsync(AuditEntry, CancellationToken)`.
-- `src/AgentSwarm.Messaging.Persistence/NoOpAuditLogger.cs` — completed-task stub, null-guarded and cancellation-aware.
-- `src/AgentSwarm.Messaging.Persistence/IMessageStore.cs` — `SaveInboundAsync(MessengerEvent,...)`, `SaveOutboundAsync(MessengerMessage,...)`, `GetByCorrelationIdAsync(string, CT) → Task<IReadOnlyList<PersistedMessage>>`.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/*.cs` — five test classes (immutability via reflection, checksum determinism + sensitivity, vocabulary, interface contracts, no-op behavior).
-- `AgentSwarm.Messaging.sln` — added both new projects via `dotnet sln add`.
+- `src/AgentSwarm.Messaging.Teams/AgentSwarm.Messaging.Teams.csproj` — NEW. net8.0; PackageRef `Microsoft.Bot.Builder 4.22.7` + `Microsoft.Extensions.Logging.Abstractions 8.0.0`; ProjectRefs Abstractions + Persistence; `TreatWarningsAsErrors=true`, doc gen on, `NoWarn=CS1591`.
+- `src/AgentSwarm.Messaging.Teams/TeamsConversationReference.cs` — NEW. Sealed record per architecture §3.2.
+- `src/AgentSwarm.Messaging.Teams/IConversationReferenceStore.cs` — NEW. Full 13-method interface (Stage 2.1 canonical home; moved into this stage to unblock compile since 2.1 hasn't landed yet).
+- `src/AgentSwarm.Messaging.Teams/ICardActionHandler.cs` — NEW. `HandleAsync(ITurnContext, CT) → Task<AdaptiveCardInvokeResponse>`. Lives here because returns Bot.Builder type.
+- `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs` — NEW (~29 KB). 9-arg ctor, `OnTurnAsync`, `OnMessageActivityAsync`, `OnTeamsMembersAddedAsync`, `OnTeamsMembersRemovedAsync`, `OnInstallationUpdateActivityAsync`, `OnAdaptiveCardInvokeAsync`, helpers (mention strip, verb extract, tenant/channel/corr-id pull, audit, persist).
+- `AgentSwarm.Messaging.sln` — added Teams project + Teams.Tests project.
+- `tests/AgentSwarm.Messaging.Teams.Tests/*` — NEW project (csproj + 5 files): `TestDoubles.cs` (hand-rolled spies, no Moq, matches existing style), `HandlerFactory.cs` (harness builder + activity factories + `InertBotAdapter`), `TeamsSwarmActivityHandlerTests.cs` (12 scenario tests), `CorrelationIdPropagationTests.cs` (3 tests), `TeamsSwarmActivityHandlerConstructorTests.cs` (9 null-arg tests). 24 tests total, all passing.
 
 ## Decisions made this iter
-- `GetByCorrelationIdAsync` returns `Task<IReadOnlyList<PersistedMessage>>`. The plan only said "list of messages" without mixing inbound (`MessengerEvent` polymorphic) and outbound (`MessengerMessage`) shapes into one return type. A thin envelope avoids that mismatch and maps 1:1 to a future SQL row.
-- `SaveInboundAsync` takes `MessengerEvent` (base record, already polymorphic via `EventType`); `SaveOutboundAsync` takes `MessengerMessage`. Both are canonical Abstractions records — no new persistence-only domain types.
-- `AuditEntry.Checksum` is a required `init` field; computation is delegated to a static `ComputeChecksum(...)` helper so the record stays a pure value (no implicit hashing during `with` expressions) and the SQL implementation can recompute/verify on read.
-- Canonical-field serialization for checksum: pipe-delimited UTF-8 with ISO-8601 round-trip timestamp; nulls rendered as `"\0"` so null vs empty differ (verified by test).
-- Kept `TreatWarningsAsErrors=true` + `GenerateDocumentationFile=true` to match the sibling Abstractions project's conventions (the existing project sets `CS1591` to ignore, suppressing missing-doc warnings on test-helper-only members).
+- **Scaffold Stage 2.1 surface inline** (Teams project, TeamsConversationReference, IConversationReferenceStore, ICardActionHandler). Stage 2.1 hasn't landed; without these the handler can't compile. When 2.1 lands it should be additive (it'll register the DI bindings + add the HTTP host).
+- **Cast `IActivity` → `Activity` via `as Activity`**. `ITurnContext<T>.Activity` returns the interface type, but `RemoveRecipientMention()`, `GetConversationReference()`, and `GetChannelData<TeamsChannelData>()` are extension methods on the concrete `Activity` class. `as` (not hard cast) tolerates exotic test doubles.
+- **Two-tier auth** kept strict: install events get tenant-only (already enforced by `TenantValidationMiddleware` from Stage 2.1); command events get tenant + identity + RBAC. Rejection ORDER in `OnMessageActivityAsync`: strip mention → identity (null ⇒ `UnmappedUserRejected` audit + access-denied reply, NO conv-ref save) → verb extract → authorize (false ⇒ `InsufficientRoleRejected` audit, NO conv-ref save) → save conv-ref → dispatch.
+- **`@mention` stripping SOLE site**: only `OnMessageActivityAsync` calls `Activity.RemoveRecipientMention()`. `CommandContext.NormalizedText` is the cleaned text — `CommandDispatcher` (Stage 3.2) does not re-strip.
+- **CorrelationId**: read from `Activity.Properties["correlationId"]` (with `CorrelationId` / `correlation_id` fallbacks) or new GUID. Stamped on `TurnState[CorrelationIdTurnStateKey]` so downstream middleware/handlers see the same value.
+- **Install audit uses `AuditEventTypes.CommandReceived`** (no `InstallEvent` value in the canonical vocab) with descriptive `Action` strings (`AppInstalled`, `AppUninstalled`, `BotAddedToTeam`, …). Rejections use `AuditEventTypes.SecurityRejection` per persistence vocab.
+- **Verb extraction helper** (lightweight pre-parse) only used to populate `command` for `AuthorizeAsync`. Full parse stays in `CommandDispatcher` (Stage 3.2). Matches the seven canonical verbs.
+- **Tests use `InertBotAdapter`** (custom `BotAdapter` that doesn't mutate the inbound activity). The in-box `TestAdapter` *unconditionally* overwrites `Recipient`, `Conversation`, `ServiceUrl` on the activity — which clobbered the AAD/Bot IDs needed for mention stripping and broke the assertions on ConversationId. Rolling our own avoids that.
 
 ## Dead ends tried this iter
-- Initial draft of `AuditEntryChecksumTests` had an unused local function `Vary` that tripped `CS8321` under TreatWarningsAsErrors — removed.
+- First attempt at tests used `TestAdapter` from `Microsoft.Bot.Builder.Adapters` — 6 tests failed because `TestAdapter.ProcessActivityAsync` overwrites `activity.Recipient = _conversation.Bot` (and Conversation, ServiceUrl) regardless of what the caller supplied. Replaced with a 30-line `InertBotAdapter` that just runs the pipeline.
+- Initial helper signatures took `Activity?` but call sites passed `IMessageActivity` / `IConversationUpdateActivity` (8 errors). Fixed by `var activity = turnContext.Activity as Activity;` at the top of each override.
+- Tried `<see cref="Activity.RemoveRecipientMention"/>` in XML doc — failed `CS1574` under TreatWarningsAsErrors because the method is on an extension class. Switched to plain `<c>` ref.
 
 ## Open questions surfaced this iter
-- None blocking. Implementation-plan paragraph for Stage 1.3 said "list of messages" without specifying type — chose `PersistedMessage` envelope; can be revisited in Stage 6 when the SQL `MessageStore` is concretized.
+- `Persistence` and `Core` projects exist on disk but aren't in `AgentSwarm.Messaging.sln`. I only added my new projects (Teams + Teams.Tests). Whoever owns Stage 1.3 should sln-add Persistence/Core when their workstream lands.
+- Some 13 methods on `IConversationReferenceStore` are technically Stage 2.1's; this stage uses only `SaveOrUpdateAsync`, `MarkInactiveAsync`, `MarkInactiveByChannelAsync`. The other 10 are defined so Stage 2.1 doesn't have to re-define them on top of mine.
 
 ## What's still left
-- Nothing for Stage 1.3. Stage 2.1 will register `NoOpAuditLogger` as the default `IAuditLogger` in DI; Stage 5.2 swaps in `SqlAuditLogger`.
-- Verified `dotnet build` exit 0 and `dotnet test` 35/35 passing in the new project, 51/51 in the existing one.
+- Nothing for Stage 2.2. Build clean (0/0), 106 tests pass (82 abstractions + 24 Teams).
+- Stage 2.1 will: register `TeamsSwarmActivityHandler` + 9 dependencies in DI, scaffold the ASP.NET Core host + `CloudAdapter`, register `TenantValidationMiddleware`, register `ChannelInboundEventPublisher`, register default-deny stubs for identity/RBAC/card-handler/agent-question-store, register `NoOpAuditLogger` from Persistence.
+- Stage 3.2 will replace the stub `ICommandDispatcher` with the real `CommandDispatcher` that parses verbs out of `CommandContext.NormalizedText`.
