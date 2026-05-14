@@ -1,23 +1,24 @@
-# Iter notes — Stage 1.3 (Persistence Abstractions) — iter 2
+# Iter notes — Stage 1.3 (Persistence Abstractions) — iter 3
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Persistence/AuditEntry.cs` — added init-setter validation against canonical vocabularies for `EventType`/`ActorType`/`Outcome` (private backing fields), and replaced pipe-delimited canonical encoding with length-prefixed binary (32-bit LE byte length + UTF-8 bytes; `-1` sentinel for null), prefixed with `CanonicalEncodingVersion = 1`.
-- `src/AgentSwarm.Messaging.Persistence/NoOpAuditLogger.cs` — stripped the argument-null guard and `ThrowIfCancellationRequested` call. Now a true no-op returning the singleton `Task.CompletedTask`.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/NoOpAuditLoggerTests.cs` — replaced the two "throws on null / cancelled" assertions with "returns CompletedTask on null / cancelled / both" assertions; added `Assert.Same(Task.CompletedTask, task)` reference-identity test.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/AuditEntryChecksumTests.cs` — replaced the pipe-joined `ComputeChecksum_MatchesReferenceSha256` reference with a length-prefixed reference; added `ComputeChecksum_DelimiterCollision_DistinguishedAcrossFieldBoundary` (Theory: 3 distinct shifts) and `ComputeChecksum_NullableFieldCollision_DistinguishedFromSentinelContent`.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/AuditEntryVocabularyValidationTests.cs` — NEW. Verifies invalid `EventType` / `ActorType` / `Outcome` (including null, empty, wrong case, and domain-event values that collide by name) throw `ArgumentException` from both constructor and `with` expression; verifies all valid combinations construct successfully.
+- None. No source changes. This iter was a verification pass — confirmed iter-2's committed state still satisfies the brief after the `feature/teams` merge.
+
+## What I verified this iter
+- `git status` clean; iter-2's work is at HEAD (`630bd34 impl(...): Persistence Abstractions`).
+- `dotnet build --nologo --verbosity minimal` → exit 0, 0 warnings, 0 errors.
+- `dotnet test AgentSwarm.Messaging.sln --no-build` → 144/144 pass (82 Abstractions.Tests + 62 Persistence.Tests). Note: Abstractions test count grew from iter-2's 51 → 82 because the `feature/teams` merge brought more abstractions tests into the parent project; my Persistence count is stable at 62.
+- No `## LATEST evaluator feedback` section in this prompt — nothing to address.
+- Re-read `IAuditLogger`, `IMessageStore`, `AuditEntry`, `NoOpAuditLogger`, `PersistedMessage`, and the four vocabulary classes; every Stage 1.3 brief bullet is satisfied (project created, `LogAsync(AuditEntry, CT)`, three message-store methods, `AgentId` first-class plus all other canonical fields, `Checksum`, no-op stub, etc.).
 
 ## Decisions made this iter
-- Validation via private backing field + init accessor (rather than a separate `Validate()` method) so callers cannot construct or derive an invalid `AuditEntry`. `with` expressions go through the same init setter so derivation is also gated. Records preserve value-equality semantics because the synthesized `Equals` reads through the property getter.
-- Length-prefixed binary canonical encoding rather than deterministic JSON. Reason: dependency-free (no `System.Text.Json` surface area to lock down), trivially auditable, and `BinaryWriter` + 32-bit length prefixes are textbook collision-resistant. Added a `CanonicalEncodingVersion = 1` prefix so a future schema change produces a clearly different digest.
-- Kept the original "null vs empty" guarantee under the new encoding via `-1` length sentinel (verified by `ComputeChecksum_NullableFieldCollision_DistinguishedFromSentinelContent`).
-- Did NOT add validation on `CorrelationId`/`TenantId`/`ActorId`/`Action`/`PayloadJson`/`Checksum` (non-empty / shape). Evaluator scoped feedback to the three closed-vocabulary fields; keeping focus avoids scope creep that could regress other items.
+- Left the `AgentSwarm.Messaging.Core` and `AgentSwarm.Messaging.Core.Tests` projects (on disk under `src/` and `tests/` after the feature/teams merge) OUT of `AgentSwarm.Messaging.sln`. They belong to Stage 1.2 (Core Data Models, the outbox abstractions), not Stage 1.3. The prior commit `296be98 fix(persistence): re-add Persistence projects to solution after feature/teams merge` only restored Persistence references — re-adding Core projects is for the Stage 1.2 owner. Touching them here would expand the workstream's diff into another stage's territory.
+- No re-running of `dotnet sln add` for Persistence — already present in `AgentSwarm.Messaging.sln` (GUIDs `670A41FF-...` and `DC744886-...`).
 
 ## Dead ends tried this iter
-- Briefly considered marking the new backing fields `readonly` — C# does allow `readonly` field assignment inside init accessors, but the declaration order can cause "use before assigned" diagnostics under nullable-aware analysis when the property type is non-nullable string. Left them as plain private fields with a `string.Empty` default; the init setter is still the only assignment path externally.
+- None.
 
 ## Open questions surfaced this iter
-- None — the evaluator's three items were specific and actionable.
+- None. (For the next iter / next stage: somebody owning Stage 1.2 should re-add `AgentSwarm.Messaging.Core{,.Tests}` to the solution. Not in this workstream's scope.)
 
 ## What's still left
-- Nothing for Stage 1.3. Verified `dotnet build` exit 0 (0 warnings) and `dotnet test AgentSwarm.Messaging.sln` 113/113 pass (62 persistence + 51 abstractions). Stage 2.1 will register `NoOpAuditLogger` as the default `IAuditLogger` in DI; Stage 5.2 swaps in `SqlAuditLogger` whose validation surface can now safely assume `AuditEntry`'s init-time guarantees.
+- Nothing for Stage 1.3. Stage 2.1 will register `NoOpAuditLogger` as the default `IAuditLogger` in DI; Stage 5.2 swaps in `SqlAuditLogger`.

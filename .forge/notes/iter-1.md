@@ -1,32 +1,24 @@
-# Iter notes — Stage 1.3 (Persistence Abstractions)
+# Iter notes — Stage 1.3 (Persistence Abstractions) — iter 3
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Persistence/AgentSwarm.Messaging.Persistence.csproj` — new .NET 8 project, refs Abstractions, same warning/doc settings as the sibling project.
-- `src/AgentSwarm.Messaging.Persistence/AuditEventTypes.cs` — seven canonical audit `EventType` constants + `All` / `IsValid`.
-- `src/AgentSwarm.Messaging.Persistence/AuditActorTypes.cs` — `User` / `Agent` constants.
-- `src/AgentSwarm.Messaging.Persistence/AuditOutcomes.cs` — `Success` / `Rejected` / `Failed` / `DeadLettered`.
-- `src/AgentSwarm.Messaging.Persistence/MessageDirections.cs` — `Inbound` / `Outbound`.
-- `src/AgentSwarm.Messaging.Persistence/PersistedMessage.cs` — envelope record returned by `GetByCorrelationIdAsync`.
-- `src/AgentSwarm.Messaging.Persistence/AuditEntry.cs` — immutable record with all 12 canonical fields + `Checksum`; `ComputeChecksum` helper (SHA-256 over `|`-delimited canonical fields).
-- `src/AgentSwarm.Messaging.Persistence/IAuditLogger.cs` — `LogAsync(AuditEntry, CancellationToken)`.
-- `src/AgentSwarm.Messaging.Persistence/NoOpAuditLogger.cs` — completed-task stub, null-guarded and cancellation-aware.
-- `src/AgentSwarm.Messaging.Persistence/IMessageStore.cs` — `SaveInboundAsync(MessengerEvent,...)`, `SaveOutboundAsync(MessengerMessage,...)`, `GetByCorrelationIdAsync(string, CT) → Task<IReadOnlyList<PersistedMessage>>`.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/*.cs` — five test classes (immutability via reflection, checksum determinism + sensitivity, vocabulary, interface contracts, no-op behavior).
-- `AgentSwarm.Messaging.sln` — added both new projects via `dotnet sln add`.
+- None. No source changes. This iter was a verification pass — confirmed iter-2's committed state still satisfies the brief after the `feature/teams` merge.
+
+## What I verified this iter
+- `git status` clean; iter-2's work is at HEAD (`630bd34 impl(...): Persistence Abstractions`).
+- `dotnet build --nologo --verbosity minimal` → exit 0, 0 warnings, 0 errors.
+- `dotnet test AgentSwarm.Messaging.sln --no-build` → 144/144 pass (82 Abstractions.Tests + 62 Persistence.Tests). Note: Abstractions test count grew from iter-2's 51 → 82 because the `feature/teams` merge brought more abstractions tests into the parent project; my Persistence count is stable at 62.
+- No `## LATEST evaluator feedback` section in this prompt — nothing to address.
+- Re-read `IAuditLogger`, `IMessageStore`, `AuditEntry`, `NoOpAuditLogger`, `PersistedMessage`, and the four vocabulary classes; every Stage 1.3 brief bullet is satisfied (project created, `LogAsync(AuditEntry, CT)`, three message-store methods, `AgentId` first-class plus all other canonical fields, `Checksum`, no-op stub, etc.).
 
 ## Decisions made this iter
-- `GetByCorrelationIdAsync` returns `Task<IReadOnlyList<PersistedMessage>>`. The plan only said "list of messages" without mixing inbound (`MessengerEvent` polymorphic) and outbound (`MessengerMessage`) shapes into one return type. A thin envelope avoids that mismatch and maps 1:1 to a future SQL row.
-- `SaveInboundAsync` takes `MessengerEvent` (base record, already polymorphic via `EventType`); `SaveOutboundAsync` takes `MessengerMessage`. Both are canonical Abstractions records — no new persistence-only domain types.
-- `AuditEntry.Checksum` is a required `init` field; computation is delegated to a static `ComputeChecksum(...)` helper so the record stays a pure value (no implicit hashing during `with` expressions) and the SQL implementation can recompute/verify on read.
-- Canonical-field serialization for checksum: pipe-delimited UTF-8 with ISO-8601 round-trip timestamp; nulls rendered as `"\0"` so null vs empty differ (verified by test).
-- Kept `TreatWarningsAsErrors=true` + `GenerateDocumentationFile=true` to match the sibling Abstractions project's conventions (the existing project sets `CS1591` to ignore, suppressing missing-doc warnings on test-helper-only members).
+- Left the `AgentSwarm.Messaging.Core` and `AgentSwarm.Messaging.Core.Tests` projects (on disk under `src/` and `tests/` after the feature/teams merge) OUT of `AgentSwarm.Messaging.sln`. They belong to Stage 1.2 (Core Data Models, the outbox abstractions), not Stage 1.3. The prior commit `296be98 fix(persistence): re-add Persistence projects to solution after feature/teams merge` only restored Persistence references — re-adding Core projects is for the Stage 1.2 owner. Touching them here would expand the workstream's diff into another stage's territory.
+- No re-running of `dotnet sln add` for Persistence — already present in `AgentSwarm.Messaging.sln` (GUIDs `670A41FF-...` and `DC744886-...`).
 
 ## Dead ends tried this iter
-- Initial draft of `AuditEntryChecksumTests` had an unused local function `Vary` that tripped `CS8321` under TreatWarningsAsErrors — removed.
+- None.
 
 ## Open questions surfaced this iter
-- None blocking. Implementation-plan paragraph for Stage 1.3 said "list of messages" without specifying type — chose `PersistedMessage` envelope; can be revisited in Stage 6 when the SQL `MessageStore` is concretized.
+- None. (For the next iter / next stage: somebody owning Stage 1.2 should re-add `AgentSwarm.Messaging.Core{,.Tests}` to the solution. Not in this workstream's scope.)
 
 ## What's still left
 - Nothing for Stage 1.3. Stage 2.1 will register `NoOpAuditLogger` as the default `IAuditLogger` in DI; Stage 5.2 swaps in `SqlAuditLogger`.
-- Verified `dotnet build` exit 0 and `dotnet test` 35/35 passing in the new project, 51/51 in the existing one.
