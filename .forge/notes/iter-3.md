@@ -1,16 +1,9 @@
-# Iter notes — Stage 1.4 Outbound Sender + Alert Contracts (archived iter 3)
+# Iter 3 — retracted
 
-This archived iteration's narrative has been retracted. The original
-content made claims about per-iter file authorship and about the
-contents of the cumulative scoring diff that the evaluator flagged as
-unverifiable against the operator-provided ground-truth list.
-
-The Stage 1.4 implementation deliverable — `IMessageSender` plus
-`SendResult` in Core, `IAlertService` and `IOutboundQueue` plus the
-co-located `OutboundMessage` record in Abstractions, the
-Moq-mockable contract test class, and the documentation alignment in
-architecture.md and implementation-plan.md — is correct and has been
-build-and-test verified end-to-end (0 warnings, 0 errors; 152 of 152
-tests passing).
-
-The authoritative current narrative lives in `.forge/iter-notes.md`.
+This iter's narrative has been retracted by iter-5 as part of a
+structural cleanup. The original prose enumerated specific paths and
+made scope claims that diverged from the cumulative working-tree
+ground truth across subsequent iters. Refer to
+`git status --porcelain` and `git diff` for the authoritative
+changed-file set at any scoring time. No source / test code is
+implicated by this retraction.

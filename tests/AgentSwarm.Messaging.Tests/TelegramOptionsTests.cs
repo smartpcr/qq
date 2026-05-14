@@ -77,6 +77,55 @@ public class TelegramOptionsTests
         options.ToString().Should().Contain("0 ids");
     }
 
+    // Hardens the story-brief "token never logged" acceptance criterion
+    // against any plausible Telegram bot-token shape: real tokens follow
+    // <bot_id>:<35-char-secret> but BotFather has rotated formats over the
+    // years (longer secrets, alphanumerics with - and _), and a regression
+    // here would re-introduce credential leakage. Each Theory row asserts
+    // that ToString() (a) never echoes the verbatim token, (b) never
+    // echoes the secret portion after the ':' on its own (except when the
+    // secret collides with a legitimate redaction marker — see below),
+    // and (c) always emits the [REDACTED] marker so log readers can tell
+    // the field was set vs. [NOT SET]. The two adversarial rows guard
+    // against the unlikely-but-pathological case where a token's secret
+    // portion happens to match a redaction marker string; those rows
+    // skip the secret-portion-absent assertion because the marker
+    // legitimately appears in the BotToken slot of the output.
+    [Theory]
+    [InlineData("1234567890:AAH9hyTeleGramSecRetToken_test_value_only")]
+    [InlineData("7654321:short_but_valid_secret_99")] // shorter realistic shape
+    [InlineData("999999999999:" +
+                "AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz_-1234567890")]
+    [InlineData("42:[REDACTED]")] // adversarial: secret portion matches the redaction marker
+    [InlineData("42:[NOT SET]")] // adversarial: secret portion matches the not-set marker
+    public void ToString_NeverLeaksBotToken_AcrossRealisticTokenFormats(string token)
+    {
+        var options = new TelegramOptions { BotToken = token };
+
+        var text = options.ToString();
+
+        text.Should().NotContain(token,
+            "the verbatim bot token must never appear in ToString output");
+        text.Should().Contain("BotToken = [REDACTED]",
+            "the redaction marker must be emitted so structured logs show the field was set");
+
+        var colonIndex = token.IndexOf(':');
+        if (colonIndex >= 0 && colonIndex < token.Length - 1)
+        {
+            var secretPortion = token[(colonIndex + 1)..];
+            // When the secret itself happens to match a marker, the
+            // output legitimately contains that marker in the BotToken
+            // slot, so the secret-portion-absent check would false-
+            // positive. The verbatim-token-absent assertion above is
+            // still enforced, which is the strongest guarantee.
+            if (secretPortion is not "[REDACTED]" and not "[NOT SET]")
+            {
+                text.Should().NotContain(secretPortion,
+                    "the secret portion of the token must never appear in ToString output");
+            }
+        }
+    }
+
     // ============================================================
     // Validator — story-brief scenario (missing token fails fast)
     // ============================================================
