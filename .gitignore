@@ -25,3 +25,6 @@ coverage.json
 # Misc
 *.swp
 *.swo
+
+# Teams sideload package output
+src/AgentSwarm.Messaging.Teams/Manifest/bin/

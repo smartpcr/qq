@@ -1,23 +1,21 @@
-# Iter notes — Stage 1.3 (Persistence Abstractions) — iter 2
+# Iter notes — Stage 2.4 (Teams App Manifest) — iter 2 (no-op)
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Persistence/AuditEntry.cs` — added init-setter validation against canonical vocabularies for `EventType`/`ActorType`/`Outcome` (private backing fields), and replaced pipe-delimited canonical encoding with length-prefixed binary (32-bit LE byte length + UTF-8 bytes; `-1` sentinel for null), prefixed with `CanonicalEncodingVersion = 1`.
-- `src/AgentSwarm.Messaging.Persistence/NoOpAuditLogger.cs` — stripped the argument-null guard and `ThrowIfCancellationRequested` call. Now a true no-op returning the singleton `Task.CompletedTask`.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/NoOpAuditLoggerTests.cs` — replaced the two "throws on null / cancelled" assertions with "returns CompletedTask on null / cancelled / both" assertions; added `Assert.Same(Task.CompletedTask, task)` reference-identity test.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/AuditEntryChecksumTests.cs` — replaced the pipe-joined `ComputeChecksum_MatchesReferenceSha256` reference with a length-prefixed reference; added `ComputeChecksum_DelimiterCollision_DistinguishedAcrossFieldBoundary` (Theory: 3 distinct shifts) and `ComputeChecksum_NullableFieldCollision_DistinguishedFromSentinelContent`.
-- `tests/AgentSwarm.Messaging.Persistence.Tests/AuditEntryVocabularyValidationTests.cs` — NEW. Verifies invalid `EventType` / `ActorType` / `Outcome` (including null, empty, wrong case, and domain-event values that collide by name) throw `ArgumentException` from both constructor and `with` expression; verifies all valid combinations construct successfully.
+- None. Iter 2's evaluator block reported a pipeline fault ("evaluator output could not be parsed: no JSON block found … Do NOT rewrite your prior work … Re-run your build/tests once and wait for the next evaluator turn"). Followed that instruction literally and made no edits to source, tests, manifest, or schema.
 
 ## Decisions made this iter
-- Validation via private backing field + init accessor (rather than a separate `Validate()` method) so callers cannot construct or derive an invalid `AuditEntry`. `with` expressions go through the same init setter so derivation is also gated. Records preserve value-equality semantics because the synthesized `Equals` reads through the property getter.
-- Length-prefixed binary canonical encoding rather than deterministic JSON. Reason: dependency-free (no `System.Text.Json` surface area to lock down), trivially auditable, and `BinaryWriter` + 32-bit length prefixes are textbook collision-resistant. Added a `CanonicalEncodingVersion = 1` prefix so a future schema change produces a clearly different digest.
-- Kept the original "null vs empty" guarantee under the new encoding via `-1` length sentinel (verified by `ComputeChecksum_NullableFieldCollision_DistinguishedFromSentinelContent`).
-- Did NOT add validation on `CorrelationId`/`TenantId`/`ActorId`/`Action`/`PayloadJson`/`Checksum` (non-empty / shape). Evaluator scoped feedback to the three closed-vocabulary fields; keeping focus avoids scope creep that could regress other items.
+- **Trust the pipeline-fault directive**: did NOT speculatively re-touch the manifest or tests to "address" the unparsed feedback. Doing so would introduce noise without a real critique to anchor against — the prompt explicitly warns this is a pipeline fault, not feedback.
+- Recorded an explicit no-op note so iter 3 can see this was a deliberate skip, not an oversight.
 
 ## Dead ends tried this iter
-- Briefly considered marking the new backing fields `readonly` — C# does allow `readonly` field assignment inside init accessors, but the declaration order can cause "use before assigned" diagnostics under nullable-aware analysis when the property type is non-nullable string. Left them as plain private fields with a `string.Empty` default; the init setter is still the only assignment path externally.
+- None — no code changes attempted.
 
 ## Open questions surfaced this iter
-- None — the evaluator's three items were specific and actionable.
+- None. If iter 3 also fails to deliver parseable evaluator feedback, the operator may need to inspect the evaluator pipeline rather than have me iterate blind.
 
 ## What's still left
-- Nothing for Stage 1.3. Verified `dotnet build` exit 0 (0 warnings) and `dotnet test AgentSwarm.Messaging.sln` 113/113 pass (62 persistence + 51 abstractions). Stage 2.1 will register `NoOpAuditLogger` as the default `IAuditLogger` in DI; Stage 5.2 swaps in `SqlAuditLogger` whose validation surface can now safely assume `AuditEntry`'s init-time guarantees.
+- Same status as end-of-iter-1: build green (0 warn / 0 err), 104/104 tests pass (82 Abstractions + 22 Manifest). All Stage 2.4 implementation steps and all three test scenarios are satisfied. Waiting on a real evaluator turn to either confirm pass or surface concrete critique.
+
+## Verification re-run this iter (no source changes)
+- `dotnet build --nologo --verbosity minimal` → exit 0, 0 warnings, 0 errors.
+- `dotnet test --nologo --verbosity minimal` → 82/82 Abstractions tests pass; 22/22 Manifest tests pass.
