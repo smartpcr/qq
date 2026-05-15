@@ -15,12 +15,13 @@ namespace AgentSwarm.Messaging.Teams.Commands;
 /// <c>"agent ask"</c> handler.
 /// </para>
 /// <para>
-/// The <see cref="All"/> list is provided as a convenience for consumers that need the
-/// canonical command vocabulary in priority order (e.g. help-card builders, diagnostic
-/// listings). It is <b>not</b> consumed by <see cref="CommandDispatcher"/> — the dispatcher
-/// derives its own ordering from the <see cref="ICommandHandler.CommandName"/> values of
-/// the DI-registered handlers, so unregistered constants in this file have no effect on
-/// runtime dispatch.
+/// <b>Dispatcher does not consume <see cref="All"/>.</b> <see cref="CommandDispatcher"/>
+/// builds its own ordered list from the <c>CommandName</c> of every registered
+/// <c>ICommandHandler</c> (sorted by descending length, then alphabetically for stable
+/// tie-breaks). <see cref="All"/> is provided here purely as a static inventory of every
+/// canonical command name for documentation, help-card composition, and tests; it is
+/// ordered identically to the dispatcher's runtime list so consumers that iterate it see
+/// the same longest-first ordering, but the dispatcher itself never reads this property.
 /// </para>
 /// </remarks>
 public static class CommandNames
@@ -47,17 +48,23 @@ public static class CommandNames
     public const string Resume = "resume";
 
     /// <summary>
-    /// Every canonical command name, ordered by descending length with case-insensitive
-    /// ordinal alphabetical tiebreaks. This mirrors the priority ordering that
-    /// <see cref="CommandDispatcher"/> applies internally to its registered handler set,
-    /// so consumers iterating this list see multi-word verbs ("agent status", "agent ask")
-    /// before single-word ones. The dispatcher does <b>not</b> iterate this list — it
-    /// builds its own ordering from the DI-registered <see cref="ICommandHandler"/>
-    /// instances — but this list is the canonical reference for any non-dispatcher consumer
-    /// (help cards, docs, parsers) that needs the same priority order.
+    /// Every canonical command name, ordered by descending keyword length with an
+    /// alphabetical tie-break — the same ordering <see cref="CommandDispatcher"/> applies
+    /// when it builds its internal match list from registered handlers, so consumers that
+    /// iterate this inventory (for example help-card builders or parity tests) see the
+    /// same longest-first sequence the dispatcher uses.
     /// </summary>
+    /// <remarks>
+    /// This property is purely an inventory. <see cref="CommandDispatcher"/> does
+    /// <b>not</b> iterate <see cref="All"/> at runtime; it constructs its own ordered list
+    /// from the registered handler set so the dispatch path stays self-contained even if a
+    /// future handler is added without a corresponding constant here.
+    /// </remarks>
     public static IReadOnlyList<string> All { get; } = new[]
     {
+        // Ordering rule: OrderByDescending(length).ThenBy(name, OrdinalIgnoreCase).
+        // Lengths — "agent status" (12), "agent ask" (9), "escalate" (8), "approve" (7),
+        // "reject" (6), "resume" (6), "pause" (5).
         AgentStatus,
         AgentAsk,
         Escalate,
