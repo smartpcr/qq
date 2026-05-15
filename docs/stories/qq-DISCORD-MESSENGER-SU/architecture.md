@@ -93,7 +93,7 @@ The agent swarm (100+ autonomous agents) requires a Discord-based human interfac
 | **AuthZ Service** | `AgentSwarm.Messaging.Core` (shared) | Validates that the Discord user has the required guild role and is operating in an authorized guild/channel. For Discord, `IUserAuthorizationService.AuthorizeAsync` receives the Discord user ID as `externalUserId` and the channel ID as `chatId`. The `GuildBinding` registry provides the guild/channel/role mapping. |
 | **Guild Registry** | `AgentSwarm.Messaging.Discord` (to be created) | Persistent map of `(GuildId, ChannelId) -> GuildBinding(TenantId, WorkspaceId, ChannelPurpose, AllowedRoleIds)`. Populated via configuration. Provides `IGuildRegistry` interface for authorization lookups. Supports the channel model: one control channel, one alert channel, and optional per-workstream channels. |
 | **Swarm Command Bus** | `AgentSwarm.Messaging.Abstractions` / `Core` (shared) | Publishes validated commands to the orchestrator via `ISwarmCommandBus.PublishCommandAsync`. Subscribes to agent events (questions, alerts, status) via `SubscribeAsync` and routes them to the Discord outbound pipeline. Same shared interface as other connectors. |
-| **OutboundMessageQueue** | `AgentSwarm.Messaging.Abstractions` (interface) / `AgentSwarm.Messaging.Persistence` (impl) (shared) | Durable queue for outbound messages. Same `IOutboundQueue` interface as other connectors, with Discord-specific `OutboundMessage` records using `ChannelId` (ulong) instead of Telegram's `ChatId` (long). Provides severity-based priority ordering (`Critical > High > Normal > Low`), retry with exponential backoff, and dead-letter after exhaustion. |
+| **OutboundMessageQueue** | `AgentSwarm.Messaging.Abstractions` (interface) / `AgentSwarm.Messaging.Persistence` (impl) (shared) | Durable queue for outbound messages. Same `IOutboundQueue` interface as other connectors. The shared `OutboundMessage` record stores channel identity in the `ChatId` field as `long`; the Discord connector stores Discord channel snowflake IDs cast to `long` (safe because Discord snowflakes are unsigned 64-bit integers that fit in signed `long` for all currently-issued IDs). Provides severity-based priority ordering (`Critical > High > Normal > Low`), retry with exponential backoff, and dead-letter after exhaustion. |
 | **DiscordSender** | `AgentSwarm.Messaging.Discord` (to be created) | Concrete `DiscordMessageSender` implementing `IMessageSender` (defined in `AgentSwarm.Messaging.Core`). Wraps Discord.Net's REST client. Builds Discord embeds with agent identity fields (name, role, current task, confidence score, blocking question). Builds component rows with action buttons and select menus. Manages thread creation for per-task conversations. Respects Discord REST rate limits by reading `X-RateLimit-*` response headers and queuing sends when approaching limits. |
 | **OutboundQueueProcessor** | `AgentSwarm.Messaging.Worker` (shared) | `BackgroundService` with configurable concurrency. Dequeues highest-severity pending `OutboundMessage`, dispatches to `IMessageSender`, calls `MarkSentAsync` on success. For question messages, calls `IPendingQuestionStore.StoreAsync` as a post-send hook. Same shared component as other connectors. |
 | **AuditLogger** | `AgentSwarm.Messaging.Persistence` (shared) | Writes immutable audit records for every command and response. For Discord, includes guild ID, channel ID, Discord user ID, message ID, interaction ID, and correlation ID. Uses the shared `IAuditLogger` interface. |
@@ -153,7 +153,23 @@ The Discord connector uses the shared `OutboundMessage` record from `AgentSwarm.
 | `SourceEnvelopeJson` | `string?` | Serialized `AgentQuestionEnvelope` JSON for question messages. Used by `DiscordMessageSender.SendQuestionAsync` to build the embed and component rows at send time. |
 | `SourceType` | `enum` | Same shared enum: `Question`, `Alert`, `StatusUpdate`, `CommandAck`. |
 
-All other fields (`MessageId`, `IdempotencyKey`, `Severity`, `Status`, `AttemptCount`, `MaxAttempts`, `NextRetryAt`, `CreatedAt`, `SentAt`, `CorrelationId`, `SourceId`, `ErrorDetail`) follow the shared model defined in the Telegram architecture (qq-TELEGRAM-MESSENGER-S). The `TelegramMessageId` field is repurposed as a generic `PlatformMessageId` at the shared level; for Discord, this stores the Discord message snowflake ID (cast to `long`).
+All other shared `OutboundMessage` fields are defined inline below (this document is self-contained and does not depend on sibling connector docs):
+
+| Field | Type | Description |
+|---|---|---|
+| `MessageId` | `Guid` | Internal unique identifier. Primary key. |
+| `IdempotencyKey` | `string` | Deterministic key preventing duplicate sends (see derivation table below). |
+| `Severity` | `MessageSeverity` | `Critical`, `High`, `Normal`, `Low`. Determines priority queue ordering. |
+| `Status` | `OutboundMessageStatus` | `Pending`, `Sending`, `Sent`, `Failed`, `DeadLettered`. |
+| `AttemptCount` | `int` | Number of delivery attempts so far. |
+| `MaxAttempts` | `int` | Maximum delivery attempts before dead-lettering (default 5). |
+| `NextRetryAt` | `DateTimeOffset?` | Scheduled next attempt. |
+| `CreatedAt` | `DateTimeOffset` | Enqueue time. |
+| `SentAt` | `DateTimeOffset?` | Discord REST API confirmation time. |
+| `PlatformMessageId` | `long?` | Discord message snowflake ID (cast to `long`; null before first successful send). The shared `OutboundMessage` record in `AgentSwarm.Messaging.Abstractions` defines this field generically so each connector can store its platform-specific message ID. |
+| `CorrelationId` | `string` | End-to-end trace ID. |
+| `SourceId` | `string?` | `QuestionId` for question messages; alert rule ID for alerts; command correlation ID for acks. |
+| `ErrorDetail` | `string?` | Last error message for diagnostics. |
 
 **Idempotency key derivation:** Same derivation rules as the shared model:
 
@@ -166,7 +182,19 @@ All other fields (`MessageId`, `IdempotencyKey`, `Severity`, `Status`, `AttemptC
 
 #### AgentQuestion (shared model -- defined in `AgentSwarm.Messaging.Abstractions`)
 
-The same shared `AgentQuestion` model used across all connectors. See qq-TELEGRAM-MESSENGER-S architecture.md section 3.1 for the full field table. Key fields: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity` (`MessageSeverity`), `AllowedActions` (`HumanAction[]`), `ExpiresAt`, `CorrelationId`.
+The shared `AgentQuestion` model is defined in `AgentSwarm.Messaging.Abstractions` (proposed in the epic-level brief FR-001, `.forge-attachments/agent_swarm_messenger_user_stories.md` lines 831-841). Full field table:
+
+| Field | Type | Description |
+|---|---|---|
+| `QuestionId` | `string` | Unique question identifier. Constrained to printable ASCII, max 30 characters, no `:` separator, no control characters. |
+| `AgentId` | `string` | Originating agent. |
+| `TaskId` | `string` | Associated work item / task. |
+| `Title` | `string` | Short summary. |
+| `Body` | `string` | Full context for the operator. |
+| `Severity` | `MessageSeverity` | Enum: `Critical`, `High`, `Normal`, `Low`. |
+| `AllowedActions` | `HumanAction[]` | Buttons to render. See `HumanAction` definition below. |
+| `ExpiresAt` | `DateTimeOffset` | Timeout deadline. |
+| `CorrelationId` | `string` | Trace ID. |
 
 **Discord-specific constraint relaxation:** Discord's `custom_id` field for message components supports up to 100 characters (vs. Telegram's 64-byte `callback_data` limit). The `QuestionId:ActionId` format used in `custom_id` therefore has more headroom (`q:{QuestionId}:{ActionId}` with the `q:` prefix fits comfortably within 100 chars). However, the shared `AgentQuestion` model retains the 30-character `QuestionId` limit and ASCII-only constraint for cross-connector compatibility.
 
@@ -204,7 +232,11 @@ Tracks an `AgentQuestion` sent to Discord and awaiting operator response. Persis
 - Index on `(Status, ExpiresAt)` -- used by `QuestionTimeoutService`.
 - Index on `(DiscordChannelId, DiscordMessageId)` -- used by recovery sweep.
 
-**Crash-window analysis:** The same two-gap analysis applies as in the Telegram connector (see qq-TELEGRAM-MESSENGER-S architecture.md section 3.1). Gap A (crash between Discord API success and `MarkSentAsync`) produces a duplicate message -- operationally benign because `PendingQuestionRecord` is keyed by `QuestionId`. Gap B (crash between `MarkSentAsync` and `PendingQuestionRecord` persistence) is mitigated by `QuestionRecoverySweep`.
+**Crash-window analysis:** The outbound send flow for a question message is: (1) `OutboundMessage` dequeued, `Status` set to `Sending`; (2) `DiscordMessageSender` calls Discord REST API; (3) on success, `MarkSentAsync` updates `OutboundMessage` to `Status = Sent` with `PlatformMessageId`; (4) `PendingQuestionRecord` is persisted. Two crash windows exist:
+
+**Gap A -- Crash between Discord API success (step 2) and `MarkSentAsync` (step 3).** The `OutboundMessage` is still in `Sending` status with no `PlatformMessageId`. On restart, the queue processor treats `Sending` records as incomplete and re-sends them, producing a duplicate Discord message. This is the inherent cost of at-least-once delivery over an external API without two-phase commit. **Mitigation:** The duplicate message is operationally benign because the `PendingQuestionRecord` (keyed by `QuestionId`) ensures only one pending question exists -- whichever button the operator clicks resolves correctly. The `IdempotencyKey` (`q:{AgentId}:{QuestionId}`) prevents the same question from being *enqueued* twice, but cannot prevent duplicate sends from the same `OutboundMessage` across crash boundaries.
+
+**Gap B -- Crash between `MarkSentAsync` (step 3) and `PendingQuestionRecord` persistence (step 4).** The `OutboundMessage` has `Status = Sent` and `PlatformMessageId` populated, but no `PendingQuestionRecord` exists. **Mitigation:** On restart, `QuestionRecoverySweep` queries for `OutboundMessage` records with `SourceType = Question` and `Status = Sent` that lack a corresponding `PendingQuestionRecord`, and backfills the missing records using the stored `PlatformMessageId`, `SourceId` (as `QuestionId`), and the original `AgentQuestionEnvelope` (preserved in `OutboundMessage.SourceEnvelopeJson`).
 
 #### HumanDecisionEvent (shared model -- defined in `AgentSwarm.Messaging.Abstractions`)
 
@@ -219,9 +251,10 @@ Uses the shared `AuditLogEntry` persistence entity with `Platform = "Discord"`. 
 | `GuildId` | `string` | Discord guild snowflake ID. |
 | `ChannelId` | `string` | Discord channel snowflake ID. |
 | `InteractionId` | `string` | Discord interaction snowflake ID. |
+| `DiscordMessageId` | `string` | Discord message snowflake ID of the bot's response message. Present on every command acknowledgement and outbound agent message. For slash commands, this is the follow-up message ID returned by `ModifyOriginalResponseAsync`. For outbound agent messages, this is the message ID returned by the REST API send call. |
 | `ThreadId` | `string?` | Discord thread snowflake ID (if applicable). |
 
-This approach avoids adding Discord-specific columns to the shared `AuditLogEntry` table while preserving all required audit data.
+The story audit requirement mandates that Discord message IDs are stored with every command and response. The `MessageId` field on the shared `AuditEntry` / `HumanResponseAuditEntry` records carries the Discord message snowflake ID (stringified) to satisfy this requirement at the abstraction layer. The `Details` JSON provides the full set of Discord-specific IDs for queries that need guild/channel/thread context.
 
 #### DeadLetterMessage
 
@@ -247,9 +280,9 @@ DeadLetterMessage 1--1 OutboundMessage          (via DeadLetterMessage.OriginalM
 
 ## 4. Interfaces Between Components
 
-### 4.1 IMessengerConnector (shared abstraction -- defined in `AgentSwarm.Messaging.Abstractions`)
+### 4.1 IMessengerConnector (proposed contract -- evolves FR-001 from epic brief)
 
-The Discord connector implements the common gateway interface:
+The epic-level FR-001 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 43-54) defines the original shared interface with `SendQuestionAsync(AgentQuestion question, ...)`. This architecture evolves that contract to accept `AgentQuestionEnvelope` instead, wrapping `AgentQuestion` with routing metadata (`RoutingMetadata` dictionary for connector-specific fields like `DiscordChannelId`) and a proposed default action (`ProposedDefaultActionId`). The envelope pattern avoids polluting the shared `AgentQuestion` model with per-connector routing concerns. This is the proposed contract for all connectors:
 
 ```csharp
 public interface IMessengerConnector
@@ -259,6 +292,8 @@ public interface IMessengerConnector
     Task<IReadOnlyList<MessengerEvent>> ReceiveAsync(CancellationToken ct);
 }
 ```
+
+> **Migration note:** The `AgentQuestionEnvelope` wrapper is an architecture-level decision that extends FR-001 without breaking it -- `AgentQuestion` remains accessible via `envelope.Question`. This pattern is consistent with the Telegram connector implementation on the `feature/telegram` branch (file `src/AgentSwarm.Messaging.Abstractions/IMessengerConnector.cs`), which already uses `AgentQuestionEnvelope`. The FR-001 brief's `SendQuestionAsync(AgentQuestion, CancellationToken)` is superseded by this signature.
 
 `DiscordMessengerConnector : IMessengerConnector` delegates `SendMessageAsync` and `SendQuestionAsync` to the `OutboundMessageQueue`. `SendMessageAsync` pre-renders the Discord embed JSON (including agent identity fields) and enqueues with the rendered payload. `SendQuestionAsync` stores the full `AgentQuestionEnvelope` in `SourceEnvelopeJson` for send-time rendering (buttons, select menus, embeds require the full question context). `ReceiveAsync` drains processed inbound events from the Gateway pipeline.
 
@@ -271,9 +306,9 @@ public interface IDiscordInteractionPipeline
 }
 ```
 
-The same `PipelineResult(bool Handled, string? ResponseText, string CorrelationId)` return type as the Telegram pipeline. The `DiscordGatewayService` maps raw Discord interactions to `MessengerEvent` via `DiscordInteractionMapper`, then passes them to `ProcessAsync`. The pipeline handles deduplication, authorization, and command dispatch.
+The `PipelineResult(bool Handled, string? ResponseText, string CorrelationId)` return type provides structured outcome information. The `DiscordGatewayService` maps raw Discord interactions to `MessengerEvent` via `DiscordInteractionMapper`, then passes them to `ProcessAsync`. The pipeline handles deduplication, authorization, and command dispatch.
 
-**Discord-specific pipeline behavior:** Because Discord requires interaction acknowledgement within 3 seconds, the pipeline calls `DeferAsync()` on the interaction context before performing authorization or command processing. The deferred response is then completed with the full result (or ephemeral error message) once processing finishes.
+**Discord-specific pipeline behavior:** The `DiscordGatewayService` persists the `DiscordInteractionRecord` (including `RawPayload`) **before** calling `DeferAsync()`, ensuring the durable inbox has recorded the command before Discord considers the interaction acknowledged. `DeferAsync()` is called immediately after the durable persist, within the 3-second Discord interaction response deadline. Authorization, deduplication, and command processing then proceed asynchronously after the ACK. The deferred response is completed with the full result (or ephemeral error message) once processing finishes.
 
 ### 4.3 IGuildRegistry (to be defined in `AgentSwarm.Messaging.Discord`)
 
@@ -295,9 +330,9 @@ public interface IGuildRegistry
 - `GetWorkstreamChannelsAsync(guildId, workspaceId)` returns all `Workstream` channels for a workspace -- used to route per-task status updates.
 - `IsAuthorizedChannelAsync(guildId, channelId)` fast-path check used by the pipeline gate.
 
-### 4.4 IOutboundQueue (shared -- defined in `AgentSwarm.Messaging.Abstractions`)
+### 4.4 IOutboundQueue (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Same shared interface as the Telegram connector:
+Proposed shared interface for durable outbound message queuing. This interface is not yet defined in the repo; it is proposed by this architecture as part of the Messenger Gateway epic's shared abstractions. The Telegram connector on the `feature/telegram` branch has implemented a version of this interface at `src/AgentSwarm.Messaging.Abstractions/IOutboundQueue.cs`; the Discord connector will share the same contract:
 
 ```csharp
 public interface IOutboundQueue
@@ -312,9 +347,9 @@ public interface IOutboundQueue
 
 `DequeueAsync` returns the highest-severity pending message, oldest-first within a severity. The `platformMessageId` parameter on `MarkSentAsync` stores the Discord message snowflake ID (cast to `long`).
 
-### 4.5 IUserAuthorizationService (shared -- defined in `AgentSwarm.Messaging.Core`)
+### 4.5 IUserAuthorizationService (proposed contract -- to be defined in `AgentSwarm.Messaging.Core`)
 
-Same shared interface. For Discord, the authorization service receives:
+Proposed shared interface. The Telegram connector on the `feature/telegram` branch defines this at `src/AgentSwarm.Messaging.Core/IUserAuthorizationService.cs`. For Discord, the authorization service receives:
 - `externalUserId`: Discord user snowflake ID (stringified)
 - `chatId`: Discord channel snowflake ID (stringified)
 - `commandName`: The slash subcommand name (e.g., `"ask"`, `"approve"`)
@@ -325,9 +360,9 @@ The Discord-specific authorization logic:
 3. Validates that the user has at least one role from `AllowedRoleIds` (or from `CommandRestrictions[commandName]` if the subcommand has a role override).
 4. Returns `AuthorizationResult` with the binding as the resolved context.
 
-### 4.6 ISwarmCommandBus (shared -- defined in `AgentSwarm.Messaging.Abstractions`)
+### 4.6 ISwarmCommandBus (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Same shared interface:
+Proposed shared interface for bidirectional communication between messenger connectors and the agent swarm orchestrator. The epic-level FR-001 (`.forge-attachments/agent_swarm_messenger_user_stories.md`) defines the requirement for agents to send progress updates, ask questions, and request approvals; this interface is the proposed realization. The Telegram connector on the `feature/telegram` branch implements a version at `src/AgentSwarm.Messaging.Abstractions/ISwarmCommandBus.cs`:
 
 ```csharp
 public interface ISwarmCommandBus
@@ -340,11 +375,11 @@ public interface ISwarmCommandBus
 }
 ```
 
-The Discord connector publishes commands via `PublishCommandAsync`, human decisions (from button/select interactions) via `PublishHumanDecisionAsync`, and queries swarm state via `QueryStatusAsync` and `QueryAgentsAsync`. The `DiscordGatewayService` subscribes to `SwarmEvent`s at startup for each active tenant and routes them to the appropriate Discord channel based on event type and `GuildBinding.ChannelPurpose`.
+The Discord connector uses this interface identically: publishing commands via `PublishCommandAsync`, human decisions (from button/select interactions) via `PublishHumanDecisionAsync`, and querying swarm state via `QueryStatusAsync` and `QueryAgentsAsync`. The `DiscordGatewayService` subscribes to `SwarmEvent`s at startup for each active tenant and routes them to the appropriate Discord channel based on event type and `GuildBinding.ChannelPurpose`.
 
-### 4.7 IPendingQuestionStore (shared -- defined in `AgentSwarm.Messaging.Abstractions`)
+### 4.7 IPendingQuestionStore (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Same shared interface with Discord-specific parameter mapping:
+Proposed shared interface for managing pending agent questions. The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Abstractions/IPendingQuestionStore.cs`. The Discord connector proposes the same interface with platform-agnostic parameter names:
 
 ```csharp
 public interface IPendingQuestionStore
@@ -378,9 +413,9 @@ public interface IDiscordInteractionStore
 
 `PersistAsync` returns `false` if the `InteractionId` already exists (the `UNIQUE` constraint on `InteractionId` is the canonical deduplication mechanism). Since Discord interaction IDs are globally unique snowflake IDs, deduplication is straightforward -- no equivalent to Telegram's `update_id` scoping is needed.
 
-### 4.9 IMessageSender (shared -- defined in `AgentSwarm.Messaging.Core`)
+### 4.9 IMessageSender (proposed contract -- to be defined in `AgentSwarm.Messaging.Core`)
 
-Same shared interface:
+Proposed shared interface for platform-agnostic outbound sends. The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Core/IMessageSender.cs`. The Discord connector proposes the same interface with platform-agnostic parameter names:
 
 ```csharp
 public interface IMessageSender
@@ -399,9 +434,9 @@ The concrete `DiscordMessageSender` implements this interface and wraps Discord.
 - **Confidence score**: Displayed as a progress-bar emoji sequence (e.g., 4 filled + 1 empty = 80%)
 - **Blocking question**: Indicator when the agent is blocked waiting for human input
 
-### 4.10 IAuditLogger (shared -- defined in `AgentSwarm.Messaging.Abstractions`)
+### 4.10 IAuditLogger (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Same shared interface:
+Proposed shared interface for audit logging. The epic-level FR-006 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 115-125) requires audit logging across all connectors. The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Abstractions/IAuditLogger.cs`:
 
 ```csharp
 public interface IAuditLogger
@@ -411,11 +446,11 @@ public interface IAuditLogger
 }
 ```
 
-For Discord, audit entries store guild ID, channel ID, and interaction ID in the `Details` JSON field. `ExternalUserId` is the Discord user snowflake ID (stringified). `Platform` is always `"Discord"`.
+For Discord, audit entries store guild ID, channel ID, interaction ID, and Discord message ID in the `Details` JSON field. The `MessageId` field on `AuditEntry` / `HumanResponseAuditEntry` carries the Discord message snowflake ID (stringified). `ExternalUserId` is the Discord user snowflake ID (stringified). `Platform` is always `"Discord"`.
 
-### 4.11 IDeduplicationService (shared -- defined in `AgentSwarm.Messaging.Abstractions`)
+### 4.11 IDeduplicationService (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Same shared interface with the same three-method contract (`TryReserveAsync`, `IsProcessedAsync`, `MarkProcessedAsync`). For Discord, the event ID is the interaction snowflake ID (stringified). Backed by a sliding-window cache with configurable TTL (default 1 hour).
+Proposed shared interface with a three-method contract (`TryReserveAsync`, `IsProcessedAsync`, `MarkProcessedAsync`). The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Abstractions/IDeduplicationService.cs`. For Discord, the event ID is the interaction snowflake ID (stringified). Backed by a sliding-window cache with configurable TTL (default 1 hour).
 
 ---
 
@@ -427,10 +462,10 @@ Same shared interface with the same three-method contract (`TryReserveAsync`, `I
 Human (Discord)    DiscordGatewayService   InteractionPipeline   SlashCommandDispatcher   AuthZ    SwarmCommandBus    Orchestrator
       |                    |                      |                      |                   |            |                |
       |--slash command---->|                      |                      |                   |            |                |
-      |                    |--DeferAsync()------->|                      |                   |            |                |
-      |                    |  (3s ACK to Discord) |                      |                   |            |                |
       |                    |--persist InteractionRecord (interaction_id) |                   |            |                |
-      |                    |  (UNIQUE constraint; INSERT fails = dup)    |                   |            |                |
+      |                    |  (UNIQUE constraint; INSERT fails = dup --> skip + return)      |            |                |
+      |                    |--DeferAsync()------->|                      |                   |            |                |
+      |                    |  (3s ACK to Discord; sent AFTER durable persist)                |            |                |
       |                    |--map to MessengerEvent                     |                   |            |                |
       |                    |--ProcessAsync------->|                      |                   |            |                |
       |                    |                      |--dedup check-------->|                   |            |                |
@@ -449,11 +484,11 @@ Human (Discord)    DiscordGatewayService   InteractionPipeline   SlashCommandDis
 ```
 
 **Key invariants:**
-1. The interaction is acknowledged within 3 seconds via `DeferAsync()` before any authorization or command processing begins. This satisfies Discord's interaction response deadline.
-2. The `DiscordInteractionRecord` is persisted (with `RawPayload`) before processing begins. The `UNIQUE` constraint on `InteractionId` prevents duplicate processing if Discord retries the interaction.
+1. The `DiscordInteractionRecord` (including `RawPayload`) is persisted **before** `DeferAsync()` acknowledges the interaction. If the `UNIQUE` constraint on `InteractionId` rejects the insert, the interaction is a duplicate and is dropped immediately without acknowledgement. This persist-before-ACK order eliminates the crash window where Discord considers the interaction delivered but the durable inbox has not recorded it. On restart, `InteractionRecoverySweep` re-processes any records with `IdempotencyStatus` in `Received`, `Processing`, or `Failed` (where `AttemptCount < MaxRetries`).
+2. `DeferAsync()` is called immediately after the durable persist, within the 3-second Discord interaction response deadline. Authorization and command processing proceed asynchronously after the ACK.
 3. Authorization validates guild ID, channel ID, and user roles against the `GuildBinding` registry. Unauthorized users receive an ephemeral error message visible only to them.
 4. The reply is an embed posted as a follow-up to the deferred interaction, containing the task ID and assigned agent information.
-5. `AuditLogger` records the `/agent ask` command with correlation ID, guild ID, channel ID, and user ID.
+5. `AuditLogger` records the `/agent ask` command with correlation ID, guild ID, channel ID, user ID, and the Discord message ID of the follow-up response.
 
 ### 5.2 Scenario: Agent asks a blocking question, operator answers via button
 
@@ -504,7 +539,7 @@ Orchestrator    SwarmCommandBus   DiscordConnector    OutboundQueue   QueueProce
 3. On button click, the `ComponentInteractionHandler` parses `QuestionId` and `ActionId` from `custom_id`, looks up the `PendingQuestionRecord` via `IPendingQuestionStore.GetAsync(questionId)`, resolves `HumanAction.Value` to populate `HumanDecisionEvent.ActionValue`.
 4. For actions with `RequiresComment = true`, the handler responds with a Discord modal dialog to collect the comment text. The `PendingQuestionRecord.Status` transitions to `AwaitingComment` until the modal is submitted.
 5. After the decision is recorded, the original embed is edited to disable buttons and show the result (who approved/rejected, when).
-6. `AuditLogger` records the decision with all Discord-specific IDs.
+6. `AuditLogger` records the decision with guild ID, channel ID, user ID, interaction ID, Discord message ID, and correlation ID.
 
 ### 5.3 Scenario: Bot reconnects after Gateway disconnect
 
@@ -750,13 +785,13 @@ Discord.Net's `DiscordSocketClient` handles Gateway reconnection with built-in e
 
 ### 10.2 Inbound Deduplication
 
-Two-layer deduplication (same as Telegram connector):
+Two-layer deduplication:
 1. **IDeduplicationService** (in-memory/cache): Fast-path suppression of duplicate interaction IDs within the TTL window.
 2. **IDiscordInteractionStore** (database): UNIQUE constraint on `InteractionId` prevents duplicate processing across restarts and multi-instance deployments.
 
 ### 10.3 Outbound Durability
 
-Same durable outbound pipeline as the Telegram connector:
+Durable outbound pipeline:
 1. Messages are persisted to the `OutboundMessage` table before being processed.
 2. `OutboundQueueProcessor` dequeues, sends via `IMessageSender`, and marks sent/failed.
 3. Failed messages retry with exponential backoff up to `MaxAttempts` (default 5).
