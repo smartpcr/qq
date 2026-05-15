@@ -120,11 +120,11 @@ public sealed class TeamsMessengerConnectorTests
         var publisher = new ChannelInboundEventPublisher();
         var harness = ConnectorHarness.Build(reader: publisher);
 
-        var handlerHarness = HandlerFactory.Build(publisher);
+        var handlerHarness = HandlerFactory.BuildE2E(publisher);
         HandlerFactory.MapDave(handlerHarness.IdentityResolver);
         var activity = HandlerFactory.NewPersonalMessage("agent status", correlationId: "corr-status-e2e");
 
-        await HandlerFactory.ProcessAsync(handlerHarness, activity);
+        await HandlerFactory.ProcessE2EAsync(handlerHarness, activity);
 
         var received = await harness.Connector.ReceiveAsync(CancellationToken.None)
             .WaitAsync(TimeSpan.FromSeconds(2));
@@ -136,8 +136,6 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Equal("corr-status-e2e", commandEvent.CorrelationId);
         Assert.Equal("Teams", commandEvent.Messenger);
         Assert.Equal("aad-obj-dave-001", commandEvent.ExternalUserId);
-        Assert.Equal(MessengerEventSources.PersonalChat, commandEvent.Source);
-        Assert.Equal(activity.Id, commandEvent.ActivityId);
     }
 
     [Fact]

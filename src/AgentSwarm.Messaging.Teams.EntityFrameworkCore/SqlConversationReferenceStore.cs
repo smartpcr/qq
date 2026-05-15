@@ -434,7 +434,7 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
     /// that does not accept a <c>tenantId</c> parameter, so the lookup is not tenant-scoped
     /// like every other read (which honour the FR-006 multi-tenant isolation requirement).
     /// The gap is intentional and structural, not an oversight: the sole consumer is
-    /// <see cref="IConversationReferenceRouter.RouteAsync"/> invoked from
+    /// <see cref="IConversationReferenceRouter.GetByConversationIdAsync"/> invoked from
     /// <c>TeamsMessengerConnector.SendMessageAsync</c>, whose only correlation handle is
     /// <c>MessengerMessage.ConversationId</c>. <c>MessengerMessage</c> deliberately carries
     /// no <c>TenantId</c> field today (it is messenger-platform-agnostic), so the caller
