@@ -221,7 +221,7 @@ public sealed class TeamsServiceCollectionExtensionsTests
         : IConversationReferenceStore, IConversationReferenceRouter
     {
         public Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct) => Task.CompletedTask;
-        public Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
+        public Task<TeamsConversationReference?> GetAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByAadObjectIdAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByInternalUserIdAsync(string tenantId, string internalUserId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
@@ -249,7 +249,7 @@ public sealed class TeamsServiceCollectionExtensionsTests
     public sealed class StoreOnlyConversationReferenceStore : IConversationReferenceStore
     {
         public Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct) => Task.CompletedTask;
-        public Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
+        public Task<TeamsConversationReference?> GetAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByAadObjectIdAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByInternalUserIdAsync(string tenantId, string internalUserId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
