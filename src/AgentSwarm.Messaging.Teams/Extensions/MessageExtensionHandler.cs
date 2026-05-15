@@ -55,17 +55,18 @@ namespace AgentSwarm.Messaging.Teams.Extensions;
 /// </list>
 /// <para>
 /// <b>Dispatch failures.</b> If <see cref="ICommandDispatcher.DispatchAsync"/> throws
-/// (publisher channel full, serialisation error, downstream queue rejection, ...) the
-/// handler closes the audit gap by emitting a <see cref="AuditEventTypes.MessageActionReceived"/>
-/// entry with <see cref="AuditOutcomes.Failed"/> (carrying the exception type and a
-/// truncated message in the payload), then returns an attention-styled "Submission
-/// failed" card so the user receives actionable feedback instead of a generic Teams
-/// invoke error. The failure-path audit is best-effort and uses
-/// <see cref="CancellationToken.None"/> so a client disconnect cannot strip the
-/// compliance entry (mirrored secondary failures are still surfaced via
-/// <see cref="ILogger"/>). Cooperative cancellation via the inbound token (e.g. the host
-/// aborts the request) is rethrown and not audited as a failure — it is not a dispatch
-/// fault.
+/// (publisher channel full, serialisation failure, transient downstream outage, …), the
+/// handler still emits a <see cref="AuditEventTypes.MessageActionReceived"/> audit entry
+/// with <see cref="AuditOutcomes.Failed"/> and an <c>error</c> field on the payload so the
+/// compliance trail records that a forward was received but did not dispatch — closing
+/// the gap that would otherwise be left when only the success / rejection paths are
+/// audited. The user receives an actionable error card carrying the correlation ID
+/// (rather than the generic invoke 500) so support can correlate the failure with
+/// upstream telemetry. Cancellation (<see cref="OperationCanceledException"/> driven by
+/// the inbound <c>CancellationToken</c>) is treated as a graceful control-flow signal
+/// from the bot framework, NOT a compliance failure: it propagates without an audit
+/// entry, mirroring the convention in
+/// <see cref="TeamsSwarmActivityHandler.OnMessageActivityAsync"/>.
 /// </para>
 /// <para>
 /// <b>Correlation ID.</b> The handler reuses the per-turn correlation ID stamped by
@@ -93,17 +94,6 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
     /// Aligned with the Stage 3.4 spec test scenario "Message action audit call".
     /// </summary>
     public const string MessageActionForwardAction = "message_action_forward";
-
-    /// <summary>
-    /// Maximum number of characters from <see cref="Exception.Message"/> stored on a
-    /// dispatch-failure audit entry. Exception messages can carry serialiser internals,
-    /// transport details, or fragments of the rejected payload — bounding the recorded
-    /// length keeps the audit row size predictable and limits incidental disclosure
-    /// while still preserving enough context for forensic triage. The exception type
-    /// (<see cref="Type.FullName"/>) is recorded separately and unbounded because it is
-    /// a stable identifier rather than free-form prose.
-    /// </summary>
-    private const int ErrorMessageAuditMaxLength = 256;
 
     private static readonly JsonSerializerOptions PayloadJsonOptions = new()
     {
@@ -349,78 +339,49 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
             SuppressReply = true,
         };
 
-        // Wrap ONLY the dispatch in try/catch — not the post-dispatch audit/confirmation.
-        // The reviewer flagged a real audit gap: if `DispatchAsync` throws (publisher
-        // channel full, serialisation error, downstream queue rejection, …) the handler
-        // would previously skip both the success audit AND the confirmation card,
-        // returning a generic Teams invoke error with no `MessageActionReceived` entry
-        // anywhere — leaving a hole in the compliance trail the rest of this method
-        // diligently maintains. We keep the catch scoped to dispatch (not extended over
-        // the success-path audit/confirmation) on purpose: if dispatch succeeded but the
-        // success audit then throws, the agent task IS already in flight — surfacing a
-        // "submission failed" card to the user would be misleading. That post-success
-        // audit failure is better surfaced via the framework as a 500.
+        // Dispatch is the only step that touches downstream infrastructure (publisher
+        // channel, serializer, command handler) and therefore the only step that can throw
+        // for non-policy reasons. Wrap it so a transport / serialisation failure still
+        // produces:
+        //   * a `MessageActionReceived` audit entry with `Outcome=Failed` (closes the
+        //     compliance gap noted in code review — every other failure path on this
+        //     handler is audited; the dispatch path must be too); and
+        //   * an actionable error card carrying the correlation ID (rather than the
+        //     generic Teams invoke 500 the framework would surface if the exception
+        //     escaped) so the user can reference the tracking ID with support.
+        // Cancellation triggered by the inbound `ct` is treated as a graceful control-flow
+        // signal from the bot framework — propagated without an audit entry, matching the
+        // convention used in TeamsSwarmActivityHandler.OnMessageActivityAsync.
         try
         {
             await _commandDispatcher.DispatchAsync(context, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Cooperative cancellation initiated through the inbound token (e.g. the host
-            // is shutting down the request). Not a dispatch fault — propagate so the
-            // ASP.NET pipeline can record a cancelled request, and do NOT audit as
-            // Failed (the canonical audit-outcome set has no `Cancelled` value and the
-            // audit logger would itself observe the cancelled token).
             throw;
         }
         catch (Exception ex)
         {
             _logger.LogError(
                 ex,
-                "Message-extension dispatch failed (commandId '{CommandId}', tenant {TenantId}, actor {InternalUserId}, correlation {CorrelationId}). Returning dispatch-failure card.",
+                "Message-extension dispatch failed (commandId '{CommandId}', tenant {TenantId}, actor {InternalUserId}, correlation {CorrelationId}, body length {BodyLength}). Returning dispatch-failure card.",
                 commandId,
                 tenantId,
                 resolvedIdentity.InternalUserId,
-                correlationId);
+                correlationId,
+                extraction.PlainText.Length);
 
-            // Best-effort failure audit. Two deliberate departures from the rest of the
-            // method:
-            //   1. Wrapped in its own try/catch — if the audit logger itself throws, we
-            //      still want the user to receive the actionable error card rather than
-            //      a generic Teams invoke 500 (the original ask of this fix). The audit
-            //      failure is surfaced to the structured logger as a secondary error.
-            //   2. Uses `CancellationToken.None` instead of the inbound `ct` so a client
-            //      disconnect between dispatch failure and audit write cannot strip the
-            //      compliance entry. The audit logger is in-process / fast — using None
-            //      here does not introduce an unbounded wait risk.
-            try
-            {
-                await LogMessageActionReceivedAsync(
-                    correlationId: correlationId,
-                    tenantId: tenantId,
-                    actorId: actorForAudit,
-                    conversationId: conversationId,
-                    forwardedText: extraction.PlainText,
-                    sourceMessageId: extraction.SourceMessageId,
-                    senderDisplayName: extraction.SenderDisplayName,
-                    sourceTimestamp: extraction.SourceTimestamp,
-                    commandId: commandId,
-                    outcome: AuditOutcomes.Failed,
-                    ct: CancellationToken.None,
-                    errorType: ex.GetType().FullName,
-                    errorMessage: TruncateForAudit(ex.Message)).ConfigureAwait(false);
-            }
-            catch (Exception auditEx)
-            {
-                _logger.LogError(
-                    auditEx,
-                    "Failed to record MessageActionReceived(Outcome=Failed) audit entry after dispatch failure (commandId '{CommandId}', tenant {TenantId}, correlation {CorrelationId}). Compliance trail will be incomplete for this invocation.",
-                    commandId,
-                    tenantId,
-                    correlationId);
-            }
+            await TryLogDispatchFailureAuditAsync(
+                correlationId: correlationId,
+                tenantId: tenantId,
+                actorId: actorForAudit,
+                conversationId: conversationId,
+                extraction: extraction,
+                commandId: commandId,
+                exception: ex,
+                ct: ct).ConfigureAwait(false);
 
-            return BuildDispatchFailedResponse(correlationId);
+            return BuildDispatchFailureResponse(correlationId);
         }
 
         await LogMessageActionReceivedAsync(
@@ -528,23 +489,60 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
     }
 
     /// <summary>
-    /// Trim an exception <see cref="Exception.Message"/> for inclusion in the audit
-    /// payload. Exception messages can carry serialiser internals or fragments of the
-    /// rejected payload — bounding the recorded length keeps the audit row size
-    /// predictable and limits incidental disclosure while still preserving enough
-    /// context for forensic triage. Returns <c>null</c> for null/empty input so the
-    /// payload dictionary can omit the key entirely.
+    /// Best-effort wrapper around <see cref="LogMessageActionReceivedAsync"/> for the
+    /// dispatch-failure path. Wraps the audit call in its own try/catch so an audit-logger
+    /// failure (which would itself throw) cannot cascade and resurrect the very gap we
+    /// closed by adding the dispatch try/catch in the first place: the user must always
+    /// receive an actionable error card with a correlation ID, even if the durable audit
+    /// store is also unhealthy. Secondary failure is recorded to <see cref="ILogger"/> so
+    /// ops still has a structured trail of "primary dispatch failed AND audit logger
+    /// failed" incidents.
     /// </summary>
-    private static string? TruncateForAudit(string? value)
+    private async Task TryLogDispatchFailureAuditAsync(
+        string correlationId,
+        string tenantId,
+        string actorId,
+        string? conversationId,
+        PayloadExtraction extraction,
+        string commandId,
+        Exception exception,
+        CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(value))
+        try
         {
-            return null;
+            await LogMessageActionReceivedAsync(
+                correlationId: correlationId,
+                tenantId: tenantId,
+                actorId: actorId,
+                conversationId: conversationId,
+                forwardedText: extraction.PlainText,
+                sourceMessageId: extraction.SourceMessageId,
+                senderDisplayName: extraction.SenderDisplayName,
+                sourceTimestamp: extraction.SourceTimestamp,
+                commandId: commandId,
+                outcome: AuditOutcomes.Failed,
+                ct: ct,
+                errorType: exception.GetType().FullName,
+                errorMessage: exception.Message).ConfigureAwait(false);
         }
-
-        return value.Length <= ErrorMessageAuditMaxLength
-            ? value
-            : value[..ErrorMessageAuditMaxLength] + "…";
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Cancellation while writing the failure audit is treated the same as
+            // cancellation during dispatch: a graceful control signal, not a swallowed
+            // error. The primary dispatch failure has already been logged via ILogger,
+            // so propagating cancellation does not lose information for ops.
+            throw;
+        }
+        catch (Exception auditException)
+        {
+            _logger.LogError(
+                auditException,
+                "Failed to write MessageActionReceived audit entry for dispatch failure (correlation {CorrelationId}, tenant {TenantId}, actor {ActorId}). Original dispatch error: {OriginalError}",
+                correlationId,
+                tenantId,
+                actorId,
+                exception.Message);
+        }
     }
 
     private async Task LogMessageActionReceivedAsync(
@@ -571,17 +569,16 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
             ["commandId"] = string.IsNullOrEmpty(commandId) ? null : commandId,
         };
 
-        // Optional dispatch-failure diagnostics. Added only when the caller is on the
-        // Failed path so the existing Success/Rejected payload shape is unchanged
-        // (preserves stable JSON for downstream audit consumers and existing tests).
-        if (!string.IsNullOrEmpty(errorType))
+        // Only emit the `error` field when this is a failure-path audit. Keeping it absent
+        // on success / rejection preserves byte-for-byte payload compatibility with the
+        // existing audit envelope shape and keeps the checksum stable for the happy paths.
+        if (errorType is not null || errorMessage is not null)
         {
-            payloadObject["errorType"] = errorType;
-        }
-
-        if (!string.IsNullOrEmpty(errorMessage))
-        {
-            payloadObject["errorMessage"] = errorMessage;
+            payloadObject["error"] = new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["type"] = errorType,
+                ["message"] = errorMessage,
+            };
         }
 
         var payloadJson = JsonSerializer.Serialize(payloadObject, PayloadJsonOptions);
@@ -829,16 +826,17 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
     }
 
     /// <summary>
-    /// Build the dispatch-failure response — shown when
-    /// <see cref="ICommandDispatcher.DispatchAsync"/> throws (publisher channel full,
-    /// serialisation error, downstream queue rejection, ...). The card mirrors the
-    /// attention-styled template used by the other error builders so users get a
-    /// consistent "something went wrong" UX, and surfaces the correlation ID as a
-    /// tracking facet so support follow-up can stitch the failure to the structured log
-    /// entry and the <see cref="AuditEventTypes.MessageActionReceived"/>
-    /// (<see cref="AuditOutcomes.Failed"/>) audit row written alongside.
+    /// Build the error response for the dispatch-failure path. Shown when
+    /// <see cref="ICommandDispatcher.DispatchAsync"/> threw a non-cancellation exception
+    /// (publisher channel saturation, serialisation failure, transient downstream
+    /// outage, …). The card surfaces the correlation ID so the user can quote it to
+    /// support, and the language stays generic on purpose — leaking exception types or
+    /// internal infrastructure detail to end users would violate the Security
+    /// requirement's spirit (no token / internal-state leakage). Detailed diagnostics
+    /// live in the <see cref="AuditOutcomes.Failed"/> audit entry and the structured
+    /// <see cref="ILogger"/> error event.
     /// </summary>
-    internal static MessagingExtensionActionResponse BuildDispatchFailedResponse(string correlationId)
+    internal static MessagingExtensionActionResponse BuildDispatchFailureResponse(string correlationId)
     {
         var card = new AdaptiveCard(Cards.AdaptiveCardBuilder.SchemaVersion);
 
@@ -849,7 +847,7 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         };
         header.Items.Add(new AdaptiveTextBlock
         {
-            Text = "Submission failed",
+            Text = "Forward failed",
             Weight = AdaptiveTextWeight.Bolder,
             Size = AdaptiveTextSize.Medium,
             Color = AdaptiveTextColor.Attention,
@@ -859,7 +857,7 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
 
         card.Body.Add(new AdaptiveTextBlock
         {
-            Text = "We couldn't forward this message to the agent right now. Please try again in a few moments. If the problem persists, contact your administrator and reference the tracking ID below.",
+            Text = "We couldn't queue your message for the agent. Please try again in a moment. If the problem persists, contact your administrator and reference the tracking ID below.",
             Wrap = true,
             Spacing = AdaptiveSpacing.Small,
         });
