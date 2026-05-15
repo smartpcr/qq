@@ -1,34 +1,131 @@
-# Iter notes — Stage 2.2 (Teams Activity Handler)
+# Iter notes — Stage 2.3 (Teams Messenger Connector) — iter 5
+
+## What this iter delivered (Stage 2.3 from scratch)
+First iter on Stage 2.3 — prior iters worked Stage 2.2. Stage 2.1
+(`TeamsMessagingOptions`, `ICardStateStore`, `TeamsCardState`,
+`ChannelInboundEventPublisher`) had not landed; required for 2.3 to compile so
+the **interface + canonical record types** are created here. DI stubs
+(`NoOpCardStateStore`, `Program.cs`, middleware) remain Stage 2.1 work.
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Teams/AgentSwarm.Messaging.Teams.csproj` — NEW. net8.0; PackageRef `Microsoft.Bot.Builder 4.22.7` + `Microsoft.Extensions.Logging.Abstractions 8.0.0`; ProjectRefs Abstractions + Persistence; `TreatWarningsAsErrors=true`, doc gen on, `NoWarn=CS1591`.
-- `src/AgentSwarm.Messaging.Teams/TeamsConversationReference.cs` — NEW. Sealed record per architecture §3.2.
-- `src/AgentSwarm.Messaging.Teams/IConversationReferenceStore.cs` — NEW. Full 13-method interface (Stage 2.1 canonical home; moved into this stage to unblock compile since 2.1 hasn't landed yet).
-- `src/AgentSwarm.Messaging.Teams/ICardActionHandler.cs` — NEW. `HandleAsync(ITurnContext, CT) → Task<AdaptiveCardInvokeResponse>`. Lives here because returns Bot.Builder type.
-- `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs` — NEW (~29 KB). 9-arg ctor, `OnTurnAsync`, `OnMessageActivityAsync`, `OnTeamsMembersAddedAsync`, `OnTeamsMembersRemovedAsync`, `OnInstallationUpdateActivityAsync`, `OnAdaptiveCardInvokeAsync`, helpers (mention strip, verb extract, tenant/channel/corr-id pull, audit, persist).
-- `AgentSwarm.Messaging.sln` — added Teams project + Teams.Tests project.
-- `tests/AgentSwarm.Messaging.Teams.Tests/*` — NEW project (csproj + 5 files): `TestDoubles.cs` (hand-rolled spies, no Moq, matches existing style), `HandlerFactory.cs` (harness builder + activity factories + `InertBotAdapter`), `TeamsSwarmActivityHandlerTests.cs` (12 scenario tests), `CorrelationIdPropagationTests.cs` (3 tests), `TeamsSwarmActivityHandlerConstructorTests.cs` (9 null-arg tests). 24 tests total, all passing.
+**Production (new):**
+- `src/AgentSwarm.Messaging.Abstractions/IInboundEventReader.cs` — read-only
+  abstraction (`Task<MessengerEvent> ReceiveAsync(CancellationToken)`); lets
+  connector depend on a small read interface instead of the publisher contract.
+- `src/AgentSwarm.Messaging.Teams/TeamsMessagingOptions.cs` — Stage 2.1 config
+  (impl-plan §2.1 step 5); setting `MaxRetryAttempts` recomputes base
+  `RetryCount = MaxRetryAttempts - 1` (5 total → 4 retries — fixes off-by-one
+  rubber-duck flagged).
+- `src/AgentSwarm.Messaging.Teams/TeamsCardStatuses.cs` — `Pending`/`Answered`/
+  `Expired`/`Deleted` constants + `IsValid`.
+- `src/AgentSwarm.Messaging.Teams/TeamsCardState.cs` — fields per impl-plan §2.1
+  step 3 (`QuestionId` is natural PK; no surrogate `Id` — rubber-duck guidance).
+- `src/AgentSwarm.Messaging.Teams/ICardStateStore.cs` — three methods per
+  architecture §4.3 (`SaveAsync`, `GetByQuestionIdAsync`, `UpdateStatusAsync`).
+- `src/AgentSwarm.Messaging.Teams/ChannelInboundEventPublisher.cs` — `Channel<>`-
+  backed; satisfies BOTH `IInboundEventPublisher` (write) and
+  `IInboundEventReader` (read).
+- `src/AgentSwarm.Messaging.Teams/TeamsMessengerConnector.cs` — main 2.3
+  deliverable. Ctor takes 7 deps (CloudAdapter, options, conv-ref store,
+  question store, card-state store, inbound reader, logger). `SendQuestionAsync`
+  implements §2.3 three-step pattern: (1) `SaveAsync` with null ConversationId,
+  (2) resolve ref by `TargetUserId` via `GetByInternalUserIdAsync` or
+  `TargetChannelId` via `GetByChannelIdAsync` then `ContinueConversationAsync`,
+  (3) `UpdateConversationIdAsync` + `ICardStateStore.SaveAsync` with the
+  activity ID and a **fresh** `ConversationReference` captured from the proactive
+  turn context (saving the stored ReferenceJson would give Stage 3.3 stale
+  rehydration data — rubber-duck blocker).
+- `src/AgentSwarm.Messaging.Teams/TeamsServiceCollectionExtensions.cs` — DI
+  helpers: `AddInProcessInboundEventChannel` (one publisher singleton under both
+  interfaces) + `AddTeamsMessengerConnector` (.NET 8 keyed
+  `IMessengerConnector` under `"teams"`, same instance as
+  `TeamsMessengerConnector` singleton).
+
+**Production (modified):**
+- `src/AgentSwarm.Messaging.Teams/AgentSwarm.Messaging.Teams.csproj` — added
+  `Microsoft.Bot.Builder.Integration.AspNet.Core` 4.22.7 (CloudAdapter, per
+  impl-plan §2.1 line 74) + `Microsoft.Extensions.DependencyInjection.Abstractions`
+  8.0.0 (keyed services).
+- `src/AgentSwarm.Messaging.Teams/IConversationReferenceStore.cs` — added
+  `GetByConversationIdAsync(string conversationId, CancellationToken)`. Necessary
+  because `MessengerMessage` (Stage 1.1) carries no `TenantId`, so the BF
+  `ConversationId` is the only routing key reachable from `SendMessageAsync`.
+  Documented as Stage 1 contract deficiency (not normal store growth).
+
+**Tests (new):**
+- `tests/AgentSwarm.Messaging.Teams.Tests/ChannelInboundEventPublisherTests.cs` —
+  7 tests: round-trip, await-publish ordering, cancellation, null-event guard,
+  null-channel guard, concurrent publishers, bounded backpressure.
+- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsMessengerConnectorTests.cs` — 11
+  tests covering all 3 brief scenarios (SendMessage happy + missing ref,
+  ReceiveAsync wired through real publisher) plus SendQuestion happy
+  (asserts question saved, send invoked, ConversationId update, card-state row
+  with valid `ConversationReferenceJson` that round-trips through Newtonsoft to
+  `ConversationReference`), channel-target via `GetByChannelIdAsync`, missing
+  ref still saves question but skips card state, invalid question throws
+  pre-persist, null-arg guards, full ctor null-arg matrix.
+- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsServiceCollectionExtensionsTests.cs`
+  — 5 tests: same-instance binding for publisher/reader, keyed resolution.
+
+**Tests (modified):**
+- `tests/AgentSwarm.Messaging.Teams.Tests/TestDoubles.cs` — added
+  `PreloadByConversationId` map + `ConversationLookups` recorder; implemented
+  the new `GetByConversationIdAsync` method on
+  `RecordingConversationReferenceStore` so the existing 35 Stage 2.2 tests stay
+  green.
 
 ## Decisions made this iter
-- **Scaffold Stage 2.1 surface inline** (Teams project, TeamsConversationReference, IConversationReferenceStore, ICardActionHandler). Stage 2.1 hasn't landed; without these the handler can't compile. When 2.1 lands it should be additive (it'll register the DI bindings + add the HTTP host).
-- **Cast `IActivity` → `Activity` via `as Activity`**. `ITurnContext<T>.Activity` returns the interface type, but `RemoveRecipientMention()`, `GetConversationReference()`, and `GetChannelData<TeamsChannelData>()` are extension methods on the concrete `Activity` class. `as` (not hard cast) tolerates exotic test doubles.
-- **Two-tier auth** kept strict: install events get tenant-only (already enforced by `TenantValidationMiddleware` from Stage 2.1); command events get tenant + identity + RBAC. Rejection ORDER in `OnMessageActivityAsync`: strip mention → identity (null ⇒ `UnmappedUserRejected` audit + access-denied reply, NO conv-ref save) → verb extract → authorize (false ⇒ `InsufficientRoleRejected` audit, NO conv-ref save) → save conv-ref → dispatch.
-- **`@mention` stripping SOLE site**: only `OnMessageActivityAsync` calls `Activity.RemoveRecipientMention()`. `CommandContext.NormalizedText` is the cleaned text — `CommandDispatcher` (Stage 3.2) does not re-strip.
-- **CorrelationId**: read from `Activity.Properties["correlationId"]` (with `CorrelationId` / `correlation_id` fallbacks) or new GUID. Stamped on `TurnState[CorrelationIdTurnStateKey]` so downstream middleware/handlers see the same value.
-- **Install audit uses `AuditEventTypes.CommandReceived`** (no `InstallEvent` value in the canonical vocab) with descriptive `Action` strings (`AppInstalled`, `AppUninstalled`, `BotAddedToTeam`, …). Rejections use `AuditEventTypes.SecurityRejection` per persistence vocab.
-- **Verb extraction helper** (lightweight pre-parse) only used to populate `command` for `AuthorizeAsync`. Full parse stays in `CommandDispatcher` (Stage 3.2). Matches the seven canonical verbs.
-- **Tests use `InertBotAdapter`** (custom `BotAdapter` that doesn't mutate the inbound activity). The in-box `TestAdapter` *unconditionally* overwrites `Recipient`, `Conversation`, `ServiceUrl` on the activity — which clobbered the AAD/Bot IDs needed for mention stripping and broke the assertions on ConversationId. Rolling our own avoids that.
+- **`CloudAdapter` (concrete) not `BotAdapter` (abstract)** — rubber-duck
+  blocker. Pulling in `Microsoft.Bot.Builder.Integration.AspNet.Core` matches
+  impl-plan §2.1 line 74 exactly. `CloudAdapter`'s
+  `ContinueConversationAsync(string, ConversationReference, BotCallbackHandler,
+  CancellationToken)` is virtual → test adapter subclasses + overrides.
+- **`MaxRetryAttempts` → `RetryCount = value - 1`** — base `ConnectorOptions`
+  defines RetryCount as "additional attempts after first" (total = RetryCount+1).
+  5 total Teams attempts → `RetryCount = 4`.
+- **Fresh `ConversationReference` captured from proactive turn context** for
+  `TeamsCardState.ConversationReferenceJson` (via
+  `turnContext.Activity.GetConversationReference()`) — saving the stored
+  `ReferenceJson` would cache stale `serviceUrl` / conversation thread for the
+  Stage 3.3 update/delete path. Falls back to stored ref's JSON only if BF
+  callback doesn't yield one.
+- **`IInboundEventReader` instead of injecting concrete publisher** — keeps
+  connector decoupled, prevents accidental publish-from-connector, gives tests
+  a tiny stub surface. Same singleton implements both interfaces in DI.
+- **Single `TeamsMessengerConnector` singleton, exposed as keyed
+  `IMessengerConnector("teams")` via factory delegate** — rubber-duck guidance;
+  Stage 3.3 will layer `ITeamsCardManager` onto the same instance.
+- **`GetByConversationIdAsync` added to `IConversationReferenceStore`** — XML
+  doc explicitly notes this compensates for the `MessengerMessage` model gap
+  (no `TenantId` field) so a future Stage 1 revision (add tenant to
+  `MessengerMessage` or destination URI parser) can retire it.
+- **Plain-text question summary** (`{Title}\n\n{Body}\n\nReply with: {actions}`)
+  — Adaptive Card lands in Stage 3.1; brief explicitly says "render the question
+  as a simple text summary" until then. Action verbs are lowercased to match the
+  canonical command vocabulary.
 
 ## Dead ends tried this iter
-- First attempt at tests used `TestAdapter` from `Microsoft.Bot.Builder.Adapters` — 6 tests failed because `TestAdapter.ProcessActivityAsync` overwrites `activity.Recipient = _conversation.Bot` (and Conversation, ServiceUrl) regardless of what the caller supplied. Replaced with a 30-line `InertBotAdapter` that just runs the pipeline.
-- Initial helper signatures took `Activity?` but call sites passed `IMessageActivity` / `IConversationUpdateActivity` (8 errors). Fixed by `var activity = turnContext.Activity as Activity;` at the top of each override.
-- Tried `<see cref="Activity.RemoveRecipientMention"/>` in XML doc — failed `CS1574` under TreatWarningsAsErrors because the method is on an extension class. Switched to plain `<c>` ref.
+- `<see cref="RetryCount"/>` xmldoc in `TeamsMessagingOptions` failed CS1574
+  (inherited base members aren't directly resolvable at that scope) — switched
+  to fully qualified `<see cref="ConnectorOptions.RetryCount"/>`.
+- `<see cref="ServiceCollectionDescriptorExtensions.TryAddSingleton{TService}(IServiceCollection)"/>`
+  also failed CS1574 (DI.Abstractions XML docs not resolvable in our context) —
+  rewrote as plain prose.
+- First `ParsedCommand` test stub used a 2-arg ctor — actual record has three
+  positional members (`CommandType, Payload, CorrelationId`).
 
 ## Open questions surfaced this iter
-- `Persistence` and `Core` projects exist on disk but aren't in `AgentSwarm.Messaging.sln`. I only added my new projects (Teams + Teams.Tests). Whoever owns Stage 1.3 should sln-add Persistence/Core when their workstream lands.
-- Some 13 methods on `IConversationReferenceStore` are technically Stage 2.1's; this stage uses only `SaveOrUpdateAsync`, `MarkInactiveAsync`, `MarkInactiveByChannelAsync`. The other 10 are defined so Stage 2.1 doesn't have to re-define them on top of mine.
+- None blocking. Long-term: should `MessengerMessage` carry `TenantId` + a
+  routing-target hint so `IConversationReferenceStore.GetByConversationIdAsync`
+  can be retired? Belongs to a Stage 1 revision workstream, not 2.3.
 
 ## What's still left
-- Nothing for Stage 2.2. Build clean (0/0), 106 tests pass (82 abstractions + 24 Teams).
-- Stage 2.1 will: register `TeamsSwarmActivityHandler` + 9 dependencies in DI, scaffold the ASP.NET Core host + `CloudAdapter`, register `TenantValidationMiddleware`, register `ChannelInboundEventPublisher`, register default-deny stubs for identity/RBAC/card-handler/agent-question-store, register `NoOpAuditLogger` from Persistence.
-- Stage 3.2 will replace the stub `ICommandDispatcher` with the real `CommandDispatcher` that parses verbs out of `CommandContext.NormalizedText`.
+- Nothing for Stage 2.3 itself. Solution build clean (0 warn / 0 err); tests:
+  82 Abstractions + 58 Teams = 140 pass on the .sln (was 117 — +23 for 2.3).
+- Pre-existing failures NOT caused by this iter: 7 failures in
+  `AgentSwarm.Messaging.Teams.Manifest.Tests` (manifest.json maxLength + missing
+  `scripts/package-teams-app.ps1`). Stage 2.4 scope; not in the .sln so the
+  `dotnet test AgentSwarm.Messaging.sln` gate is green.
+- Stage 2.1 still pending: `Program.cs`, middleware classes, in-memory store
+  registrations, `NoOpCardStateStore`/`NoOpCardActionHandler`/`NoOpCardManager`.
+  Stage 3.x dispatch + card handler + Stage 4.x proactive worker also pending.

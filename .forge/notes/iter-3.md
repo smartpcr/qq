@@ -1,37 +1,150 @@
-# Iter notes — Stage 2.2 (Teams Activity Handler) — iter 3
+# Iter notes — Stage 2.3 (Teams Messenger Connector) — iter 5
 
 ## Prior feedback resolution
-- [x] 1. ADDRESSED — `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs:816-863` (`LogCommandReceivedAsync`) + new helper `ExtractCommandBody` at line 864. The command-audit record now matches the e2e contract in `docs/stories/qq-MICROSOFT-TEAMS-MESS/e2e-scenarios.md:809-823`:
-  - `Action` is now the **canonical command verb** (`"agent ask"`, `"approve"`, etc.) — was the literal string `"CommandReceived"`.
-  - `PayloadJson` is now `{"body":"<remainder>"}` — was `{"command":"<verb>","normalizedText":"<full>"}`.
-  - Body extraction is case-insensitive at the verb position and preserves the original casing + interior whitespace of the remainder (verified by the `multi   space body` theory row).
-  - Updated existing test `OnMessageActivityAsync_AuthorizedCommand_EmitsCommandReceivedAuditBeforeDispatch` to assert the exact `audit.Action == "agent ask"` and `audit.PayloadJson == "{\"body\":\"create e2e test scenarios for update service\"}"` strings from e2e:820. Added new `[Theory]` `OnMessageActivityAsync_AuthorizedCommand_AuditActionAndBodyMatchCanonicalSchema` with 5 InlineData rows covering all canonical-verb shapes (`agent status` / `approve` / `approve <id>` / `pause` with trailing whitespace / `agent ask` with multi-space body).
-  - Verification (literal `grep -rnF` of the pre-edit symbols):
-    ```
-    $ grep -rnF 'action: "CommandReceived"' src/ tests/
-    (empty)
-    $ grep -rnF 'command = commandVerb' src/ tests/
-    (empty)
-    $ grep -rnF 'Assert.Equal("CommandReceived", audit.Action)' src/ tests/
-    (empty)
-    ```
+
+Iter-2 evaluator (score 88, verdict iterate) flagged TWO items: a real
+production-DI gap (item 1) and a narrative-quality issue (item 2). Both
+addressed below.
+
+- [x] 1. FIXED — `src/AgentSwarm.Messaging.Teams/TeamsServiceCollectionExtensions.cs:115-132`.
+  Added a default `services.TryAddSingleton<IConversationReferenceRouter>(...)`
+  registration to `AddTeamsMessengerConnector` that adapts the host-supplied
+  `IConversationReferenceStore` singleton via an `as IConversationReferenceRouter`
+  cast. The canonical store implementations (Stage 2.1's
+  `InMemoryConversationReferenceStore` and Stage 4.1's
+  `SqlConversationReferenceStore`) BOTH implement BOTH interfaces, so the
+  cast resolves to the same singleton without an extra type and without
+  requiring the host to write a router-only registration. When the
+  registered store does NOT implement `IConversationReferenceRouter`, the
+  factory throws `InvalidOperationException` with a descriptive message
+  that names the offending store type, both interfaces, and the canonical
+  fix paths. The `TryAddSingleton` guard means hosts that pre-register an
+  explicit router (e.g. for testing) win — the default wiring is a no-op
+  in that case. Three new regression tests landed in
+  `tests/AgentSwarm.Messaging.Teams.Tests/TeamsServiceCollectionExtensionsTests.cs`:
+  - `AddTeamsMessengerConnector_StoreImplementsBothInterfaces_AutoWiresRouterToSameSingleton` —
+    success path: store implements both, router and store resolve to the
+    same instance, and the keyed `IMessengerConnector` resolves end-to-end
+    via the auto-wired router.
+  - `AddTeamsMessengerConnector_StoreDoesNotImplementRouter_ResolvingRouterThrowsWithDescriptiveMessage` —
+    failure path: the `InvalidOperationException` message contains the
+    store's full type name, the `IConversationReferenceRouter` symbol, and
+    the `AddTeamsMessengerConnector` helper name (so an operator can grep
+    their stack for the fix).
+  - `AddTeamsMessengerConnector_ExplicitRouterPreRegistered_AutoWiringIsNoOp` —
+    idempotency: an explicit router registration before the helper call
+    is preserved by `TryAddSingleton`, and the connector receives that
+    instance rather than the cast adapter.
+
+  Two new test doubles landed in the same file —
+  `DualInterfaceConversationReferenceStore` (mimics the canonical Stage 2.1
+  + 4.1 stores; satisfies BOTH interfaces) and
+  `StoreOnlyConversationReferenceStore` (mimics a host-supplied store that
+  satisfies only `IConversationReferenceStore`). Both are standalone
+  implementations rather than subclasses of the existing
+  `ConnectorRecordingConversationReferenceStore` (which is `sealed`); the
+  CS0509 compile failure on the first attempt forced this restructure
+  before the suite would build.
+
+  Verification (the `IConversationReferenceRouter` symbol the evaluator
+  flagged is now bound through the helper):
+  ```
+  $ grep -nF 'IConversationReferenceRouter' src/AgentSwarm.Messaging.Teams/TeamsServiceCollectionExtensions.cs
+  32:/// Also fills in a default <see cref="IConversationReferenceRouter"/> registration that
+  84:    /// <see cref="IConversationReferenceRouter"/> registration that adapts the host-supplied
+  86:    /// <see cref="IConversationReferenceRouter"/> for the contract documenting that the
+  105:        // Default IConversationReferenceRouter wiring — adapt the host-supplied
+  112:        // wire a store NOT implementing IConversationReferenceRouter get a clear startup
+  115:        services.TryAddSingleton<IConversationReferenceRouter>(sp =>
+  118:            return store as IConversationReferenceRouter
+  122:                    "IConversationReferenceRouter. TeamsMessengerConnector.SendMessageAsync " +
+  129:                    "separate IConversationReferenceRouter implementation BEFORE calling " +
+  ```
+
+- [x] 2. ADDRESSED — narrative correction. The iter-2 / iter-3 / iter-4
+  iter-notes claimed `.forge/iter-notes.md` was edited as part of the
+  changed-file list, but `.forge/` is gitignored and not part of the
+  operator-supplied ground-truth diff. The Working-Notes-REQUIRED instruction
+  in the agent prompt tells me to write `.forge/iter-notes.md` as the
+  agent-to-future-self artifact; that file is NEVER part of the change
+  accounting because it never lands in commits. This iter's `Files touched
+  this iter` block (below) lists ONLY files that ARE in the worktree's
+  ground-truth diff — `.forge/iter-notes.md` is intentionally NOT listed
+  there even though it is being written, because Forge excludes the
+  `.forge/` dir from the worktree's git index by design.
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs` — rewrote `LogCommandReceivedAsync` payload shape + Action; added `ExtractCommandBody` helper (preserves body casing + interior whitespace via single `TrimStart` of the leading whitespace following the verb).
-- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsSwarmActivityHandlerTests.cs` — tightened existing audit-shape test to assert the exact e2e contract; added new theory covering 5 canonical-verb shapes (no body, single-token body, trailing whitespace, multi-space body).
+
+- `src/AgentSwarm.Messaging.Teams/TeamsServiceCollectionExtensions.cs` —
+  added the default `TryAddSingleton<IConversationReferenceRouter>` factory
+  that adapts the host-supplied `IConversationReferenceStore` via an `as`
+  cast, with a descriptive `InvalidOperationException` fallback when the
+  store does not also implement the router contract; expanded the class +
+  method xmldoc to document the auto-wiring behaviour and the host-override
+  escape hatch (item 1).
+- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsServiceCollectionExtensionsTests.cs` —
+  added three regression tests (success path, failure path, explicit-override
+  no-op) plus two standalone test doubles
+  (`DualInterfaceConversationReferenceStore` /
+  `StoreOnlyConversationReferenceStore`) and a parameterized
+  `BuildServicesWithoutSeparateRouter<TStore>` helper that intentionally
+  omits the explicit router registration so the cast-adapter code path is
+  the one under test (item 1).
 
 ## Decisions made this iter
-- **Body extraction preserves interior whitespace**: only the single space between verb and body is stripped (via index skip), then `TrimStart` strips any additional leading whitespace from the body region. This means `"agent ask  multi   space body"` → body `"multi   space body"` (interior triple-space preserved). Rationale: the body is intended to be opaque to the audit logger; compliance reviewers will see the user-entered text verbatim. The verb-boundary requirement is just "verb followed by whitespace OR end-of-text".
-- **`Action` field uses the canonical lowercase verb** returned by `ExtractCommandVerb` (which already lowercases via `ToLower(InvariantCulture)`). This matches the e2e table verbatim (`agent ask`, `approve`, etc.) and aligns with `tech-spec.md` §4.3's `Action` field doc which gives `agent ask`, `approve`, etc. as canonical examples.
-- **Did NOT change install / rejection audit Actions** (`AppInstalled`, `BotAddedToTeam`, `UnmappedUserRejected`, `InsufficientRoleRejected`, etc.). The evaluator's item-1 critique scoped strictly to the inbound-command audit shape; install/rejection events are lifecycle/security records and the e2e contract doesn't constrain their `Action` strings beyond the `EventType` discriminator.
-- **Test split into one targeted Fact + one Theory**: keeps the literal e2e:820 string assertion visible at a glance, while the theory exercises edge cases (empty body, trailing whitespace, interior whitespace) that would otherwise hide in a single mega-test.
+
+- **Cast-adapter rather than a separate `ConversationReferenceStoreRouterAdapter`
+  class.** The evaluator gave two options: "register the real store under
+  the companion interface OR avoid the extra contract". I picked option 1
+  (register the store under both contracts via a factory cast) because:
+  (a) the canonical store implementations already satisfy both interfaces
+  per `IConversationReferenceRouter.cs:26-29` (Stage 2.1 + Stage 4.1 design
+  intent); (b) shipping a bridge class would add a third type that
+  duplicates the store's state in a wrapper-of-wrapper pattern; (c) the
+  cast in a factory delegate is the idiomatic .NET DI pattern for
+  "adapter when both interfaces are on the same class". The fallback throw
+  fires at FIRST resolution of `IConversationReferenceRouter` (eager during
+  connector resolution if no other consumer triggers it earlier), not at
+  first send — this is the closest .NET DI gets to compile-time validation
+  without `ValidateOnBuild`.
+- **`TryAddSingleton` for the new registration** matches the iter-2 fix's
+  idempotency pattern. Tests that pre-register an explicit router (e.g.
+  the existing `BuildServices()` helper that wires the
+  `RecordingConversationReferenceRouter` test double) keep working because
+  the explicit registration wins. Verified by the new
+  `AddTeamsMessengerConnector_ExplicitRouterPreRegistered_AutoWiringIsNoOp`
+  test.
+- **Standalone test doubles, not subclasses** — the existing
+  `ConnectorRecordingConversationReferenceStore` is `sealed` (CS0509 on
+  the first build attempt). Two standalone classes mirror the same method
+  surface, and the duplication is intentional: the Dual / Store-Only
+  distinction is the EXACT contract being tested. Neither test double
+  needs to record calls — they only need to expose a specific interface
+  surface so the cast in `AddTeamsMessengerConnector` resolves
+  predictably.
+- **Narrative correction (item 2) is notes-only** — the production code is
+  already correct (the `.forge/` dir was always gitignored and never
+  intended to land in commits); the iter-2 evaluator's complaint was that
+  earlier iter notes claimed it was in the changed-file list. This iter's
+  notes correctly describe `.forge/iter-notes.md` as the
+  agent-to-future-self artifact rather than a changed source file.
 
 ## Dead ends tried this iter
-- None — the fix was structural (rewrite the payload-build + Action assignment in one method), the test update was a direct contract assertion, and the build/test cycle was clean on the first attempt.
+
+- First attempt at the test doubles tried to subclass
+  `ConnectorRecordingConversationReferenceStore` and add the router
+  interface — failed CS0509 because the base is `sealed`. Resolved by
+  rewriting both doubles as standalone `IConversationReferenceStore`
+  implementations.
 
 ## Open questions surfaced this iter
-- None. The `Messenger` column in the e2e:813-823 table is NOT a property of the canonical `AuditEntry` record (Stage 1.3 schema). The evaluator did not flag it. Treating it as out-of-scope for Stage 2.2 — if a future workstream needs that column, it lands on the `AuditEntry` record itself, not in the Teams handler.
+
+- None.
 
 ## What's still left
-- Nothing for Stage 2.2 iter 3. Build clean (0 warnings / 0 errors), 116 tests pass solution-wide (82 abstractions + 34 Teams; was 29 Teams in iter 2, +1 Fact + 5 Theory rows = +5).
-- Stage 2.1 DI wiring + Stage 3.x dispatch/card-handler still pending downstream.
+
+- Nothing for Stage 2.3 iter 5. Build clean (0 warnings / 0 errors), 155
+  tests pass solution-wide (82 abstractions + 73 Teams; iter 4 had
+  82 + 70 = 152, this iter adds +3 router-wiring regression tests).
+- Stage 3.x command-handler dispatch + `AdaptiveCardBuilder` still pending
+  downstream.
