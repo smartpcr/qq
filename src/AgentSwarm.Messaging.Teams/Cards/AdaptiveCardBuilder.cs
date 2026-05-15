@@ -411,7 +411,7 @@ public sealed class AdaptiveCardBuilder : IAdaptiveCardRenderer
         {
             return severity is MessageSeverities.Critical or MessageSeverities.Error
                 ? "destructive"
-                : "destructive";
+                : null;
         }
 
         return null;
