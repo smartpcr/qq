@@ -1,33 +1,24 @@
-# Iter notes — Stage 2.4 (Teams App Manifest)
+# Iter notes — Stage 1.3 (Persistence Abstractions) — iter 3
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Teams/Manifest/manifest.json` — NEW. Teams app manifest v1.16. Placeholder GUID `00000000-...` at four required sites (`id`, `bots[0].botId`, `composeExtensions[0].botId`, `webApplicationInfo.id`); placeholder domain `bot.example.com`. Bots: scopes=["personal","team"], supportsFiles=false. ComposeExtensions action command `forwardToAgent` (type=action, fetchTask=false, context=[message,commandBox]). Includes accentColor, developer URLs, validDomains, webApplicationInfo for SSO.
-- `src/AgentSwarm.Messaging.Teams/Manifest/color.png` — NEW. 192×192 PNG (PowerShell+System.Drawing AS-monogram placeholder).
-- `src/AgentSwarm.Messaging.Teams/Manifest/outline.png` — NEW. 32×32 transparent outline PNG.
-- `src/AgentSwarm.Messaging.Teams/Manifest/build-manifest.ps1` — NEW. Cross-platform pwsh packaging script. Mandatory `-AppId` (GUID) + `-BotDomain`; rejects placeholder values; re-validates substituted JSON parses; writes `bin/manifest.zip` (gitignored). Optional `-OutputPath` override.
-- `src/AgentSwarm.Messaging.Teams/Manifest/README.md` — NEW. Operator deployment + substitution semantics doc.
-- `tests/AgentSwarm.Messaging.Teams.Manifest.Tests/*` — NEW xunit project (added to sln). 22 tests across 4 files: `ManifestSchemaValidationTests` (full v1.16 schema validation), `BotScopesTests`, `ComposeExtensionTests`, `PackagingScriptSmokeTests`. Embedded official schema as resource.
-- `AgentSwarm.Messaging.sln` — added new test project via `dotnet sln add`.
-- `.gitignore` — added `src/AgentSwarm.Messaging.Teams/Manifest/bin/`.
+- None. No source changes. This iter was a verification pass — confirmed iter-2's committed state still satisfies the brief after the `feature/teams` merge.
+
+## What I verified this iter
+- `git status` clean; iter-2's work is at HEAD (`630bd34 impl(...): Persistence Abstractions`).
+- `dotnet build --nologo --verbosity minimal` → exit 0, 0 warnings, 0 errors.
+- `dotnet test AgentSwarm.Messaging.sln --no-build` → 144/144 pass (82 Abstractions.Tests + 62 Persistence.Tests). Note: Abstractions test count grew from iter-2's 51 → 82 because the `feature/teams` merge brought more abstractions tests into the parent project; my Persistence count is stable at 62.
+- No `## LATEST evaluator feedback` section in this prompt — nothing to address.
+- Re-read `IAuditLogger`, `IMessageStore`, `AuditEntry`, `NoOpAuditLogger`, `PersistedMessage`, and the four vocabulary classes; every Stage 1.3 brief bullet is satisfied (project created, `LogAsync(AuditEntry, CT)`, three message-store methods, `AgentId` first-class plus all other canonical fields, `Checksum`, no-op stub, etc.).
 
 ## Decisions made this iter
-- **Manifest home**: `src/AgentSwarm.Messaging.Teams/Manifest/` (forward-compat with Stage 2.1 which will create the Teams .csproj). Did NOT create a csproj for it — manifest is non-source artifact.
-- **Placeholder GUID** = `00000000-0000-0000-0000-000000000000` at all four required sites. Schema-valid GUID shape so the file validates out of the box; `build-manifest.ps1` substitutes and fails loudly if placeholder remains. Avoided `{{TOKEN}}` form (would break schema validation).
-- **No preemptive `parameters` on the action command**: v1.16 schema only requires `id` + `title` at command level. Rubber-duck flagged preemptive `parameters` as risky for Stage 3.4 UX. Stage 3.4 will add if its handler needs them.
-- **Single pwsh script** (no separate `.sh`): pwsh is cross-platform.
-- **Schema validation via JsonSchema.Net 7.0.4** (not hand-rolled structural assertions): rubber-duck flagged "schema validation" as the actual ask. Two surprises:
-  1. The v1.16 schema declares the legacy draft-04 dialect; JsonSchema.Net 7.x dropped Draft 4 support. Workaround: `ManifestFixture.LoadSchemaTextForEvaluation()` rewrites the `$schema` declaration to draft-07 before parsing. Draft-07 is a strict superset of the keywords this schema actually uses (`type`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`, `pattern`, `$ref`, `definitions`, `minItems`/`maxItems`, `minLength`/`maxLength`) — semantically equivalent for this schema.
-  2. Schema only validates that each GUID-shaped field is a GUID; it does NOT enforce that `id == bots[0].botId == composeExtensions[0].botId == webApplicationInfo.id`. Added explicit cross-site consistency tests (`Manifest_AppIdIsConsistentAcrossAllRequiredSites`, `ComposeExtension_BotIdMatchesTopLevelId`) — these catch hand-edit drift that schema alone cannot.
-- **`PackagingScriptSmokeTests` via `Xunit.SkippableFact`**: end-to-end exercises the real `pwsh` script (substitution, zip layout, refusal paths, re-validates output against schema). Auto-skips when pwsh missing so non-Windows CI passes regardless.
+- Left the `AgentSwarm.Messaging.Core` and `AgentSwarm.Messaging.Core.Tests` projects (on disk under `src/` and `tests/` after the feature/teams merge) OUT of `AgentSwarm.Messaging.sln`. They belong to Stage 1.2 (Core Data Models, the outbox abstractions), not Stage 1.3. The prior commit `296be98 fix(persistence): re-add Persistence projects to solution after feature/teams merge` only restored Persistence references — re-adding Core projects is for the Stage 1.2 owner. Touching them here would expand the workstream's diff into another stage's territory.
+- No re-running of `dotnet sln add` for Persistence — already present in `AgentSwarm.Messaging.sln` (GUIDs `670A41FF-...` and `DC744886-...`).
 
 ## Dead ends tried this iter
-- First test draft used `Assert.Equal(1, count)` → xunit analyzer rejected (xUnit2013). Switched to `Assert.Single`.
-- First test run failed with `RefResolutionException: Could not resolve 'http://json-schema.org/draft-04/schema#'`. JsonSchema.Net 7.x and 6.x both lack Draft 4. Solved with dialect-rewrite at load time (see decision above) rather than downgrading or registering a stub meta-schema.
+- None.
 
 ## Open questions surfaced this iter
-- None blocking.
-- Pre-existing orphan state observed (Persistence/Core projects exist on disk but aren't in the sln — must have been left behind by a recent sibling merge). Out of my workstream's scope; left untouched.
+- None. (For the next iter / next stage: somebody owning Stage 1.2 should re-add `AgentSwarm.Messaging.Core{,.Tests}` to the solution. Not in this workstream's scope.)
 
 ## What's still left
-- Nothing for Stage 2.4. Build green (0 warn / 0 err). 104/104 tests pass (82 existing Abstractions + 22 new Manifest, including 7 pwsh smoke tests).
-- Stage 3.4 (Message Extension Handler) will implement `OnTeamsMessagingExtensionSubmitActionAsync` to handle `forwardToAgent` invocations this manifest declares. The plan explicitly notes Stage 3.4 may add manifest fields (likely `parameters`) if the handler needs them.
+- Nothing for Stage 1.3. Stage 2.1 will register `NoOpAuditLogger` as the default `IAuditLogger` in DI; Stage 5.2 swaps in `SqlAuditLogger`.
