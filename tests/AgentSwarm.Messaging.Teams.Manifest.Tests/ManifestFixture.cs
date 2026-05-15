@@ -30,12 +30,6 @@ internal static class ManifestFixture
         Path.Combine(AppContext.BaseDirectory, "ManifestArtifacts", "outline.png");
 
     /// <summary>
-    /// Path to the cross-platform packaging script staged alongside the manifest.
-    /// </summary>
-    public static string PackagingScriptPath { get; } =
-        Path.Combine(AppContext.BaseDirectory, "ManifestArtifacts", "build-manifest.ps1");
-
-    /// <summary>
     /// Loads <c>manifest.json</c> as a <see cref="JsonNode"/>. The file is required to
     /// exist — failure to parse is a test fixture failure, not a soft assertion.
     /// </summary>

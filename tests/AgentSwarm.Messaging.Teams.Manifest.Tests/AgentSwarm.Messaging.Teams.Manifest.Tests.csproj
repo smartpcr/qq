@@ -32,9 +32,6 @@
     <None Include="..\..\src\AgentSwarm.Messaging.Teams\Manifest\outline.png" Link="ManifestArtifacts\outline.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="..\..\src\AgentSwarm.Messaging.Teams\Manifest\build-manifest.ps1" Link="ManifestArtifacts\build-manifest.ps1">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
     <EmbeddedResource Include="Resources\MicrosoftTeams.v1.16.schema.json" />
   </ItemGroup>
 
