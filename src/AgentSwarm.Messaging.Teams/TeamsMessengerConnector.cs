@@ -46,6 +46,21 @@ namespace AgentSwarm.Messaging.Teams;
 /// <see cref="ICardStateStore.SaveAsync"/>.</description></item>
 /// </list>
 /// <para>
+/// <b>Post-send-throw retry contract.</b> The step-3 validation runs AFTER the proactive
+/// send has already pushed the question text to the Teams user, so a throw at that point
+/// signals "delivered but untracked" rather than "not delivered". Callers (including any
+/// retry middleware wrapping the orchestrator) MUST NOT retry <see cref="SendQuestionAsync"/>
+/// for the same <see cref="AgentQuestion.QuestionId"/> after such a failure, otherwise the
+/// user will see the question text a second time. The two specific
+/// <see cref="InvalidOperationException"/>s thrown by step-3 validation set
+/// <see cref="System.Exception.Data"/>[<see cref="DeliveryAlreadyOccurredDataKey"/>] to
+/// <c>true</c> as a refactor-stable, machine-readable signal that the user has already
+/// seen the message; orchestrator retry policies SHOULD branch on that key (preferred)
+/// rather than substring-matching the exception message. The recommended recovery is to
+/// mark the question as sent-but-untracked, cancel any in-progress card lifecycle, and
+/// surface to operators for manual reconciliation.
+/// </para>
+/// <para>
 /// <b>Adapter type:</b> the constructor takes the concrete <see cref="CloudAdapter"/> per the
 /// canonical contract in <c>implementation-plan.md</c> §2.3 step 1. <see cref="CloudAdapter"/>
 /// inherits the proactive <c>ContinueConversationAsync(string, ConversationReference,
@@ -66,6 +81,19 @@ namespace AgentSwarm.Messaging.Teams;
 /// </remarks>
 public sealed class TeamsMessengerConnector : IMessengerConnector
 {
+    /// <summary>
+    /// <see cref="System.Exception.Data"/> key stamped on the two
+    /// <see cref="InvalidOperationException"/>s that <see cref="SendQuestionAsync"/> throws
+    /// from its step-3 validation block. When the value at this key is <c>true</c>, the
+    /// proactive send already pushed the question text to the Teams user before the throw,
+    /// so retry middleware MUST treat the failure as "delivered but untracked" and MUST NOT
+    /// re-invoke <see cref="SendQuestionAsync"/> for the same
+    /// <see cref="AgentQuestion.QuestionId"/> (otherwise the user sees the question twice).
+    /// This key is the canonical machine-readable signal — prefer it over substring-matching
+    /// the exception message, which is brittle to refactors.
+    /// </summary>
+    public const string DeliveryAlreadyOccurredDataKey = "DeliveryAlreadyOccurred";
+
     private readonly CloudAdapter _adapter;
     private readonly TeamsMessagingOptions _options;
     private readonly IConversationReferenceStore _conversationReferenceStore;
@@ -149,6 +177,37 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// <b>Teams-specific post-send-throw contract.</b> The step-3 validation runs AFTER the
+    /// proactive send has already pushed the question text to the Teams user. If the
+    /// proactive turn context yields no <c>Conversation.Id</c>, or if
+    /// <c>SendActivityAsync</c> returns no <c>Activity.Id</c>, this method throws
+    /// <see cref="InvalidOperationException"/> to surface the partial-state failure — but the
+    /// user has already seen the question. Callers and any retry middleware MUST NOT retry
+    /// <see cref="SendQuestionAsync"/> for the same
+    /// <see cref="AgentQuestion.QuestionId"/> after such a failure, otherwise the user will
+    /// see the question text a second time and step-1
+    /// <see cref="IAgentQuestionStore.SaveAsync"/> will be re-invoked (whose semantics —
+    /// insert vs upsert — depend on the store implementation).
+    /// </para>
+    /// <para>
+    /// To distinguish these "delivered but untracked" failures from genuine pre-send
+    /// failures (invalid input, missing conversation reference, transport error before the
+    /// callback runs), the two step-3 throws stamp
+    /// <see cref="System.Exception.Data"/>[<see cref="DeliveryAlreadyOccurredDataKey"/>] to
+    /// <c>true</c>. Retry policies SHOULD branch on that key — it is the canonical
+    /// machine-readable signal. The exception message also retains the substrings
+    /// <c>"Conversation.Id"</c> and <c>"Activity.Id"</c> for human diagnostics, but
+    /// substring-matching is brittle and SHOULD NOT be used as the primary control-flow
+    /// contract.
+    /// </para>
+    /// <para>
+    /// Failures thrown BEFORE the proactive send (null/invalid <see cref="AgentQuestion"/>,
+    /// no stored conversation reference) are safe to retry — they do NOT carry the
+    /// <see cref="DeliveryAlreadyOccurredDataKey"/> flag.
+    /// </para>
+    /// </remarks>
     public async Task SendQuestionAsync(AgentQuestion question, CancellationToken ct)
     {
         if (question is null)
@@ -235,22 +294,35 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         // GetOpenByConversation) AND no card state row (breaking
         // ITeamsCardManager.UpdateCardAsync / DeleteCardAsync). The check is performed
         // BEFORE either persistence call so we never produce partial state.
+        //
+        // IMPORTANT — duplicate-delivery contract: by the time these checks run, the
+        // proactive send above has ALREADY pushed the question text to the Teams user.
+        // Throwing here therefore signals "delivered but untracked", NOT "not delivered".
+        // Both throws stamp Data[DeliveryAlreadyOccurredDataKey] = true so retry middleware
+        // can branch on a refactor-stable signal rather than substring-matching the message;
+        // see the SendQuestionAsync XML <remarks> block for the full caller contract.
         if (string.IsNullOrWhiteSpace(deliveredConversationId))
         {
-            throw new InvalidOperationException(
+            throw BuildDeliveredButUntrackedException(
                 $"ContinueConversationAsync for question '{question.QuestionId}' did not yield " +
                 $"a Conversation.Id from the proactive turn context. The card was sent but cannot " +
                 $"be resolved by bare approve/reject text commands; treating this as a delivery failure " +
-                $"to avoid silent partial persistence.");
+                $"to avoid silent partial persistence. The question text was already delivered to the " +
+                $"user — callers MUST NOT retry SendQuestionAsync (branch on " +
+                $"Data[\"{DeliveryAlreadyOccurredDataKey}\"] == true) to avoid duplicate user-visible " +
+                $"delivery; treat the question as sent-but-untracked and surface to operators.");
         }
 
         if (string.IsNullOrWhiteSpace(deliveredActivityId))
         {
-            throw new InvalidOperationException(
+            throw BuildDeliveredButUntrackedException(
                 $"ContinueConversationAsync for question '{question.QuestionId}' did not yield " +
                 $"an Activity.Id from the SendActivityAsync response. The card was sent but cannot " +
                 $"be updated or deleted later; treating this as a delivery failure to avoid silent " +
-                $"partial persistence.");
+                $"partial persistence. The question text was already delivered to the user — callers " +
+                $"MUST NOT retry SendQuestionAsync (branch on Data[\"{DeliveryAlreadyOccurredDataKey}\"] == true) " +
+                $"to avoid duplicate user-visible delivery; treat the question as sent-but-untracked and " +
+                $"surface to operators.");
         }
 
         await _agentQuestionStore
@@ -320,5 +392,12 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         }
 
         return builder.ToString();
+    }
+
+    private static InvalidOperationException BuildDeliveredButUntrackedException(string message)
+    {
+        var ex = new InvalidOperationException(message);
+        ex.Data[DeliveryAlreadyOccurredDataKey] = true;
+        return ex;
     }
 }
