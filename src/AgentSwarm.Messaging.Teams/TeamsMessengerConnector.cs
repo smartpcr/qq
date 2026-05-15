@@ -1,6 +1,5 @@
-using System.Globalization;
-using System.Text;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Teams.Cards;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
@@ -33,8 +32,12 @@ namespace AgentSwarm.Messaging.Teams;
 /// <see cref="IConversationReferenceStore.GetByInternalUserIdAsync"/>) or
 /// <see cref="AgentQuestion.TargetChannelId"/> (via
 /// <see cref="IConversationReferenceStore.GetByChannelIdAsync"/>), rehydrate to a Bot
-/// Framework <see cref="ConversationReference"/> via <c>Newtonsoft.Json</c>, and send a
-/// text summary through <c>ContinueConversationAsync</c>.</description></item>
+/// Framework <see cref="ConversationReference"/> via <c>Newtonsoft.Json</c>, render the
+/// question into an Adaptive Card via the injected <see cref="IAdaptiveCardRenderer"/>
+/// (Stage 3.1), wrap it in an <see cref="Attachment"/> with
+/// <c>ContentType = "application/vnd.microsoft.card.adaptive"</c>, and send it through
+/// <c>ContinueConversationAsync</c>. <see cref="Activity.Text"/> is set to the
+/// question title as a notification-banner / accessibility fallback only.</description></item>
 /// <item><description>Capture the <c>ResourceResponse.Id</c> (Teams activity ID) and the
 /// proactive turn context's <c>Conversation.Id</c>. If EITHER is missing the connector
 /// throws <see cref="InvalidOperationException"/> — partial persistence (saving the
@@ -72,17 +75,20 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
     private readonly IConversationReferenceRouter _conversationReferenceRouter;
     private readonly IAgentQuestionStore _agentQuestionStore;
     private readonly ICardStateStore _cardStateStore;
+    private readonly IAdaptiveCardRenderer _cardRenderer;
     private readonly IInboundEventReader _inboundEventReader;
     private readonly ILogger<TeamsMessengerConnector> _logger;
 
     /// <summary>
     /// Construct the connector with the dependencies required by
-    /// <c>implementation-plan.md</c> §2.3 step 1, plus a
+    /// <c>implementation-plan.md</c> §2.3 step 1 and §3.1 step 7, plus a
     /// <see cref="IConversationReferenceRouter"/> for <see cref="SendMessageAsync"/>
-    /// routing, an <see cref="IInboundEventReader"/> for <see cref="ReceiveAsync"/>, and an
-    /// <see cref="ILogger{T}"/> for operational logging. Every parameter is null-guarded so
-    /// DI mis-registration fails loudly at startup rather than producing a
-    /// <see cref="NullReferenceException"/> deep inside an outbound delivery.
+    /// routing, an <see cref="IInboundEventReader"/> for <see cref="ReceiveAsync"/>, an
+    /// <see cref="IAdaptiveCardRenderer"/> for <see cref="SendQuestionAsync"/> card
+    /// rendering, and an <see cref="ILogger{T}"/> for operational logging. Every
+    /// parameter is null-guarded so DI mis-registration fails loudly at startup rather
+    /// than producing a <see cref="NullReferenceException"/> deep inside an outbound
+    /// delivery.
     /// </summary>
     public TeamsMessengerConnector(
         CloudAdapter adapter,
@@ -91,6 +97,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         IConversationReferenceRouter conversationReferenceRouter,
         IAgentQuestionStore agentQuestionStore,
         ICardStateStore cardStateStore,
+        IAdaptiveCardRenderer cardRenderer,
         IInboundEventReader inboundEventReader,
         ILogger<TeamsMessengerConnector> logger)
     {
@@ -100,6 +107,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         _conversationReferenceRouter = conversationReferenceRouter ?? throw new ArgumentNullException(nameof(conversationReferenceRouter));
         _agentQuestionStore = agentQuestionStore ?? throw new ArgumentNullException(nameof(agentQuestionStore));
         _cardStateStore = cardStateStore ?? throw new ArgumentNullException(nameof(cardStateStore));
+        _cardRenderer = cardRenderer ?? throw new ArgumentNullException(nameof(cardRenderer));
         _inboundEventReader = inboundEventReader ?? throw new ArgumentNullException(nameof(inboundEventReader));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
@@ -199,7 +207,13 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         }
 
         var conversationReference = DeserializeReference(stored);
-        var summaryText = RenderQuestionSummary(question);
+
+        // Implementation-plan §3.1 step 7 — render the question as an Adaptive Card via
+        // IAdaptiveCardRenderer and attach it to the outbound activity. Activity.Text is
+        // populated with the question title so Teams can fall back to a plain-text
+        // notification banner on clients that cannot render the card (mobile lock screens,
+        // accessibility tooling, etc.).
+        var attachment = _cardRenderer.RenderQuestionCard(question);
 
         // Step 2b — perform the proactive send. Closure variables capture the activityId
         // returned by Bot Framework and a fresh ConversationReference rebuilt from the
@@ -215,7 +229,8 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
             conversationReference,
             async (turnContext, innerCt) =>
             {
-                var reply = MessageFactory.Text(summaryText);
+                var reply = MessageFactory.Attachment(attachment);
+                reply.Text = question.Title;
                 var resourceResponse = await turnContext.SendActivityAsync(reply, innerCt).ConfigureAwait(false);
                 deliveredActivityId = resourceResponse?.Id;
                 deliveredConversationId = turnContext.Activity?.Conversation?.Id;
@@ -294,31 +309,4 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         return reference;
     }
 
-    private static string RenderQuestionSummary(AgentQuestion question)
-    {
-        // Adaptive Card rendering is wired in Stage 3.1 when AdaptiveCardBuilder lands. For
-        // Stage 2.3 we send a plain-text summary that names the question, body, and
-        // available action verbs so a human can answer via the bare `approve` / `reject`
-        // command path that Stage 3.2 enables.
-        var builder = new StringBuilder();
-        builder.Append(question.Title);
-        builder.Append("\n\n");
-        builder.Append(question.Body);
-
-        if (question.AllowedActions.Count > 0)
-        {
-            builder.Append("\n\nReply with: ");
-            for (var i = 0; i < question.AllowedActions.Count; i++)
-            {
-                if (i > 0)
-                {
-                    builder.Append(", ");
-                }
-
-                builder.Append(question.AllowedActions[i].ActionId.ToLower(CultureInfo.InvariantCulture));
-            }
-        }
-
-        return builder.ToString();
-    }
 }

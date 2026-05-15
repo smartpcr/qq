@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Teams.Cards;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -102,6 +103,44 @@ public sealed class TeamsServiceCollectionExtensionsTests
         Assert.Equal(1, services.Count(d => d.ServiceType == typeof(ChannelInboundEventPublisher)));
         Assert.Equal(1, services.Count(d => d.ServiceType == typeof(IInboundEventPublisher)));
         Assert.Equal(1, services.Count(d => d.ServiceType == typeof(IInboundEventReader)));
+        // Stage 3.1 step 7 — the helper auto-registers IAdaptiveCardRenderer; idempotency
+        // must hold for that descriptor too.
+        Assert.Equal(1, services.Count(d => d.ServiceType == typeof(IAdaptiveCardRenderer)));
+    }
+
+    /// <summary>
+    /// Stage 3.1 step 7 — <see cref="TeamsServiceCollectionExtensions.AddTeamsMessengerConnector"/>
+    /// must default-register an <see cref="IAdaptiveCardRenderer"/> implementation
+    /// (canonical: <see cref="AdaptiveCardBuilder"/>) so the connector resolves end-to-end
+    /// without forcing every host to write a renderer registration of its own. Hosts that
+    /// ship a custom renderer can register it BEFORE calling the helper; the
+    /// <c>TryAddSingleton</c> guard preserves the explicit registration.
+    /// </summary>
+    [Fact]
+    public void AddTeamsMessengerConnector_RegistersAdaptiveCardRenderer_AsAdaptiveCardBuilder()
+    {
+        var services = BuildServices();
+        services.AddTeamsMessengerConnector();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var renderer = sp.GetRequiredService<IAdaptiveCardRenderer>();
+        Assert.IsType<AdaptiveCardBuilder>(renderer);
+
+        var connector = sp.GetRequiredService<TeamsMessengerConnector>();
+        Assert.NotNull(connector);
+    }
+
+    [Fact]
+    public void AddTeamsMessengerConnector_ExplicitRendererPreRegistered_AutoWiringIsNoOp()
+    {
+        var explicitRenderer = new AdaptiveCardBuilder();
+        var services = BuildServices();
+        services.AddSingleton<IAdaptiveCardRenderer>(explicitRenderer);
+        services.AddTeamsMessengerConnector();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var resolved = sp.GetRequiredService<IAdaptiveCardRenderer>();
+        Assert.Same(explicitRenderer, resolved);
     }
 
     /// <summary>

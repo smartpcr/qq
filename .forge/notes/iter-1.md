@@ -1,131 +1,47 @@
-# Iter notes — Stage 2.3 (Teams Messenger Connector) — iter 5
+# Iter notes — Stage 3.1 (Adaptive Card Templates) — iter 1
 
-## What this iter delivered (Stage 2.3 from scratch)
-First iter on Stage 2.3 — prior iters worked Stage 2.2. Stage 2.1
-(`TeamsMessagingOptions`, `ICardStateStore`, `TeamsCardState`,
-`ChannelInboundEventPublisher`) had not landed; required for 2.3 to compile so
-the **interface + canonical record types** are created here. DI stubs
-(`NoOpCardStateStore`, `Program.cs`, middleware) remain Stage 2.1 work.
+This is the first iter of a fresh workstream branched from `feature/teams`
+(post Stage 2.3). All 7 implementation steps from `implementation-plan.md`
+§3.1 are addressed. No prior evaluator feedback to triage.
 
 ## Files touched this iter
-**Production (new):**
-- `src/AgentSwarm.Messaging.Abstractions/IInboundEventReader.cs` — read-only
-  abstraction (`Task<MessengerEvent> ReceiveAsync(CancellationToken)`); lets
-  connector depend on a small read interface instead of the publisher contract.
-- `src/AgentSwarm.Messaging.Teams/TeamsMessagingOptions.cs` — Stage 2.1 config
-  (impl-plan §2.1 step 5); setting `MaxRetryAttempts` recomputes base
-  `RetryCount = MaxRetryAttempts - 1` (5 total → 4 retries — fixes off-by-one
-  rubber-duck flagged).
-- `src/AgentSwarm.Messaging.Teams/TeamsCardStatuses.cs` — `Pending`/`Answered`/
-  `Expired`/`Deleted` constants + `IsValid`.
-- `src/AgentSwarm.Messaging.Teams/TeamsCardState.cs` — fields per impl-plan §2.1
-  step 3 (`QuestionId` is natural PK; no surrogate `Id` — rubber-duck guidance).
-- `src/AgentSwarm.Messaging.Teams/ICardStateStore.cs` — three methods per
-  architecture §4.3 (`SaveAsync`, `GetByQuestionIdAsync`, `UpdateStatusAsync`).
-- `src/AgentSwarm.Messaging.Teams/ChannelInboundEventPublisher.cs` — `Channel<>`-
-  backed; satisfies BOTH `IInboundEventPublisher` (write) and
-  `IInboundEventReader` (read).
-- `src/AgentSwarm.Messaging.Teams/TeamsMessengerConnector.cs` — main 2.3
-  deliverable. Ctor takes 7 deps (CloudAdapter, options, conv-ref store,
-  question store, card-state store, inbound reader, logger). `SendQuestionAsync`
-  implements §2.3 three-step pattern: (1) `SaveAsync` with null ConversationId,
-  (2) resolve ref by `TargetUserId` via `GetByInternalUserIdAsync` or
-  `TargetChannelId` via `GetByChannelIdAsync` then `ContinueConversationAsync`,
-  (3) `UpdateConversationIdAsync` + `ICardStateStore.SaveAsync` with the
-  activity ID and a **fresh** `ConversationReference` captured from the proactive
-  turn context (saving the stored ReferenceJson would give Stage 3.3 stale
-  rehydration data — rubber-duck blocker).
-- `src/AgentSwarm.Messaging.Teams/TeamsServiceCollectionExtensions.cs` — DI
-  helpers: `AddInProcessInboundEventChannel` (one publisher singleton under both
-  interfaces) + `AddTeamsMessengerConnector` (.NET 8 keyed
-  `IMessengerConnector` under `"teams"`, same instance as
-  `TeamsMessengerConnector` singleton).
 
-**Production (modified):**
-- `src/AgentSwarm.Messaging.Teams/AgentSwarm.Messaging.Teams.csproj` — added
-  `Microsoft.Bot.Builder.Integration.AspNet.Core` 4.22.7 (CloudAdapter, per
-  impl-plan §2.1 line 74) + `Microsoft.Extensions.DependencyInjection.Abstractions`
-  8.0.0 (keyed services).
-- `src/AgentSwarm.Messaging.Teams/IConversationReferenceStore.cs` — added
-  `GetByConversationIdAsync(string conversationId, CancellationToken)`. Necessary
-  because `MessengerMessage` (Stage 1.1) carries no `TenantId`, so the BF
-  `ConversationId` is the only routing key reachable from `SendMessageAsync`.
-  Documented as Stage 1 contract deficiency (not normal store growth).
+### New (production)
+- `src/AgentSwarm.Messaging.Teams/Cards/IAdaptiveCardRenderer.cs` — contract per architecture §4.6 (5 Render* → Attachment).
+- `src/AgentSwarm.Messaging.Teams/Cards/AdaptiveCardBuilder.cs` — concrete renderer (AdaptiveCards 3.1, schema 1.5 pinned per tech-spec §5.1 R-3).
+- `src/AgentSwarm.Messaging.Teams/Cards/AgentStatusSummary.cs`, `IncidentSummary.cs`, `ReleaseGateRequest.cs` — payload records (architecture §3.3) extended with `QuestionId` for per-recipient round-trip correlation per §6.3.1.
+- `src/AgentSwarm.Messaging.Teams/Cards/CardActionPayload.cs` — typed Action.Submit data view + `CardActionDataKeys` constants (`questionId`, `actionId`, `actionValue`, `correlationId`, `comment`).
+- `src/AgentSwarm.Messaging.Teams/Cards/CardActionMapper.cs` — `Map` produces `HumanDecisionEvent`; `ReadPayload` exposes the typed payload (incl. `ActionId`) for Stage 3.3.
 
-**Tests (new):**
-- `tests/AgentSwarm.Messaging.Teams.Tests/ChannelInboundEventPublisherTests.cs` —
-  7 tests: round-trip, await-publish ordering, cancellation, null-event guard,
-  null-channel guard, concurrent publishers, bounded backpressure.
-- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsMessengerConnectorTests.cs` — 11
-  tests covering all 3 brief scenarios (SendMessage happy + missing ref,
-  ReceiveAsync wired through real publisher) plus SendQuestion happy
-  (asserts question saved, send invoked, ConversationId update, card-state row
-  with valid `ConversationReferenceJson` that round-trips through Newtonsoft to
-  `ConversationReference`), channel-target via `GetByChannelIdAsync`, missing
-  ref still saves question but skips card state, invalid question throws
-  pre-persist, null-arg guards, full ctor null-arg matrix.
-- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsServiceCollectionExtensionsTests.cs`
-  — 5 tests: same-instance binding for publisher/reader, keyed resolution.
+### New (tests)
+- `tests/.../AdaptiveCardBuilderTests.cs` — 16 tests (3 explicit plan scenarios + every Render* + schema-version pin + shared-input invariant + null guards).
+- `tests/.../CardActionMapperTests.cs` — 13 tests (round-trip + every required-key error path + dictionary input shape + render-then-map e2e + ActionId presence assertion).
 
-**Tests (modified):**
-- `tests/AgentSwarm.Messaging.Teams.Tests/TestDoubles.cs` — added
-  `PreloadByConversationId` map + `ConversationLookups` recorder; implemented
-  the new `GetByConversationIdAsync` method on
-  `RecordingConversationReferenceStore` so the existing 35 Stage 2.2 tests stay
-  green.
+### Modified
+- `src/AgentSwarm.Messaging.Teams/AgentSwarm.Messaging.Teams.csproj` — added `<PackageReference Include="AdaptiveCards" Version="3.1.0" />` per tech-spec.
+- `src/AgentSwarm.Messaging.Teams/TeamsMessengerConnector.cs` — injected `IAdaptiveCardRenderer` (ctor now 9 params); `SendQuestionAsync` builds `MessageFactory.Attachment(_cardRenderer.RenderQuestionCard(question))` with `Activity.Text = question.Title` as notification-banner fallback. Removed text-summary helper. This satisfies acceptance criteria for "proactive Adaptive Card questions" and §3.1 step 7.
+- `src/AgentSwarm.Messaging.Teams/TeamsServiceCollectionExtensions.cs` — `TryAddSingleton<IAdaptiveCardRenderer, AdaptiveCardBuilder>()` honoring idempotency contract from prior iters.
+- `tests/.../TeamsMessengerConnectorTests.cs` — happy-path now asserts attachment shape (ContentType + JObject); ConnectorHarness wires renderer; Constructor_NullDependencies test now has 9 throw assertions.
+- `tests/.../TeamsServiceCollectionExtensionsTests.cs` — idempotency counts new descriptor; +2 tests for renderer registration + explicit-pre-registration honor.
 
 ## Decisions made this iter
-- **`CloudAdapter` (concrete) not `BotAdapter` (abstract)** — rubber-duck
-  blocker. Pulling in `Microsoft.Bot.Builder.Integration.AspNet.Core` matches
-  impl-plan §2.1 line 74 exactly. `CloudAdapter`'s
-  `ContinueConversationAsync(string, ConversationReference, BotCallbackHandler,
-  CancellationToken)` is virtual → test adapter subclasses + overrides.
-- **`MaxRetryAttempts` → `RetryCount = value - 1`** — base `ConnectorOptions`
-  defines RetryCount as "additional attempts after first" (total = RetryCount+1).
-  5 total Teams attempts → `RetryCount = 4`.
-- **Fresh `ConversationReference` captured from proactive turn context** for
-  `TeamsCardState.ConversationReferenceJson` (via
-  `turnContext.Activity.GetConversationReference()`) — saving the stored
-  `ReferenceJson` would cache stale `serviceUrl` / conversation thread for the
-  Stage 3.3 update/delete path. Falls back to stored ref's JSON only if BF
-  callback doesn't yield one.
-- **`IInboundEventReader` instead of injecting concrete publisher** — keeps
-  connector decoupled, prevents accidental publish-from-connector, gives tests
-  a tiny stub surface. Same singleton implements both interfaces in DI.
-- **Single `TeamsMessengerConnector` singleton, exposed as keyed
-  `IMessengerConnector("teams")` via factory delegate** — rubber-duck guidance;
-  Stage 3.3 will layer `ITeamsCardManager` onto the same instance.
-- **`GetByConversationIdAsync` added to `IConversationReferenceStore`** — XML
-  doc explicitly notes this compensates for the `MessengerMessage` model gap
-  (no `TenantId` field) so a future Stage 1 revision (add tenant to
-  `MessengerMessage` or destination URI parser) can retire it.
-- **Plain-text question summary** (`{Title}\n\n{Body}\n\nReply with: {actions}`)
-  — Adaptive Card lands in Stage 3.1; brief explicitly says "render the question
-  as a simple text summary" until then. Action verbs are lowercased to match the
-  canonical command vocabulary.
+
+- **Architecture-aligned `ActionId` in payload (rubber-duck finding).** Architecture §2.10 line 181 explicitly says cards embed `QuestionId, ActionId, CorrelationId`. Initial draft only carried `ActionValue`. Fixed by adding `CardActionDataKeys.ActionId`, propagating through builder + payload + mapper. `Map()` enforces presence at gateway boundary even though `HumanDecisionEvent` itself only carries `ActionValue` — Stage 3.3's `CardActionHandler` will use `ActionId` for unambiguous button resolution.
+- **Per-approver `QuestionId` on `ReleaseGateRequest` and `IncidentSummary` (rubber-duck finding).** Initial draft used `GateId`/`IncidentId` as the synthetic questionId, but per architecture §6.3.1 each approver / acknowledger gets their own `AgentQuestion` record. Added `QuestionId` field to both records so the orchestrator passes the per-recipient question ID to render. Cards still surface `GateId`/`IncidentId` as metadata in the body fact set. This is a minor extension to the §3.3 table that's necessary for §6.3 step-4 correctness.
+- **Single shared `Input.Text` (not per-action).** Bot Framework merges the typed value into every action's Data dict on submit, so a single shared input is the correct design. Mapper normalises empty/whitespace to `null` on `HumanDecisionEvent.Comment`. Comment label is now context-aware: "Comment (required)" when all actions need it, otherwise "Comment (required for: <names>)" — addresses rubber-duck UX nit.
+- **`Activity.Text = question.Title`** kept as notification-banner / accessibility fallback (mobile lock screens, low-bandwidth clients). Drops the previous multiline body+actions summary because the canonical card now carries that information; rubber-duck confirmed not a regression.
+- **Schema version 1.5 pinned** as static `AdaptiveCardBuilder.SchemaVersion` and verified by an explicit test (`RenderQuestionCard_PinsAdaptiveCardSchemaVersion_To_1_5`).
 
 ## Dead ends tried this iter
-- `<see cref="RetryCount"/>` xmldoc in `TeamsMessagingOptions` failed CS1574
-  (inherited base members aren't directly resolvable at that scope) — switched
-  to fully qualified `<see cref="ConnectorOptions.RetryCount"/>`.
-- `<see cref="ServiceCollectionDescriptorExtensions.TryAddSingleton{TService}(IServiceCollection)"/>`
-  also failed CS1574 (DI.Abstractions XML docs not resolvable in our context) —
-  rewrote as plain prose.
-- First `ParsedCommand` test stub used a 2-arg ctor — actual record has three
-  positional members (`CommandType, Payload, CorrelationId`).
+
+- Initially had `BuildSubmitAction` carry only `actionValue`; rubber-duck flagged the missing `ActionId` against architecture §2.10. Backtracked and threaded `actionId` through every Render* call site (`HumanAction.ActionId` for question buttons; `gate.<verb>` / `incident.<verb>` synthetic IDs for the 5 fixed-template buttons).
 
 ## Open questions surfaced this iter
-- None blocking. Long-term: should `MessengerMessage` carry `TenantId` + a
-  routing-target hint so `IConversationReferenceStore.GetByConversationIdAsync`
-  can be retired? Belongs to a Stage 1 revision workstream, not 2.3.
+
+- None this iter. The reflection-on-NuGet API surface, the architecture §2.10/§4.6 contract, and the §6.3.1 multi-approver model all aligned cleanly after the rubber-duck pass.
 
 ## What's still left
-- Nothing for Stage 2.3 itself. Solution build clean (0 warn / 0 err); tests:
-  82 Abstractions + 58 Teams = 140 pass on the .sln (was 117 — +23 for 2.3).
-- Pre-existing failures NOT caused by this iter: 7 failures in
-  `AgentSwarm.Messaging.Teams.Manifest.Tests` (manifest.json maxLength + missing
-  `scripts/package-teams-app.ps1`). Stage 2.4 scope; not in the .sln so the
-  `dotnet test AgentSwarm.Messaging.sln` gate is green.
-- Stage 2.1 still pending: `Program.cs`, middleware classes, in-memory store
-  registrations, `NoOpCardStateStore`/`NoOpCardActionHandler`/`NoOpCardManager`.
-  Stage 3.x dispatch + card handler + Stage 4.x proactive worker also pending.
+
+- Nothing for Stage 3.1. Build clean (0 warnings / 0 errors, `TreatWarningsAsErrors=true`), 188 tests pass solution-wide (82 abstractions + 106 Teams; +33 from the iter-7 baseline of 73 — see Stage 2.3 prior notes).
+- Stage 3.2 (`TeamsCommandRouter`) + Stage 3.3 (`CardActionHandler`) consume this stage's surface (`IAdaptiveCardRenderer.Render*`, `CardActionMapper.Map` / `ReadPayload`, `CardActionPayload.ActionId`) — handled by their own workstreams.
+- Stage 4.2 (`TeamsProactiveNotifier`) also depends on `IAdaptiveCardRenderer` — wiring is part of that stage per the Phase 4 dependency chain.
