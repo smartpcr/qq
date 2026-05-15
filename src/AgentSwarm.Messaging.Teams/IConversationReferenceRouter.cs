@@ -39,12 +39,72 @@ namespace AgentSwarm.Messaging.Teams;
 public interface IConversationReferenceRouter
 {
     /// <summary>
-    /// Look up a stored conversation reference whose Bot Framework
-    /// <c>ConversationId</c> matches <paramref name="conversationId"/>. Returns
+    /// <b>Legacy tenantless lookup.</b> Look up a stored conversation reference whose Bot
+    /// Framework <c>ConversationId</c> matches <paramref name="conversationId"/>. Returns
     /// <c>null</c> when no reference exists.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Bot Framework <c>ConversationId</c> values are generated server-side and the
+    /// platform does NOT guarantee uniqueness across Entra ID tenants. A row with the same
+    /// <c>ConversationId</c> could exist in two distinct tenants and this method would
+    /// return whichever the database surfaces first — that's a cross-tenant isolation gap.
+    /// </para>
+    /// <para>
+    /// <b>Production callers SHOULD invoke the tenant-aware overload</b>
+    /// <see cref="GetByConversationIdAsync(string, string, CancellationToken)"/> instead.
+    /// This tenantless variant is retained for back-compat with consumers that have not yet
+    /// been migrated and for test doubles that don't model multi-tenant data.
+    /// </para>
+    /// </remarks>
     /// <param name="conversationId">Bot Framework <c>ConversationId</c>.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The matching reference, or <c>null</c>.</returns>
     Task<TeamsConversationReference?> GetByConversationIdAsync(string conversationId, CancellationToken ct);
+
+    /// <summary>
+    /// <b>Tenant-aware lookup.</b> Look up the stored conversation reference whose
+    /// Bot Framework <c>ConversationId</c> matches <paramref name="conversationId"/> AND
+    /// whose <c>TenantId</c> matches <paramref name="tenantId"/>. Returns <c>null</c> when
+    /// no matching reference exists in the supplied tenant — including when a reference
+    /// with the same <c>ConversationId</c> exists but in a DIFFERENT tenant. This is the
+    /// FR-006 multi-tenant-isolation contract: a tenant cannot resolve a sibling tenant's
+    /// conversation reference even if they happen to share a Bot Framework conversation ID.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The default interface implementation post-filters the result of the legacy
+    /// tenantless lookup. It is correct for test doubles and any single-row store, but
+    /// real stores SHOULD override with a server-side tenant filter so cross-tenant rows
+    /// are excluded by the index seek rather than discovered and discarded in memory.
+    /// <c>SqlConversationReferenceStore</c> (in the EntityFrameworkCore assembly) provides
+    /// such an override against the <c>IX_ConversationReferences_ConversationId</c>
+    /// filtered index.
+    /// </para>
+    /// </remarks>
+    /// <param name="tenantId">Entra ID tenant that scopes the lookup.</param>
+    /// <param name="conversationId">Bot Framework <c>ConversationId</c>.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The matching reference (active or inactive — store-specific), or <c>null</c>.</returns>
+    async Task<TeamsConversationReference?> GetByConversationIdAsync(string tenantId, string conversationId, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(tenantId))
+        {
+            throw new ArgumentException("Tenant ID must be a non-empty string.", nameof(tenantId));
+        }
+
+        if (string.IsNullOrEmpty(conversationId))
+        {
+            throw new ArgumentException("Conversation ID must be a non-empty string.", nameof(conversationId));
+        }
+
+        var hit = await GetByConversationIdAsync(conversationId, ct).ConfigureAwait(false);
+
+        // Post-filter by tenant. A cross-tenant row that happens to share the
+        // ConversationId returns null — which is the correct multi-tenant isolation
+        // behavior even when the underlying store doesn't enforce it server-side.
+        return hit is not null && string.Equals(hit.TenantId, tenantId, StringComparison.Ordinal)
+            ? hit
+            : null;
+    }
 }

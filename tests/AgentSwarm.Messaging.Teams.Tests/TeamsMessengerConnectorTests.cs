@@ -48,7 +48,108 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Equal(ActivityTypes.Message, sent.Type);
         Assert.Equal(message.Body, sent.Text);
 
-        Assert.Equal(ConversationId, Assert.Single(harness.ConversationReferenceRouter.Lookups));
+        Assert.Empty(harness.ConversationReferenceRouter.Lookups);
+        var lookup = Assert.Single(harness.ConversationReferenceRouter.TenantAwareLookups);
+        Assert.Equal(TenantId, lookup.TenantId);
+        Assert.Equal(ConversationId, lookup.ConversationId);
+    }
+
+    [Fact(DisplayName = "SendMessageAsync fails closed when MicrosoftAppTenantId is not configured (FR-006: no tenantless production path)")]
+    public async Task SendMessageAsync_TenantNotConfigured_FailsClosedWithDescriptiveError()
+    {
+        // FR-006 multi-tenant isolation hard contract: the connector MUST NOT fall back
+        // to a tenantless conversation lookup because Bot Framework ConversationId values
+        // are not globally unique across Entra ID tenants. With no tenant pin, the
+        // connector cannot guarantee a stored reference belongs to the intended tenant,
+        // so it fails closed. This test pins that the legacy tenantless router method
+        // is NOT a reachable production path from SendMessageAsync.
+        var harness = ConnectorHarness.Build(tenantId: null);
+        var stored = NewPersonalReference("ref-no-tenant", aadObjectId: "aad-no-tenant", internalUserId: "internal-no-tenant");
+        harness.ConversationReferenceRouter.PreloadByConversationId[ConversationId] = stored;
+
+        var message = new MessengerMessage(
+            MessageId: "msg-no-tenant",
+            CorrelationId: "corr-no-tenant",
+            AgentId: "agent-build",
+            TaskId: "task-no-tenant",
+            ConversationId: ConversationId,
+            Body: "Should not deliver without a tenant pin.",
+            Severity: MessageSeverities.Info,
+            Timestamp: DateTimeOffset.UtcNow);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Connector.SendMessageAsync(message, CancellationToken.None));
+
+        Assert.Contains("MicrosoftAppTenantId", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("msg-no-tenant", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("FR-006", ex.Message, StringComparison.Ordinal);
+
+        // Neither router overload was invoked — the connector refuses to look up at all
+        // when tenant context is missing, rather than falling back to a tenantless lookup
+        // that could surface a foreign-tenant reference.
+        Assert.Empty(harness.ConversationReferenceRouter.Lookups);
+        Assert.Empty(harness.ConversationReferenceRouter.TenantAwareLookups);
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.Adapter.Sent);
+    }
+
+    [Fact(DisplayName = "SendMessageAsync uses tenant-aware router lookup when MicrosoftAppTenantId is configured (FR-006)")]
+    public async Task SendMessageAsync_TenantConfigured_UsesTenantAwareRouterLookup()
+    {
+        var harness = ConnectorHarness.Build(tenantId: TenantId);
+        var stored = NewPersonalReference("ref-tenant-aware", aadObjectId: "aad-tenanted", internalUserId: "internal-tenanted");
+        harness.ConversationReferenceRouter.PreloadByConversationId[ConversationId] = stored;
+
+        var message = new MessengerMessage(
+            MessageId: "msg-tenant-aware",
+            CorrelationId: "corr-tenant-aware",
+            AgentId: "agent-build",
+            TaskId: "task-99",
+            ConversationId: ConversationId,
+            Body: "Tenant-scoped delivery.",
+            Severity: MessageSeverities.Info,
+            Timestamp: DateTimeOffset.UtcNow);
+
+        await harness.Connector.SendMessageAsync(message, CancellationToken.None);
+
+        // Tenant-aware overload MUST be the one invoked; the legacy tenantless overload
+        // must NOT be touched on the proactive hot path when tenant context is available.
+        Assert.Empty(harness.ConversationReferenceRouter.Lookups);
+        var tenantAware = Assert.Single(harness.ConversationReferenceRouter.TenantAwareLookups);
+        Assert.Equal(TenantId, tenantAware.TenantId);
+        Assert.Equal(ConversationId, tenantAware.ConversationId);
+
+        Assert.Single(harness.Adapter.ContinueCalls);
+        Assert.Single(harness.Adapter.Sent);
+    }
+
+    [Fact(DisplayName = "SendMessageAsync with tenant-aware lookup throws when stored reference belongs to a different tenant")]
+    public async Task SendMessageAsync_TenantConfigured_RejectsCrossTenantConversationCollision()
+    {
+        // FR-006 multi-tenant isolation: even if a row with the same ConversationId exists
+        // in another tenant, the tenant-aware overload must NOT return it. The connector
+        // should treat the lookup as "no reference" and fail closed.
+        var harness = ConnectorHarness.Build(tenantId: "other-tenant-id");
+        var stored = NewPersonalReference("ref-cross-tenant", aadObjectId: "aad-foreign", internalUserId: "internal-foreign");
+        harness.ConversationReferenceRouter.PreloadByConversationId[ConversationId] = stored;
+
+        var message = new MessengerMessage(
+            MessageId: "msg-cross",
+            CorrelationId: "corr-cross",
+            AgentId: "agent-build",
+            TaskId: "task-cross",
+            ConversationId: ConversationId,
+            Body: "Should not deliver cross-tenant.",
+            Severity: MessageSeverities.Info,
+            Timestamp: DateTimeOffset.UtcNow);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Connector.SendMessageAsync(message, CancellationToken.None));
+
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.Adapter.Sent);
+        Assert.Empty(harness.ConversationReferenceRouter.Lookups);
+        Assert.Single(harness.ConversationReferenceRouter.TenantAwareLookups);
     }
 
     [Fact]
@@ -466,10 +567,14 @@ public sealed class TeamsMessengerConnectorTests
         RecordingCardStateStore CardStateStore,
         TeamsMessagingOptions Options)
     {
-        public static ConnectorHarness Build(IInboundEventReader? reader = null, RecordingCloudAdapter? adapter = null)
+        public static ConnectorHarness Build(IInboundEventReader? reader = null, RecordingCloudAdapter? adapter = null, string? tenantId = TenantId)
         {
             adapter ??= new RecordingCloudAdapter();
             var options = new TeamsMessagingOptions { MicrosoftAppId = MicrosoftAppId };
+            if (!string.IsNullOrEmpty(tenantId))
+            {
+                options.MicrosoftAppTenantId = tenantId;
+            }
             var convStore = new ConnectorRecordingConversationReferenceStore();
             var router = new RecordingConversationReferenceRouter();
             var qStore = new RecordingAgentQuestionStore();

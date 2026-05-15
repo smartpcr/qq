@@ -44,7 +44,17 @@ public sealed class TeamsMessagingOptions : ConnectorOptions
     /// <summary>Bot Framework AAD application secret. Required.</summary>
     public string MicrosoftAppPassword { get; set; } = string.Empty;
 
-    /// <summary>The bot's home tenant (single-tenant configuration). Optional for multi-tenant deployments.</summary>
+    /// <summary>
+    /// The bot's home tenant (Entra ID tenant GUID). <b>Required</b> for outbound proactive
+    /// sends through <c>TeamsMessengerConnector.SendMessageAsync</c>: the connector refuses
+    /// to deliver any message without a tenant pin because Bot Framework
+    /// <c>ConversationId</c> values are NOT guaranteed unique across tenants and a
+    /// tenantless lookup could route a message into the wrong organization (FR-006
+    /// multi-tenant isolation). Optional for inbound-only configurations and for the
+    /// multi-tenant inbound activity surface — multi-tenant outbound delivery is not yet
+    /// supported and will be enabled by a future <c>ITeamsOutboundTenantResolver</c>
+    /// abstraction.
+    /// </summary>
     public string MicrosoftAppTenantId { get; set; } = string.Empty;
 
     /// <summary>Tenants whose inbound activities are accepted. Empty list means deny all.</summary>

@@ -118,9 +118,31 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
                 $"MessengerMessage '{message.MessageId}' has no ConversationId; cannot route the outbound delivery.");
         }
 
+        // FR-006 multi-tenant isolation — tenant is REQUIRED for every outbound proactive
+        // send. The legacy tenantless overload on IConversationReferenceRouter is no longer
+        // reachable from this connector: a Bot Framework ConversationId is NOT globally
+        // unique across Entra ID tenants, so a tenantless lookup could return the wrong
+        // tenant's reference and route a sensitive proactive message into the wrong
+        // organization. The connector therefore fails closed when no tenant is configured.
+        //
+        // Single-tenant deployments (the architecture.md §6 common case) set
+        // TeamsMessagingOptions.MicrosoftAppTenantId to the bot's home tenant. Multi-tenant
+        // bot deployments are not yet supported by this connector — they will require a
+        // future ITeamsOutboundTenantResolver abstraction tracked under a separate stage so
+        // tenant can be derived from per-message ambient context. Until then,
+        // SendMessageAsync MUST refuse to deliver a message without a tenant pin.
+        if (string.IsNullOrWhiteSpace(_options.MicrosoftAppTenantId))
+        {
+            throw new InvalidOperationException(
+                $"Cannot send MessengerMessage '{message.MessageId}': TeamsMessagingOptions.MicrosoftAppTenantId is not configured. " +
+                "Outbound Teams proactive sends require a tenant pin to enforce FR-006 multi-tenant isolation; the connector refuses to fall back to a tenantless conversation lookup because Bot Framework ConversationId values are NOT guaranteed unique across Entra ID tenants. " +
+                "Set MicrosoftAppTenantId to the bot's home tenant for single-tenant deployments. Multi-tenant deployments are not yet supported by TeamsMessengerConnector — track the ITeamsOutboundTenantResolver follow-up workstream.");
+        }
+
         var stored = await _conversationReferenceRouter
-            .GetByConversationIdAsync(message.ConversationId, ct)
+            .GetByConversationIdAsync(_options.MicrosoftAppTenantId, message.ConversationId, ct)
             .ConfigureAwait(false);
+
         if (stored is null)
         {
             throw new InvalidOperationException(
