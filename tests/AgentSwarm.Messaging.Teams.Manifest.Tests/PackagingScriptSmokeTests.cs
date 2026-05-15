@@ -13,71 +13,58 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.Json;
-using System.Threading.Tasks;
 using Xunit;
 
 /// <summary>
-/// Smoke tests for the PowerShell packaging script that produces the
-/// Microsoft Teams app manifest zip (manifest.json + icons). These tests
-/// shell out to <c>pwsh</c>; if pwsh is not on PATH the tests are skipped
-/// rather than failed so they can run on developer machines without a
-/// PowerShell 7 install.
+/// Smoke tests for <c>scripts/package-teams-app.ps1</c>, the build-time script that
+/// renders <c>manifest.json</c> from a template, bundles it with the color/outline
+/// icons, and produces the <c>teams-app.zip</c> sideloading package required by
+/// MSG-MT-001 (Microsoft Teams Support).
 /// </summary>
+/// <remarks>
+/// Each invocation of <see cref="RunPackaging"/> creates a unique temporary working
+/// directory under <c>%TEMP%</c>. The class implements <see cref="IDisposable"/> so
+/// xUnit will dispose the instance after every test, and every temp directory is
+/// tracked in <see cref="tempDirs"/> and best-effort deleted in <see cref="Dispose"/>.
+/// This prevents unbounded accumulation of leaked package directories under
+/// <c>%TEMP%</c> across CI runs.
+/// </remarks>
 public sealed class PackagingScriptSmokeTests : IDisposable
 {
-    private const string TeamsManifestSchemaUrl =
-        "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json";
+    private const string SampleAppId = "11111111-2222-3333-4444-555555555555";
+    private const string SampleBotId = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+    private const string SampleVersion = "1.0.0";
 
-    private static readonly TimeSpan PwshTimeout = TimeSpan.FromSeconds(60);
+    private static readonly string RepoRoot = ResolveRepoRoot();
+    private static readonly string ScriptPath = Path.Combine(RepoRoot, "scripts", "package-teams-app.ps1");
+    private static readonly TimeSpan ScriptTimeout = TimeSpan.FromSeconds(60);
 
-    private readonly string repoRoot;
-    private readonly string workingDirectory;
+    private readonly List<string> tempDirs = new();
+    private bool disposed;
 
-    public PackagingScriptSmokeTests()
+    [Fact]
+    public void PackagingScript_ExistsAtExpectedPath()
     {
-        this.repoRoot = LocateRepoRoot();
-        this.workingDirectory = Path.Combine(
-            Path.GetTempPath(),
-            "agentswarm-teams-manifest-tests-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(this.workingDirectory);
-    }
-
-    public void Dispose()
-    {
-        try
-        {
-            if (Directory.Exists(this.workingDirectory))
-            {
-                Directory.Delete(this.workingDirectory, recursive: true);
-            }
-        }
-        catch
-        {
-            // Best-effort cleanup; never fail Dispose.
-        }
+        Assert.True(
+            File.Exists(ScriptPath),
+            $"Packaging script not found at '{ScriptPath}'. The Teams app manifest stage requires this script.");
     }
 
     [Fact]
-    public void PackagingScript_ProducesManifestZip_ContainingExpectedAssets()
+    public void PackagingScript_ProducesZipAtRequestedPath()
     {
-        SkipIfPwshUnavailable();
+        var result = this.RunPackaging(SampleAppId, SampleBotId, SampleVersion);
 
-        var scriptPath = this.GetPackagingScriptPath();
-        Assert.True(File.Exists(scriptPath), $"packaging script not found at {scriptPath}");
+        Assert.True(File.Exists(result.ZipPath), $"Expected zip at '{result.ZipPath}'.");
+        Assert.True(new FileInfo(result.ZipPath).Length > 0, "Zip is empty.");
+    }
 
-        var outputZip = Path.Combine(this.workingDirectory, "manifest.zip");
+    [Fact]
+    public void PackagingScript_ZipContainsManifestAndIcons()
+    {
+        var result = this.RunPackaging(SampleAppId, SampleBotId, SampleVersion);
 
-        var result = RunPwsh(
-            scriptPath,
-            "-OutputPath", outputZip,
-            "-Environment", "Development");
-
-        Assert.True(
-            result.ExitCode == 0,
-            $"packaging script exited with code {result.ExitCode}.\nSTDOUT:\n{result.Stdout}\nSTDERR:\n{result.Stderr}");
-        Assert.True(File.Exists(outputZip), "packaging script did not produce the expected zip");
-
-        using var archive = ZipFile.OpenRead(outputZip);
+        using var archive = ZipFile.OpenRead(result.ZipPath);
         var entries = archive.Entries
             .Select(e => e.FullName)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -85,204 +72,175 @@ public sealed class PackagingScriptSmokeTests : IDisposable
         Assert.Contains("manifest.json", entries);
         Assert.Contains("color.png", entries);
         Assert.Contains("outline.png", entries);
-
-        var manifestEntry = archive.GetEntry("manifest.json")!;
-        using var manifestStream = manifestEntry.Open();
-        using var manifestReader = new StreamReader(manifestStream);
-        var manifestJson = manifestReader.ReadToEnd();
-
-        using var manifestDoc = JsonDocument.Parse(manifestJson);
-        var root = manifestDoc.RootElement;
-
-        Assert.Equal(TeamsManifestSchemaUrl, root.GetProperty("$schema").GetString());
-        Assert.False(
-            string.IsNullOrWhiteSpace(root.GetProperty("id").GetString()),
-            "manifest.id must be present");
-
-        var bots = root.GetProperty("bots");
-        Assert.True(bots.GetArrayLength() >= 1, "manifest must declare at least one bot");
-        var bot = bots[0];
-        Assert.False(
-            string.IsNullOrWhiteSpace(bot.GetProperty("botId").GetString()),
-            "bots[0].botId must be present");
     }
 
     [Fact]
-    public void PackagingScript_RejectsMissingEnvironmentArgument()
+    public void PackagingScript_SubstitutesAppIdBotIdAndVersionIntoManifest()
     {
-        SkipIfPwshUnavailable();
+        var result = this.RunPackaging(SampleAppId, SampleBotId, SampleVersion);
 
-        var scriptPath = this.GetPackagingScriptPath();
-        var outputZip = Path.Combine(this.workingDirectory, "manifest.zip");
+        using var archive = ZipFile.OpenRead(result.ZipPath);
+        var manifestEntry = archive.GetEntry("manifest.json")
+            ?? throw new Xunit.Sdk.XunitException("Zip is missing manifest.json.");
 
-        var result = RunPwsh(
-            scriptPath,
-            "-OutputPath", outputZip);
+        using var stream = manifestEntry.Open();
+        using var doc = JsonDocument.Parse(stream);
+        var root = doc.RootElement;
 
-        Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("Environment", result.Stderr, StringComparison.OrdinalIgnoreCase);
-        Assert.False(File.Exists(outputZip), "no zip should be produced on failure");
+        Assert.Equal(SampleAppId, root.GetProperty("id").GetString());
+        Assert.Equal(SampleVersion, root.GetProperty("version").GetString());
+
+        var bots = root.GetProperty("bots");
+        Assert.True(bots.GetArrayLength() >= 1, "manifest.bots must contain at least one entry.");
+        Assert.Equal(SampleBotId, bots[0].GetProperty("botId").GetString());
     }
 
-    private string GetPackagingScriptPath() => Path.Combine(
-        this.repoRoot,
-        "src",
-        "AgentSwarm.Messaging.Teams.Manifest",
-        "Scripts",
-        "Pack-TeamsManifest.ps1");
-
-    private static string LocateRepoRoot()
+    [Fact]
+    public void PackagingScript_RejectsInvalidAppIdGuid()
     {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null)
-        {
-            if (Directory.EnumerateFiles(current.FullName, "*.sln").Any())
-            {
-                return current.FullName;
-            }
+        var ex = Assert.Throws<PackagingScriptFailedException>(
+            () => this.RunPackaging("not-a-guid", SampleBotId, SampleVersion));
 
-            current = current.Parent;
+        Assert.Contains("AppId", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void PackagingScript_RejectsInvalidBotIdGuid()
+    {
+        var ex = Assert.Throws<PackagingScriptFailedException>(
+            () => this.RunPackaging(SampleAppId, "not-a-guid", SampleVersion));
+
+        Assert.Contains("BotId", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        if (this.disposed)
+        {
+            return;
         }
 
-        throw new InvalidOperationException(
-            "unable to locate repository root (no *.sln found) from " + AppContext.BaseDirectory);
-    }
+        this.disposed = true;
 
-    private static void SkipIfPwshUnavailable()
-    {
-        Skip.IfNot(
-            IsPwshOnPath(),
-            "pwsh (PowerShell 7+) is not available on PATH; skipping packaging smoke test.");
-    }
-
-    private static bool IsPwshOnPath()
-    {
-        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        var exts = (Environment.GetEnvironmentVariable("PATHEXT") ?? ".EXE")
-            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var dir in pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        foreach (var dir in this.tempDirs)
         {
-            foreach (var ext in exts.Concat(new[] { string.Empty }))
-            {
-                var candidate = Path.Combine(dir, "pwsh" + ext);
-                if (File.Exists(candidate))
-                {
-                    return true;
-                }
-            }
+            TryDeleteDirectory(dir);
         }
 
-        return false;
+        this.tempDirs.Clear();
     }
 
-    private static PwshResult RunPwsh(string scriptPath, params string[] args)
+    private PackagingResult RunPackaging(string appId, string botId, string version)
     {
+        // Each invocation gets a unique temp directory; the path is registered with
+        // `this.tempDirs` BEFORE the script runs so partial output is still cleaned
+        // up in Dispose() even if the script throws or times out.
+        var tempDir = Path.Combine(
+            Path.GetTempPath(),
+            "teams-pkg-smoke-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        this.tempDirs.Add(tempDir);
+
+        var outputZip = Path.Combine(tempDir, "teams-app.zip");
+
         var psi = new ProcessStartInfo
         {
             FileName = "pwsh",
-            UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            UseShellExecute = false,
             CreateNoWindow = true,
+            WorkingDirectory = RepoRoot,
         };
-        psi.ArgumentList.Add("-NoLogo");
         psi.ArgumentList.Add("-NoProfile");
         psi.ArgumentList.Add("-NonInteractive");
         psi.ArgumentList.Add("-ExecutionPolicy");
         psi.ArgumentList.Add("Bypass");
         psi.ArgumentList.Add("-File");
-        psi.ArgumentList.Add(scriptPath);
-        foreach (var arg in args)
+        psi.ArgumentList.Add(ScriptPath);
+        psi.ArgumentList.Add("-AppId");
+        psi.ArgumentList.Add(appId);
+        psi.ArgumentList.Add("-BotId");
+        psi.ArgumentList.Add(botId);
+        psi.ArgumentList.Add("-Version");
+        psi.ArgumentList.Add(version);
+        psi.ArgumentList.Add("-OutputPath");
+        psi.ArgumentList.Add(outputZip);
+
+        using var proc = Process.Start(psi)
+            ?? throw new PackagingScriptFailedException("Failed to launch 'pwsh' for packaging script.");
+
+        var stdout = proc.StandardOutput.ReadToEnd();
+        var stderr = proc.StandardError.ReadToEnd();
+
+        if (!proc.WaitForExit((int)ScriptTimeout.TotalMilliseconds))
         {
-            psi.ArgumentList.Add(arg);
+            try
+            {
+                proc.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+            }
+
+            throw new PackagingScriptFailedException(
+                $"Packaging script timed out after {ScriptTimeout.TotalSeconds:0}s." +
+                Environment.NewLine + "STDOUT:" + Environment.NewLine + stdout +
+                Environment.NewLine + "STDERR:" + Environment.NewLine + stderr);
         }
 
-        using var process = new Process { StartInfo = psi };
-        if (!process.Start())
+        if (proc.ExitCode != 0)
         {
-            throw new InvalidOperationException("failed to start pwsh");
+            throw new PackagingScriptFailedException(
+                $"Packaging script exited with code {proc.ExitCode}." +
+                Environment.NewLine + "STDOUT:" + Environment.NewLine + stdout +
+                Environment.NewLine + "STDERR:" + Environment.NewLine + stderr);
         }
 
-        // Drain stdout and stderr concurrently. Reading them sequentially while
-        // both are redirected is a documented deadlock pattern: if the child
-        // fills its 4 KB stderr buffer before stdout is fully consumed it will
-        // block on stderr writes while we block on the stdout ReadToEnd(), and
-        // neither side ever makes progress.
-        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
-        Task<string> stderrTask = process.StandardError.ReadToEndAsync();
-
-        if (!process.WaitForExit((int)PwshTimeout.TotalMilliseconds))
-        {
-            TryKill(process);
-            // Give the reader tasks a brief chance to drain after the kill so we
-            // can include any captured output in the timeout message.
-            string stdoutOnTimeout = SafeWait(stdoutTask, TimeSpan.FromSeconds(2));
-            string stderrOnTimeout = SafeWait(stderrTask, TimeSpan.FromSeconds(2));
-            throw new TimeoutException(
-                $"pwsh did not exit within {PwshTimeout.TotalSeconds:F0}s while running '{scriptPath}'.\n"
-                + $"STDOUT (partial):\n{stdoutOnTimeout}\nSTDERR (partial):\n{stderrOnTimeout}");
-        }
-
-        // WaitForExit(int) does not guarantee the async stream readers have
-        // observed EOF; call the parameterless overload to flush them.
-        process.WaitForExit();
-
-        var stdout = stdoutTask.GetAwaiter().GetResult();
-        var stderr = stderrTask.GetAwaiter().GetResult();
-        return new PwshResult(process.ExitCode, stdout, stderr);
+        return new PackagingResult(outputZip, tempDir, stdout, stderr);
     }
 
-    private static void TryKill(Process process)
+    private static void TryDeleteDirectory(string dir)
     {
         try
         {
-            if (!process.HasExited)
+            if (Directory.Exists(dir))
             {
-                process.Kill(entireProcessTree: true);
+                Directory.Delete(dir, recursive: true);
             }
         }
-        catch
+        catch (IOException)
         {
-            // Best-effort kill; the TimeoutException will still surface.
+            // Best-effort cleanup: a virus scanner or another process may briefly
+            // lock a file. Leaking on rare CI failure is preferable to failing the
+            // test run during teardown.
+        }
+        catch (UnauthorizedAccessException)
+        {
         }
     }
 
-    private static string SafeWait(Task<string> task, TimeSpan timeout)
+    private static string ResolveRepoRoot()
     {
-        try
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null && !File.Exists(Path.Combine(dir.FullName, "AgentSwarm.Messaging.sln")))
         {
-            return task.Wait(timeout) ? task.Result : "<not drained>";
+            dir = dir.Parent;
         }
-        catch (Exception ex)
-        {
-            return "<error draining stream: " + ex.Message + ">";
-        }
+
+        return dir?.FullName
+            ?? throw new InvalidOperationException(
+                $"Could not locate AgentSwarm.Messaging.sln walking up from '{AppContext.BaseDirectory}'.");
     }
 
-    private readonly record struct PwshResult(int ExitCode, string Stdout, string Stderr);
-}
+    private sealed record PackagingResult(string ZipPath, string TempDir, string Stdout, string Stderr);
 
-/// <summary>
-/// Minimal xUnit skip helper. Mirrors the API of <c>Xunit.SkipException</c>
-/// from Xunit.SkippableFact so tests can declare environmental prerequisites
-/// without taking an extra package dependency.
-/// </summary>
-internal static class Skip
-{
-    public static void IfNot(bool condition, string reason)
+    private sealed class PackagingScriptFailedException : Exception
     {
-        if (!condition)
+        public PackagingScriptFailedException(string message)
+            : base(message)
         {
-            throw new SkipException(reason);
         }
-    }
-}
-
-internal sealed class SkipException : Exception
-{
-    public SkipException(string reason)
-        : base(reason)
-    {
     }
 }
