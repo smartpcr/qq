@@ -354,4 +354,91 @@ public class TelegramOptionsTests
         builder.Services.AddTelegram(builder.Configuration);
         return builder.Build();
     }
+
+    // ============================================================
+    // PR #20 review item 3: RateLimitOptions must fail fast at host
+    // startup, mirroring the TelegramOptions validation pattern. An
+    // invalid value (e.g., GlobalPerSecond=0, PerChatPerMinute=-1)
+    // must surface as OptionsValidationException during
+    // IHost.StartAsync — not as a delayed ArgumentOutOfRangeException
+    // when the TokenBucketRateLimiter singleton is first resolved.
+    // ============================================================
+
+    [Theory]
+    [InlineData("Telegram:RateLimits:GlobalPerSecond", "0")]
+    [InlineData("Telegram:RateLimits:GlobalPerSecond", "-1")]
+    [InlineData("Telegram:RateLimits:PerChatPerMinute", "0")]
+    [InlineData("Telegram:RateLimits:PerChatPerMinute", "-1")]
+    [InlineData("Telegram:RateLimits:GlobalBurstCapacity", "0")]
+    [InlineData("Telegram:RateLimits:PerChatBurstCapacity", "0")]
+    [InlineData("Telegram:RateLimits:PerChatIdleEvictionMinutes", "0")]
+    [InlineData("Telegram:RateLimits:PerChatEvictionThreshold", "0")]
+    public async Task Host_StartAsync_ThrowsOptionsValidationException_WhenRateLimitOptionIsInvalid(
+        string key,
+        string value)
+    {
+        using var host = BuildHost(new Dictionary<string, string?>
+        {
+            ["Telegram:BotToken"] = SampleToken,
+            [key] = value,
+        });
+
+        var act = async () => await host.StartAsync();
+
+        var ex = await act.Should().ThrowAsync<OptionsValidationException>();
+        ex.Which.OptionsType.Should().Be(typeof(RateLimitOptions));
+        ex.Which.Message.Should().Contain(key);
+    }
+
+    [Fact]
+    public async Task Host_StartAsync_Succeeds_WhenRateLimitOptionsAreValidDefaults()
+    {
+        // No explicit RateLimits config — defaults apply and pass.
+        using var host = BuildHost(new Dictionary<string, string?>
+        {
+            ["Telegram:BotToken"] = SampleToken,
+        });
+
+        await host.StartAsync();
+        await host.StopAsync();
+    }
+
+    [Fact]
+    public void RateLimitOptionsValidator_FailsForZeroGlobalPerSecond()
+    {
+        var validator = new RateLimitOptionsValidator();
+        var options = new RateLimitOptions { GlobalPerSecond = 0 };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue();
+        result.FailureMessage.Should().Contain("GlobalPerSecond");
+    }
+
+    [Fact]
+    public void RateLimitOptionsValidator_SucceedsForDefaults()
+    {
+        var validator = new RateLimitOptionsValidator();
+        var options = new RateLimitOptions();
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Succeeded.Should().BeTrue();
+    }
+
+    [Fact]
+    public void AddTelegram_RegistersRateLimitOptionsValidator()
+    {
+        var services = new ServiceCollection();
+        var config = BuildConfig(new Dictionary<string, string?>
+        {
+            ["Telegram:BotToken"] = SampleToken,
+        });
+
+        services.AddTelegram(config);
+        using var provider = services.BuildServiceProvider();
+
+        provider.GetService<IValidateOptions<RateLimitOptions>>()
+            .Should().BeOfType<RateLimitOptionsValidator>();
+    }
 }

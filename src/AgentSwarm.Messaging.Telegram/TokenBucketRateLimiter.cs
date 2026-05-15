@@ -33,6 +33,8 @@ internal sealed class TokenBucketRateLimiter : ITelegramRateLimiter
     private readonly object _gate = new();
     private readonly Bucket _global;
     private readonly Dictionary<long, Bucket> _perChat = new();
+    private readonly TimeSpan _idleEvictionThreshold;
+    private readonly int _evictionThreshold;
 
     public TokenBucketRateLimiter(
         IOptions<RateLimitOptions> options,
@@ -63,6 +65,10 @@ internal sealed class TokenBucketRateLimiter : ITelegramRateLimiter
             capacity: Math.Max(1, _options.GlobalBurstCapacity),
             refillPerSecond: _options.GlobalPerSecond,
             startTimestamp: _timeProvider.GetTimestamp());
+
+        _idleEvictionThreshold = TimeSpan.FromMinutes(
+            Math.Max(1, _options.PerChatIdleEvictionMinutes));
+        _evictionThreshold = Math.Max(1, _options.PerChatEvictionThreshold);
     }
 
     public async Task AcquireAsync(long chatId, CancellationToken ct)
@@ -77,6 +83,21 @@ internal sealed class TokenBucketRateLimiter : ITelegramRateLimiter
                 var now = _timeProvider.GetTimestamp();
                 _global.Refill(now, _timeProvider);
 
+                // Opportunistic LRU-style eviction: when the per-chat
+                // dictionary grows beyond the configured soft cap, sweep
+                // entries whose last access exceeds the idle threshold.
+                // Bucket reconstruction is cheap (full capacity is the
+                // conservative, correct default) so evicting and
+                // re-creating a long-idle chat costs at most one extra
+                // dictionary insert. This bounds memory for long-running
+                // workers that fan out across many distinct chats over
+                // time. See PR #20 review comment on TokenBucketRateLimiter
+                // unbounded growth.
+                if (_perChat.Count > _evictionThreshold)
+                {
+                    EvictIdleChats(now);
+                }
+
                 if (!_perChat.TryGetValue(chatId, out var chatBucket))
                 {
                     chatBucket = new Bucket(
@@ -89,6 +110,7 @@ internal sealed class TokenBucketRateLimiter : ITelegramRateLimiter
                 {
                     chatBucket.Refill(now, _timeProvider);
                 }
+                chatBucket.MarkAccessed(now);
 
                 if (_global.Tokens >= 1 && chatBucket.Tokens >= 1)
                 {
@@ -116,12 +138,56 @@ internal sealed class TokenBucketRateLimiter : ITelegramRateLimiter
         }
     }
 
+    /// <summary>
+    /// Test-visible snapshot of the per-chat dictionary size. Callers
+    /// should treat this as best-effort: the lock is taken to obtain a
+    /// consistent count, but the value can change immediately after
+    /// return.
+    /// </summary>
+    internal int TrackedChatCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _perChat.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Removes per-chat buckets whose last access exceeds the configured
+    /// idle threshold. Caller must hold <see cref="_gate"/>. Iterates the
+    /// dictionary once, materialising the doomed keys, then removes them
+    /// in a second pass — necessary because <see cref="Dictionary{TKey,TValue}"/>
+    /// does not permit mutation during enumeration.
+    /// </summary>
+    private void EvictIdleChats(long now)
+    {
+        List<long>? toEvict = null;
+        foreach (var (chatId, bucket) in _perChat)
+        {
+            var idleFor = _timeProvider.GetElapsedTime(bucket.LastAccessTimestamp, now);
+            if (idleFor > _idleEvictionThreshold)
+            {
+                toEvict ??= new List<long>();
+                toEvict.Add(chatId);
+            }
+        }
+        if (toEvict is null) return;
+        foreach (var chatId in toEvict)
+        {
+            _perChat.Remove(chatId);
+        }
+    }
+
     private sealed class Bucket
     {
         private readonly int _capacity;
         private readonly double _refillPerSecond;
         private double _tokens;
         private long _lastRefillTimestamp;
+        private long _lastAccessTimestamp;
 
         public Bucket(int capacity, double refillPerSecond, long startTimestamp)
         {
@@ -129,9 +195,14 @@ internal sealed class TokenBucketRateLimiter : ITelegramRateLimiter
             _refillPerSecond = refillPerSecond;
             _tokens = capacity;
             _lastRefillTimestamp = startTimestamp;
+            _lastAccessTimestamp = startTimestamp;
         }
 
         public double Tokens => _tokens;
+
+        public long LastAccessTimestamp => _lastAccessTimestamp;
+
+        public void MarkAccessed(long now) => _lastAccessTimestamp = now;
 
         public void Refill(long now, TimeProvider clock)
         {

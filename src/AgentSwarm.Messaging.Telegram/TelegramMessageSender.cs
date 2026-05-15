@@ -58,6 +58,18 @@ public sealed class TelegramMessageSender : IMessageSender
     /// </summary>
     public const int MaxTelegramMessageLength = 4096;
 
+    /// <summary>
+    /// Telegram Bot API hard limit on the <c>callback_data</c> field of
+    /// an inline-keyboard button — 64 bytes when UTF-8 encoded
+    /// (1–64 bytes inclusive). Exceeding this causes the Bot API to
+    /// reject <c>sendMessage</c> with a generic
+    /// <see cref="ApiRequestException"/>; the sender validates the
+    /// composed <c>QuestionId:ActionId</c> payload up front so callers
+    /// get a clear <see cref="ArgumentException"/> rather than a cryptic
+    /// API rejection at send time.
+    /// </summary>
+    public const int MaxCallbackDataBytes = 64;
+
     private const int MaxRetryAttempts = 3;
     private static readonly TimeSpan CacheGracePeriod = TimeSpan.FromMinutes(5);
 
@@ -208,6 +220,14 @@ public sealed class TelegramMessageSender : IMessageSender
         ArgumentNullException.ThrowIfNull(envelope);
         var question = envelope.Question;
 
+        // Validate every callback_data payload up front so any oversize
+        // (QuestionId, ActionId) pair fails with a clear ArgumentException
+        // at the sender boundary rather than as a cryptic
+        // ApiRequestException from Telegram after the cache writes have
+        // already happened. Telegram Bot API limits callback_data to
+        // 1–64 UTF-8 bytes; see MaxCallbackDataBytes / PR #20 review.
+        ValidateCallbackDataLengths(question);
+
         // Cache full HumanAction payloads BEFORE sending so that an
         // operator who happens to tap a button before our send completes
         // can still resolve the action via CallbackQueryHandler. (The
@@ -321,6 +341,73 @@ public sealed class TelegramMessageSender : IMessageSender
         return $"{questionId}:{actionId}";
     }
 
+    /// <summary>
+    /// Builds the Telegram <c>callback_data</c> payload for a question's
+    /// inline-keyboard button. Currently the same shape as
+    /// <see cref="BuildCallbackCacheKey"/>, but exposed as a distinct
+    /// method so the length check and the wire-level encoding stay
+    /// co-located.
+    /// </summary>
+    public static string BuildCallbackData(string questionId, string actionId)
+    {
+        return $"{questionId}:{actionId}";
+    }
+
+    /// <summary>
+    /// Validates that every <c>(QuestionId, ActionId)</c> pair fits inside
+    /// the Telegram Bot API <c>callback_data</c> limit of
+    /// <see cref="MaxCallbackDataBytes"/> UTF-8 bytes. Throws
+    /// <see cref="ArgumentException"/> on the first violation so callers
+    /// (Stage 4.1 <c>OutboundQueueProcessor</c>, integration tests) get a
+    /// diagnostic at the sender boundary rather than an opaque
+    /// <see cref="ApiRequestException"/> from Telegram. Per the Bot API
+    /// docs (and PR #20 review): two 36-char GUIDs joined by ':' total
+    /// 73 bytes, which Telegram rejects.
+    /// </summary>
+    /// <remarks>
+    /// Defense-in-depth: <see cref="AgentQuestion.QuestionId"/> and
+    /// <see cref="HumanAction.ActionId"/> both enforce a 30-ASCII-char
+    /// construction-time cap, so a well-formed envelope cannot reach
+    /// this method with an oversize payload. This sender-side guard
+    /// remains in place because (a) the wire-level Telegram constraint
+    /// is byte-oriented and could be re-defined upstream without
+    /// touching the abstractions, (b) any future loosening of the
+    /// per-field caps (e.g., non-ASCII labels, longer IDs) would
+    /// silently regress on the wire if only the per-field guards
+    /// existed, and (c) failing fast with a sender-specific message
+    /// (<c>"Telegram callback_data must be 1–64 UTF-8 bytes..."</c>)
+    /// keeps the diagnostic close to the call site.
+    /// </remarks>
+    internal static void ValidateCallbackDataLengths(AgentQuestion question)
+    {
+        foreach (var action in question.AllowedActions)
+        {
+            ValidateCallbackDataLength(question.QuestionId, action.ActionId);
+        }
+    }
+
+    /// <summary>
+    /// Validates a single <c>(questionId, actionId)</c> pair against the
+    /// Telegram 1–64 UTF-8 byte <c>callback_data</c> limit. Extracted
+    /// from <see cref="ValidateCallbackDataLengths(AgentQuestion)"/> so
+    /// the wire-level check can be exercised in isolation by unit tests
+    /// without having to bypass the record-level construction guards in
+    /// <see cref="AgentQuestion"/> / <see cref="HumanAction"/>.
+    /// </summary>
+    internal static void ValidateCallbackDataLength(string questionId, string actionId)
+    {
+        var payload = BuildCallbackData(questionId, actionId);
+        var byteLength = Encoding.UTF8.GetByteCount(payload);
+        if (byteLength == 0 || byteLength > MaxCallbackDataBytes)
+        {
+            throw new ArgumentException(
+                $"Telegram callback_data must be 1–{MaxCallbackDataBytes} UTF-8 bytes; "
+                + $"composed payload '{payload}' is {byteLength} bytes "
+                + $"(QuestionId='{questionId}', ActionId='{actionId}'). "
+                + "Shorten the QuestionId or ActionId — Telegram will reject sendMessage otherwise.");
+        }
+    }
+
     private static InlineKeyboardMarkup BuildInlineKeyboard(AgentQuestion question)
     {
         var rows = new List<InlineKeyboardButton[]>(question.AllowedActions.Count);
@@ -329,7 +416,7 @@ public sealed class TelegramMessageSender : IMessageSender
             var label = action.RequiresComment
                 ? $"{action.Label} (reply required)"
                 : action.Label;
-            var callbackData = $"{question.QuestionId}:{action.ActionId}";
+            var callbackData = BuildCallbackData(question.QuestionId, action.ActionId);
             rows.Add(new[] { InlineKeyboardButton.WithCallbackData(label, callbackData) });
         }
         return new InlineKeyboardMarkup(rows);

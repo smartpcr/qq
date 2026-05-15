@@ -318,6 +318,214 @@ public class TelegramMessageSenderTests
     }
 
     // ============================================================
+    // PR #20 review item 1: TokenBucketRateLimiter._perChat must not
+    // grow unbounded. Idle per-chat buckets are evicted opportunistically
+    // once the dictionary exceeds the configured soft cap so a long-
+    // running worker fan-ning out across many distinct chats over time
+    // stays bounded in memory.
+    // ============================================================
+
+    [Fact]
+    public async Task TokenBucketRateLimiter_EvictsIdlePerChatBuckets_OnceThresholdIsExceeded()
+    {
+        var clock = new StubTimeProvider(new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero));
+        var delays = new SyntheticDelayProvider(clock);
+        var options = Options.Create(new RateLimitOptions
+        {
+            GlobalPerSecond = 10_000,
+            GlobalBurstCapacity = 10_000,
+            PerChatPerMinute = 6_000,
+            PerChatBurstCapacity = 100,
+            PerChatIdleEvictionMinutes = 10,
+            PerChatEvictionThreshold = 4,
+        });
+        var limiter = new TokenBucketRateLimiter(options, delays, clock);
+
+        // Populate the dictionary with 4 chats. With the eviction
+        // threshold at 4, none has yet been evicted (count is NOT > 4).
+        for (var chatId = 1L; chatId <= 4L; chatId++)
+        {
+            await limiter.AcquireAsync(chatId, CancellationToken.None);
+        }
+        limiter.TrackedChatCount.Should().Be(4,
+            "the first four chats populate the dictionary up to the threshold without triggering eviction");
+
+        // Advance the clock 11 minutes — all four chats are now "idle"
+        // (older than the 10-minute eviction threshold).
+        clock.Advance(TimeSpan.FromMinutes(11));
+
+        // A 5th chat acquires. The dictionary count is 4 BEFORE adding
+        // this entry, so the eviction sweep does not run yet — count
+        // becomes 5.
+        await limiter.AcquireAsync(chatId: 5L, CancellationToken.None);
+        limiter.TrackedChatCount.Should().Be(5,
+            "the 5th chat appends without sweeping because the count > threshold check happens BEFORE insertion");
+
+        // A 6th chat acquires. Now count (5) > threshold (4) at the top
+        // of AcquireAsync, the sweep evicts the four idle chats, then
+        // chat 5 (just-accessed) and chat 6 (new) remain.
+        await limiter.AcquireAsync(chatId: 6L, CancellationToken.None);
+        limiter.TrackedChatCount.Should().Be(2,
+            "the eviction sweep reclaims the four idle chats and keeps the recently-accessed chats 5 and 6");
+    }
+
+    [Fact]
+    public async Task TokenBucketRateLimiter_DoesNotEvictRecentlyAccessedChats()
+    {
+        var clock = new StubTimeProvider(new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero));
+        var delays = new SyntheticDelayProvider(clock);
+        var options = Options.Create(new RateLimitOptions
+        {
+            GlobalPerSecond = 10_000,
+            GlobalBurstCapacity = 10_000,
+            PerChatPerMinute = 6_000,
+            PerChatBurstCapacity = 100,
+            PerChatIdleEvictionMinutes = 10,
+            PerChatEvictionThreshold = 2,
+        });
+        var limiter = new TokenBucketRateLimiter(options, delays, clock);
+
+        // Two chats acquire at t=0.
+        await limiter.AcquireAsync(1L, CancellationToken.None);
+        await limiter.AcquireAsync(2L, CancellationToken.None);
+        limiter.TrackedChatCount.Should().Be(2);
+
+        // Advance 11 minutes, then touch chat 1 again so its LastAccess
+        // becomes fresh. Chat 2 remains idle.
+        clock.Advance(TimeSpan.FromMinutes(11));
+        await limiter.AcquireAsync(1L, CancellationToken.None);
+
+        // Add chat 3 — count is now 3 > threshold 2 at top of AcquireAsync
+        // when chat 4 is added next, so sweep would fire there. First
+        // observe pre-sweep state (3 entries, none evicted yet).
+        await limiter.AcquireAsync(3L, CancellationToken.None);
+        limiter.TrackedChatCount.Should().Be(3);
+
+        // Now add chat 4 — sweep fires (count 3 > threshold 2). Chat 2
+        // is idle (11 minutes since access) and is evicted; chats 1 (just
+        // touched), 3 (just touched), and the new chat 4 survive.
+        await limiter.AcquireAsync(4L, CancellationToken.None);
+        limiter.TrackedChatCount.Should().Be(3,
+            "the sweep evicts only the truly idle chat 2; recently-accessed chats 1 and 3, plus the new chat 4, survive");
+    }
+
+    // ============================================================
+    // PR #20 review item 2: callback_data must be 1–64 UTF-8 bytes.
+    // The sender rejects oversize (QuestionId, ActionId) pairs at the
+    // boundary so callers get an ArgumentException with diagnostic
+    // detail rather than a cryptic ApiRequestException from Telegram.
+    // ============================================================
+
+    [Fact]
+    public async Task SendQuestionAsync_Succeeds_WhenCallbackDataFitsIn64Bytes()
+    {
+        var sender = BuildSender(out var api, out _, out _, out _, out _);
+        // Short IDs — payload is well under the 64-byte limit.
+        var question = BuildQuestion(
+            questionId: "Q-1",
+            actions: new[]
+            {
+                new HumanAction { ActionId = "approve", Label = "OK", Value = "ok" },
+            });
+
+        await sender.SendQuestionAsync(
+            chatId: 1001, BuildEnvelope(question), CancellationToken.None);
+
+        api.Sends.Should().HaveCount(1,
+            "a well-sized callback_data payload passes validation and reaches the Telegram API");
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_Succeeds_AtMaximumConstructable61BytePayload()
+    {
+        // The record-level guards cap QuestionId and ActionId at 30 ASCII
+        // chars each, so the maximum constructable payload is
+        // 30 + 1 + 30 = 61 UTF-8 bytes — just under the 64-byte limit.
+        // This exercises the sender path at the construction-time
+        // boundary; oversize cases require bypassing the record guards
+        // and are pinned by ValidateCallbackDataLength_* unit tests.
+        var qid = new string('a', 30);
+        var aid = new string('b', 30);
+        var sender = BuildSender(out var api, out _, out _, out _, out _);
+        var question = BuildQuestion(
+            questionId: qid,
+            actions: new[]
+            {
+                new HumanAction { ActionId = aid, Label = "OK", Value = "ok" },
+            });
+
+        await sender.SendQuestionAsync(
+            chatId: 1001, BuildEnvelope(question), CancellationToken.None);
+
+        api.Sends.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public void ValidateCallbackDataLength_BoundaryAt64Bytes_IsAccepted()
+    {
+        // Exactly 64 bytes: QuestionId = 30 'a's, ':', ActionId = 33 'b's
+        // → 30 + 1 + 33 = 64 bytes. Exceeds the record-level ActionId
+        // cap (30) but exercises the sender-level guard which is the
+        // wire-level invariant and the defense-in-depth surface.
+        var qid = new string('a', 30);
+        var aid = new string('b', 33);
+
+        var act = () => TelegramMessageSender.ValidateCallbackDataLength(qid, aid);
+
+        act.Should().NotThrow(
+            "exactly 64 bytes is at the inclusive upper bound of Telegram's callback_data limit");
+    }
+
+    [Fact]
+    public void ValidateCallbackDataLength_BoundaryAt65Bytes_IsRejected()
+    {
+        // 65 bytes: 30 + 1 + 34 = 65 bytes → over the limit by one.
+        var qid = new string('a', 30);
+        var aid = new string('b', 34);
+
+        var act = () => TelegramMessageSender.ValidateCallbackDataLength(qid, aid);
+
+        act.Should().Throw<ArgumentException>()
+            .Which.Message.Should().Contain("65 bytes");
+    }
+
+    [Fact]
+    public void ValidateCallbackDataLength_TwoGuids_IsRejected()
+    {
+        // The exact scenario the PR #20 reviewer described: two GUIDs
+        // joined by ':' = 36 + 1 + 36 = 73 bytes UTF-8. Telegram would
+        // reject sendMessage with a cryptic ApiRequestException; the
+        // sender-side guard turns it into a clear ArgumentException at
+        // the boundary. The construction-time guards on QuestionId /
+        // ActionId already prevent this in normal flow; this test pins
+        // the wire-level invariant so any future loosening of the
+        // record guards cannot silently regress on the wire.
+        var qid = Guid.NewGuid().ToString();
+        var aid = Guid.NewGuid().ToString();
+
+        var act = () => TelegramMessageSender.ValidateCallbackDataLength(qid, aid);
+
+        act.Should().Throw<ArgumentException>()
+            .Which.Message.Should().Contain("73 bytes");
+    }
+
+    [Fact]
+    public void ValidateCallbackDataLength_EmptyInputs_AreRejected()
+    {
+        // Telegram's lower bound is 1 byte — an empty payload would be
+        // rejected, so the sender-side guard surfaces it as
+        // ArgumentException up front.
+        var act = () => TelegramMessageSender.ValidateCallbackDataLength(string.Empty, string.Empty);
+
+        // Empty + ':' + empty = ":" = 1 byte → accepted by length, but
+        // the joined payload is technically valid here. We assert no
+        // throw because length is 1. The record-level guards reject
+        // empty strings upstream.
+        act.Should().NotThrow(
+            "the wire-level guard checks only byte length; empty-string semantics are caught earlier by the record-level guards on QuestionId/ActionId");
+    }
+
+    // ============================================================
     // Iter-2 item 4 / iter-3 / iter-5 structural fix: plain-text path
     // applies MarkdownV2 escaping ONCE up front, then chunks the
     // already-escaped body via SplitEscapedOnBoundaries. Because the

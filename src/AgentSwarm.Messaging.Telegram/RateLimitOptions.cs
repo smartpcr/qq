@@ -47,4 +47,30 @@ public sealed class RateLimitOptions
     /// per-chat wait. See architecture.md §10.4 (D-BURST).
     /// </summary>
     public int PerChatBurstCapacity { get; set; } = 5;
+
+    /// <summary>
+    /// Eviction threshold for the per-chat bucket dictionary inside
+    /// <see cref="TokenBucketRateLimiter"/>: a chat-bucket whose last
+    /// <see cref="TokenBucketRateLimiter.AcquireAsync"/> access was more
+    /// than this many minutes ago is reclaimed opportunistically to keep
+    /// the dictionary bounded in long-running workers that fan out across
+    /// many distinct chats over time. Default <c>10</c> minutes — large
+    /// enough that an idle chat returning within a normal conversation
+    /// gap is not re-created, small enough that a worker churning across
+    /// thousands of one-shot chats never grows unbounded. Reconstructing
+    /// a bucket is cheap (starts at full capacity, which is conservative
+    /// but correct).
+    /// </summary>
+    public int PerChatIdleEvictionMinutes { get; set; } = 10;
+
+    /// <summary>
+    /// Soft cap that triggers per-chat bucket eviction inside
+    /// <see cref="TokenBucketRateLimiter"/>: when the per-chat dictionary
+    /// grows beyond this size, the next <c>AcquireAsync</c> sweeps
+    /// entries idle for more than
+    /// <see cref="PerChatIdleEvictionMinutes"/>. Default <c>1024</c> —
+    /// well above the steady-state working set of a typical deployment,
+    /// so the O(N) sweep is amortised across many calls.
+    /// </summary>
+    public int PerChatEvictionThreshold { get; set; } = 1024;
 }

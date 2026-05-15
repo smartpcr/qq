@@ -76,7 +76,10 @@ public static class TelegramServiceCollectionExtensions
         // Stage 2.3 — outbound message sender wiring.
         services.AddOptions<RateLimitOptions>()
             .Bind(configuration.GetSection(
-                $"{TelegramOptions.SectionName}:{RateLimitOptions.SectionName}"));
+                $"{TelegramOptions.SectionName}:{RateLimitOptions.SectionName}"))
+            .ValidateOnStart();
+
+        services.AddSingleton<IValidateOptions<RateLimitOptions>, RateLimitOptionsValidator>();
 
         // First stage that writes to IDistributedCache — production swaps
         // for AddStackExchangeRedisCache() via configuration. The
