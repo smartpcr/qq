@@ -34,11 +34,18 @@ public interface IConversationReferenceStore
     /// <param name="ct">Cancellation token.</param>
     Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct);
 
-    /// <summary>Look up a reference by its primary key (the <see cref="TeamsConversationReference.Id"/> GUID).</summary>
-    /// <param name="referenceId">Primary-key GUID.</param>
+    /// <summary>
+    /// General-purpose single-record retrieval for a user-scoped reference keyed by
+    /// <c>(TenantId, AadObjectId)</c>. Returns the reference regardless of
+    /// <see cref="TeamsConversationReference.IsActive"/> — used for administrative inspection,
+    /// audit replay, and post-uninstall lookups. For proactive-send pre-checks use
+    /// <see cref="GetByAadObjectIdAsync"/> (active-only) instead.
+    /// </summary>
+    /// <param name="tenantId">Entra ID tenant.</param>
+    /// <param name="aadObjectId">User AAD object ID.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>The reference, or <c>null</c> if no row exists.</returns>
-    Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct);
+    /// <returns>The reference (active or inactive), or <c>null</c> if no row exists.</returns>
+    Task<TeamsConversationReference?> GetAsync(string tenantId, string aadObjectId, CancellationToken ct);
 
     /// <summary>Look up a personal-scope reference by Teams-native AAD object ID.</summary>
     /// <param name="tenantId">Entra ID tenant.</param>

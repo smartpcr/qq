@@ -585,7 +585,7 @@ public sealed class TeamsMessengerConnectorTests
         public List<(string TenantId, string ChannelId)> ChannelLookups { get; } = new();
 
         public Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct) => Task.CompletedTask;
-        public Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
+        public Task<TeamsConversationReference?> GetAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByAadObjectIdAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
 
         public Task<TeamsConversationReference?> GetByInternalUserIdAsync(string tenantId, string internalUserId, CancellationToken ct)
