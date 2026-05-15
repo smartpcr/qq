@@ -1,33 +1,35 @@
-# Iter notes — Stage 2.4 (Teams App Manifest)
+# Iter notes — Stage 1.2 (Messenger Connector Interface) — review iter
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Teams/Manifest/manifest.json` — NEW. Teams app manifest v1.16. Placeholder GUID `00000000-...` at four required sites (`id`, `bots[0].botId`, `composeExtensions[0].botId`, `webApplicationInfo.id`); placeholder domain `bot.example.com`. Bots: scopes=["personal","team"], supportsFiles=false. ComposeExtensions action command `forwardToAgent` (type=action, fetchTask=false, context=[message,commandBox]). Includes accentColor, developer URLs, validDomains, webApplicationInfo for SSO.
-- `src/AgentSwarm.Messaging.Teams/Manifest/color.png` — NEW. 192×192 PNG (PowerShell+System.Drawing AS-monogram placeholder).
-- `src/AgentSwarm.Messaging.Teams/Manifest/outline.png` — NEW. 32×32 transparent outline PNG.
-- `src/AgentSwarm.Messaging.Teams/Manifest/build-manifest.ps1` — NEW. Cross-platform pwsh packaging script. Mandatory `-AppId` (GUID) + `-BotDomain`; rejects placeholder values; re-validates substituted JSON parses; writes `bin/manifest.zip` (gitignored). Optional `-OutputPath` override.
-- `src/AgentSwarm.Messaging.Teams/Manifest/README.md` — NEW. Operator deployment + substitution semantics doc.
-- `tests/AgentSwarm.Messaging.Teams.Manifest.Tests/*` — NEW xunit project (added to sln). 22 tests across 4 files: `ManifestSchemaValidationTests` (full v1.16 schema validation), `BotScopesTests`, `ComposeExtensionTests`, `PackagingScriptSmokeTests`. Embedded official schema as resource.
-- `AgentSwarm.Messaging.sln` — added new test project via `dotnet sln add`.
-- `.gitignore` — added `src/AgentSwarm.Messaging.Teams/Manifest/bin/`.
+- (none — surface inherited from prior iters was reviewed and judged complete)
+- `.forge/iter-notes.md` — refreshed for this turn (Forge archives prior content automatically)
+
+## State found at iter start
+- HEAD: `cbc70a4 test(stage-1.2): cover NoOpMessageOutbox cancellation and dead-letter logging`
+- Worktree has 5 projects on disk: Abstractions, Core, Persistence, +tests. The sln only references the 4 Stage 1.2 projects (Abstractions + Core + their tests) — Persistence files were brought in by the `a344005` merge of `feature/teams` and are intentionally NOT in the sln since they belong to Stage 1.3's separate workstream.
+- `dotnet build AgentSwarm.Messaging.sln` → 0 warn / 0 err.
+- `dotnet test AgentSwarm.Messaging.sln --no-build` → 103 / 103 pass (82 Abstractions + 21 Core).
 
 ## Decisions made this iter
-- **Manifest home**: `src/AgentSwarm.Messaging.Teams/Manifest/` (forward-compat with Stage 2.1 which will create the Teams .csproj). Did NOT create a csproj for it — manifest is non-source artifact.
-- **Placeholder GUID** = `00000000-0000-0000-0000-000000000000` at all four required sites. Schema-valid GUID shape so the file validates out of the box; `build-manifest.ps1` substitutes and fails loudly if placeholder remains. Avoided `{{TOKEN}}` form (would break schema validation).
-- **No preemptive `parameters` on the action command**: v1.16 schema only requires `id` + `title` at command level. Rubber-duck flagged preemptive `parameters` as risky for Stage 3.4 UX. Stage 3.4 will add if its handler needs them.
-- **Single pwsh script** (no separate `.sh`): pwsh is cross-platform.
-- **Schema validation via JsonSchema.Net 7.0.4** (not hand-rolled structural assertions): rubber-duck flagged "schema validation" as the actual ask. Two surprises:
-  1. The v1.16 schema declares the legacy draft-04 dialect; JsonSchema.Net 7.x dropped Draft 4 support. Workaround: `ManifestFixture.LoadSchemaTextForEvaluation()` rewrites the `$schema` declaration to draft-07 before parsing. Draft-07 is a strict superset of the keywords this schema actually uses (`type`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`, `pattern`, `$ref`, `definitions`, `minItems`/`maxItems`, `minLength`/`maxLength`) — semantically equivalent for this schema.
-  2. Schema only validates that each GUID-shaped field is a GUID; it does NOT enforce that `id == bots[0].botId == composeExtensions[0].botId == webApplicationInfo.id`. Added explicit cross-site consistency tests (`Manifest_AppIdIsConsistentAcrossAllRequiredSites`, `ComposeExtension_BotIdMatchesTopLevelId`) — these catch hand-edit drift that schema alone cannot.
-- **`PackagingScriptSmokeTests` via `Xunit.SkippableFact`**: end-to-end exercises the real `pwsh` script (substitution, zip layout, refusal paths, re-validates output against schema). Auto-skips when pwsh missing so non-Windows CI passes regardless.
+- Rejected the rubber-duck's one finding (have `DefaultDenyAuthorizationService` map canonical commands → `RequiredRole`). Rationale: the brief literally says "minimal deny-all policy"; role-to-command mapping is explicitly Stage 5.1's `RbacAuthorizationService` territory (impl-plan.md §5.1, line 324). Implementing that here would (a) duplicate Stage 5.1 logic in a stub, (b) silently ship a fake RBAC matrix that Stage 2.2 tests might trust, and (c) drift from the literal brief wording. The current stub's `RequiredRole = null` correctly signals "stub has no policy opinion".
+
+## Verified — Stage 1.2's 10 implementation steps & 2 test scenarios
+- ✅ `IMessengerConnector` exposes exactly `SendMessageAsync`, `SendQuestionAsync`, `ReceiveAsync` returning `Task<MessengerEvent>` (asserted by `IMessengerConnectorContractTests`).
+- ✅ `AgentSwarm.Messaging.Core` targets net8.0; registered in `.sln` with GUID `355D2A37-…`.
+- ✅ `IMessageOutbox` has all 4 methods (`EnqueueAsync`/`DequeueAsync`/`AcknowledgeAsync`/`DeadLetterAsync`); `NoOpMessageOutbox` logs dead-letter via `ILogger.LogWarning` and discards.
+- ✅ `ICommandDispatcher.DispatchAsync(CommandContext, CancellationToken)` defined in Abstractions.
+- ✅ `IInboundEventPublisher.PublishAsync(MessengerEvent, CancellationToken)` defined in Abstractions.
+- ✅ `IIdentityResolver.ResolveAsync(string, CancellationToken)` + `IUserAuthorizationService.AuthorizeAsync(string,string,string, CancellationToken)`.
+- ✅ `DefaultDenyIdentityResolver` returns `null`; `DefaultDenyAuthorizationService` returns `IsAuthorized=false`. Both honor cancellation.
+- ✅ `IAgentQuestionStore` has all 7 methods including `TryUpdateStatusAsync` returning `Task<bool>` (asserted by `Stage12ContractShapeTests.IAgentQuestionStore_DeclaresAllSevenRequiredMethods`).
+- ✅ `ConnectorOptions` has `RetryCount=3`, `RetryDelayMs=1000`, `MaxConcurrency=1`, `DeadLetterThreshold=5` (defaults asserted by `ConnectorOptionsDefaultsTests`).
+- ✅ Test scenarios: contract completeness ✓; options defaults ✓.
 
 ## Dead ends tried this iter
-- First test draft used `Assert.Equal(1, count)` → xunit analyzer rejected (xUnit2013). Switched to `Assert.Single`.
-- First test run failed with `RefResolutionException: Could not resolve 'http://json-schema.org/draft-04/schema#'`. JsonSchema.Net 7.x and 6.x both lack Draft 4. Solved with dialect-rewrite at load time (see decision above) rather than downgrading or registering a stub meta-schema.
+- (none — review-only iter)
 
 ## Open questions surfaced this iter
-- None blocking.
-- Pre-existing orphan state observed (Persistence/Core projects exist on disk but aren't in the sln — must have been left behind by a recent sibling merge). Out of my workstream's scope; left untouched.
+- None new. (No `## LATEST evaluator feedback` section in this iter's prompt, so no specific items to chase.)
 
 ## What's still left
-- Nothing for Stage 2.4. Build green (0 warn / 0 err). 104/104 tests pass (82 existing Abstractions + 22 new Manifest, including 7 pwsh smoke tests).
-- Stage 3.4 (Message Extension Handler) will implement `OnTeamsMessagingExtensionSubmitActionAsync` to handle `forwardToAgent` invocations this manifest declares. The plan explicitly notes Stage 3.4 may add manifest fields (likely `parameters`) if the handler needs them.
+- Nothing actionable for Stage 1.2 in this worktree. The next stages (handled by other workstreams) will: register stubs in DI (Stage 2.1), implement `ChannelInboundEventPublisher` (Stage 2.1), wire `TeamsMessengerConnector` (Stage 2.3), real `CommandDispatcher` (Stage 3.2), real `SqlAgentQuestionStore` (Stage 3.3), real `EntraIdentityResolver`/`RbacAuthorizationService` (Stage 5.1), real `SqlMessageOutbox` (Stage 6.1).

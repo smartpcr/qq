@@ -7,11 +7,13 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{63C0970D-7B7
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Abstractions", "src\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj", "{D4ED5193-0AD2-4567-96C4-2808E2420933}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Core", "src\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj", "{355D2A37-5898-4859-918C-20A183D4E728}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{73B7DD66-2EE7-46E8-8F29-F9A93CF89517}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Abstractions.Tests", "tests\AgentSwarm.Messaging.Abstractions.Tests\AgentSwarm.Messaging.Abstractions.Tests.csproj", "{06BFFF8F-933B-47A1-9556-46B515E26B80}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Teams.Manifest.Tests", "tests\AgentSwarm.Messaging.Teams.Manifest.Tests\AgentSwarm.Messaging.Teams.Manifest.Tests.csproj", "{CA6C37C8-CE97-4307-BDE5-2D7398829835}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Core.Tests", "tests\AgentSwarm.Messaging.Core.Tests\AgentSwarm.Messaging.Core.Tests.csproj", "{2C730A3D-6B99-43CB-AC55-FCC318BBE02D}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -26,18 +28,23 @@ Global
 		{D4ED5193-0AD2-4567-96C4-2808E2420933}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{D4ED5193-0AD2-4567-96C4-2808E2420933}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{D4ED5193-0AD2-4567-96C4-2808E2420933}.Release|Any CPU.Build.0 = Release|Any CPU
+		{355D2A37-5898-4859-918C-20A183D4E728}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{355D2A37-5898-4859-918C-20A183D4E728}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{355D2A37-5898-4859-918C-20A183D4E728}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{355D2A37-5898-4859-918C-20A183D4E728}.Release|Any CPU.Build.0 = Release|Any CPU
 		{06BFFF8F-933B-47A1-9556-46B515E26B80}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{06BFFF8F-933B-47A1-9556-46B515E26B80}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{06BFFF8F-933B-47A1-9556-46B515E26B80}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{06BFFF8F-933B-47A1-9556-46B515E26B80}.Release|Any CPU.Build.0 = Release|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2C730A3D-6B99-43CB-AC55-FCC318BBE02D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2C730A3D-6B99-43CB-AC55-FCC318BBE02D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2C730A3D-6B99-43CB-AC55-FCC318BBE02D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2C730A3D-6B99-43CB-AC55-FCC318BBE02D}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{D4ED5193-0AD2-4567-96C4-2808E2420933} = {63C0970D-7B73-4144-9020-8F5913C4F943}
+		{355D2A37-5898-4859-918C-20A183D4E728} = {63C0970D-7B73-4144-9020-8F5913C4F943}
 		{06BFFF8F-933B-47A1-9556-46B515E26B80} = {73B7DD66-2EE7-46E8-8F29-F9A93CF89517}
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835} = {73B7DD66-2EE7-46E8-8F29-F9A93CF89517}
+		{2C730A3D-6B99-43CB-AC55-FCC318BBE02D} = {73B7DD66-2EE7-46E8-8F29-F9A93CF89517}
 	EndGlobalSection
 EndGlobal

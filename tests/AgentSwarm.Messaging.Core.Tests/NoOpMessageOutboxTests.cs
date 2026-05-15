@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AgentSwarm.Messaging.Core.Tests;
@@ -81,5 +82,66 @@ public sealed class NoOpMessageOutboxTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => outbox.DequeueAsync(1, cts.Token));
+    }
+
+    [Fact]
+    public async Task AcknowledgeAsync_HonorsCancellation()
+    {
+        var outbox = CreateOutbox();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => outbox.AcknowledgeAsync("outbox-1", cts.Token));
+    }
+
+    [Fact]
+    public async Task DeadLetterAsync_HonorsCancellation()
+    {
+        var outbox = CreateOutbox();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => outbox.DeadLetterAsync("outbox-1", "test failure", cts.Token));
+    }
+
+    [Fact]
+    public async Task DeadLetterAsync_EmitsWarningLogContainingEntryIdAndError()
+    {
+        var logger = new CapturingLogger<NoOpMessageOutbox>();
+        var outbox = new NoOpMessageOutbox(logger);
+
+        await outbox.DeadLetterAsync("outbox-abc", "boom — 429 Too Many Requests", CancellationToken.None);
+
+        var warning = Assert.Single(logger.Entries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Contains("outbox-abc", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("boom", warning.Message, StringComparison.Ordinal);
+    }
+
+    private sealed class CapturingLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = new();
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Entries.Add((logLevel, formatter(state, exception)));
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+            public void Dispose() { }
+        }
     }
 }
