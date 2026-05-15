@@ -97,6 +97,7 @@ The agent swarm (100+ autonomous agents) requires a Discord-based human interfac
 | **DiscordSender** | `AgentSwarm.Messaging.Discord` (to be created) | Concrete `DiscordMessageSender` implementing `IMessageSender` (defined in `AgentSwarm.Messaging.Core`). Wraps Discord.Net's REST client. Builds Discord embeds with agent identity fields (name, role, current task, confidence score, blocking question). Builds component rows with action buttons and select menus. Manages thread creation for per-task conversations. Respects Discord REST rate limits by reading `X-RateLimit-*` response headers and queuing sends when approaching limits. |
 | **OutboundQueueProcessor** | `AgentSwarm.Messaging.Worker` (shared) | `BackgroundService` with configurable concurrency. Dequeues highest-severity pending `OutboundMessage`, dispatches to `IMessageSender`, calls `MarkSentAsync` on success. For question messages, calls `IPendingQuestionStore.StoreAsync` as a post-send hook. Same shared component as other connectors. |
 | **AuditLogger** | `AgentSwarm.Messaging.Persistence` (shared) | Writes immutable audit records for every command and response. For Discord, includes guild ID, channel ID, Discord user ID, message ID, interaction ID, and correlation ID. Uses the shared `IAuditLogger` interface. |
+| **InteractionRecoverySweep** | `AgentSwarm.Messaging.Discord` (to be created) | `BackgroundService` that periodically scans `IDiscordInteractionStore.GetRecoverableAsync` for interactions that were persisted but not fully processed (e.g., process crash after persist but before pipeline completion). Re-enqueues recoverable records into `IDiscordInteractionPipeline.ProcessAsync`. Runs on startup and then every 60 seconds (configurable). Respects a max-retry count (default 3) before marking records as permanently failed. |
 
 ---
 
@@ -293,7 +294,7 @@ public interface IMessengerConnector
 }
 ```
 
-> **Migration note:** The `AgentQuestionEnvelope` wrapper is an architecture-level decision that extends FR-001 without breaking it -- `AgentQuestion` remains accessible via `envelope.Question`. This pattern is consistent with the Telegram connector implementation on the `feature/telegram` branch (file `src/AgentSwarm.Messaging.Abstractions/IMessengerConnector.cs`), which already uses `AgentQuestionEnvelope`. The FR-001 brief's `SendQuestionAsync(AgentQuestion, CancellationToken)` is superseded by this signature.
+> **Migration note:** The `AgentQuestionEnvelope` wrapper is an architecture-level decision that extends FR-001 without breaking it -- `AgentQuestion` remains accessible via `envelope.Question`. The envelope adds routing metadata and default-action context that FR-001's original `SendQuestionAsync(AgentQuestion, CancellationToken)` signature does not carry. This architecture proposes the envelope-based signature as the canonical contract for all connectors.
 
 `DiscordMessengerConnector : IMessengerConnector` delegates `SendMessageAsync` and `SendQuestionAsync` to the `OutboundMessageQueue`. `SendMessageAsync` pre-renders the Discord embed JSON (including agent identity fields) and enqueues with the rendered payload. `SendQuestionAsync` stores the full `AgentQuestionEnvelope` in `SourceEnvelopeJson` for send-time rendering (buttons, select menus, embeds require the full question context). `ReceiveAsync` drains processed inbound events from the Gateway pipeline.
 
@@ -332,7 +333,7 @@ public interface IGuildRegistry
 
 ### 4.4 IOutboundQueue (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Proposed shared interface for durable outbound message queuing. This interface is not yet defined in the repo; it is proposed by this architecture as part of the Messenger Gateway epic's shared abstractions. The Telegram connector on the `feature/telegram` branch has implemented a version of this interface at `src/AgentSwarm.Messaging.Abstractions/IOutboundQueue.cs`; the Discord connector will share the same contract:
+Proposed shared interface for durable outbound message queuing. This interface is proposed by this architecture as part of the Messenger Gateway epic's shared abstractions (per the recommended solution structure in `.forge-attachments/agent_swarm_messenger_user_stories.md` lines 185-195):
 
 ```csharp
 public interface IOutboundQueue
@@ -349,7 +350,7 @@ public interface IOutboundQueue
 
 ### 4.5 IUserAuthorizationService (proposed contract -- to be defined in `AgentSwarm.Messaging.Core`)
 
-Proposed shared interface. The Telegram connector on the `feature/telegram` branch defines this at `src/AgentSwarm.Messaging.Core/IUserAuthorizationService.cs`. For Discord, the authorization service receives:
+Proposed shared interface for authorization. The epic-level FR-006 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 115-125) requires user allowlist, tenant validation, and role validation. For Discord, the authorization service receives:
 - `externalUserId`: Discord user snowflake ID (stringified)
 - `chatId`: Discord channel snowflake ID (stringified)
 - `commandName`: The slash subcommand name (e.g., `"ask"`, `"approve"`)
@@ -362,7 +363,7 @@ The Discord-specific authorization logic:
 
 ### 4.6 ISwarmCommandBus (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Proposed shared interface for bidirectional communication between messenger connectors and the agent swarm orchestrator. The epic-level FR-001 (`.forge-attachments/agent_swarm_messenger_user_stories.md`) defines the requirement for agents to send progress updates, ask questions, and request approvals; this interface is the proposed realization. The Telegram connector on the `feature/telegram` branch implements a version at `src/AgentSwarm.Messaging.Abstractions/ISwarmCommandBus.cs`:
+Proposed shared interface for bidirectional communication between messenger connectors and the agent swarm orchestrator. The epic-level FR-001 and FR-003 (`.forge-attachments/agent_swarm_messenger_user_stories.md`) define the requirements for agents to send progress updates, ask questions, request approvals, and for humans to issue commands; this interface is the proposed realization:
 
 ```csharp
 public interface ISwarmCommandBus
@@ -379,7 +380,7 @@ The Discord connector uses this interface identically: publishing commands via `
 
 ### 4.7 IPendingQuestionStore (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Proposed shared interface for managing pending agent questions. The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Abstractions/IPendingQuestionStore.cs`. The Discord connector proposes the same interface with platform-agnostic parameter names:
+Proposed shared interface for managing pending agent questions. The epic-level FR-005 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 103-112) requires idempotency and durable queues; this interface tracks questions from send to resolution:
 
 ```csharp
 public interface IPendingQuestionStore
@@ -415,7 +416,7 @@ public interface IDiscordInteractionStore
 
 ### 4.9 IMessageSender (proposed contract -- to be defined in `AgentSwarm.Messaging.Core`)
 
-Proposed shared interface for platform-agnostic outbound sends. The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Core/IMessageSender.cs`. The Discord connector proposes the same interface with platform-agnostic parameter names:
+Proposed shared interface for platform-agnostic outbound sends. The epic-level FR-001 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 43-54) requires a common send contract; each connector implements a platform-specific sender:
 
 ```csharp
 public interface IMessageSender
@@ -436,7 +437,7 @@ The concrete `DiscordMessageSender` implements this interface and wraps Discord.
 
 ### 4.10 IAuditLogger (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Proposed shared interface for audit logging. The epic-level FR-006 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 115-125) requires audit logging across all connectors. The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Abstractions/IAuditLogger.cs`:
+Proposed shared interface for audit logging. The epic-level FR-006 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 115-125) requires audit logging across all connectors; this interface is the proposed realization:
 
 ```csharp
 public interface IAuditLogger
@@ -450,7 +451,7 @@ For Discord, audit entries store guild ID, channel ID, interaction ID, and Disco
 
 ### 4.11 IDeduplicationService (proposed contract -- to be defined in `AgentSwarm.Messaging.Abstractions`)
 
-Proposed shared interface with a three-method contract (`TryReserveAsync`, `IsProcessedAsync`, `MarkProcessedAsync`). The Telegram connector on the `feature/telegram` branch defines a version at `src/AgentSwarm.Messaging.Abstractions/IDeduplicationService.cs`. For Discord, the event ID is the interaction snowflake ID (stringified). Backed by a sliding-window cache with configurable TTL (default 1 hour).
+Proposed shared interface with a three-method contract (`TryReserveAsync`, `IsProcessedAsync`, `MarkProcessedAsync`). The epic-level FR-005 (`.forge-attachments/agent_swarm_messenger_user_stories.md` lines 103-112) requires idempotent message processing; this interface is the proposed realization. For Discord, the event ID is the interaction snowflake ID (stringified). Backed by a sliding-window cache with configurable TTL (default 1 hour).
 
 ---
 
@@ -608,8 +609,10 @@ Orchestrator    SwarmCommandBus   DiscordConnector    OutboundQueue   QueueProce
 Human (Discord)    DiscordGatewayService   InteractionPipeline    AuthZ Service
       |                    |                      |                    |
       |--/agent ask ...--->|                      |                    |
-      |                    |--DeferAsync()-------->|                    |
       |                    |--persist record------>|                    |
+      |                    |  (durable inbox first)|                    |
+      |                    |--DeferAsync()-------->|                    |
+      |                    |  (ACK after persist)  |                    |
       |                    |--ProcessAsync-------->|                    |
       |                    |                      |--AuthorizeAsync---->|
       |                    |                      |                    |--check binding
@@ -638,7 +641,7 @@ Human (Discord)    DiscordGatewayService   InteractionPipeline    AuthZ Service
 |---|---|---|---|
 | `AgentSwarm.Messaging.Abstractions` | Abstractions | Shared | `IMessengerConnector`, `IOutboundQueue`, `IDeduplicationService`, `IPendingQuestionStore`, `MessengerMessage`, `AgentQuestion`, `AgentQuestionEnvelope`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent`, `OutboundMessage`, `SwarmCommand`, `MessageSeverity` |
 | `AgentSwarm.Messaging.Core` | Domain | Shared | `IMessageSender`, `IUserAuthorizationService`, `IOperatorRegistry`, `ITaskOversightRepository`, `AuthorizationResult`, `SendResult` |
-| `AgentSwarm.Messaging.Discord` | Connector | **New** | `DiscordGatewayService`, `DiscordInteractionRouter`, `SlashCommandDispatcher`, `ComponentInteractionHandler`, `DiscordMessengerConnector`, `DiscordMessageSender`, `DiscordInteractionMapper`, `IGuildRegistry`, `IDiscordInteractionPipeline`, `IDiscordInteractionStore`, `DiscordOptions`, `DiscordServiceCollectionExtensions` |
+| `AgentSwarm.Messaging.Discord` | Connector | **New** | `DiscordGatewayService`, `DiscordInteractionRouter`, `SlashCommandDispatcher`, `ComponentInteractionHandler`, `DiscordMessengerConnector`, `DiscordMessageSender`, `DiscordInteractionMapper`, `InteractionRecoverySweep`, `IGuildRegistry`, `IDiscordInteractionPipeline`, `IDiscordInteractionStore`, `DiscordOptions`, `DiscordServiceCollectionExtensions` |
 | `AgentSwarm.Messaging.Persistence` | Infrastructure | Shared | `PersistentOutboundQueue`, `PersistentAuditLogger`, `PersistentPendingQuestionStore`, `MessagingDbContext` |
 | `AgentSwarm.Messaging.Worker` | Host | Shared | `OutboundQueueProcessor`, `QuestionRecoverySweep`, `QuestionTimeoutService`, `Program` |
 | `AgentSwarm.Messaging.Tests` | Test | Shared + New | `DiscordInteractionMapperTests`, `DiscordPipelineTests`, `GuildRegistryTests`, `ComponentInteractionHandlerTests`, `DiscordOptionsTests` |
@@ -716,7 +719,7 @@ Slash commands are registered as guild commands (not global commands) for faster
 
 ### 8.2 Interaction Acknowledgement Strategy
 
-Discord requires interaction responses within 3 seconds. The pipeline uses `DeferAsync()` immediately on receiving any interaction, then follows up with the full response. This approach is simpler than trying to race the authorization + command processing against the deadline.
+Discord requires interaction responses within 3 seconds. The `DiscordGatewayService` follows a strict two-step sequence: (1) persist the `DiscordInteractionRecord` (including `RawPayload`) to the durable inbox, then (2) call `DeferAsync()` to acknowledge the interaction. The durable persist is fast (single INSERT with a UNIQUE constraint check) and reliably completes within the 3-second deadline. This persist-before-ACK order ensures no command is lost if the process crashes after Discord considers the interaction delivered. Authorization and command processing proceed asynchronously after the ACK.
 
 ### 8.3 Component custom_id Format
 
