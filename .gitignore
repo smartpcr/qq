@@ -28,3 +28,5 @@ coverage.json
 
 # Teams sideload package output
 src/AgentSwarm.Messaging.Teams/Manifest/bin/
+
+.forge/
