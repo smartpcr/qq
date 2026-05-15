@@ -749,6 +749,8 @@ Steps:
 
 ---
 
+## 6. Reliability and Performance
+
 ### 6.1 Durable Message Pipeline
 
 The Slack connector uses the shared pipeline infrastructure proposed in
@@ -766,7 +768,8 @@ The Slack connector uses the shared pipeline infrastructure proposed in
 
 | Metric | Target | Mechanism |
 |---|---|---|
-| Interactive ACK latency | < 3 seconds | Immediate HTTP 200 before processing |
+| Interactive ACK latency (async commands: `ask`, `status`, `approve`, `reject`) | < 3 seconds | Immediate HTTP 200 before processing |
+| Interactive ACK latency (modal commands: `review`, `escalate`) | < 3 seconds | Synchronous fast-path: signature + auth + idempotency + `views.open` via `SlackDirectApiClient`, then HTTP 200 |
 | P95 outbound latency | < 3 seconds | Outbox drain + Slack API call |
 | Concurrent threads | 1000+ | Thread mapping is a lightweight DB lookup |
 | Message loss | 0 | Durable queues + at-least-once delivery |
