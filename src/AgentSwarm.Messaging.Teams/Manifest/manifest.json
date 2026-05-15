@@ -1,0 +1,78 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "00000000-0000-0000-0000-000000000000",
+  "packageName": "com.agentswarm.messaging.teams",
+  "developer": {
+    "name": "AgentSwarm",
+    "websiteUrl": "https://bot.example.com",
+    "privacyUrl": "https://bot.example.com/privacy",
+    "termsOfUseUrl": "https://bot.example.com/terms"
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "name": {
+    "short": "AgentSwarm",
+    "full": "AgentSwarm Messaging for Microsoft Teams"
+  },
+  "description": {
+    "short": "Command and approve agent-swarm work from Microsoft Teams.",
+    "full": "AgentSwarm Messaging connects enterprise operators to autonomous agent swarms from inside Microsoft Teams. Issue agent commands, approve or reject release gates, escalate incidents, and respond to agent questions through personal chat, team channels, Adaptive Cards, and message actions."
+  },
+  "accentColor": "#465AA8",
+  "bots": [
+    {
+      "botId": "00000000-0000-0000-0000-000000000000",
+      "scopes": [
+        "personal",
+        "team"
+      ],
+      "isNotificationOnly": false,
+      "supportsFiles": false,
+      "supportsCalling": false,
+      "supportsVideo": false
+    }
+  ],
+  "composeExtensions": [
+    {
+      "botId": "00000000-0000-0000-0000-000000000000",
+      "canUpdateConfiguration": false,
+      "commands": [
+        {
+          "id": "forwardToAgent",
+          "type": "action",
+          "title": "Forward to Agent",
+          "description": "Forward this message context to the AgentSwarm orchestrator.",
+          "context": [
+            "message",
+            "commandBox"
+          ],
+          "fetchTask": false,
+          "initialRun": false,
+          "parameters": [
+            {
+              "name": "instruction",
+              "title": "Instruction",
+              "description": "Task or message to forward to the AgentSwarm orchestrator. Optional when forwarding a message; required when invoked from the command box.",
+              "inputType": "text"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": [
+    "identity",
+    "messageTeamMembers"
+  ],
+  "validDomains": [
+    "bot.example.com"
+  ],
+  "webApplicationInfo": {
+    "id": "00000000-0000-0000-0000-000000000000",
+    "resource": "api://bot.example.com/00000000-0000-0000-0000-000000000000"
+  }
+}
