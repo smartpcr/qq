@@ -24,6 +24,12 @@ namespace AgentSwarm.Messaging.Teams.Middleware;
 /// influence the HTTP status code returned by <c>CloudAdapter.ProcessAsync</c> (which always
 /// returns HTTP 200 for processed activities).
 /// </para>
+/// <para>
+/// Tenant-ID extraction is delegated to <see cref="TenantIdExtractor.GetOrExtractFromBodyAsync"/>,
+/// which caches the result of the upstream <see cref="TenantValidationMiddleware"/> call in
+/// <see cref="HttpContext.Items"/> — so this middleware does NOT re-parse the inbound JSON
+/// body on the hot path.
+/// </para>
 /// </remarks>
 public sealed class RateLimitMiddleware : IMiddleware
 {
@@ -76,7 +82,7 @@ public sealed class RateLimitMiddleware : IMiddleware
         }
 
         var tenantId = await TenantIdExtractor
-            .TryExtractFromBodyAsync(context, context.RequestAborted)
+            .GetOrExtractFromBodyAsync(context, context.RequestAborted)
             .ConfigureAwait(false);
         if (context.Request.Body.CanSeek)
         {

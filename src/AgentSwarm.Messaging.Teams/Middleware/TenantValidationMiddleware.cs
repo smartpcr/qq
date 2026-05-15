@@ -86,7 +86,7 @@ public sealed class TenantValidationMiddleware : IMiddleware
         context.Request.EnableBuffering();
 
         var tenantId = await TenantIdExtractor
-            .TryExtractFromBodyAsync(context, context.RequestAborted)
+            .GetOrExtractFromBodyAsync(context, context.RequestAborted)
             .ConfigureAwait(false);
         if (context.Request.Body.CanSeek)
         {

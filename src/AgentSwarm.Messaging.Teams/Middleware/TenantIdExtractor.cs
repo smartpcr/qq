@@ -41,8 +41,26 @@ namespace AgentSwarm.Messaging.Teams.Middleware;
 internal static class TenantIdExtractor
 {
     /// <summary>
+    /// Per-request cache slot key used by <see cref="GetOrExtractFromBodyAsync"/>. An
+    /// <see cref="object"/> instance (not a string) so the entry cannot collide with any
+    /// caller-defined key in <see cref="HttpContext.Items"/>.
+    /// </summary>
+    private static readonly object CacheKey = new();
+
+    /// <summary>
+    /// Sentinel cached for the "extraction completed but yielded no tenant" case so that
+    /// cache hits can distinguish a legitimate <c>null</c> result (already attempted) from
+    /// a missing cache entry (never attempted). Stored under <see cref="CacheKey"/> in
+    /// <see cref="HttpContext.Items"/>.
+    /// </summary>
+    private static readonly object NoTenantSentinel = new();
+
+    /// <summary>
     /// Read the buffered HTTP request body and return the Teams tenant ID, or <c>null</c>
     /// when the body is empty, malformed, or carries no tenant on either supported path.
+    /// This overload always re-parses the body — callers that want per-request caching across
+    /// multiple ASP.NET Core middleware stages should use <see cref="GetOrExtractFromBodyAsync"/>
+    /// instead.
     /// </summary>
     /// <param name="context">The current HTTP context. <c>Request.Body</c> must be seekable
     /// (caller has already enabled buffering).</param>
@@ -122,5 +140,44 @@ internal static class TenantIdExtractor
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Per-request cached variant of <see cref="TryExtractFromBodyAsync"/>. The first call in
+    /// the ASP.NET Core HTTP pipeline parses the body and stashes the result (including a
+    /// negative result) under a private key in <see cref="HttpContext.Items"/>; subsequent
+    /// callers in the same request hit the cache and avoid re-parsing the body.
+    /// </summary>
+    /// <param name="context">The current HTTP context. <c>Request.Body</c> must be seekable
+    /// when the cache misses (caller has already enabled buffering).</param>
+    /// <param name="cancellationToken">Cancellation token co-operating with the request
+    /// lifetime.</param>
+    /// <returns>The extracted tenant ID, or <c>null</c> when no tenant can be determined.</returns>
+    /// <remarks>
+    /// Used by both <see cref="TenantValidationMiddleware"/> (the first ASP.NET Core HTTP
+    /// middleware in the pipeline) and <see cref="RateLimitMiddleware"/> (the second stage).
+    /// Without this cache the second stage would re-buffer and re-parse the same JSON
+    /// payload — a measurable cost on the hot path because every inbound activity flows
+    /// through both stages. The cache key is a private <see cref="object"/> instance, not
+    /// a string literal, to guarantee no accidental collisions with caller-defined entries
+    /// in <see cref="HttpContext.Items"/>.
+    /// </remarks>
+    public static async Task<string?> GetOrExtractFromBodyAsync(
+        HttpContext context,
+        CancellationToken cancellationToken)
+    {
+        if (context is null) throw new ArgumentNullException(nameof(context));
+
+        if (context.Items.TryGetValue(CacheKey, out var cached))
+        {
+            // Cache hit — we have already attempted extraction once on this request.
+            // ReferenceEquals against the sentinel disambiguates "extracted to null" from
+            // "missing entry" so even cached null results short-circuit re-parsing.
+            return ReferenceEquals(cached, NoTenantSentinel) ? null : (string?)cached;
+        }
+
+        var extracted = await TryExtractFromBodyAsync(context, cancellationToken).ConfigureAwait(false);
+        context.Items[CacheKey] = extracted is null ? NoTenantSentinel : (object)extracted;
+        return extracted;
     }
 }

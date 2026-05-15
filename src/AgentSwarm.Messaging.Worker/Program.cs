@@ -1,13 +1,16 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams;
 using AgentSwarm.Messaging.Teams.Controllers;
 using AgentSwarm.Messaging.Teams.Middleware;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Connector.Authentication;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
@@ -150,8 +153,24 @@ app.UseMiddleware<TenantValidationMiddleware>();
 app.UseMiddleware<RateLimitMiddleware>();
 
 app.MapControllers();
-app.MapHealthChecks("/health");
-app.MapHealthChecks("/ready");
+
+// Health/Ready endpoints write a deterministic plain-text body so the Stage 2.1 acceptance
+// scenario "GET /health returns HTTP 200 with status `Healthy`" is intentional rather than
+// dependent on framework default behavior. Body format: "<Status>" (e.g., "Healthy") +
+// newline.
+var healthOptions = new HealthCheckOptions
+{
+    ResponseWriter = static async (ctx, report) =>
+    {
+        ctx.Response.ContentType = "text/plain; charset=utf-8";
+        var status = report.Status.ToString();
+        await ctx.Response
+            .WriteAsync(string.Format(CultureInfo.InvariantCulture, "{0}\n", status))
+            .ConfigureAwait(false);
+    },
+};
+app.MapHealthChecks("/health", healthOptions);
+app.MapHealthChecks("/ready", healthOptions);
 
 app.Run();
 
