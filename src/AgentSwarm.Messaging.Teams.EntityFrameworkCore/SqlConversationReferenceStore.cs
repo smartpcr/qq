@@ -32,6 +32,21 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// </remarks>
 public sealed class SqlConversationReferenceStore : IConversationReferenceStore, IConversationReferenceRouter
 {
+    /// <summary>
+    /// Maximum attempts for the read-then-write upsert in <see cref="SaveOrUpdateAsync"/>.
+    /// Bounded retry guards against the inevitable insert-vs-insert race between two
+    /// concurrent requests carrying the same natural key (e.g. a Teams install-activity
+    /// burst, plausible at the FR-007 1000+ concurrent-user scale): both transactions
+    /// observe <c>existing == null</c>, both attempt to insert, and the loser hits the
+    /// filtered unique index on <c>(AadObjectId, TenantId)</c> or <c>(ChannelId, TenantId)</c>.
+    /// On retry the runner-up sees the now-committed row and takes the update path. Three
+    /// attempts is sufficient because every retry strictly converges (an insert that lost
+    /// the race produces an existing row visible to the next read), so two losers in a row
+    /// against the same natural key would require a third concurrent inserter — an
+    /// impractical contention pattern for any single Teams conversation reference.
+    /// </summary>
+    private const int MaxSaveAttempts = 3;
+
     private readonly IDbContextFactory<TeamsConversationReferenceDbContext> _contextFactory;
     private readonly TimeProvider _timeProvider;
 
@@ -47,6 +62,17 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Implemented as a bounded retry loop (<see cref="MaxSaveAttempts"/>) around the
+    /// classic read-then-write upsert. Without the loop, two concurrent <c>SaveOrUpdateAsync</c>
+    /// calls for the same natural key — common during Teams bot-install bursts and required
+    /// to be safe by FR-007 (1000+ concurrent users) — could both observe <c>existing == null</c>
+    /// and both attempt to insert; the loser would surface a <see cref="DbUpdateException"/>
+    /// from the filtered unique index. The retry catches that single class of conflict (verified
+    /// via <see cref="IsUniqueConstraintViolation"/>) and re-runs against a fresh context,
+    /// where the loser will now observe the winner's row and take the update branch. Failures
+    /// that are not unique-constraint violations propagate immediately on the first attempt.
+    /// </remarks>
     public async Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(reference);
@@ -81,77 +107,103 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
                 nameof(reference));
         }
 
-        await using var context = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
-
-        var now = _timeProvider.GetUtcNow();
-        ConversationReferenceEntity? existing;
-
-        if (hasAad)
+        for (var attempt = 1; ; attempt++)
         {
-            existing = await context.ConversationReferences
-                .FirstOrDefaultAsync(
-                    e => e.AadObjectId == reference.AadObjectId && e.TenantId == reference.TenantId,
-                    ct)
-                .ConfigureAwait(false);
-        }
-        else
-        {
-            existing = await context.ConversationReferences
-                .FirstOrDefaultAsync(
-                    e => e.ChannelId == reference.ChannelId && e.TenantId == reference.TenantId,
-                    ct)
-                .ConfigureAwait(false);
-        }
+            await using var context = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
 
-        if (existing is null)
-        {
-            var entity = new ConversationReferenceEntity
+            var now = _timeProvider.GetUtcNow();
+            ConversationReferenceEntity? existing;
+
+            if (hasAad)
             {
-                Id = string.IsNullOrEmpty(reference.Id) ? Guid.NewGuid().ToString("D") : reference.Id,
-                TenantId = reference.TenantId,
-                AadObjectId = reference.AadObjectId,
-                InternalUserId = reference.InternalUserId,
-                ChannelId = reference.ChannelId,
-                TeamId = reference.TeamId,
-                ServiceUrl = reference.ServiceUrl,
-                ConversationId = reference.ConversationId,
-                BotId = reference.BotId,
-                ConversationJson = reference.ReferenceJson,
-                IsActive = true,
-                DeactivatedAt = null,
-                DeactivationReason = null,
-                CreatedAt = reference.CreatedAt == default ? now : reference.CreatedAt,
-                UpdatedAt = now,
-            };
-
-            context.ConversationReferences.Add(entity);
-        }
-        else
-        {
-            existing.AadObjectId = reference.AadObjectId ?? existing.AadObjectId;
-            // Preserve a previously-resolved InternalUserId when the inbound reference does
-            // not yet carry one — IIdentityResolver may have populated it on a prior message
-            // and the resolver is asynchronous (subsequent messages may arrive before the
-            // resolver writes back). Letting a fresh save clobber an existing internal ID
-            // with null would silently break proactive routing.
-            if (!string.IsNullOrEmpty(reference.InternalUserId))
+                existing = await context.ConversationReferences
+                    .FirstOrDefaultAsync(
+                        e => e.AadObjectId == reference.AadObjectId && e.TenantId == reference.TenantId,
+                        ct)
+                    .ConfigureAwait(false);
+            }
+            else
             {
-                existing.InternalUserId = reference.InternalUserId;
+                existing = await context.ConversationReferences
+                    .FirstOrDefaultAsync(
+                        e => e.ChannelId == reference.ChannelId && e.TenantId == reference.TenantId,
+                        ct)
+                    .ConfigureAwait(false);
             }
 
-            existing.ChannelId = reference.ChannelId ?? existing.ChannelId;
-            existing.TeamId = reference.TeamId ?? existing.TeamId;
-            existing.ServiceUrl = reference.ServiceUrl;
-            existing.ConversationId = reference.ConversationId;
-            existing.BotId = reference.BotId;
-            existing.ConversationJson = reference.ReferenceJson;
-            existing.IsActive = true;
-            existing.DeactivatedAt = null;
-            existing.DeactivationReason = null;
-            existing.UpdatedAt = now;
-        }
+            // Whether this iteration's SaveChangesAsync issues an INSERT or an UPDATE
+            // determines which DbUpdateException failures are retry-eligible: only an
+            // INSERT can collide with the filtered unique indexes via a concurrent
+            // peer; an UPDATE that violates the unique constraint indicates the caller
+            // is intentionally moving a row onto a duplicate key, which must surface
+            // as an error rather than silently retry.
+            bool isInsert;
 
-        await context.SaveChangesAsync(ct).ConfigureAwait(false);
+            if (existing is null)
+            {
+                var entity = new ConversationReferenceEntity
+                {
+                    Id = string.IsNullOrEmpty(reference.Id) ? Guid.NewGuid().ToString("D") : reference.Id,
+                    TenantId = reference.TenantId,
+                    AadObjectId = reference.AadObjectId,
+                    InternalUserId = reference.InternalUserId,
+                    ChannelId = reference.ChannelId,
+                    TeamId = reference.TeamId,
+                    ServiceUrl = reference.ServiceUrl,
+                    ConversationId = reference.ConversationId,
+                    BotId = reference.BotId,
+                    ConversationJson = reference.ReferenceJson,
+                    IsActive = true,
+                    DeactivatedAt = null,
+                    DeactivationReason = null,
+                    CreatedAt = reference.CreatedAt == default ? now : reference.CreatedAt,
+                    UpdatedAt = now,
+                };
+
+                context.ConversationReferences.Add(entity);
+                isInsert = true;
+            }
+            else
+            {
+                existing.AadObjectId = reference.AadObjectId ?? existing.AadObjectId;
+                // Preserve a previously-resolved InternalUserId when the inbound reference does
+                // not yet carry one — IIdentityResolver may have populated it on a prior message
+                // and the resolver is asynchronous (subsequent messages may arrive before the
+                // resolver writes back). Letting a fresh save clobber an existing internal ID
+                // with null would silently break proactive routing.
+                if (!string.IsNullOrEmpty(reference.InternalUserId))
+                {
+                    existing.InternalUserId = reference.InternalUserId;
+                }
+
+                existing.ChannelId = reference.ChannelId ?? existing.ChannelId;
+                existing.TeamId = reference.TeamId ?? existing.TeamId;
+                existing.ServiceUrl = reference.ServiceUrl;
+                existing.ConversationId = reference.ConversationId;
+                existing.BotId = reference.BotId;
+                existing.ConversationJson = reference.ReferenceJson;
+                existing.IsActive = true;
+                existing.DeactivatedAt = null;
+                existing.DeactivationReason = null;
+                existing.UpdatedAt = now;
+                isInsert = false;
+            }
+
+            try
+            {
+                await context.SaveChangesAsync(ct).ConfigureAwait(false);
+                return;
+            }
+            catch (DbUpdateException ex)
+                when (isInsert && attempt < MaxSaveAttempts && IsUniqueConstraintViolation(ex))
+            {
+                // A concurrent SaveOrUpdateAsync for the same natural key won the race
+                // against the filtered unique index. The next iteration disposes this
+                // context, opens a fresh one, re-reads (which will now find the winner's
+                // committed row), and falls into the update branch — so the call still
+                // honours its upsert contract without surfacing the transient conflict.
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -390,6 +442,59 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
             .ConfigureAwait(false);
 
         return entity is null ? null : Map(entity);
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when the supplied <see cref="DbUpdateException"/>
+    /// chain originates from a unique-constraint violation surfaced by the underlying
+    /// database provider.
+    /// </summary>
+    /// <remarks>
+    /// Detection is provider-agnostic by design — the assembly intentionally does not
+    /// take a hard dependency on <c>Microsoft.Data.SqlClient</c> or
+    /// <c>Microsoft.Data.Sqlite</c> so the same store works against the SQL Server
+    /// provider in production (per <c>architecture.md</c> §9.2) and the SQLite provider
+    /// used by the test fixtures. Instead the inner-exception chain is inspected by
+    /// type name and message text:
+    /// <list type="bullet">
+    /// <item><description>SQL Server (<c>Microsoft.Data.SqlClient.SqlException</c>) raises error
+    /// numbers 2601 / 2627 with text containing &quot;UNIQUE&quot; or &quot;duplicate key&quot;.</description></item>
+    /// <item><description>SQLite (<c>Microsoft.Data.Sqlite.SqliteException</c>) raises
+    /// SQLITE_CONSTRAINT_UNIQUE (extended code 2067) with text &quot;UNIQUE constraint failed&quot;.</description></item>
+    /// </list>
+    /// A generic fallback covers other relational providers whose driver exception text
+    /// includes both &quot;duplicate&quot; and &quot;UNIQUE&quot;. When no marker is found the
+    /// helper returns <see langword="false"/>, which causes the surrounding catch filter
+    /// to re-throw — uncertain failures must surface as errors rather than be silently retried.
+    /// </remarks>
+    private static bool IsUniqueConstraintViolation(DbUpdateException ex)
+    {
+        for (var inner = ex.InnerException; inner is not null; inner = inner.InnerException)
+        {
+            var typeName = inner.GetType().FullName ?? string.Empty;
+            var message = inner.Message ?? string.Empty;
+
+            if (typeName.Contains("SqlException", StringComparison.Ordinal)
+                && (message.Contains("UNIQUE", StringComparison.OrdinalIgnoreCase)
+                    || message.Contains("duplicate key", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            if (typeName.Contains("SqliteException", StringComparison.Ordinal)
+                && message.Contains("UNIQUE constraint failed", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (message.Contains("duplicate", StringComparison.OrdinalIgnoreCase)
+                && message.Contains("UNIQUE", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static TeamsConversationReference Map(ConversationReferenceEntity e) => new()
