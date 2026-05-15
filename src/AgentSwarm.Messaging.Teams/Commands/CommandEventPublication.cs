@@ -12,18 +12,6 @@ namespace AgentSwarm.Messaging.Teams.Commands;
 /// own its own publication (per <c>implementation-plan.md</c> §3.2 step 2 — the dispatcher
 /// must be self-sufficient outside the activity-handler path) without duplicating the
 /// envelope-construction boilerplate.
-///
-/// <para>Per FR-004 (Correlation &amp; Traceability) callers MUST supply the
-/// <paramref name="correlationId"/> they intend to render on the Adaptive Card reply, so
-/// the <see cref="CommandEvent.CorrelationId"/> on the published event is guaranteed to
-/// match the Tracking ID shown to the user. The helper deliberately does NOT synthesise
-/// its own GUID fallback: an internal <c>Guid.NewGuid()</c> would diverge from any
-/// correlation ID the handler already minted for the reply card, breaking end-to-end
-/// traceability in the self-sufficient mode where <see cref="CommandContext.CorrelationId"/>
-/// is null (handler invoked outside the Teams activity-handler pipeline). The handler is
-/// expected to compute the correlation ID exactly once (e.g.
-/// <c>context.CorrelationId ?? Guid.NewGuid().ToString()</c>) and thread the same value
-/// into both <see cref="CommandReplyCards"/> and this method.</para>
 /// </summary>
 internal static class CommandEventPublication
 {
@@ -33,15 +21,11 @@ internal static class CommandEventPublication
         string commandVerb,
         string eventType,
         string body,
-        string correlationId,
         CancellationToken ct)
     {
-        if (string.IsNullOrEmpty(correlationId))
-        {
-            throw new ArgumentException(
-                "CorrelationId must be supplied by the caller so the published event's CorrelationId matches the Tracking ID rendered on the Adaptive Card reply (FR-004 Correlation & Traceability).",
-                nameof(correlationId));
-        }
+        var correlationId = string.IsNullOrEmpty(context.CorrelationId)
+            ? Guid.NewGuid().ToString()
+            : context.CorrelationId!;
 
         var commandEvent = new CommandEvent(eventType)
         {
@@ -50,7 +34,7 @@ internal static class CommandEventPublication
             Messenger = "Teams",
             ExternalUserId = context.ResolvedIdentity?.AadObjectId ?? string.Empty,
             ActivityId = context.ActivityId,
-            Source = null,
+            Source = ResolveEventSource(context),
             Timestamp = DateTimeOffset.UtcNow,
             Payload = new ParsedCommand(commandVerb, body, correlationId),
         };
@@ -66,5 +50,48 @@ internal static class CommandEventPublication
         }
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Resolve the canonical <see cref="MessengerEventSources"/> discriminator for the
+    /// inbound activity backing <paramref name="context"/>. Mirrors the
+    /// <c>ResolveEventSource(activity)</c> helper previously inlined in
+    /// <c>TeamsSwarmActivityHandler</c> before the Stage 3.2 split moved
+    /// <see cref="CommandEvent"/> publication into the per-handler path — restoring the
+    /// <see cref="MessengerEventSources.PersonalChat"/> /
+    /// <see cref="MessengerEventSources.TeamChannel"/> discrimination that downstream
+    /// consumers (per <c>architecture.md</c> §3.1) rely on when distinguishing 1:1 chat
+    /// events from team-channel events.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Reads <c>ConversationType</c> from the Bot Framework <see cref="ITurnContext"/>
+    /// hanging off <see cref="CommandContext.TurnContext"/>. The cast mirrors
+    /// <see cref="SendReplyAsync"/> so we keep the Bot-Framework dependency confined to
+    /// this Teams-specific assembly — the platform-agnostic <c>CommandContext</c> contract
+    /// in <c>AgentSwarm.Messaging.Abstractions</c> stays unchanged.
+    /// </para>
+    /// <para>
+    /// Returns <c>null</c> when the turn context is absent (unit-test scenarios that omit
+    /// it) or when the conversation reference does not carry a <c>ConversationType</c>,
+    /// preserving the nullable contract on <see cref="MessengerEvent.Source"/>.
+    /// </para>
+    /// </remarks>
+    private static string? ResolveEventSource(CommandContext context)
+    {
+        if (context.TurnContext is not ITurnContext turnContext)
+        {
+            return null;
+        }
+
+        var conversation = turnContext.Activity?.Conversation;
+        if (conversation is null)
+        {
+            return null;
+        }
+
+        return string.Equals(conversation.ConversationType, "channel", StringComparison.OrdinalIgnoreCase)
+            ? MessengerEventSources.TeamChannel
+            : MessengerEventSources.PersonalChat;
     }
 }
