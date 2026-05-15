@@ -428,6 +428,38 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// <b>Known tenant-isolation gap (accepted):</b> this is the only query on the store
+    /// that does not accept a <c>tenantId</c> parameter, so the lookup is not tenant-scoped
+    /// like every other read (which honour the FR-006 multi-tenant isolation requirement).
+    /// The gap is intentional and structural, not an oversight: the sole consumer is
+    /// <see cref="IConversationReferenceRouter.RouteAsync"/> invoked from
+    /// <c>TeamsMessengerConnector.SendMessageAsync</c>, whose only correlation handle is
+    /// <c>MessengerMessage.ConversationId</c>. <c>MessengerMessage</c> deliberately carries
+    /// no <c>TenantId</c> field today (it is messenger-platform-agnostic), so the caller
+    /// has no tenant context to pass through. Adding a required <c>tenantId</c> parameter
+    /// here would force every messenger to teach its message contract about Entra tenants,
+    /// which is out of scope for the proactive-messaging stage.
+    /// </para>
+    /// <para>
+    /// <b>Why this is safe in practice:</b> Bot Framework <c>ConversationId</c> values are
+    /// generated server-side per (tenant, conversation) pair and are practically unique
+    /// across tenants for the lifetime of a conversation; the filtered <c>IsActive = 1</c>
+    /// predicate further narrows the candidate set, and the <c>(AadObjectId, TenantId)</c>
+    /// and <c>(ChannelId, TenantId)</c> unique indexes guard upstream writes. A collision
+    /// would require two tenants' Bot Framework conversations to coincidentally share an
+    /// opaque ID, which the platform does not produce.
+    /// </para>
+    /// <para>
+    /// <b>Forward path:</b> when <c>MessengerMessage</c> grows a <c>TenantId</c> (or an
+    /// equivalent platform-context field — see the doc on
+    /// <c>IConversationReferenceRouter</c>), tighten this method to accept and apply that
+    /// tenant filter so the defense-in-depth posture matches the rest of the store. Until
+    /// then the gap is documented here so future readers do not mistake it for a missed
+    /// security check.
+    /// </para>
+    /// </remarks>
     public async Task<TeamsConversationReference?> GetByConversationIdAsync(string conversationId, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(conversationId))
