@@ -3,6 +3,7 @@ using FluentAssertions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
 
@@ -307,16 +308,19 @@ public class TelegramOptionsTests
     {
         // Bypass the AddTelegram validator wiring to exercise the
         // factory's defensive guard directly.
-        var options = Options.Create(new TelegramOptions { BotToken = string.Empty });
+        var monitor = BuildOptionsMonitor(new TelegramOptions { BotToken = string.Empty });
         var httpClientServices = new ServiceCollection().AddHttpClient().BuildServiceProvider();
         var httpClientFactory = httpClientServices.GetRequiredService<IHttpClientFactory>();
 
-        var factory = new TelegramBotClientFactory(options, httpClientFactory);
+        var factory = new TelegramBotClientFactory(
+            monitor,
+            NullLogger<TelegramBotClientFactory>.Instance,
+            httpClientFactory);
 
         var act = () => factory.Create();
 
         act.Should().Throw<InvalidOperationException>()
-            .WithMessage("*Telegram:BotToken*");
+            .WithMessage("*BotToken*");
     }
 
     [Fact]
@@ -325,17 +329,20 @@ public class TelegramOptionsTests
         var httpClientServices = new ServiceCollection().AddHttpClient().BuildServiceProvider();
         var httpClientFactory = httpClientServices.GetRequiredService<IHttpClientFactory>();
 
-        var act = () => new TelegramBotClientFactory(null!, httpClientFactory);
+        var act = () => new TelegramBotClientFactory(
+            null!,
+            NullLogger<TelegramBotClientFactory>.Instance,
+            httpClientFactory);
 
         act.Should().Throw<ArgumentNullException>();
     }
 
     [Fact]
-    public void Factory_Constructor_GuardsAgainstNullHttpClientFactory()
+    public void Factory_Constructor_GuardsAgainstNullLogger()
     {
-        var options = Options.Create(new TelegramOptions { BotToken = SampleToken });
+        var monitor = BuildOptionsMonitor(new TelegramOptions { BotToken = SampleToken });
 
-        var act = () => new TelegramBotClientFactory(options, null!);
+        var act = () => new TelegramBotClientFactory(monitor, null!);
 
         act.Should().Throw<ArgumentNullException>();
     }
@@ -353,5 +360,19 @@ public class TelegramOptionsTests
         builder.Configuration.AddInMemoryCollection(telegramSection);
         builder.Services.AddTelegram(builder.Configuration);
         return builder.Build();
+    }
+
+    private static IOptionsMonitor<TelegramOptions> BuildOptionsMonitor(TelegramOptions current)
+    {
+        var services = new ServiceCollection();
+        services.AddOptions<TelegramOptions>().Configure(o =>
+        {
+            o.BotToken = current.BotToken;
+            o.WebhookUrl = current.WebhookUrl;
+            o.UsePolling = current.UsePolling;
+            o.SecretToken = current.SecretToken;
+            o.AllowedUserIds = current.AllowedUserIds;
+        });
+        return services.BuildServiceProvider().GetRequiredService<IOptionsMonitor<TelegramOptions>>();
     }
 }

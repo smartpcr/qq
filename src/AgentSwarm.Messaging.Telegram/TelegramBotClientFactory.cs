@@ -26,6 +26,14 @@ public interface ITelegramBotClientFactory
 /// <inheritdoc cref="ITelegramBotClientFactory"/>
 public sealed class TelegramBotClientFactory : ITelegramBotClientFactory
 {
+    /// <summary>
+    /// Named <see cref="HttpClient"/> registration key used by
+    /// <see cref="TelegramServiceCollectionExtensions.AddTelegram"/> and
+    /// resolved by <see cref="Create"/>. Centralised here so the registration
+    /// site and the consumer cannot drift.
+    /// </summary>
+    public const string HttpClientName = "Telegram.Bot";
+
     private readonly IOptionsMonitor<TelegramOptions> _options;
     private readonly IHttpClientFactory? _httpClientFactory;
     private readonly ILogger<TelegramBotClientFactory> _logger;
@@ -54,7 +62,7 @@ public sealed class TelegramBotClientFactory : ITelegramBotClientFactory
         // IMPORTANT: log the redacted options view only — never the raw token.
         _logger.LogInformation("Creating Telegram bot client. Options: {Options}", opts);
 
-        HttpClient? httpClient = _httpClientFactory?.CreateClient("Telegram.Bot");
+        HttpClient? httpClient = _httpClientFactory?.CreateClient(HttpClientName);
         return new TelegramBotClient(opts.BotToken, httpClient);
     }
 }
