@@ -89,8 +89,16 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         "<[^>]+>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    // Match either:
+    //   * the void-element <br> in any of its real-world forms (<br>, <br/>, <br />,
+    //     including stray inner whitespace and the technically-invalid </br>); OR
+    //   * the closing form of the other block-level tags (</p>, </div>, </li>, </tr>,
+    //     </h1>..</h6>).
+    // Teams' native HTML body emits self-closing <br> for soft line breaks; matching only
+    // </br> (as the previous pattern did) silently dropped those breaks via HtmlTagRegex
+    // and merged adjacent lines (e.g. "Hello<br>World" -> "HelloWorld").
     private static readonly Regex BlockBreakRegex = new(
-        @"</\s*(p|div|br|li|tr|h[1-6])\s*/?>",
+        @"<\s*/?\s*br\s*/?>|</\s*(?:p|div|li|tr|h[1-6])\s*/?>",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private readonly ICommandDispatcher _commandDispatcher;
@@ -384,9 +392,11 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
 
     /// <summary>
     /// Strip HTML tags and decode entities from a Teams-native message body. Block-level
-    /// closing tags (<c>p</c>, <c>div</c>, <c>br</c>, <c>li</c>, <c>tr</c>, <c>h1</c>..<c>h6</c>)
-    /// are first replaced with a newline so multi-paragraph content stays readable in
-    /// downstream consumers (audit log, agent prompt).
+    /// closing tags (<c>p</c>, <c>div</c>, <c>li</c>, <c>tr</c>, <c>h1</c>..<c>h6</c>)
+    /// and every form of the void <c>br</c> element (<c>&lt;br&gt;</c>,
+    /// <c>&lt;br/&gt;</c>, <c>&lt;br /&gt;</c>, plus the technically-invalid
+    /// <c>&lt;/br&gt;</c>) are first replaced with a newline so multi-paragraph content
+    /// stays readable in downstream consumers (audit log, agent prompt).
     /// </summary>
     internal static string HtmlToPlainText(string html)
     {
