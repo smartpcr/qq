@@ -29,8 +29,7 @@ orchestrator and agent runtime are upstream consumers.
 > directory, no `.csproj` files, and no implementation code. All project and
 > namespace references in this document (e.g., `AgentSwarm.Messaging.Slack`,
 > `AgentSwarm.Messaging.Core`) describe the **target solution structure** to be
-> created during implementation. See the companion `implementation-plan.md` for
-> the build-out sequence.
+> created during implementation.
 
 **Library choice.** SlackNet is the preferred C# client library (see story
 description). Fallback: Slack.NetStandard or direct `HttpClient` calls against
@@ -79,7 +78,7 @@ Each transport converts Slack-native payloads into a normalized
 | Attribute | Value |
 |---|---|
 | Transport | HTTP POST endpoints (ASP.NET Core) |
-| Responsibility | Handles Events API callbacks (including `app_mention` events), the `url_verification` challenge, slash commands, and interactive payloads. Validates request signature via `SlackSignatureValidator`. Immediately returns HTTP 200 to satisfy the 3-second ACK requirement, then enqueues the event envelope for async processing. For slash commands that require a modal (`review`, `escalate`), the receiver invokes `views.open` synchronously before responding, because the `trigger_id` expires within 3 seconds (see section 5.3). |
+| Responsibility | Handles Events API callbacks (including `app_mention` events), the `url_verification` challenge, slash commands, and interactive payloads. Validates request signature via `SlackSignatureValidator`. Immediately returns HTTP 200 to satisfy the 3-second ACK requirement, then enqueues the event envelope for async processing. For slash commands that require a modal (`review`, `escalate`), the receiver uses a **synchronous fast-path**: it validates signature, runs authorization and idempotency checks inline, then calls `views.open` via `SlackDirectApiClient` before returning the HTTP response, because the `trigger_id` expires within 3 seconds (see section 5.3). |
 
 Endpoint routes:
 
@@ -212,13 +211,21 @@ Lifecycle:
 
 | Attribute | Value |
 |---|---|
-| Responsibility | Sends messages to Slack via the Web API (`chat.postMessage`, `chat.update`, `views.open`, `views.update`). Reads from the durable outbound queue. Handles Slack rate limits (HTTP 429) with `Retry-After` backoff. Failed messages after max retries are moved to the dead-letter queue. |
+| Responsibility | Sends messages to Slack via the Web API (`chat.postMessage`, `chat.update`, `views.update`). Reads from the durable outbound queue. Handles Slack rate limits (HTTP 429) with `Retry-After` backoff. Failed messages after max retries are moved to the dead-letter queue. |
+
+> **Note on `views.open`.** Modal-opening calls (`views.open`) do NOT pass
+> through the durable outbound queue because they require a short-lived
+> `trigger_id` (expires in ~3 seconds). Instead, the modal fast-path uses
+> `SlackDirectApiClient` (section 2.15) to call `views.open` synchronously
+> during request processing. The dispatcher handles all other outbound calls
+> including `views.update` for modal modifications after initial open.
 
 Rate-limit strategy:
 
 - On HTTP 429, pause dispatch for the duration in `Retry-After` header.
 - Tier-aware: `chat.postMessage` is Tier 2 (roughly 1 req/s per channel);
-  `views.open` is Tier 4.
+  `views.update` is Tier 4. (`views.open` is handled by `SlackDirectApiClient`
+  using the same shared rate-limiter state.)
 - Burst capacity is managed via a token-bucket rate limiter per API method
   tier.
 
@@ -233,6 +240,12 @@ Rate-limit strategy:
 | Attribute | Value |
 |---|---|
 | Responsibility | Persists every inbound and outbound Slack exchange as a `SlackAuditEntry`. Captures both successful operations and rejected/unauthorized requests. Queryable by `correlation_id`, `task_id`, `agent_id`, `team_id`, `channel_id`, `user_id`, and time range. |
+
+### 2.15 SlackDirectApiClient
+
+| Attribute | Value |
+|---|---|
+| Responsibility | Thin wrapper around SlackNet for Slack Web API calls that must execute synchronously within the HTTP request lifecycle (i.e., cannot be deferred to the durable outbound queue). Used exclusively for `views.open` in the modal fast-path. Applies the same token-bucket rate limiter as `SlackOutboundDispatcher` (shared rate-limit state) and logs every call to `SlackAuditLogger`. Does NOT use the durable outbound queue or retry engine -- if the call fails, the slash command returns an ephemeral error message to the user. |
 
 ---
 
@@ -500,12 +513,15 @@ SlackConnector
   |     |     \-- SlackMembershipResolver
   |     |-- ISlackIdempotencyGuard
   |     |-- SlackCommandHandler
+  |     |     \-- SlackDirectApiClient (modal fast-path: views.open)
   |     |-- SlackAppMentionHandler
   |     \-- SlackInteractionHandler
   |-- SlackOutboundDispatcher
   |     |-- ISlackThreadManager
   |     |-- ISlackMessageRenderer
-  |     \-- Rate limiter (token-bucket per API tier)
+  |     \-- Rate limiter (token-bucket per API tier, shared with SlackDirectApiClient)
+  |-- SlackDirectApiClient
+  |     \-- ISlackAuditLogger
   \-- ISlackAuditLogger
 ```
 
@@ -625,34 +641,48 @@ Steps:
 > **Trigger-ID constraint.** Slack's `trigger_id` (included in every slash
 > command and interactive payload) expires approximately 3 seconds after
 > issuance. Because `views.open` requires a valid `trigger_id`, modal-opening
-> commands (`review`, `escalate`) follow a **synchronous fast-path**: the
-> `SlackEventsApiReceiver` validates the signature, calls `views.open` with the
-> `trigger_id` immediately (before returning the HTTP response), and only then
-> enqueues the remaining work for async processing. This differs from the
-> standard flow where the receiver ACKs first and processes later.
+> commands (`review`, `escalate`) follow a **synchronous fast-path** that
+> performs signature validation, authorization, and idempotency checks inline
+> (not deferred to async processing), then calls `views.open` via
+> `SlackDirectApiClient` before returning the HTTP response.
 
 Steps:
 
 1. Human types `/agent review TASK-42`.
-2. `SlackEventsApiReceiver` validates the request signature.
-3. The receiver detects that sub-command `review` requires a modal. It
-   synchronously calls `SlackCommandHandler` which invokes `views.open` with
-   the `trigger_id` from the slash-command payload, passing a modal rendered by
-   `SlackMessageRenderer.RenderReviewModal`. This must complete within the
-   3-second `trigger_id` window. The modal contains:
+2. `SlackEventsApiReceiver` validates the request signature via
+   `SlackSignatureValidator`. If invalid, HTTP 401 is returned and an audit
+   entry with `outcome = rejected_signature` is logged. Processing stops.
+3. The receiver runs `SlackAuthorizationFilter` synchronously: workspace
+   (`team_id`), channel (`channel_id`), and user-group membership are checked
+   against `SlackWorkspaceConfig`. If any layer fails, an ephemeral error
+   message is returned to the user and an audit entry with `outcome =
+   rejected_auth` is logged. Processing stops.
+4. The receiver runs `SlackIdempotencyGuard.TryAcquireAsync` with key
+   `cmd:{team_id}:{user_id}:{command}:{trigger_id}`. If this is a duplicate,
+   the request is silently ACKed and an audit entry with `outcome = duplicate`
+   is logged. Processing stops.
+5. The receiver detects that sub-command `review` requires a modal. It
+   synchronously calls `SlackCommandHandler`, which invokes `views.open` via
+   `SlackDirectApiClient` (not the durable outbound queue) with the
+   `trigger_id` from the slash-command payload, passing a modal rendered by
+   `SlackMessageRenderer.RenderReviewModal`. The `SlackDirectApiClient` logs
+   an audit entry with `request_type = modal_open`. The modal contains:
    - Read-only section showing task summary (fetched from orchestrator cache).
    - Multi-line text input for review comments.
    - Select menu for verdict (approve / request-changes / reject).
    - Submit and cancel buttons.
-4. The receiver returns HTTP 200 to Slack (ACK).
-5. Human fills in the modal and clicks Submit.
-6. Slack sends a `view_submission` payload to `/api/slack/interactions`.
-7. `SlackInteractionHandler` extracts form values, builds a
+6. The receiver returns HTTP 200 to Slack (ACK).
+7. Human fills in the modal and clicks Submit.
+8. Slack sends a `view_submission` payload to `/api/slack/interactions`.
+9. `SlackInteractionHandler` extracts form values, builds a
    `HumanDecisionEvent` with `ActionValue` = selected verdict and `Comment` =
    review text.
-8. Event is published; the originating thread receives a confirmation reply.
+10. Event is published; the originating thread receives a confirmation reply.
 
 The same fast-path applies to `/agent escalate`, which also opens a modal.
+If `views.open` fails (e.g., rate limit or network error), the command handler
+returns an ephemeral error to the user; the call is not retried via the
+outbound queue because the `trigger_id` is already expired.
 
 ### 5.4 Duplicate Event Handling (Idempotency)
 
