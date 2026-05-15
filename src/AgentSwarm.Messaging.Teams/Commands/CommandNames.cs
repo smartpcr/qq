@@ -15,9 +15,12 @@ namespace AgentSwarm.Messaging.Teams.Commands;
 /// <c>"agent ask"</c> handler.
 /// </para>
 /// <para>
-/// The <see cref="All"/> list is ordered longest-first to support the dispatcher's
-/// longest-prefix selection — <c>"agent ask"</c> wins over a hypothetical short alias like
-/// <c>"ask"</c>.
+/// The <see cref="All"/> list is provided as a convenience for consumers that need the
+/// canonical command vocabulary in priority order (e.g. help-card builders, diagnostic
+/// listings). It is <b>not</b> consumed by <see cref="CommandDispatcher"/> — the dispatcher
+/// derives its own ordering from the <see cref="ICommandHandler.CommandName"/> values of
+/// the DI-registered handlers, so unregistered constants in this file have no effect on
+/// runtime dispatch.
 /// </para>
 /// </remarks>
 public static class CommandNames
@@ -44,18 +47,23 @@ public static class CommandNames
     public const string Resume = "resume";
 
     /// <summary>
-    /// Every canonical command name in longest-first order. The dispatcher iterates this
-    /// list when performing longest-prefix matching so multi-word verbs ("agent ask",
-    /// "agent status") win over any single-word alias.
+    /// Every canonical command name, ordered by descending length with case-insensitive
+    /// ordinal alphabetical tiebreaks. This mirrors the priority ordering that
+    /// <see cref="CommandDispatcher"/> applies internally to its registered handler set,
+    /// so consumers iterating this list see multi-word verbs ("agent status", "agent ask")
+    /// before single-word ones. The dispatcher does <b>not</b> iterate this list — it
+    /// builds its own ordering from the DI-registered <see cref="ICommandHandler"/>
+    /// instances — but this list is the canonical reference for any non-dispatcher consumer
+    /// (help cards, docs, parsers) that needs the same priority order.
     /// </summary>
     public static IReadOnlyList<string> All { get; } = new[]
     {
-        AgentAsk,
         AgentStatus,
+        AgentAsk,
+        Escalate,
         Approve,
         Reject,
-        Escalate,
-        Pause,
         Resume,
+        Pause,
     };
 }
