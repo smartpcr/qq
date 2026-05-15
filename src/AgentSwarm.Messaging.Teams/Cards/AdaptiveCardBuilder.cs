@@ -277,6 +277,10 @@ public sealed class AdaptiveCardBuilder : IAdaptiveCardRenderer
 
     /// <inheritdoc />
     public Attachment RenderDecisionConfirmationCard(HumanDecisionEvent decision)
+        => RenderDecisionConfirmationCard(decision, actorDisplayName: null);
+
+    /// <inheritdoc />
+    public Attachment RenderDecisionConfirmationCard(HumanDecisionEvent decision, string? actorDisplayName)
     {
         if (decision is null)
         {
@@ -284,13 +288,21 @@ public sealed class AdaptiveCardBuilder : IAdaptiveCardRenderer
         }
 
         var card = new AdaptiveCard(SchemaVersion);
-        AddPlainHeader(card, $"Decision recorded — {decision.ActionValue}");
+        var actorLabel = string.IsNullOrWhiteSpace(actorDisplayName)
+            ? decision.ExternalUserId
+            : actorDisplayName!;
+        // Header carries the action-attributed acknowledgement that the implementation-plan
+        // §3.3 acceptance scenario requires (e.g. "Approved by Alice"). The actor-display
+        // fallback to ExternalUserId keeps the contract working even when the inbound turn
+        // context did not carry a friendly name (e.g. test channels, missing From.Name).
+        var headline = $"{ActionVerbForActionValue(decision.ActionValue)} by {actorLabel}";
+        AddPlainHeader(card, headline);
 
         var facts = new List<(string Key, string Value)>
         {
             ("Question", decision.QuestionId),
             ("Action", decision.ActionValue),
-            ("Decided by", decision.ExternalUserId),
+            ("Decided by", actorLabel),
             ("Recorded at", FormatTimestamp(decision.ReceivedAt)),
         };
 
@@ -305,6 +317,79 @@ public sealed class AdaptiveCardBuilder : IAdaptiveCardRenderer
         // an existing approval card after decision: "the updated card no longer contains
         // action buttons"). No card.Actions are added.
         return ToAttachment(card);
+    }
+
+    /// <inheritdoc />
+    public Attachment RenderExpiredNoticeCard(string questionId)
+    {
+        if (string.IsNullOrWhiteSpace(questionId))
+        {
+            throw new ArgumentNullException(nameof(questionId));
+        }
+
+        var card = new AdaptiveCard(SchemaVersion);
+        AddPlainHeader(card, "Question expired");
+        card.Body.Add(BuildMetadataFactSet(new (string, string)[]
+        {
+            ("Question", questionId),
+            ("Status", "Expired"),
+            ("Recorded at", FormatTimestamp(DateTimeOffset.UtcNow)),
+        }));
+        card.Body.Add(new AdaptiveTextBlock
+        {
+            Text = "This question expired before a human response was recorded.",
+            Wrap = true,
+            IsSubtle = true,
+            Spacing = AdaptiveSpacing.Medium,
+        });
+        return ToAttachment(card);
+    }
+
+    /// <inheritdoc />
+    public Attachment RenderCancelledNoticeCard(string questionId)
+    {
+        if (string.IsNullOrWhiteSpace(questionId))
+        {
+            throw new ArgumentNullException(nameof(questionId));
+        }
+
+        var card = new AdaptiveCard(SchemaVersion);
+        AddPlainHeader(card, "Question cancelled");
+        card.Body.Add(BuildMetadataFactSet(new (string, string)[]
+        {
+            ("Question", questionId),
+            ("Status", "Cancelled"),
+            ("Recorded at", FormatTimestamp(DateTimeOffset.UtcNow)),
+        }));
+        card.Body.Add(new AdaptiveTextBlock
+        {
+            Text = "This question was cancelled before a human response was recorded.",
+            Wrap = true,
+            IsSubtle = true,
+            Spacing = AdaptiveSpacing.Medium,
+        });
+        return ToAttachment(card);
+    }
+
+    private static string ActionVerbForActionValue(string actionValue)
+    {
+        // Translate the lowercase machine-readable action value into a past-tense verb so
+        // the confirmation card header reads naturally in English. Unknown action values
+        // fall back to "Responded" so the card still renders coherently for custom
+        // action vocabularies.
+        return actionValue?.ToLowerInvariant() switch
+        {
+            "approve" => "Approved",
+            "reject" => "Rejected",
+            "acknowledge" => "Acknowledged",
+            "escalate" => "Escalated",
+            "defer" => "Deferred",
+            "pause" => "Paused",
+            "resume" => "Resumed",
+            null => "Responded",
+            "" => "Responded",
+            _ => char.ToUpperInvariant(actionValue[0]) + actionValue[1..],
+        };
     }
 
     private static void AddPlainHeader(AdaptiveCard card, string title)

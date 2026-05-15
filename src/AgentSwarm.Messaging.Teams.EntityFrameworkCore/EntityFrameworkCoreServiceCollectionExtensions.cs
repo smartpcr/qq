@@ -1,3 +1,4 @@
+using AgentSwarm.Messaging.Abstractions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -48,6 +49,59 @@ public static class EntityFrameworkCoreServiceCollectionExtensions
             sp => sp.GetRequiredService<SqlConversationReferenceStore>());
         services.TryAddSingleton<IConversationReferenceRouter>(
             sp => sp.GetRequiredService<SqlConversationReferenceStore>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Register the EF Core context factory for <see cref="TeamsLifecycleDbContext"/>
+    /// (shared by both Stage 3.3 stores) and the <see cref="SqlAgentQuestionStore"/>
+    /// singleton, exposed under <see cref="IAgentQuestionStore"/>.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent — the underlying <c>AddDbContextFactory</c> call is safe to invoke
+    /// twice with identical options, and the singleton registration uses
+    /// <see cref="ServiceCollectionDescriptorExtensions.TryAddSingleton(IServiceCollection, Type, Func{IServiceProvider, object})"/>
+    /// so an explicit pre-registration of <see cref="IAgentQuestionStore"/> is
+    /// preserved. The context factory is shared with
+    /// <see cref="AddSqlCardStateStore"/> so a host that calls both helpers gets a single
+    /// pooled-context factory rather than two competing ones.
+    /// </remarks>
+    /// <param name="services">DI container.</param>
+    /// <param name="optionsAction">EF context options (provider, connection string).</param>
+    /// <returns>The same <paramref name="services"/> for chaining.</returns>
+    public static IServiceCollection AddSqlAgentQuestionStore(
+        this IServiceCollection services,
+        Action<DbContextOptionsBuilder> optionsAction)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(optionsAction);
+
+        services.AddDbContextFactory<TeamsLifecycleDbContext>(optionsAction);
+        services.TryAddSingleton<SqlAgentQuestionStore>();
+        services.TryAddSingleton<IAgentQuestionStore>(
+            sp => sp.GetRequiredService<SqlAgentQuestionStore>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Register the EF Core context factory for <see cref="TeamsLifecycleDbContext"/>
+    /// (shared by both Stage 3.3 stores) and the <see cref="SqlCardStateStore"/>
+    /// singleton, exposed under <see cref="ICardStateStore"/>. Replaces the Stage 2.1
+    /// <c>NoOpCardStateStore</c> stub when the host wires this helper.
+    /// </summary>
+    public static IServiceCollection AddSqlCardStateStore(
+        this IServiceCollection services,
+        Action<DbContextOptionsBuilder> optionsAction)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(optionsAction);
+
+        services.AddDbContextFactory<TeamsLifecycleDbContext>(optionsAction);
+        services.TryAddSingleton<SqlCardStateStore>();
+        services.TryAddSingleton<ICardStateStore>(
+            sp => sp.GetRequiredService<SqlCardStateStore>());
 
         return services;
     }

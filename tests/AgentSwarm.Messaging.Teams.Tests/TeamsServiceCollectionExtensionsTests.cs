@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Extensions.DependencyInjection;
@@ -212,6 +213,37 @@ public sealed class TeamsServiceCollectionExtensionsTests
         var resolvedRouter = sp.GetRequiredService<IConversationReferenceRouter>();
         Assert.Same(explicitRouter, resolvedRouter);
         Assert.IsType<RecordingConversationReferenceRouter>(resolvedRouter);
+    }
+
+    /// <summary>
+    /// Stage 3.3 step 6 / iter-5 critique #1 — the lifecycle helper must register
+    /// every Stage 3.3 collaborator in a single call: <see cref="ITeamsCardManager"/>
+    /// (delegating to the same <see cref="TeamsMessengerConnector"/> singleton),
+    /// <see cref="ICardActionHandler"/>, and the <see cref="QuestionExpiryProcessor"/>
+    /// hosted service. This test pins the wiring shape so a regression that splits
+    /// the helper or drops a registration trips the suite.
+    /// </summary>
+    [Fact]
+    public void AddTeamsCardLifecycle_RegistersCardManager_Handler_AndExpiryHostedService()
+    {
+        var services = BuildServices();
+        services.AddSingleton<IAuditLogger, RecordingAuditLogger>();
+
+        services.AddTeamsCardLifecycle();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        // ITeamsCardManager resolves and is the same singleton as the connector.
+        var cardManager = sp.GetRequiredService<ITeamsCardManager>();
+        var connector = sp.GetRequiredService<TeamsMessengerConnector>();
+        Assert.Same(connector, cardManager);
+
+        // ICardActionHandler is the concrete CardActionHandler (replacing any NoOp stub).
+        var handler = sp.GetRequiredService<ICardActionHandler>();
+        Assert.IsType<CardActionHandler>(handler);
+
+        // QuestionExpiryProcessor is registered as IHostedService.
+        var hosted = sp.GetServices<Microsoft.Extensions.Hosting.IHostedService>();
+        Assert.Contains(hosted, h => h is AgentSwarm.Messaging.Teams.Lifecycle.QuestionExpiryProcessor);
     }
 
     private static ServiceCollection BuildServices()

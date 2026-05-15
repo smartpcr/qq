@@ -2,8 +2,10 @@ using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Extensions;
+using AgentSwarm.Messaging.Teams.Lifecycle;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 
 namespace AgentSwarm.Messaging.Teams;
 
@@ -205,6 +207,60 @@ public static class TeamsServiceCollectionExtensions
         services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, ResumeCommandHandler>());
 
         services.TryAddSingleton<ICommandDispatcher, CommandDispatcher>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Composes the Stage 3.3 card-lifecycle dependency graph in a single call: registers
+    /// <see cref="TeamsMessengerConnector"/> under <see cref="ITeamsCardManager"/>
+    /// (delegating to the existing singleton wired by
+    /// <see cref="AddTeamsMessengerConnector"/>), the concrete
+    /// <see cref="Cards.CardActionHandler"/> under
+    /// <see cref="ICardActionHandler"/> (replacing the Stage 2.1 <c>NoOpCardActionHandler</c>),
+    /// and the <see cref="QuestionExpiryProcessor"/> hosted service so the lifecycle worker
+    /// boots with the host.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Persistence-store registration is intentionally NOT included</b>: the SQL-backed
+    /// <c>IAgentQuestionStore</c> and <c>ICardStateStore</c> implementations live in the
+    /// <c>AgentSwarm.Messaging.Teams.EntityFrameworkCore</c> package and are wired by
+    /// <c>AddSqlAgentQuestionStore()</c> / <c>AddSqlCardStateStore()</c> on the EF
+    /// service-collection extensions. Hosts compose those helpers BEFORE calling this
+    /// method so the lifecycle worker sees the production stores rather than the
+    /// Stage 2.1 in-memory stubs.
+    /// </para>
+    /// <para>
+    /// Every registration uses <c>TryAdd*</c>: calling the helper multiple times is
+    /// idempotent, and host-supplied custom <see cref="ICardActionHandler"/> or
+    /// <see cref="ITeamsCardManager"/> registrations made BEFORE this call are
+    /// preserved.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddTeamsCardLifecycle(this IServiceCollection services)
+    {
+        if (services is null)
+        {
+            throw new ArgumentNullException(nameof(services));
+        }
+
+        // Compose the base connector first so TryAddSingleton<TeamsMessengerConnector>()
+        // there resolves the same instance we register under ITeamsCardManager below.
+        services.AddTeamsMessengerConnector();
+
+        // Connector is the canonical ITeamsCardManager implementation per
+        // architecture.md §4.1.1 ("TeamsMessengerConnector implements both
+        // IMessengerConnector and ITeamsCardManager").
+        services.TryAddSingleton<ITeamsCardManager>(
+            sp => sp.GetRequiredService<TeamsMessengerConnector>());
+
+        // Replace the Stage 2.1 NoOpCardActionHandler with the concrete CardActionHandler.
+        services.TryAddSingleton<ICardActionHandler, CardActionHandler>();
+
+        // Lifecycle worker — singleton per BackgroundService convention. Registered via
+        // AddHostedService<T>() so the runtime picks it up automatically.
+        services.AddHostedService<QuestionExpiryProcessor>();
 
         return services;
     }
