@@ -28,6 +28,7 @@ internal static class HandlerFactory
         RecordingAuditLogger AuditLogger,
         RecordingCardActionHandler CardHandler,
         IInboundEventPublisher EventPublisher,
+        RecordingMessageExtensionHandler MessageExtensionHandler,
         InertBotAdapter Adapter);
 
     /// <summary>
@@ -46,6 +47,7 @@ internal static class HandlerFactory
         RecordingCardActionHandler CardHandler,
         IInboundEventPublisher EventPublisher,
         InMemoryAgentQuestionStore QuestionStore,
+        RecordingMessageExtensionHandler MessageExtensionHandler,
         InertBotAdapter Adapter);
 
     public static Harness Build()
@@ -64,6 +66,7 @@ internal static class HandlerFactory
         var authorization = new AlwaysAuthorizationService();
         var auditLogger = new RecordingAuditLogger();
         var cardHandler = new RecordingCardActionHandler();
+        var messageExtensionHandler = new RecordingMessageExtensionHandler();
         var handler = new TeamsSwarmActivityHandler(
             store,
             dispatcher,
@@ -73,8 +76,9 @@ internal static class HandlerFactory
             auditLogger,
             cardHandler,
             eventPublisher,
+            messageExtensionHandler,
             NullLogger<TeamsSwarmActivityHandler>.Instance);
-        return new Harness(handler, store, dispatcher, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, new InertBotAdapter());
+        return new Harness(handler, store, dispatcher, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, messageExtensionHandler, new InertBotAdapter());
     }
 
     /// <summary>
@@ -110,6 +114,7 @@ internal static class HandlerFactory
             eventPublisher,
             NullLogger<AgentSwarm.Messaging.Teams.Commands.CommandDispatcher>.Instance);
 
+        var messageExtensionHandler = new RecordingMessageExtensionHandler();
         var handler = new TeamsSwarmActivityHandler(
             store,
             dispatcher,
@@ -119,9 +124,10 @@ internal static class HandlerFactory
             auditLogger,
             cardHandler,
             eventPublisher,
+            messageExtensionHandler,
             NullLogger<TeamsSwarmActivityHandler>.Instance);
 
-        return new E2EHarness(handler, store, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, questionStore, new InertBotAdapter());
+        return new E2EHarness(handler, store, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, questionStore, messageExtensionHandler, new InertBotAdapter());
     }
 
     public static async Task ProcessE2EAsync(E2EHarness harness, Activity activity, CancellationToken ct = default)

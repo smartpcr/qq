@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
+using AgentSwarm.Messaging.Teams.Extensions;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Schema;
+using Microsoft.Bot.Schema.Teams;
 
 namespace AgentSwarm.Messaging.Teams.Tests;
 
@@ -302,6 +304,39 @@ internal static class TestDoubles
             Lookups.Add(conversationId);
             PreloadByConversationId.TryGetValue(conversationId, out var hit);
             return Task.FromResult<TeamsConversationReference?>(hit);
+        }
+    }
+
+    /// <summary>
+    /// Recording <see cref="IMessageExtensionHandler"/> used by
+    /// <see cref="TeamsSwarmActivityHandler"/> tests that exercise the
+    /// <c>composeExtension/submitAction</c> override delegation path.
+    /// </summary>
+    public sealed class RecordingMessageExtensionHandler : IMessageExtensionHandler
+    {
+        public int Invocations { get; private set; }
+        public ITurnContext<IInvokeActivity>? LastTurnContext { get; private set; }
+        public MessagingExtensionAction? LastAction { get; private set; }
+
+        public MessagingExtensionActionResponse Response { get; set; } = new()
+        {
+            ComposeExtension = new MessagingExtensionResult
+            {
+                Type = "result",
+                AttachmentLayout = "list",
+                Attachments = new List<MessagingExtensionAttachment>(),
+            },
+        };
+
+        public Task<MessagingExtensionActionResponse> HandleAsync(
+            ITurnContext<IInvokeActivity> turnContext,
+            MessagingExtensionAction action,
+            CancellationToken ct)
+        {
+            Invocations++;
+            LastTurnContext = turnContext;
+            LastAction = action;
+            return Task.FromResult(Response);
         }
     }
 }
