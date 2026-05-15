@@ -17,6 +17,10 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// <item><description>Unique <c>(ChannelId, TenantId)</c> WHERE <c>ChannelId IS NOT NULL</c> — channel-scoped key.</description></item>
 /// <item><description>Non-clustered <c>TenantId</c>.</description></item>
 /// <item><description>Filtered index on <c>IsActive = true</c> for <c>GetAllActiveAsync</c> and pre-send checks.</description></item>
+/// <item><description>Filtered index on <c>(ConversationId)</c> WHERE <c>IsActive = 1</c> — covers the hot-path lookup
+/// performed by <c>SqlConversationReferenceStore.GetByConversationIdAsync</c>, which is called from
+/// <c>TeamsMessengerConnector.SendMessageAsync</c> on every outbound proactive message. Required to keep
+/// outbound P95 latency under the FR-007 3-second target at the 1000+ concurrent-user scale.</description></item>
 /// </list>
 /// Filtered-index syntax differs by provider (SQL Server uses <c>WHERE [Col] IS NOT NULL</c>;
 /// SQLite uses <c>WHERE "Col" IS NOT NULL</c>); EF Core emits the correct dialect per
@@ -81,6 +85,17 @@ public class TeamsConversationReferenceDbContext : DbContext
 
         builder.HasIndex(e => e.IsActive)
             .HasDatabaseName("IX_ConversationReferences_IsActive")
+            .HasFilter("\"IsActive\" = 1");
+
+        // Hot-path index: SqlConversationReferenceStore.GetByConversationIdAsync filters
+        // by ConversationId AND IsActive on every outbound proactive message. A filtered
+        // non-unique index on ConversationId WHERE IsActive = 1 keeps the active-only
+        // working set narrow and lets the lookup remain a sub-millisecond seek even at
+        // the FR-007 1000+ concurrent-user / <3 s P95 outbound-latency target. The index
+        // is intentionally non-unique because Bot Framework conversation IDs are not
+        // strictly globally unique across tenants.
+        builder.HasIndex(e => e.ConversationId)
+            .HasDatabaseName("IX_ConversationReferences_ConversationId")
             .HasFilter("\"IsActive\" = 1");
     }
 }
