@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -86,8 +85,13 @@ public sealed class TenantValidationMiddleware : IMiddleware
 
         context.Request.EnableBuffering();
 
-        var tenantId = await ExtractTenantIdAsync(context).ConfigureAwait(false);
-        context.Request.Body.Position = 0;
+        var tenantId = await TenantIdExtractor
+            .TryExtractFromBodyAsync(context, context.RequestAborted)
+            .ConfigureAwait(false);
+        if (context.Request.Body.CanSeek)
+        {
+            context.Request.Body.Position = 0;
+        }
 
         if (string.IsNullOrEmpty(tenantId))
         {
@@ -107,60 +111,6 @@ public sealed class TenantValidationMiddleware : IMiddleware
         }
 
         await next(context).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Extract the inbound activity's tenant ID from the buffered JSON body. Returns
-    /// <c>null</c> when the payload cannot be parsed or no tenant ID is present.
-    /// </summary>
-    private static async Task<string?> ExtractTenantIdAsync(HttpContext context)
-    {
-        if (context.Request.ContentLength == 0)
-        {
-            return null;
-        }
-
-        try
-        {
-            context.Request.Body.Position = 0;
-            using var doc = await JsonDocument.ParseAsync(
-                context.Request.Body,
-                cancellationToken: context.RequestAborted)
-                .ConfigureAwait(false);
-            var root = doc.RootElement;
-
-            // Bot Framework activity ChannelData.tenant.id (Teams-specific).
-            if (root.ValueKind == JsonValueKind.Object &&
-                root.TryGetProperty("channelData", out var channelData) &&
-                channelData.ValueKind == JsonValueKind.Object &&
-                channelData.TryGetProperty("tenant", out var tenant) &&
-                tenant.ValueKind == JsonValueKind.Object &&
-                tenant.TryGetProperty("id", out var tenantIdProp) &&
-                tenantIdProp.ValueKind == JsonValueKind.String)
-            {
-                var fromChannelData = tenantIdProp.GetString();
-                if (!string.IsNullOrWhiteSpace(fromChannelData))
-                {
-                    return fromChannelData;
-                }
-            }
-
-            // Conversation.TenantId fallback.
-            if (root.ValueKind == JsonValueKind.Object &&
-                root.TryGetProperty("conversation", out var conversation) &&
-                conversation.ValueKind == JsonValueKind.Object &&
-                conversation.TryGetProperty("tenantId", out var convTenant) &&
-                convTenant.ValueKind == JsonValueKind.String)
-            {
-                return convTenant.GetString();
-            }
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-
-        return null;
     }
 
     private static async Task WriteForbiddenAsync(HttpContext context, string reason)

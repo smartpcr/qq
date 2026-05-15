@@ -31,4 +31,8 @@
     <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="AgentSwarm.Messaging.Teams.Tests" />
+  </ItemGroup>
+
 </Project>
