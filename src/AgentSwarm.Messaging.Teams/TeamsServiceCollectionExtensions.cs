@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Teams.Cards;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -29,14 +30,22 @@ namespace AgentSwarm.Messaging.Teams;
 /// <c>"teams"</c> using the .NET 8 keyed-services API. Hosts that need the connector also
 /// as <c>ITeamsCardManager</c> in Stage 3.3 can layer a second
 /// <c>AddSingleton&lt;ITeamsCardManager&gt;</c> registration on the same singleton.
-/// Also fills in a default <see cref="IConversationReferenceRouter"/> registration that
-/// adapts the registered <see cref="IConversationReferenceStore"/> singleton — the
-/// canonical store implementations (Stage 2.1 in-memory + Stage 4.1 SQL) implement BOTH
-/// interfaces, so a single store registration satisfies the connector's eight ctor
-/// dependencies in production DI without forcing every host to write a router
-/// registration of its own. Hosts that ship a router-only implementation can still
-/// register it BEFORE calling this helper; the <c>TryAdd*</c> idempotency guard leaves
-/// the explicit registration untouched.
+/// Also fills in default registrations for two collaborators required by
+/// <see cref="TeamsMessengerConnector"/>'s <b>nine</b>-argument constructor:
+/// <list type="bullet">
+/// <item><description>An <see cref="IConversationReferenceRouter"/> that adapts the
+/// registered <see cref="IConversationReferenceStore"/> singleton when that store also
+/// implements <see cref="IConversationReferenceRouter"/> — the canonical Stage 2.1
+/// in-memory store and the Stage 4.1 SQL store both do, so a single store
+/// registration satisfies both interfaces in production DI.</description></item>
+/// <item><description>An <see cref="Cards.IAdaptiveCardRenderer"/> backed by the
+/// canonical <see cref="Cards.AdaptiveCardBuilder"/> implementation (Stage 3.1) so
+/// <see cref="TeamsMessengerConnector.SendQuestionAsync"/> can render proactive
+/// Adaptive Card questions.</description></item>
+/// </list>
+/// Hosts that ship custom router or renderer implementations can register them BEFORE
+/// calling this helper; the <c>TryAdd*</c> idempotency guards leave explicit
+/// registrations untouched.
 /// </description></item>
 /// </list>
 /// <para>
@@ -101,6 +110,13 @@ public static class TeamsServiceCollectionExtensions
         services.TryAddKeyedSingleton<IMessengerConnector>(
             MessengerKey,
             (sp, _) => sp.GetRequiredService<TeamsMessengerConnector>());
+
+        // Default IAdaptiveCardRenderer wiring per implementation-plan §3.1 step 7 and the
+        // architecture.md §4.6 cross-doc note: the canonical concrete is
+        // AdaptiveCardBuilder; the contract surface is IAdaptiveCardRenderer. Hosts that
+        // ship a custom renderer can register it BEFORE calling this helper —
+        // TryAddSingleton leaves the explicit registration untouched.
+        services.TryAddSingleton<IAdaptiveCardRenderer, AdaptiveCardBuilder>();
 
         // Default IConversationReferenceRouter wiring — adapt the host-supplied
         // IConversationReferenceStore by exposing it under the companion interface as well.

@@ -1,10 +1,12 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
+using AgentSwarm.Messaging.Teams.Cards;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
 using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using static AgentSwarm.Messaging.Teams.Tests.TestDoubles;
 
 namespace AgentSwarm.Messaging.Teams.Tests;
@@ -259,10 +261,19 @@ public sealed class TeamsMessengerConnectorTests
         var call = Assert.Single(harness.Adapter.ContinueCalls);
         Assert.Equal(MicrosoftAppId, call.BotAppId);
         Assert.Equal(stored.ConversationId, call.Reference.Conversation.Id);
-        var sentText = Assert.Single(harness.Adapter.Sent).Text ?? string.Empty;
-        Assert.Contains(question.Title, sentText, StringComparison.Ordinal);
-        Assert.Contains(question.Body, sentText, StringComparison.Ordinal);
-        Assert.Contains("approve", sentText, StringComparison.Ordinal);
+        var sentActivity = Assert.Single(harness.Adapter.Sent);
+        // Implementation-plan §3.1 step 7 — outbound proactive carries the rendered
+        // Adaptive Card as an Attachment, with Activity.Text falling back to the title
+        // for clients that cannot render the card.
+        Assert.Equal(question.Title, sentActivity.Text);
+        var attachment = Assert.Single(sentActivity.Attachments);
+        Assert.Equal("application/vnd.microsoft.card.adaptive", attachment.ContentType);
+        var cardJson = Assert.IsType<JObject>(attachment.Content);
+        var cardText = cardJson.ToString();
+        Assert.Contains(question.Title, cardText, StringComparison.Ordinal);
+        Assert.Contains(question.Body, cardText, StringComparison.Ordinal);
+        Assert.Contains("Action.Submit", cardText, StringComparison.Ordinal);
+        Assert.Contains("approve", cardText, StringComparison.Ordinal);
 
         // Step 3 — question's ConversationId stamped from the proactive turn context, and
         // TeamsCardState saved with the activityId returned by SendActivitiesAsync.
@@ -458,17 +469,19 @@ public sealed class TeamsMessengerConnectorTests
         var router = new RecordingConversationReferenceRouter();
         var qStore = new RecordingAgentQuestionStore();
         var cardStore = new RecordingCardStateStore();
+        var renderer = new AdaptiveCardBuilder();
         var reader = new ChannelInboundEventPublisher();
         var logger = NullLogger<TeamsMessengerConnector>.Instance;
 
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(null!, options, convStore, router, qStore, cardStore, reader, logger));
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, null!, convStore, router, qStore, cardStore, reader, logger));
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, null!, router, qStore, cardStore, reader, logger));
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, null!, qStore, cardStore, reader, logger));
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, null!, cardStore, reader, logger));
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, qStore, null!, reader, logger));
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, qStore, cardStore, null!, logger));
-        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, qStore, cardStore, reader, null!));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(null!, options, convStore, router, qStore, cardStore, renderer, reader, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, null!, convStore, router, qStore, cardStore, renderer, reader, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, null!, router, qStore, cardStore, renderer, reader, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, null!, qStore, cardStore, renderer, reader, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, null!, cardStore, renderer, reader, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, qStore, null!, renderer, reader, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, qStore, cardStore, null!, reader, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, qStore, cardStore, renderer, null!, logger));
+        Assert.Throws<ArgumentNullException>(() => new TeamsMessengerConnector(adapter, options, convStore, router, qStore, cardStore, renderer, reader, null!));
     }
 
     private static TeamsConversationReference NewPersonalReference(
@@ -579,6 +592,7 @@ public sealed class TeamsMessengerConnectorTests
             var router = new RecordingConversationReferenceRouter();
             var qStore = new RecordingAgentQuestionStore();
             var cardStore = new RecordingCardStateStore();
+            var renderer = new AdaptiveCardBuilder();
             reader ??= new ChannelInboundEventPublisher();
             var connector = new TeamsMessengerConnector(
                 adapter,
@@ -587,6 +601,7 @@ public sealed class TeamsMessengerConnectorTests
                 router,
                 qStore,
                 cardStore,
+                renderer,
                 reader,
                 NullLogger<TeamsMessengerConnector>.Instance);
             return new ConnectorHarness(connector, adapter, convStore, router, qStore, cardStore, options);
