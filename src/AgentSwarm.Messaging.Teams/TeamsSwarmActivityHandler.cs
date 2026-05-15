@@ -113,12 +113,6 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         _cardActionHandler = cardActionHandler ?? throw new ArgumentNullException(nameof(cardActionHandler));
         _inboundEventPublisher = inboundEventPublisher ?? throw new ArgumentNullException(nameof(inboundEventPublisher));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-
-        // Reference IInboundEventPublisher to silence the "assigned but never used" analyzer
-        // warning — the field is wired here so Stage 3.2's CommandDispatcher can later
-        // publish through it. Removing it from the ctor surface would force a breaking
-        // change at that point.
-        _ = _inboundEventPublisher;
     }
 
     /// <inheritdoc />
@@ -262,6 +256,76 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         };
 
         await _commandDispatcher.DispatchAsync(context, cancellationToken).ConfigureAwait(false);
+
+        // (6) Publish a CommandEvent onto the in-process inbound channel per
+        // impl-plan §2.3 step 4 — TeamsSwarmActivityHandler is named as one of the
+        // event producers writing to the channel via IInboundEventPublisher.PublishAsync,
+        // and TeamsMessengerConnector.ReceiveAsync reads from the matching channel
+        // reader. The event surfaces the parsed command to higher-level orchestration
+        // consumers without coupling them to the Bot Framework activity shape; the
+        // synchronous DispatchAsync call above remains the in-process command-handler
+        // path. Published AFTER successful dispatch so failure of the dispatcher
+        // suppresses the published event (preventing the channel from advertising a
+        // command that did not actually run).
+        //
+        // The EventType discriminator is mapped per architecture.md §3.1 (and
+        // tech-spec.md §4.3 / e2e-scenarios.md §Correlation and Traceability):
+        //   "agent ask"                                 → AgentTaskRequest
+        //   "agent status" | "approve" | "reject"       → Command
+        //   "escalate"                                  → Escalation
+        //   "pause"                                     → PauseAgent
+        //   "resume"                                    → ResumeAgent
+        // Each lifecycle command carries its own discriminator so downstream
+        // orchestrator consumers (Stage 3.x dispatchers) can pattern-match on
+        // EventType rather than re-parsing the verb string.
+        var commandBody = ExtractCommandBody(normalizedText, commandVerb);
+        var commandEventType = MapVerbToEventType(commandVerb);
+        var commandEvent = new CommandEvent(commandEventType)
+        {
+            EventId = Guid.NewGuid().ToString(),
+            CorrelationId = correlationId,
+            Messenger = "Teams",
+            ExternalUserId = aadObjectId,
+            ActivityId = activity?.Id,
+            Source = ResolveEventSource(activity),
+            Timestamp = DateTimeOffset.UtcNow,
+            Payload = new ParsedCommand(commandVerb, commandBody, correlationId),
+        };
+
+        await _inboundEventPublisher
+            .PublishAsync(commandEvent, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Map a canonical command verb to the matching <see cref="MessengerEventTypes"/>
+    /// discriminator per architecture.md §3.1. Unknown verbs (which authorization will
+    /// already have rejected) fall back to <see cref="MessengerEventTypes.Command"/> so
+    /// the channel never receives a domain-illegal discriminator and the
+    /// <see cref="CommandEvent"/> constructor's allow-list validation does not throw.
+    /// </summary>
+    private static string MapVerbToEventType(string commandVerb)
+    {
+        return commandVerb switch
+        {
+            "agent ask" => MessengerEventTypes.AgentTaskRequest,
+            "escalate" => MessengerEventTypes.Escalation,
+            "pause" => MessengerEventTypes.PauseAgent,
+            "resume" => MessengerEventTypes.ResumeAgent,
+            _ => MessengerEventTypes.Command,
+        };
+    }
+
+    private static string? ResolveEventSource(Activity? activity)
+    {
+        if (activity?.Conversation is null)
+        {
+            return null;
+        }
+
+        return string.Equals(activity.Conversation.ConversationType, "channel", StringComparison.OrdinalIgnoreCase)
+            ? MessengerEventSources.TeamChannel
+            : MessengerEventSources.PersonalChat;
     }
 
     /// <inheritdoc />

@@ -441,5 +441,44 @@ public sealed class TeamsSwarmActivityHandlerTests
         activity.ChannelData = existing;
         return activity;
     }
+
+    /// <summary>
+    /// Regression for evaluator-iter-2 finding #3 — `TeamsSwarmActivityHandler` must map
+    /// each canonical command verb to its matching `MessengerEventTypes` discriminator
+    /// per architecture.md §3.1 / e2e-scenarios.md §Correlation and Traceability rather
+    /// than collapsing every command into <see cref="AgentSwarm.Messaging.Abstractions.MessengerEventTypes.Command"/>.
+    /// Theory rows cover all five command-event types: AgentTaskRequest (the
+    /// task-creation discriminator), Command (general-purpose for status/approve/reject),
+    /// Escalation, PauseAgent, and ResumeAgent.
+    /// </summary>
+    [Theory]
+    [InlineData("agent ask create e2e tests", "agent ask", "AgentTaskRequest")]
+    [InlineData("agent status", "agent status", "Command")]
+    [InlineData("approve", "approve", "Command")]
+    [InlineData("reject Q-99", "reject", "Command")]
+    [InlineData("escalate", "escalate", "Escalation")]
+    [InlineData("pause", "pause", "PauseAgent")]
+    [InlineData("resume", "resume", "ResumeAgent")]
+    public async Task OnMessageActivityAsync_PublishedCommandEvent_CarriesCanonicalEventTypePerArchitectureSpec(
+        string text,
+        string expectedVerb,
+        string expectedEventType)
+    {
+        var harness = Build();
+        MapDave(harness.IdentityResolver);
+        var activity = NewPersonalMessage(text);
+
+        await ProcessAsync(harness, activity);
+
+        // The harness's default IInboundEventPublisher is a RecordingInboundEventPublisher
+        // — see HandlerFactory.Build(). Cast to access its Published list.
+        var recording = Assert.IsType<TestDoubles.RecordingInboundEventPublisher>(harness.EventPublisher);
+        var published = Assert.Single(recording.Published);
+        var commandEvent = Assert.IsType<AgentSwarm.Messaging.Abstractions.CommandEvent>(published);
+        Assert.Equal(expectedEventType, commandEvent.EventType);
+        Assert.Equal(expectedVerb, commandEvent.Payload.CommandType);
+        Assert.Equal("Teams", commandEvent.Messenger);
+        Assert.Equal("aad-obj-dave-001", commandEvent.ExternalUserId);
+    }
 }
 

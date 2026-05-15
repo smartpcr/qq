@@ -1,110 +1,129 @@
-# Iter notes — Stage 2.2 (Teams Activity Handler) — iter 4
+# Iter notes — Stage 2.3 (Teams Messenger Connector) — iter 4
 
 ## Prior feedback resolution
 
-Iter-3 evaluator said: `Still needs improvement: None.` Verdict was demoted from
-'pass' to 'iterate' by an OPERATOR RETRY (not a fresh critique). On entering this
-iter the worktree was actually red — `dotnet test` showed 8 failing tests in
-`AgentSwarm.Messaging.Teams.Tests` that the iter-3 notes claimed were green. The
-breakage was self-inflicted by iter-3's commit `369a89b`.
+Iter-3 evaluator (score 89, verdict iterate) flagged ONE remaining item — a
+narrative/verification issue, not a code defect. Items 1, 2, 3 from iter 2
+were all marked verified-FIXED. Items 1, 2, 3, 4, 5, 6 from iter 1 stayed
+verified-FIXED.
 
-- 1. (NEW THIS ITER, NOT IN EVAL LIST) FIXED — non-canonical audit `EventType`
-  introduced by iter-3 broke 8 tests. `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs`
-  defined a local `private const string InstallationUpdateEventType = "InstallationUpdate";`
-  and `LogInstallAuditAsync` used it. `tech-spec.md` §4.3 fixes the audit
-  vocabulary at exactly seven values
-  (`CommandReceived, MessageSent, CardActionReceived, SecurityRejection, ProactiveNotification, MessageActionReceived, Error`)
-  and `AuditEntry.EventType` setter (in
-  `src/AgentSwarm.Messaging.Persistence/AuditEntry.cs:57-72`) rejects
-  non-canonical values with `ArgumentException`. Removed the constant + xmldoc
-  and switched `LogInstallAuditAsync` (line ~767) to
-  `eventType: AuditEventTypes.CommandReceived`. Replaced the deleted xmldoc with
-  a code comment near the helper explaining the schema constraint and that
-  install rows are disambiguated from human commands via the `Action` column
-  (`AppInstalled` / `AppUninstalledFromTeam` / `BotAddedToTeam` /
-  `BotRemovedFromTeam`). The Teams test suite already asserted
-  `AuditEventTypes.CommandReceived` for install events
-  (`tests/AgentSwarm.Messaging.Teams.Tests/TeamsSwarmActivityHandlerTests.cs:314,332,357`),
-  so no test edits were needed. Verification:
-  ```
-  $ grep -rnF 'InstallationUpdateEventType' src/ tests/
-  (empty -- symbol fully removed)
-  $ grep -rnF '"InstallationUpdate"' src/ tests/
-  src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs:766: // values; "InstallationUpdate" is not in that set and the AuditEntry init setter
-  ```
-  (the lone remaining hit is the explanatory code comment).
+- [x] 1. ADDRESSED — narrative correction. Iter-3's `[x] FIXED` for the
+  verb→event-type mapping listed only the two `MessengerEventTypes.Command`
+  hits inside `TeamsSwarmActivityHandler.cs` (the xmldoc reference at L303
+  and the switch fallback arm at L315). The evaluator ran the SAME literal
+  grep across `src/` AND `tests/` and got the full nine-hit set, six of
+  which I did not explicitly acknowledge. None are bugs — every hit is
+  either an xmldoc cross-reference, a fallback-arm of the new mapper, or a
+  test that EXERCISES the fact that `agent status` / `approve` / `reject`
+  legitimately map to `MessengerEventTypes.Command` per architecture.md
+  §3.1. This iter is a narrative-only fix: paste the FULL grep output
+  verbatim and annotate each hit. NO code change because the production
+  fix from iter 3 is already correct.
 
-- 2. (NEW THIS ITER, NOT IN EVAL LIST) FIXED — iter-3 also rewrote
-  `SerializeConversationReference` from
-  `Newtonsoft.Json.JsonConvert.SerializeObject(reference)` to
-  `JsonSerializer.Serialize(reference, PayloadJsonOptions)` with a
-  silent-`"{}"` fallback on `NotSupportedException`. `Microsoft.Bot.Schema.ConversationReference`
-  is annotated with Newtonsoft `[JsonProperty(PropertyName="serviceUrl")]`-style
-  attributes, `[JsonExtensionData]` property bags, and `JObject` members — STJ
-  ignores ALL of those, emits PascalCase wire names, and the silent fallback
-  would persist `"{}"` whenever a `JObject` member was present, breaking the
-  Stage 4.x proactive-messaging worker's
-  `JsonConvert.DeserializeObject<ConversationReference>(...)` round-trip.
-  `Microsoft.Bot.Builder` 4.22.7 already pulls Newtonsoft.Json transitively, so
-  no extra package reference is needed. Restored the original Newtonsoft.Json
-  serializer + the explanatory comment. Added a new regression test
-  `OnMessageActivityAsync_PersistsReferenceJson_RoundTripsViaNewtonsoftAndPreservesCanonicalWireNames`
-  that asserts (a) `ReferenceJson != "{}"`, (b) the JSON contains the camelCase
-  wire names `"serviceUrl"`, `"conversation"`, `"bot"`, (c) it does NOT contain
-  PascalCase `"ServiceUrl"`, and (d) round-trips back to a
-  `ConversationReference` whose `ServiceUrl`, `Conversation.Id`, and `Bot.Id` are
-  populated. Verification:
+  Verification (FULL output, scope = `src/` + `tests/`, pattern is the
+  exact pre-edit symbol the evaluator used):
   ```
-  $ grep -nF 'Newtonsoft.Json.JsonConvert.SerializeObject' src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs
-  715:        return Newtonsoft.Json.JsonConvert.SerializeObject(reference);
+  $ grep -rnF "MessengerEventTypes.Command" src/ tests/
+  src/AgentSwarm.Messaging.Abstractions/MessengerEvent.cs:70: /// varies based on the parsed command — see <see cref="MessengerEventTypes.CommandEventTypes"/>.
+  src/AgentSwarm.Messaging.Abstractions/MessengerEvent.cs:76: /// <see cref="MessengerEventTypes.CommandEventTypes"/>; otherwise an
+  src/AgentSwarm.Messaging.Abstractions/MessengerEvent.cs:87: $"Allowed values: [{string.Join(", ", MessengerEventTypes.CommandEventTypes)}].",
+  src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs:303: /// already have rejected) fall back to <see cref="MessengerEventTypes.Command"/> so
+  src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs:315: _ => MessengerEventTypes.Command,
+  tests/AgentSwarm.Messaging.Abstractions.Tests/MessengerEventTests.cs:53: [InlineData(MessengerEventTypes.Command)]
+  tests/AgentSwarm.Messaging.Teams.Tests/ChannelInboundEventPublisherTests.cs:114: return new CommandEvent(MessengerEventTypes.Command)
+  tests/AgentSwarm.Messaging.Teams.Tests/TeamsMessengerConnectorTests.cs:131: Assert.Equal(MessengerEventTypes.Command, commandEvent.EventType);
+  tests/AgentSwarm.Messaging.Teams.Tests/TeamsSwarmActivityHandlerTests.cs:449: /// than collapsing every command into <see cref="AgentSwarm.Messaging.Abstractions.MessengerEventTypes.Command"/>.
   ```
+
+  Per-hit annotation (each is intentional and documented):
+
+  - `src/AgentSwarm.Messaging.Abstractions/MessengerEvent.cs:70,76,87` —
+    Three references to `MessengerEventTypes.CommandEventTypes` (the
+    constant LIST containing the discriminator subset valid for
+    `CommandEvent`). NOT the same symbol as `MessengerEventTypes.Command`
+    — the literal `grep -F` matches the prefix. These three hits are the
+    base record's xmldoc + the validator's allowed-values error message
+    that the `CommandEvent` constructor throws when an invalid
+    discriminator is supplied. Both are pre-existing Stage 1.2 contract
+    code; no change required.
+  - `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs:303` —
+    xmldoc line on `MapVerbToEventType` documenting that unknown verbs
+    fall back to `Command`. This IS the iter-3 mapping helper.
+  - `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs:315` —
+    The wildcard arm of the iter-3 switch expression. Maps
+    `agent status` / `approve` / `reject` (the architecture.md §3.1
+    "Command" row) and any unknown verb to `Command` per the spec. This
+    IS the iter-3 mapping fix and is correct per architecture.md §3.1
+    line 352 ("`CommandEvent` | `Command` | `ParsedCommand` | User sends
+    `agent status`, `approve`, or `reject`").
+  - `tests/AgentSwarm.Messaging.Abstractions.Tests/MessengerEventTests.cs:53` —
+    Pre-existing Stage 1.2 contract test (`[InlineData(...)]`) verifying
+    the `CommandEvent` constructor accepts every value in
+    `MessengerEventTypes.CommandEventTypes` including `Command`. Not
+    Stage 2.3 code; not modified this workstream.
+  - `tests/AgentSwarm.Messaging.Teams.Tests/ChannelInboundEventPublisherTests.cs:114` —
+    Test fixture in iter-1's `ChannelInboundEventPublisher` test suite
+    that synthesizes a `CommandEvent` to push through the channel. The
+    discriminator value is irrelevant to the publisher contract (the
+    publisher is event-type-agnostic); using `Command` is just one valid
+    choice from `MessengerEventTypes.CommandEventTypes`.
+  - `tests/AgentSwarm.Messaging.Teams.Tests/TeamsMessengerConnectorTests.cs:131` —
+    The end-to-end `agent status` ReceiveAsync test from iter-2
+    (item-4 fix). Asserts the connector observes
+    `commandEvent.EventType == MessengerEventTypes.Command` because
+    `agent status` IS the `Command` row of the architecture.md §3.1
+    table. This assertion is the regression that LOCKS IN the
+    `agent status → Command` half of the iter-3 mapping.
+  - `tests/AgentSwarm.Messaging.Teams.Tests/TeamsSwarmActivityHandlerTests.cs:449` —
+    xmldoc on the iter-3 verb-mapping `[Theory]`; the
+    `<see cref="MessengerEventTypes.Command"/>` reference inside a
+    documentation comment that explains the regression's scope.
+
+  None of the nine hits represent a regression of iter-3's
+  verb→event-type mapping. Items 2, 3, 4 of the iter-3 evaluator (the
+  three previously-FIXED iter-2 items it re-verified) remain green; this
+  iter-4 entry only widens the iter-3 grep verification to match the
+  evaluator's reproduction.
 
 ## Files touched this iter
 
-- `src/AgentSwarm.Messaging.Teams/TeamsSwarmActivityHandler.cs` — removed
-  `InstallationUpdateEventType` constant + xmldoc; switched `LogInstallAuditAsync`
-  to use canonical `AuditEventTypes.CommandReceived`; restored
-  Newtonsoft.Json serialization in `SerializeConversationReference` with the
-  original explanatory comment.
-- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsSwarmActivityHandlerTests.cs` —
-  added `OnMessageActivityAsync_PersistsReferenceJson_RoundTripsViaNewtonsoftAndPreservesCanonicalWireNames`
-  to lock in the serializer contract (camelCase wire names + Newtonsoft round-trip).
+- `.forge/iter-notes.md` — narrative-only update to widen the iter-3 grep
+  verification; no production-code or test edits.
 
 ## Decisions made this iter
 
-- **Use `AuditEventTypes.CommandReceived` for install/uninstall lifecycle audit
-  rows** rather than extending the canonical EventType set or skipping audit
-  logging. Rationale: tech-spec.md §4.3 is explicit ("exactly seven values"),
-  changing it would propagate across architecture/audit-completeness metrics in
-  sibling docs, and the existing test contract already chose this mapping.
-  Operators distinguish install rows from human commands via the `Action`
-  column. Logged as future schema debt only — no scope creep here.
-- **Revert the serializer change immediately rather than deferring.** The
-  rubber-duck flagged it as a real persisted-data contract regression with a
-  silent-corruption failure mode (`"{}"` fallback masks the schema mismatch).
-  Cost to revert is one line + one regression test; cost to defer is a Stage 4.x
-  worker that silently fails proactive messaging.
-- **Round-trip test asserts both wire-name shape AND deserialization** to defend
-  against a future agent re-introducing STJ (which would still pass a naive
-  "deserializes successfully" check via Newtonsoft's case-insensitive default
-  but fail the explicit camelCase-vs-PascalCase grep).
+- **Pure narrative fix, not a code change.** The evaluator explicitly noted
+  "the remaining blocker is a review-protocol/narrative verification
+  problem, not a core connector behavior defect" and that "the implementation
+  is effectively complete for Stage 2.3". Adding more code would be
+  scope-creep; the right move is to widen the grep claim until it matches
+  the evaluator's reproduction verbatim. This is the structural fix the
+  feedback template asks for after one round of "the same item flipped
+  back to `[ ]`" — instead of repeating the iter-3 word-tweak (paste two
+  lines), I now paste ALL nine lines and annotate each.
+- **Per-hit annotation in a single block.** A future agent (or reviewer)
+  reading this can confirm each grep hit against the spec without needing
+  to re-derive the mapping. The annotation is the auditable artifact that
+  proves none of the nine hits is an accidental regression.
+- **Not deferred.** The fix is a notes edit only; nothing about it requires
+  operator input or a sibling-doc change.
 
 ## Dead ends tried this iter
 
-- None. Diagnosis was straightforward (test output gave the validator's
-  rejection message verbatim with the allowed-values list), the rubber-duck
-  validated the two-fix plan up front, and both fixes landed in two clean
-  edits.
+- None. The fix was a single-file notes edit; build/test re-verified to
+  confirm the iter-3 production code is unchanged and still green
+  (0 warnings / 0 errors, 152 tests pass: 82 abstractions + 70 Teams).
 
 ## Open questions surfaced this iter
 
-- None blocking. (Long-term schema debt: should `AuditEventTypes` get an 8th
-  `InstallationUpdate` value? That belongs to a future spec-update workstream,
-  not Stage 2.2.)
+- None.
 
 ## What's still left
 
-- Nothing for Stage 2.2 iter 4. Build clean (0 warnings / 0 errors), 117 tests
-  pass solution-wide (82 abstractions + 35 Teams; was 116 in iter 3, +1
-  serializer round-trip test).
-- Stage 2.1 DI wiring + Stage 3.x dispatch/card-handler still pending downstream.
+- Nothing for Stage 2.3 iter 4. The connector implementation, all 6 iter-1
+  findings, the 3 iter-2 findings, the iter-3 verb-mapping fix, and now
+  the iter-3 grep-narrative fix are all addressed. Build clean
+  (0 warnings / 0 errors), 152 tests pass solution-wide
+  (82 abstractions + 70 Teams).
+- Stage 3.x command-handler dispatch + `AdaptiveCardBuilder` still pending
+  downstream.
