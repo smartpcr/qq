@@ -32,16 +32,30 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 /// <b>Reservation lifecycle on failure.</b> The behaviour differs by
 /// failure mode (per the Stage 2.2 brief Step 2 and Scenario 4):
 /// <list type="bullet">
-///   <item><description><b>Caught handler exception</b> — the pipeline
-///   calls <see cref="IDeduplicationService.ReleaseReservationAsync"/>
-///   inside a <c>catch</c> and then re-throws. The reservation is
-///   released so a subsequent live re-delivery's
-///   <see cref="IDeduplicationService.TryReserveAsync"/> succeeds and
-///   the event is processed normally. This satisfies the brief's
-///   "subsequent delivery of evt-1 is processed normally (not short-
-///   circuited as duplicate)" invariant. The throw still propagates so
-///   the webhook controller can transition the corresponding
-///   <c>InboundUpdate</c> row to <c>Failed</c>.</description></item>
+///   <item><description><b>Caught post-reservation exception</b> — once
+///   <see cref="IDeduplicationService.TryReserveAsync"/> succeeds, EVERY
+///   subsequent stage (parse, authorize, disambiguation-store write,
+///   inline-button construction, role enforcement, the route switch
+///   itself, and the post-route <see cref="IDeduplicationService.MarkProcessedAsync"/>
+///   call) executes inside a single <c>try</c> that releases the
+///   reservation before re-throwing. The narrower "wrap only the route
+///   switch" shape would leak the reservation whenever a stage between
+///   <c>TryReserveAsync</c> and the route — e.g. a transient
+///   <see cref="IUserAuthorizationService.AuthorizeAsync"/> network
+///   failure, a duplicate-token write in
+///   <see cref="IPendingDisambiguationStore.StoreAsync"/>, or
+///   <see cref="InlineButton.MaxCallbackDataBytes"/> validation
+///   throwing on an oversized workspace id — threw. The webhook
+///   controller would then surface a 500, Telegram would redeliver the
+///   same update, <c>TryReserveAsync</c> would return <c>false</c>, and
+///   the event would be silently dropped as a duplicate without ever
+///   reaching a handler. Widening the catch closes that gap so the
+///   brief's "subsequent delivery of evt-1 is processed normally (not
+///   short-circuited as duplicate)" invariant holds for any caught
+///   throw — not just exceptions emitted from the routed handler. The
+///   throw still propagates so the webhook controller can transition
+///   the corresponding <c>InboundUpdate</c> row to <c>Failed</c>.
+///   </description></item>
 ///   <item><description><b>Uncaught crash</b> (process exits or the
 ///   <c>catch</c> block itself fails) — neither
 ///   <see cref="IDeduplicationService.MarkProcessedAsync"/> nor
@@ -53,8 +67,15 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 ///   handler on a crash" race the implementation-plan addresses is
 ///   still closed: the only path that re-opens the gate is a successful
 ///   <see cref="IDeduplicationService.ReleaseReservationAsync"/> call,
-///   which only executes after a caught handler exception in a single
+///   which only executes after a caught exception in a single
 ///   pod.</description></item>
+///   <item><description><b>Operator cancellation</b>
+///   (<see cref="OperationCanceledException"/>) — the catch's exception
+///   filter deliberately lets <c>OperationCanceledException</c>
+///   propagate WITHOUT releasing. Cancellation means the caller asked
+///   us to stop, not that the event is retryable. The reservation
+///   remains held; the durable <c>InboundUpdate</c> sweep is again
+///   the recovery primitive.</description></item>
 ///   <item><description><b>Handler returns
 ///   <see cref="CommandResult.Success"/>=<c>false</c></b> — the
 ///   pipeline calls <see cref="IDeduplicationService.MarkProcessedAsync"/>
@@ -71,16 +92,25 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 ///   marker is symmetric with the success path. The durable
 ///   <c>InboundUpdate</c> row's terminal state is similarly aligned
 ///   by the Stage 2.4 webhook controller.</description></item>
+///   <item><description><b>Normal denials</b> (parse-empty, parse-
+///   invalid, authorize-denied, role-denied) and the multi-workspace
+///   prompt — these return normally with
+///   <see cref="PipelineResult.Handled"/>=<c>true</c> and a denial /
+///   prompt text. The catch does NOT fire (no throw), so the
+///   reservation is intentionally LEFT HELD. This is the canonical
+///   way to short-circuit a live re-delivery and stop the operator
+///   from seeing the same denial / prompt response repeated when
+///   Telegram redelivers the same update.</description></item>
 /// </list>
 /// </para>
 /// <para>
 /// <b>Concurrency property preserved.</b> The atomic-winner-per-
 /// concurrent-burst guarantee is unaffected by release-on-throw: the
-/// release executes sequentially AFTER the winner's handler completes;
+/// release executes sequentially AFTER the winner's stage that threw;
 /// during the in-flight burst every concurrent caller still sees a
 /// single <c>true</c> from <see cref="IDeduplicationService.TryReserveAsync"/>.
-/// Subsequent (post-handler-completion) callers may succeed only when
-/// the prior winner caught a handler exception.
+/// Subsequent (post-completion) callers may succeed only when the
+/// prior winner caught an exception.
 /// </para>
 /// <para>
 /// <b>Unknown events bypass dedup and authz.</b> An
@@ -210,150 +240,173 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             };
         }
 
-        // Stage: parse (only meaningful for Command events).
-        LogStage(messengerEvent, "parse");
-        ParsedCommand? parsed = null;
-        if (messengerEvent.EventType == EventType.Command)
-        {
-            if (string.IsNullOrWhiteSpace(messengerEvent.RawCommand))
-            {
-                _logger.LogWarning(
-                    "Pipeline rejected: Command event has no RawCommand. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage}",
-                    messengerEvent.CorrelationId,
-                    messengerEvent.EventId,
-                    "parse-empty");
-                return Denial(messengerEvent, PipelineResponses.CommandNotRecognized);
-            }
-
-            parsed = _parser.Parse(messengerEvent.RawCommand);
-            if (!parsed.IsValid)
-            {
-                _logger.LogWarning(
-                    "Pipeline rejected: invalid command parse. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} Reason={Reason}",
-                    messengerEvent.CorrelationId,
-                    messengerEvent.EventId,
-                    "parse-invalid",
-                    parsed.ValidationError);
-                return Denial(messengerEvent, PipelineResponses.CommandNotRecognized);
-            }
-        }
-
-        // Stage: authorize. commandName drives Tier 1 (start) vs Tier 2 (binding) lookup.
-        LogStage(messengerEvent, "authorize");
-        var authz = await _authz.AuthorizeAsync(
-            messengerEvent.UserId,
-            messengerEvent.ChatId,
-            parsed?.CommandName,
-            ct).ConfigureAwait(false);
-
-        // Defense-in-depth: BOTH the IsAuthorized boolean AND a non-empty
-        // Bindings list are required. A well-behaved IUserAuthorizationService
-        // sets these consistently (IsAuthorized == Bindings.Count > 0 per
-        // implementation-plan.md §339), but a buggy or compromised provider
-        // could return IsAuthorized=false alongside a stale binding list —
-        // checking both closes that gap and avoids constructing an
-        // AuthorizedOperator from a binding the provider has explicitly
-        // disclaimed. Pinned by
-        // Pipeline_RejectsAuthorization_WhenIsAuthorizedFalse_DespiteNonEmptyBindings.
-        if (!authz.IsAuthorized || authz.Bindings.Count == 0)
-        {
-            _logger.LogWarning(
-                "Pipeline rejected: unauthorized. CorrelationId={CorrelationId} EventId={EventId} UserId={UserId} ChatId={ChatId} Stage={Stage} Reason={Reason} IsAuthorized={IsAuthorized} BindingCount={BindingCount}",
-                messengerEvent.CorrelationId,
-                messengerEvent.EventId,
-                messengerEvent.UserId,
-                messengerEvent.ChatId,
-                "authorize-denied",
-                authz.DenialReason ?? "no active binding",
-                authz.IsAuthorized,
-                authz.Bindings.Count);
-            return Denial(messengerEvent, PipelineResponses.Unauthorized);
-        }
-
-        // Stage: resolve operator. Multi-workspace prompt is reserved for Command events.
-        LogStage(messengerEvent, "resolve-operator");
-        if (authz.Bindings.Count > 1 && messengerEvent.EventType == EventType.Command)
-        {
-            var workspaceIds = authz.Bindings.Select(b => b.WorkspaceId).ToArray();
-
-            // Persist a server-side disambiguation handle BEFORE emitting
-            // the prompt. The token is the only reference Stage 3.3
-            // receives via the callback — every other field needed to
-            // re-issue the original command (raw command text,
-            // correlation id, originating user/chat) is parked here so
-            // it does not have to fit in callback_data's 64-byte budget.
-            var token = GenerateDisambiguationToken();
-            var now = _timeProvider.GetUtcNow();
-            var pending = new PendingDisambiguation
-            {
-                Token = token,
-                OriginalRawCommand = messengerEvent.RawCommand ?? string.Empty,
-                CorrelationId = messengerEvent.CorrelationId,
-                TelegramUserId = messengerEvent.UserId,
-                TelegramChatId = messengerEvent.ChatId,
-                CandidateWorkspaceIds = workspaceIds,
-                CreatedAt = now,
-                ExpiresAt = now + DisambiguationTtl,
-            };
-            await _pendingDisambiguations.StoreAsync(pending, ct).ConfigureAwait(false);
-
-            var buttons = PipelineResponses.MultiWorkspaceButtons(token, workspaceIds);
-            _logger.LogInformation(
-                "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} WorkspaceCount={Count} DisambiguationToken={Token}",
-                messengerEvent.CorrelationId,
-                messengerEvent.EventId,
-                "resolve-prompt",
-                workspaceIds.Length,
-                token);
-            return new PipelineResult
-            {
-                Handled = true,
-                ResponseText = PipelineResponses.MultiWorkspacePromptText,
-                ResponseButtons = buttons,
-                CorrelationId = messengerEvent.CorrelationId,
-            };
-        }
-
-        var binding = authz.Bindings[0];
-        var @operator = new AuthorizedOperator
-        {
-            OperatorId = binding.Id,
-            TenantId = binding.TenantId,
-            WorkspaceId = binding.WorkspaceId,
-            Roles = binding.Roles,
-            TelegramUserId = binding.TelegramUserId,
-            TelegramChatId = binding.TelegramChatId,
-        };
-
-        // Stage: role enforcement. Only commands carry role gates.
-        if (parsed is not null)
-        {
-            LogStage(messengerEvent, "role-enforcement");
-            var requiredRole = CommandRoleRequirements.RequiredRole(parsed.CommandName);
-            if (requiredRole is not null && !CommandRoleRequirements.HasRole(@operator, requiredRole))
-            {
-                _logger.LogWarning(
-                    "Pipeline rejected: insufficient permissions. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} Command={Command} RequiredRole={Role}",
-                    messengerEvent.CorrelationId,
-                    messengerEvent.EventId,
-                    "role-denied",
-                    parsed.CommandName,
-                    requiredRole);
-                return Denial(messengerEvent, PipelineResponses.InsufficientPermissions);
-            }
-        }
-
-        // Stage: route. A caught handler exception triggers
-        // ReleaseReservationAsync so the next live re-delivery is
-        // processed normally (Stage 2.2 brief Step 2 / Scenario 4);
-        // the throw still propagates so the webhook controller can
-        // mark the InboundUpdate row Failed. An uncaught crash
-        // (process exit) leaves the reservation held — Stage 2.4's
-        // sweep recovers via the durable InboundUpdate row.
-        LogStage(messengerEvent, "route");
-        CommandResult result;
+        // Release-on-throw guard spans EVERY stage after the reservation is
+        // taken — parse, authorize, disambiguation-store write, inline-button
+        // construction, role enforcement, the route switch, and the post-
+        // route MarkProcessedAsync. The Stage 2.2 brief Scenario 4 invariant
+        // ("subsequent delivery of evt-1 is processed normally, not short-
+        // circuited as duplicate") applies to ANY caught post-reservation
+        // throw, not just exceptions emitted from the routed handler. A
+        // narrower wrap-only-the-switch shape leaks the reservation when an
+        // earlier stage throws (transient authorize call, duplicate-token
+        // store write, oversized-workspace-id button validation, …); the
+        // webhook controller would surface a 500, Telegram would redeliver,
+        // TryReserveAsync would return false, and the event would be
+        // silently dropped without ever invoking a handler.
+        //
+        // Normal returns inside this try (denials, the multi-workspace
+        // prompt, the success path) do NOT trigger the catch and
+        // deliberately leave the reservation held — that is how the
+        // pipeline prevents the same denial / prompt response from being
+        // re-sent on a live re-delivery.
+        //
+        // The catch filter deliberately excludes OperationCanceledException
+        // (caller asked us to stop) — those propagate without release;
+        // Stage 2.4's InboundUpdate sweep is the recovery primitive there.
         try
         {
+            // Stage: parse (only meaningful for Command events).
+            LogStage(messengerEvent, "parse");
+            ParsedCommand? parsed = null;
+            if (messengerEvent.EventType == EventType.Command)
+            {
+                if (string.IsNullOrWhiteSpace(messengerEvent.RawCommand))
+                {
+                    _logger.LogWarning(
+                        "Pipeline rejected: Command event has no RawCommand. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage}",
+                        messengerEvent.CorrelationId,
+                        messengerEvent.EventId,
+                        "parse-empty");
+                    return Denial(messengerEvent, PipelineResponses.CommandNotRecognized);
+                }
+
+                parsed = _parser.Parse(messengerEvent.RawCommand);
+                if (!parsed.IsValid)
+                {
+                    _logger.LogWarning(
+                        "Pipeline rejected: invalid command parse. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} Reason={Reason}",
+                        messengerEvent.CorrelationId,
+                        messengerEvent.EventId,
+                        "parse-invalid",
+                        parsed.ValidationError);
+                    return Denial(messengerEvent, PipelineResponses.CommandNotRecognized);
+                }
+            }
+
+            // Stage: authorize. commandName drives Tier 1 (start) vs Tier 2 (binding) lookup.
+            LogStage(messengerEvent, "authorize");
+            var authz = await _authz.AuthorizeAsync(
+                messengerEvent.UserId,
+                messengerEvent.ChatId,
+                parsed?.CommandName,
+                ct).ConfigureAwait(false);
+
+            // Defense-in-depth: BOTH the IsAuthorized boolean AND a non-empty
+            // Bindings list are required. A well-behaved IUserAuthorizationService
+            // sets these consistently (IsAuthorized == Bindings.Count > 0 per
+            // implementation-plan.md §339), but a buggy or compromised provider
+            // could return IsAuthorized=false alongside a stale binding list —
+            // checking both closes that gap and avoids constructing an
+            // AuthorizedOperator from a binding the provider has explicitly
+            // disclaimed. Pinned by
+            // Pipeline_RejectsAuthorization_WhenIsAuthorizedFalse_DespiteNonEmptyBindings.
+            if (!authz.IsAuthorized || authz.Bindings.Count == 0)
+            {
+                _logger.LogWarning(
+                    "Pipeline rejected: unauthorized. CorrelationId={CorrelationId} EventId={EventId} UserId={UserId} ChatId={ChatId} Stage={Stage} Reason={Reason} IsAuthorized={IsAuthorized} BindingCount={BindingCount}",
+                    messengerEvent.CorrelationId,
+                    messengerEvent.EventId,
+                    messengerEvent.UserId,
+                    messengerEvent.ChatId,
+                    "authorize-denied",
+                    authz.DenialReason ?? "no active binding",
+                    authz.IsAuthorized,
+                    authz.Bindings.Count);
+                return Denial(messengerEvent, PipelineResponses.Unauthorized);
+            }
+
+            // Stage: resolve operator. Multi-workspace prompt is reserved for Command events.
+            LogStage(messengerEvent, "resolve-operator");
+            if (authz.Bindings.Count > 1 && messengerEvent.EventType == EventType.Command)
+            {
+                var workspaceIds = authz.Bindings.Select(b => b.WorkspaceId).ToArray();
+
+                // Persist a server-side disambiguation handle BEFORE emitting
+                // the prompt. The token is the only reference Stage 3.3
+                // receives via the callback — every other field needed to
+                // re-issue the original command (raw command text,
+                // correlation id, originating user/chat) is parked here so
+                // it does not have to fit in callback_data's 64-byte budget.
+                var token = GenerateDisambiguationToken();
+                var now = _timeProvider.GetUtcNow();
+                var pending = new PendingDisambiguation
+                {
+                    Token = token,
+                    OriginalRawCommand = messengerEvent.RawCommand ?? string.Empty,
+                    CorrelationId = messengerEvent.CorrelationId,
+                    TelegramUserId = messengerEvent.UserId,
+                    TelegramChatId = messengerEvent.ChatId,
+                    CandidateWorkspaceIds = workspaceIds,
+                    CreatedAt = now,
+                    ExpiresAt = now + DisambiguationTtl,
+                };
+                await _pendingDisambiguations.StoreAsync(pending, ct).ConfigureAwait(false);
+
+                var buttons = PipelineResponses.MultiWorkspaceButtons(token, workspaceIds);
+                _logger.LogInformation(
+                    "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} WorkspaceCount={Count} DisambiguationToken={Token}",
+                    messengerEvent.CorrelationId,
+                    messengerEvent.EventId,
+                    "resolve-prompt",
+                    workspaceIds.Length,
+                    token);
+                return new PipelineResult
+                {
+                    Handled = true,
+                    ResponseText = PipelineResponses.MultiWorkspacePromptText,
+                    ResponseButtons = buttons,
+                    CorrelationId = messengerEvent.CorrelationId,
+                };
+            }
+
+            var binding = authz.Bindings[0];
+            var @operator = new AuthorizedOperator
+            {
+                OperatorId = binding.Id,
+                TenantId = binding.TenantId,
+                WorkspaceId = binding.WorkspaceId,
+                Roles = binding.Roles,
+                TelegramUserId = binding.TelegramUserId,
+                TelegramChatId = binding.TelegramChatId,
+            };
+
+            // Stage: role enforcement. Only commands carry role gates.
+            if (parsed is not null)
+            {
+                LogStage(messengerEvent, "role-enforcement");
+                var requiredRole = CommandRoleRequirements.RequiredRole(parsed.CommandName);
+                if (requiredRole is not null && !CommandRoleRequirements.HasRole(@operator, requiredRole))
+                {
+                    _logger.LogWarning(
+                        "Pipeline rejected: insufficient permissions. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} Command={Command} RequiredRole={Role}",
+                        messengerEvent.CorrelationId,
+                        messengerEvent.EventId,
+                        "role-denied",
+                        parsed.CommandName,
+                        requiredRole);
+                    return Denial(messengerEvent, PipelineResponses.InsufficientPermissions);
+                }
+            }
+
+            // Stage: route. An exception from the routed handler is caught
+            // by the outer try and triggers ReleaseReservationAsync so the
+            // next live re-delivery is processed normally (Stage 2.2 brief
+            // Step 2 / Scenario 4); the throw still propagates so the
+            // webhook controller can mark the InboundUpdate row Failed. An
+            // uncaught crash (process exit) leaves the reservation held —
+            // Stage 2.4's sweep recovers via the durable InboundUpdate row.
+            LogStage(messengerEvent, "route");
+            CommandResult result;
             switch (messengerEvent.EventType)
             {
                 case EventType.Command:
@@ -381,21 +434,79 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                         CorrelationId = messengerEvent.CorrelationId,
                     };
             }
+
+            // Stage: handler-result. Inspect CommandResult.Success to drive
+            // the operator-facing response shape. Dedup-wise the contract is
+            // hybrid: throw = retryable (release-on-throw, caught below),
+            // return = terminal (mark processed regardless of Success). A
+            // handler that returns Success=false has run to completion and
+            // delivered a definitive failure response to the operator, so
+            // the pipeline marks the event processed exactly as it does on
+            // the success path. PipelineResult.Succeeded still reflects the
+            // handler's failure so observability can alert; only the dedup
+            // marker is symmetric. Pinned by
+            // Pipeline_OnHandlerReturnsFailure_MarksProcessed_AndSurfacesError
+            // and Pipeline_OnHandlerReturnsFailure_NextDeliveryShortCircuits.
+            LogStage(messengerEvent, "handler-result");
+            if (!result.Success)
+            {
+                var failureText = string.IsNullOrEmpty(result.ResponseText)
+                    ? PipelineResponses.HandlerFailureFallback
+                    : result.ResponseText;
+                _logger.LogWarning(
+                    "Pipeline handler returned failure. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} ErrorCode={ErrorCode}",
+                    messengerEvent.CorrelationId,
+                    messengerEvent.EventId,
+                    "handler-failure",
+                    result.ErrorCode);
+
+                // TERMINAL: mark processed even on Success=false so live
+                // re-deliveries short-circuit at the dedup gate. The
+                // processed marker is the canonical "done" signal that
+                // survives the Stage 4.3 distributed-cache TTL — relying on
+                // the bare reservation alone would let the gate re-open
+                // when the reservation expired and re-issue the same
+                // failure response to the operator.
+                LogStage(messengerEvent, "mark-processed");
+                await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
+
+                return new PipelineResult
+                {
+                    Handled = true,
+                    Succeeded = false,
+                    ResponseText = failureText,
+                    ErrorCode = result.ErrorCode,
+                    CorrelationId = messengerEvent.CorrelationId,
+                };
+            }
+
+            // Stage: post-success processed marker (distinct from the
+            // reservation set at the dedup stage).
+            LogStage(messengerEvent, "mark-processed");
+            await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
+
+            return new PipelineResult
+            {
+                Handled = true,
+                Succeeded = true,
+                ResponseText = result.ResponseText,
+                CorrelationId = messengerEvent.CorrelationId,
+            };
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Release-on-throw: the brief explicitly requires a
             // subsequent live re-delivery to be processed normally.
-            // We swallow any release failure so the original handler
-            // exception reaches the caller — diagnosing the underlying
-            // bug matters more than reporting a release-side cleanup
+            // We swallow any release failure so the original exception
+            // reaches the caller — diagnosing the underlying bug
+            // matters more than reporting a release-side cleanup
             // failure.
             try
             {
                 await _dedup.ReleaseReservationAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
                 _logger.LogWarning(
                     ex,
-                    "Pipeline released reservation after handler exception. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage}",
+                    "Pipeline released reservation after post-reservation exception. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage}",
                     messengerEvent.CorrelationId,
                     messengerEvent.EventId,
                     "release-on-throw");
@@ -404,71 +515,13 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             {
                 _logger.LogError(
                     releaseEx,
-                    "Pipeline failed to release reservation after handler exception; live re-delivery may short-circuit. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage}",
+                    "Pipeline failed to release reservation after post-reservation exception; live re-delivery may short-circuit. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage}",
                     messengerEvent.CorrelationId,
                     messengerEvent.EventId,
                     "release-on-throw-failed");
             }
             throw;
         }
-
-        // Stage: handler-result. Inspect CommandResult.Success to drive
-        // the operator-facing response shape. Dedup-wise the contract is
-        // hybrid: throw = retryable (release-on-throw, caught above),
-        // return = terminal (mark processed regardless of Success). A
-        // handler that returns Success=false has run to completion and
-        // delivered a definitive failure response to the operator, so
-        // the pipeline marks the event processed exactly as it does on
-        // the success path. PipelineResult.Succeeded still reflects the
-        // handler's failure so observability can alert; only the dedup
-        // marker is symmetric. Pinned by
-        // Pipeline_OnHandlerReturnsFailure_MarksProcessed_AndSurfacesError
-        // and Pipeline_OnHandlerReturnsFailure_NextDeliveryShortCircuits.
-        LogStage(messengerEvent, "handler-result");
-        if (!result.Success)
-        {
-            var failureText = string.IsNullOrEmpty(result.ResponseText)
-                ? PipelineResponses.HandlerFailureFallback
-                : result.ResponseText;
-            _logger.LogWarning(
-                "Pipeline handler returned failure. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} ErrorCode={ErrorCode}",
-                messengerEvent.CorrelationId,
-                messengerEvent.EventId,
-                "handler-failure",
-                result.ErrorCode);
-
-            // TERMINAL: mark processed even on Success=false so live
-            // re-deliveries short-circuit at the dedup gate. The
-            // processed marker is the canonical "done" signal that
-            // survives the Stage 4.3 distributed-cache TTL — relying on
-            // the bare reservation alone would let the gate re-open
-            // when the reservation expired and re-issue the same
-            // failure response to the operator.
-            LogStage(messengerEvent, "mark-processed");
-            await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
-
-            return new PipelineResult
-            {
-                Handled = true,
-                Succeeded = false,
-                ResponseText = failureText,
-                ErrorCode = result.ErrorCode,
-                CorrelationId = messengerEvent.CorrelationId,
-            };
-        }
-
-        // Stage: post-success processed marker (distinct from the
-        // reservation set at the dedup stage).
-        LogStage(messengerEvent, "mark-processed");
-        await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
-
-        return new PipelineResult
-        {
-            Handled = true,
-            Succeeded = true,
-            ResponseText = result.ResponseText,
-            CorrelationId = messengerEvent.CorrelationId,
-        };
     }
 
     /// <summary>
