@@ -443,19 +443,20 @@ public sealed class TeamsSwarmActivityHandlerTests
     }
 
     /// <summary>
-    /// Regression for evaluator-iter-2 finding #3 — `TeamsSwarmActivityHandler` must map
-    /// each canonical command verb to its matching `MessengerEventTypes` discriminator
-    /// per architecture.md §3.1 / e2e-scenarios.md §Correlation and Traceability rather
-    /// than collapsing every command into <see cref="AgentSwarm.Messaging.Abstractions.MessengerEventTypes.Command"/>.
-    /// Theory rows cover all five command-event types: AgentTaskRequest (the
-    /// task-creation discriminator), Command (general-purpose for status/approve/reject),
-    /// Escalation, PauseAgent, and ResumeAgent.
+    /// Regression for evaluator-iter-2 finding #3 — each canonical command handler must
+    /// publish a <see cref="AgentSwarm.Messaging.Abstractions.CommandEvent"/> with the
+    /// architecture.md §3.1 / e2e-scenarios.md §Correlation discriminator for its verb.
+    /// This is now a HANDLER-owned responsibility (not the activity handler's): the
+    /// dispatcher invokes the verb-specific handler and the handler publishes its own
+    /// CommandEvent so the dispatcher is self-sufficient outside the Teams pipeline AND
+    /// approve/reject do not double-emit (DecisionEvent only — see
+    /// ApproveCommandHandlerTests / RejectCommandHandlerTests for that contract).
+    /// Theory rows cover the five command verbs that publish a CommandEvent:
+    /// AgentTaskRequest, Command (status), Escalation, PauseAgent, ResumeAgent.
     /// </summary>
     [Theory]
     [InlineData("agent ask create e2e tests", "agent ask", "AgentTaskRequest")]
     [InlineData("agent status", "agent status", "Command")]
-    [InlineData("approve", "approve", "Command")]
-    [InlineData("reject Q-99", "reject", "Command")]
     [InlineData("escalate", "escalate", "Escalation")]
     [InlineData("pause", "pause", "PauseAgent")]
     [InlineData("resume", "resume", "ResumeAgent")]
@@ -464,21 +465,49 @@ public sealed class TeamsSwarmActivityHandlerTests
         string expectedVerb,
         string expectedEventType)
     {
-        var harness = Build();
+        var recording = new TestDoubles.RecordingInboundEventPublisher();
+        var harness = BuildE2E(recording);
         MapDave(harness.IdentityResolver);
         var activity = NewPersonalMessage(text);
 
-        await ProcessAsync(harness, activity);
+        await ProcessE2EAsync(harness, activity);
 
-        // The harness's default IInboundEventPublisher is a RecordingInboundEventPublisher
-        // — see HandlerFactory.Build(). Cast to access its Published list.
-        var recording = Assert.IsType<TestDoubles.RecordingInboundEventPublisher>(harness.EventPublisher);
         var published = Assert.Single(recording.Published);
         var commandEvent = Assert.IsType<AgentSwarm.Messaging.Abstractions.CommandEvent>(published);
         Assert.Equal(expectedEventType, commandEvent.EventType);
         Assert.Equal(expectedVerb, commandEvent.Payload.CommandType);
         Assert.Equal("Teams", commandEvent.Messenger);
         Assert.Equal("aad-obj-dave-001", commandEvent.ExternalUserId);
+    }
+
+    /// <summary>
+    /// Regression for evaluator-iter-2 finding #4 — authorized users sending unrecognised
+    /// free text (text that does not match any canonical command verb) must NOT be
+    /// rejected by the role-scoped RBAC stub before reaching the dispatcher. The
+    /// dispatcher's TextEvent + help-card path (per <c>implementation-plan.md</c> §3.2 step
+    /// 7) is the contractual handling for non-canonical input; default-deny RBAC applies
+    /// to canonical verbs only.
+    /// </summary>
+    [Fact]
+    public async Task OnMessageActivityAsync_AuthorizedUserSendsUnknownText_DispatchesTextEventThroughDispatcher()
+    {
+        var recording = new TestDoubles.RecordingInboundEventPublisher();
+        var harness = BuildE2E(recording);
+        MapDave(harness.IdentityResolver);
+
+        var activity = NewPersonalMessage("hello there");
+        await ProcessE2EAsync(harness, activity);
+
+        var published = Assert.Single(recording.Published);
+        var textEvent = Assert.IsType<AgentSwarm.Messaging.Abstractions.TextEvent>(published);
+        Assert.Equal(AgentSwarm.Messaging.Abstractions.MessengerEventTypes.Text, textEvent.EventType);
+        Assert.Equal("hello there", textEvent.Payload);
+        Assert.Equal("Teams", textEvent.Messenger);
+        Assert.Equal("aad-obj-dave-001", textEvent.ExternalUserId);
+
+        // Help card should also have been sent in reply.
+        var sent = Assert.Single(harness.Adapter.Sent);
+        Assert.Single(sent.Attachments);
     }
 }
 
