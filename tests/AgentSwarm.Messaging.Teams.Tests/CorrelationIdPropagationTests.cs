@@ -50,4 +50,50 @@ public sealed class CorrelationIdPropagationTests
         var audit = Assert.Single(harness.AuditLogger.Entries);
         Assert.Equal(upstream, audit.CorrelationId);
     }
+
+    /// <summary>
+    /// Iter-4 hardening regression: incidental leading/trailing whitespace on the
+    /// upstream <c>correlationId</c> property must be trimmed before propagation so
+    /// downstream byte-exact joins (Application Insights / Kusto trace correlation,
+    /// SQL audit-query equality predicates) are not silently broken by a padded value.
+    /// </summary>
+    [Theory]
+    [InlineData(" corr-abc-123")]
+    [InlineData("corr-abc-123 ")]
+    [InlineData("  corr-abc-123  ")]
+    [InlineData("\tcorr-abc-123\t")]
+    public async Task OnTurnAsync_UpstreamCorrelationIdWithWhitespace_TrimmedBeforePropagation(string padded)
+    {
+        var harness = Build();
+        MapDave(harness.IdentityResolver);
+        var activity = NewPersonalMessage("agent status", correlationId: padded);
+
+        await ProcessAsync(harness, activity);
+
+        var context = Assert.Single(harness.Dispatcher.Dispatched);
+        Assert.Equal("corr-abc-123", context.CorrelationId);
+        var audit = Assert.Single(harness.AuditLogger.Entries);
+        Assert.Equal("corr-abc-123", audit.CorrelationId);
+    }
+
+    /// <summary>
+    /// Iter-4 hardening regression: a whitespace-only upstream value falls back to a
+    /// fresh GUID (the same path taken when no upstream value is supplied). This
+    /// prevents a bogus pure-whitespace ID from polluting the trace correlation field.
+    /// </summary>
+    [Theory]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    [InlineData("")]
+    public async Task OnTurnAsync_WhitespaceOnlyUpstreamCorrelationId_FallsBackToGuid(string blank)
+    {
+        var harness = Build();
+        MapDave(harness.IdentityResolver);
+        var activity = NewPersonalMessage("agent status", correlationId: blank);
+
+        await ProcessAsync(harness, activity);
+
+        var context = Assert.Single(harness.Dispatcher.Dispatched);
+        Assert.True(Guid.TryParse(context.CorrelationId, out _));
+    }
 }

@@ -527,9 +527,20 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             }
 
             var raw = token.ToString();
-            if (!string.IsNullOrWhiteSpace(raw))
+            if (string.IsNullOrWhiteSpace(raw))
             {
-                return raw;
+                continue;
+            }
+
+            // Iter-4 hardening: defensively trim incidental whitespace so an upstream
+            // value like " corr-abc " does not propagate through to the dispatched
+            // CommandContext, audit entries, and structured-log fields. Distributed-trace
+            // joins (Application Insights / Kusto) rely on byte-exact equality, so a
+            // padded value silently shears the trace.
+            var trimmed = raw.Trim();
+            if (trimmed.Length > 0)
+            {
+                return trimmed;
             }
         }
 
