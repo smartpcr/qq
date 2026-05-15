@@ -149,6 +149,113 @@ internal static class TestDoubles
         public Task<IReadOnlyList<AgentQuestion>> GetOpenExpiredAsync(DateTimeOffset cutoff, int batchSize, CancellationToken ct) => Task.FromResult<IReadOnlyList<AgentQuestion>>(Array.Empty<AgentQuestion>());
     }
 
+    /// <summary>
+    /// In-memory recording <see cref="IAgentQuestionStore"/> used by Stage 3.2 approve /
+    /// reject handler tests. Tracks status transitions, captures the get-by-id /
+    /// get-by-conversation calls, and supports configurable CAS behaviour to exercise the
+    /// first-writer-wins idempotency path.
+    /// </summary>
+    /// <remarks>
+    /// Named <c>InMemoryAgentQuestionStore</c> rather than <c>RecordingAgentQuestionStore</c>
+    /// to avoid a collision with the connector-tests' simpler recording double of the same
+    /// name nested in <see cref="TeamsMessengerConnectorTests"/>. Stage 3.2 needs a richer
+    /// fake with seed / get-by-id / get-open-by-conversation / CAS observability so the
+    /// approve/reject scenarios can be asserted end-to-end.
+    /// </remarks>
+    public sealed class InMemoryAgentQuestionStore : IAgentQuestionStore
+    {
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, AgentQuestion> _byId
+            = new(StringComparer.Ordinal);
+
+        public List<string> GetByIdCalls { get; } = new();
+        public List<string> GetOpenByConversationCalls { get; } = new();
+        public List<(string QuestionId, string Expected, string New)> StatusTransitionCalls { get; } = new();
+
+        /// <summary>
+        /// When true, <see cref="TryUpdateStatusAsync"/> returns false for the next call,
+        /// simulating a concurrent winning resolver (first-writer-wins per architecture
+        /// §6.3). Resets to false after one observation so subsequent calls succeed.
+        /// </summary>
+        public bool ForceTransitionFailure { get; set; }
+
+        public void Seed(AgentQuestion question)
+        {
+            _byId[question.QuestionId] = question;
+        }
+
+        public Task SaveAsync(AgentQuestion question, CancellationToken ct)
+        {
+            _byId[question.QuestionId] = question;
+            return Task.CompletedTask;
+        }
+
+        public Task<AgentQuestion?> GetByIdAsync(string questionId, CancellationToken ct)
+        {
+            GetByIdCalls.Add(questionId);
+            _byId.TryGetValue(questionId, out var hit);
+            return Task.FromResult<AgentQuestion?>(hit);
+        }
+
+        public Task<bool> TryUpdateStatusAsync(string questionId, string expectedStatus, string newStatus, CancellationToken ct)
+        {
+            StatusTransitionCalls.Add((questionId, expectedStatus, newStatus));
+
+            if (ForceTransitionFailure)
+            {
+                ForceTransitionFailure = false;
+                return Task.FromResult(false);
+            }
+
+            if (!_byId.TryGetValue(questionId, out var existing))
+            {
+                return Task.FromResult(false);
+            }
+
+            if (!string.Equals(existing.Status, expectedStatus, StringComparison.Ordinal))
+            {
+                return Task.FromResult(false);
+            }
+
+            _byId[questionId] = existing with { Status = newStatus };
+            return Task.FromResult(true);
+        }
+
+        public Task UpdateConversationIdAsync(string questionId, string conversationId, CancellationToken ct)
+        {
+            if (_byId.TryGetValue(questionId, out var existing))
+            {
+                _byId[questionId] = existing with { ConversationId = conversationId };
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public Task<AgentQuestion?> GetMostRecentOpenByConversationAsync(string conversationId, CancellationToken ct)
+        {
+            var hit = _byId.Values
+                .Where(q => q.Status == AgentQuestionStatuses.Open
+                            && string.Equals(q.ConversationId, conversationId, StringComparison.Ordinal))
+                .OrderByDescending(q => q.CreatedAt)
+                .FirstOrDefault();
+            return Task.FromResult<AgentQuestion?>(hit);
+        }
+
+        public Task<IReadOnlyList<AgentQuestion>> GetOpenByConversationAsync(string conversationId, CancellationToken ct)
+        {
+            GetOpenByConversationCalls.Add(conversationId);
+
+            IReadOnlyList<AgentQuestion> matches = _byId.Values
+                .Where(q => q.Status == AgentQuestionStatuses.Open
+                            && string.Equals(q.ConversationId, conversationId, StringComparison.Ordinal))
+                .OrderByDescending(q => q.CreatedAt)
+                .ToList();
+            return Task.FromResult(matches);
+        }
+
+        public Task<IReadOnlyList<AgentQuestion>> GetOpenExpiredAsync(DateTimeOffset cutoff, int batchSize, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<AgentQuestion>>(Array.Empty<AgentQuestion>());
+    }
+
     public sealed class RecordingCardActionHandler : ICardActionHandler
     {
         public int Invocations { get; private set; }

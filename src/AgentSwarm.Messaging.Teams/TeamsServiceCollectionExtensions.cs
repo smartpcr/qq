@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Commands;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -106,6 +107,7 @@ public static class TeamsServiceCollectionExtensions
         }
 
         services.AddInProcessInboundEventChannel();
+        services.AddTeamsCommandDispatcher();
         services.TryAddSingleton<TeamsMessengerConnector>();
         services.TryAddKeyedSingleton<IMessengerConnector>(
             MessengerKey,
@@ -146,6 +148,61 @@ public static class TeamsServiceCollectionExtensions
                     "AddTeamsMessengerConnector (the TryAddSingleton in this helper will " +
                     "then leave your registration in place).");
         });
+
+        return services;
+    }
+
+    /// <summary>
+    /// Register the Stage 3.2 <see cref="CommandDispatcher"/> and every concrete
+    /// <see cref="ICommandHandler"/> shipped in <see cref="AgentSwarm.Messaging.Teams.Commands"/>
+    /// (Ask, Status, Approve, Reject, Escalate, Pause, Resume). Idempotent — every
+    /// registration uses <c>TryAdd*</c> so calling this helper multiple times leaves the
+    /// descriptor count unchanged. The dispatcher itself is exposed under
+    /// <see cref="ICommandDispatcher"/> (the contract consumed by
+    /// <see cref="TeamsSwarmActivityHandler"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The default <see cref="IAdaptiveCardRenderer"/> registration is also installed when
+    /// missing (the approve/reject handlers depend on it for the decision-confirmation
+    /// card). Hosts that wire a custom renderer can register it BEFORE calling this helper
+    /// — <c>TryAddSingleton</c> leaves explicit registrations in place.
+    /// </para>
+    /// <para>
+    /// Handlers are registered as <c>AddSingleton&lt;ICommandHandler, T&gt;</c> (not
+    /// <c>TryAddSingleton</c>) on purpose: the dispatcher resolves the full
+    /// <see cref="IEnumerable{T}"/> of handlers from DI and the per-implementation
+    /// uniqueness invariant is enforced by <see cref="CommandDispatcher"/>'s constructor.
+    /// To prevent the same handler implementation type being registered twice when this
+    /// helper is invoked more than once, each <see cref="ICommandHandler"/> registration
+    /// is guarded with <see cref="ServiceCollectionDescriptorExtensions.TryAddEnumerable(IServiceCollection, ServiceDescriptor)"/>.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddTeamsCommandDispatcher(this IServiceCollection services)
+    {
+        if (services is null)
+        {
+            throw new ArgumentNullException(nameof(services));
+        }
+
+        services.AddInProcessInboundEventChannel();
+        services.TryAddSingleton<IAdaptiveCardRenderer, AdaptiveCardBuilder>();
+
+        // Default IAgentSwarmStatusProvider wiring — the no-op default returns an empty
+        // status list so StatusCommandHandler is wirable in DI without a real orchestrator
+        // attached. Hosts override by registering a concrete provider BEFORE calling this
+        // helper; TryAddSingleton leaves explicit registrations untouched.
+        services.TryAddSingleton<IAgentSwarmStatusProvider, NullAgentSwarmStatusProvider>();
+
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, AskCommandHandler>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, StatusCommandHandler>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, ApproveCommandHandler>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, RejectCommandHandler>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, EscalateCommandHandler>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, PauseCommandHandler>());
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, ResumeCommandHandler>());
+
+        services.TryAddSingleton<ICommandDispatcher, CommandDispatcher>();
 
         return services;
     }
