@@ -2,13 +2,23 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 
 /// <summary>
 /// Request to render a release-gate approval card via
-/// <see cref="IAdaptiveCardRenderer.RenderReleaseGateCard"/>. This entity carries gate-level
-/// metadata that the orchestrator uses to create per-approver
-/// <see cref="AgentSwarm.Messaging.Abstractions.AgentQuestion"/> records (per
-/// <c>architecture.md</c> §6.3.1 multi-approver modeling). The release gate card template
-/// renders identically for each approver; threshold aggregation (e.g., "2 of 3 approvers
-/// must approve") is handled by the orchestrator's workflow layer, NOT by
-/// <c>CardActionHandler</c> or the card template itself.
+/// <see cref="IAdaptiveCardRenderer.RenderReleaseGateCard"/>. <b>Construction order</b>
+/// (per <c>architecture.md</c> §6.3.1 multi-approver modeling): the orchestrator FIRST
+/// creates per-approver <see cref="AgentSwarm.Messaging.Abstractions.AgentQuestion"/>
+/// records (one per required approver, each with its own
+/// <see cref="AgentSwarm.Messaging.Abstractions.AgentQuestion.QuestionId"/> and
+/// <see cref="AgentSwarm.Messaging.Abstractions.AgentQuestion.TargetUserId"/>), THEN
+/// constructs one <see cref="ReleaseGateRequest"/> per approver carrying that approver's
+/// <c>QuestionId</c> plus the shared gate metadata
+/// (<see cref="GateName"/>, <see cref="ReleaseVersion"/>, <see cref="Environment"/>,
+/// <see cref="GateConditions"/>, <see cref="GateStatus"/>). Each per-approver
+/// <see cref="ReleaseGateRequest"/> is rendered into a separate Adaptive Card so
+/// Stage 3.3's <c>CardActionHandler</c> can run the standard single-decision
+/// first-writer-wins lifecycle independently for each approver. <see cref="ReleaseGateRequest"/>
+/// is therefore a <i>per-approver render input</i>, NOT a shared gate-state record. The
+/// release gate card template renders identically for each approver; threshold aggregation
+/// (e.g., "2 of 3 approvers must approve") is handled by the orchestrator's workflow layer,
+/// NOT by <c>CardActionHandler</c> or the card template itself.
 /// </summary>
 /// <param name="GateId">Unique release-gate identifier.</param>
 /// <param name="QuestionId">Per-approver <see cref="AgentSwarm.Messaging.Abstractions.AgentQuestion.QuestionId"/> embedded in the card's action payload. Per <c>architecture.md</c> §6.3.1 (multi-approver release gates), the orchestrator creates one <c>AgentQuestion</c> per required approver and the same <see cref="ReleaseGateRequest"/> metadata is rendered into N cards, each carrying its own per-approver <c>QuestionId</c> so Stage 3.3's <c>CardActionHandler</c> can run the standard single-decision first-writer-wins lifecycle independently for each approver.</param>
