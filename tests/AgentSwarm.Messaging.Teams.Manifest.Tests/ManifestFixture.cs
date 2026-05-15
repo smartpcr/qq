@@ -33,7 +33,7 @@ internal static class ManifestFixture
     /// Path to the cross-platform packaging script staged alongside the manifest.
     /// </summary>
     public static string PackagingScriptPath { get; } =
-        Path.Combine(AppContext.BaseDirectory, "ManifestArtifacts", "build-manifest.ps1");
+        Path.Combine(AppContext.BaseDirectory, "ManifestArtifacts", "package-teams-app.ps1");
 
     /// <summary>
     /// Loads <c>manifest.json</c> as a <see cref="JsonNode"/>. The file is required to
