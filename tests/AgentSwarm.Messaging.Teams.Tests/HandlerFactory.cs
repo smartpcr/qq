@@ -30,34 +30,20 @@ internal static class HandlerFactory
         IInboundEventPublisher EventPublisher,
         InertBotAdapter Adapter);
 
-    /// <summary>
-    /// E2E harness wiring the real <see cref="AgentSwarm.Messaging.Teams.Commands.CommandDispatcher"/>
-    /// and every concrete <see cref="AgentSwarm.Messaging.Abstractions.ICommandHandler"/>
-    /// shipped in <c>AgentSwarm.Messaging.Teams.Commands</c>. Used by tests that need the
-    /// full activity-handler → dispatcher → handler → publisher pipeline (so the per-verb
-    /// CommandEvent / DecisionEvent / TextEvent emissions can be asserted end-to-end).
-    /// </summary>
-    public sealed record E2EHarness(
-        TeamsSwarmActivityHandler Handler,
-        RecordingConversationReferenceStore Store,
-        FakeIdentityResolver IdentityResolver,
-        AlwaysAuthorizationService Authorization,
-        RecordingAuditLogger AuditLogger,
-        RecordingCardActionHandler CardHandler,
-        IInboundEventPublisher EventPublisher,
-        InMemoryAgentQuestionStore QuestionStore,
-        InertBotAdapter Adapter);
-
-    public static Harness Build()
-        => Build(eventPublisher: new RecordingInboundEventPublisher());
+    public static Harness Build() => Build(new RecordingInboundEventPublisher());
 
     /// <summary>
-    /// Build a harness with a caller-supplied <see cref="IInboundEventPublisher"/>. Used by
-    /// Stage 2.3 connector tests that wire the handler and the connector through the same
-    /// <c>ChannelInboundEventPublisher</c> instance for end-to-end coverage.
+    /// Build a handler harness whose inbound-event publisher is the supplied instance.
+    /// Used by Stage 2.3 connector end-to-end tests to wire the activity handler's
+    /// inbound publisher to the same <see cref="ChannelInboundEventPublisher"/> the
+    /// connector reads from, so a real <c>OnMessageActivityAsync</c> -> publisher ->
+    /// <c>TeamsMessengerConnector.ReceiveAsync</c> round-trip can be exercised without
+    /// test-side shortcuts.
     /// </summary>
     public static Harness Build(IInboundEventPublisher eventPublisher)
     {
+        if (eventPublisher is null) throw new ArgumentNullException(nameof(eventPublisher));
+
         var store = new RecordingConversationReferenceStore();
         var dispatcher = new RecordingCommandDispatcher();
         var identityResolver = new FakeIdentityResolver();
@@ -75,59 +61,6 @@ internal static class HandlerFactory
             eventPublisher,
             NullLogger<TeamsSwarmActivityHandler>.Instance);
         return new Harness(handler, store, dispatcher, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, new InertBotAdapter());
-    }
-
-    /// <summary>
-    /// Build an E2E harness wiring the real <see cref="AgentSwarm.Messaging.Teams.Commands.CommandDispatcher"/>
-    /// with every concrete handler. The dispatcher and handlers share the supplied
-    /// <paramref name="eventPublisher"/> so each canonical verb publishes its own
-    /// <c>CommandEvent</c> / <c>DecisionEvent</c> / <c>TextEvent</c> exactly once.
-    /// </summary>
-    public static E2EHarness BuildE2E(IInboundEventPublisher eventPublisher)
-    {
-        var store = new RecordingConversationReferenceStore();
-        var identityResolver = new FakeIdentityResolver();
-        var authorization = new AlwaysAuthorizationService();
-        var auditLogger = new RecordingAuditLogger();
-        var cardHandler = new RecordingCardActionHandler();
-        var questionStore = new InMemoryAgentQuestionStore();
-        var renderer = new AgentSwarm.Messaging.Teams.Cards.AdaptiveCardBuilder();
-        var statusProvider = new AgentSwarm.Messaging.Teams.Commands.NullAgentSwarmStatusProvider();
-
-        var handlers = new AgentSwarm.Messaging.Abstractions.ICommandHandler[]
-        {
-            new AgentSwarm.Messaging.Teams.Commands.AskCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.AskCommandHandler>.Instance),
-            new AgentSwarm.Messaging.Teams.Commands.StatusCommandHandler(statusProvider, renderer, eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.StatusCommandHandler>.Instance),
-            new AgentSwarm.Messaging.Teams.Commands.ApproveCommandHandler(questionStore, eventPublisher, renderer, NullLogger<AgentSwarm.Messaging.Teams.Commands.ApproveCommandHandler>.Instance),
-            new AgentSwarm.Messaging.Teams.Commands.RejectCommandHandler(questionStore, eventPublisher, renderer, NullLogger<AgentSwarm.Messaging.Teams.Commands.RejectCommandHandler>.Instance),
-            new AgentSwarm.Messaging.Teams.Commands.EscalateCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.EscalateCommandHandler>.Instance),
-            new AgentSwarm.Messaging.Teams.Commands.PauseCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.PauseCommandHandler>.Instance),
-            new AgentSwarm.Messaging.Teams.Commands.ResumeCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.ResumeCommandHandler>.Instance),
-        };
-
-        var dispatcher = new AgentSwarm.Messaging.Teams.Commands.CommandDispatcher(
-            handlers,
-            eventPublisher,
-            NullLogger<AgentSwarm.Messaging.Teams.Commands.CommandDispatcher>.Instance);
-
-        var handler = new TeamsSwarmActivityHandler(
-            store,
-            dispatcher,
-            identityResolver,
-            authorization,
-            questionStore,
-            auditLogger,
-            cardHandler,
-            eventPublisher,
-            NullLogger<TeamsSwarmActivityHandler>.Instance);
-
-        return new E2EHarness(handler, store, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, questionStore, new InertBotAdapter());
-    }
-
-    public static async Task ProcessE2EAsync(E2EHarness harness, Activity activity, CancellationToken ct = default)
-    {
-        var turnContext = new TurnContext(harness.Adapter, activity);
-        await ((IBot)harness.Handler).OnTurnAsync(turnContext, ct).ConfigureAwait(false);
     }
 
     public static UserIdentity MapDave(FakeIdentityResolver resolver, string aadObjectId = "aad-obj-dave-001")
@@ -214,6 +147,63 @@ internal static class HandlerFactory
         {
             tenant = new { id = TenantId },
         });
+
+        return activity;
+    }
+
+    /// <summary>
+    /// Build a team-scope members-added activity simulating a Teams install where the
+    /// SDK populates <c>ChannelData.team.id</c> and the <c>TeamInfo</c> handler argument
+    /// but <b>omits</b> <c>ChannelData.channel.id</c>. Used by the regression test for
+    /// iter-1 evaluator feedback item #2 (team installs without channel ID were
+    /// previously misclassified as personal references keyed by the installer AAD).
+    /// </summary>
+    /// <param name="teamId">Team ID surfaced in <c>ChannelData.team.id</c> and the
+    /// dispatched <see cref="TeamInfo"/>.</param>
+    /// <param name="conversationId">Conversation ID — defaults to a Teams channel-thread
+    /// shape <c>19:xxx@thread.tacv2</c>, which is what the handler falls back to as the
+    /// effective channel ID.</param>
+    /// <param name="channelId">Optional explicit <c>ChannelData.channel.id</c>. When
+    /// <c>null</c> (the default), the channel record is omitted entirely so the handler
+    /// must rely on the team scope hint + conversation ID fallback.</param>
+    public static Activity NewTeamMembersAddedActivity(
+        string teamId,
+        string conversationId = "19:team-conv-no-channel-id@thread.tacv2",
+        string? channelId = null)
+    {
+        var activity = new Activity(ActivityTypes.ConversationUpdate)
+        {
+            Id = Guid.NewGuid().ToString(),
+            ChannelId = "msteams",
+            ServiceUrl = "https://smba.trafficmanager.net/amer/",
+            From = new ChannelAccount(id: "29:team-installer", name: "Team Installer") { AadObjectId = "aad-obj-team-installer" },
+            Recipient = new ChannelAccount(id: BotId, name: BotName),
+            Conversation = new ConversationAccount(id: conversationId) { TenantId = TenantId, ConversationType = "channel" },
+            MembersAdded = new List<ChannelAccount>
+            {
+                new ChannelAccount(id: BotId, name: BotName),
+            },
+        };
+
+        // ChannelData carries tenant + team but NOT channel — simulating Teams payloads
+        // that omit Channel.Id on team-level install events.
+        if (channelId is null)
+        {
+            activity.ChannelData = JObject.FromObject(new
+            {
+                tenant = new { id = TenantId },
+                team = new { id = teamId },
+            });
+        }
+        else
+        {
+            activity.ChannelData = JObject.FromObject(new
+            {
+                tenant = new { id = TenantId },
+                team = new { id = teamId },
+                channel = new { id = channelId },
+            });
+        }
 
         return activity;
     }

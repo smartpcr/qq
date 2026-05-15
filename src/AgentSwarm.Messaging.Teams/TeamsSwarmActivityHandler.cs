@@ -83,9 +83,7 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 #pragma warning restore IDE0052
     private readonly IAuditLogger _auditLogger;
     private readonly ICardActionHandler _cardActionHandler;
-#pragma warning disable IDE0052 // dependency retained for backward compat; per impl-plan §3.2 step 7 the CommandDispatcher (not this handler) owns inbound event publication.
     private readonly IInboundEventPublisher _inboundEventPublisher;
-#pragma warning restore IDE0052
     private readonly ILogger<TeamsSwarmActivityHandler> _logger;
 
     /// <summary>
@@ -187,68 +185,50 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             return;
         }
 
-        // (2.5) Determine whether the inbound text matches a canonical command verb. Only
-        // canonical verbs go through role-scoped RBAC (per architecture.md §5.2 — RBAC is
-        // a per-command authorization decision keyed on the verb vocabulary). Free-text /
-        // unrecognised input is NOT a privileged action: tenant validation (upstream
-        // middleware) plus successful identity resolution above are sufficient to deliver
-        // the text to the dispatcher's TextEvent path. This branch resolves evaluator
-        // iter-1 finding #4: a realistic RBAC implementation must not reject `hello
-        // there` before the dispatcher publishes the required `TextEvent` and help card.
+        // (3) Authorize the command. The default-deny stub rejects every request;
+        // Stage 5.1 swaps in role-scoped RBAC.
         var commandVerb = ExtractCommandVerb(normalizedText);
-        var isCanonical = IsCanonicalVerb(commandVerb);
+        var authorization = await _authorizationService
+            .AuthorizeAsync(tenantId, resolvedIdentity.InternalUserId, commandVerb, cancellationToken)
+            .ConfigureAwait(false);
 
-        // (3) Authorize the command (canonical verbs only). The default-deny stub rejects
-        // every request; Stage 5.1 swaps in role-scoped RBAC.
-        if (isCanonical)
+        if (!authorization.IsAuthorized)
         {
-            var authorization = await _authorizationService
-                .AuthorizeAsync(tenantId, resolvedIdentity.InternalUserId, commandVerb, cancellationToken)
-                .ConfigureAwait(false);
+            _logger.LogWarning(
+                "Inbound message rejected — user {InternalUserId} (role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
+                resolvedIdentity.InternalUserId,
+                authorization.UserRole,
+                authorization.RequiredRole,
+                commandVerb,
+                tenantId,
+                correlationId);
 
-            if (!authorization.IsAuthorized)
-            {
-                _logger.LogWarning(
-                    "Inbound message rejected — user {InternalUserId} (role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
-                    resolvedIdentity.InternalUserId,
-                    authorization.UserRole,
-                    authorization.RequiredRole,
-                    commandVerb,
-                    tenantId,
-                    correlationId);
+            await LogSecurityRejectionAsync(
+                correlationId: correlationId,
+                tenantId: tenantId,
+                actorId: aadObjectId,
+                action: "InsufficientRoleRejected",
+                conversationId: activity?.Conversation?.Id,
+                reason: $"User role '{authorization.UserRole}' is insufficient for command '{commandVerb}' (required: '{authorization.RequiredRole}').",
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
-                await LogSecurityRejectionAsync(
-                    correlationId: correlationId,
-                    tenantId: tenantId,
-                    actorId: aadObjectId,
-                    action: "InsufficientRoleRejected",
-                    conversationId: activity?.Conversation?.Id,
-                    reason: $"User role '{authorization.UserRole}' is insufficient for command '{commandVerb}' (required: '{authorization.RequiredRole}').",
-                    cancellationToken: cancellationToken).ConfigureAwait(false);
-
-                var deniedReason = authorization.RequiredRole is null
-                    ? "Insufficient permissions for this command."
-                    : $"This command requires the '{authorization.RequiredRole}' role.";
-                var deniedCard = BuildAccessDeniedCardActivity(deniedReason, authorization.RequiredRole);
-                await turnContext.SendActivityAsync(deniedCard, cancellationToken).ConfigureAwait(false);
-                return;
-            }
+            var deniedReason = authorization.RequiredRole is null
+                ? "Insufficient permissions for this command."
+                : $"This command requires the '{authorization.RequiredRole}' role.";
+            var deniedCard = BuildAccessDeniedCardActivity(deniedReason, authorization.RequiredRole);
+            await turnContext.SendActivityAsync(deniedCard, cancellationToken).ConfigureAwait(false);
+            return;
         }
 
-        // (3.5) Authorized inbound — emit the `CommandReceived` audit BEFORE persisting
+        // (3.5) Authorized command — emit the `CommandReceived` audit BEFORE persisting
         // the reference and dispatching. Persisting an immutable audit record on every
-        // authorized inbound (both canonical commands and unrecognised free text) satisfies
-        // the story's "Persist immutable audit trail suitable for enterprise review"
-        // requirement and the attachment's e2e mandate. For non-canonical text, the
-        // commandVerb is empty so the audit `Action` records "(text)" — distinguishing the
-        // shape from a real command without inventing a new AuditEventType (the canonical
-        // set is fixed at seven per tech-spec §4.3).
+        // authorized inbound command satisfies the story's "Persist immutable audit trail
+        // suitable for enterprise review" requirement and the attachment's e2e mandate.
         await LogCommandReceivedAsync(
             correlationId: correlationId,
             tenantId: tenantId,
             actorId: aadObjectId,
-            commandVerb: isCanonical ? commandVerb : "(text)",
-            isCanonicalVerb: isCanonical,
+            commandVerb: commandVerb,
             conversationId: activity?.Conversation?.Id,
             normalizedText: normalizedText,
             cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -262,16 +242,24 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             tenantId,
             cancellationToken).ConfigureAwait(false);
 
+        // (4.5) Publish a CommandEvent to the shared in-process inbound channel for
+        // consumption by TeamsMessengerConnector.ReceiveAsync. Per
+        // implementation-plan.md §1.2 and §2.2 step 1 (dependency #8), the handler is the
+        // producer for recognized command-verb events; CommandDispatcher (Stage 3.2) is
+        // the producer for TextEvent / DecisionEvent. Unknown verbs are not published as
+        // CommandEvent here — they fall through to the dispatcher, which publishes
+        // TextEvent per impl-plan §3.2 unrecognized-input step.
+        await PublishInboundCommandEventAsync(
+            activity: activity,
+            normalizedText: normalizedText,
+            commandVerb: commandVerb,
+            correlationId: correlationId,
+            aadObjectId: aadObjectId,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+
         // (5) Dispatch to the command dispatcher with a fully populated CommandContext.
         // Per impl-plan §2.2 step 2, CommandDispatcher receives ALREADY-CLEANED text and
-        // must NOT perform any @mention stripping itself. The dispatcher and its handlers
-        // own ALL inbound event publication for this turn — canonical command handlers
-        // publish their own `CommandEvent` (per impl-plan §3.2 step 2), approve/reject
-        // publish `DecisionEvent`, and the dispatcher itself publishes `TextEvent` for
-        // unrecognised input. The activity handler therefore does NOT publish a
-        // post-dispatch `CommandEvent` — that would double-emit for approve/reject and
-        // make the dispatcher non-self-sufficient outside the activity-handler path
-        // (resolves evaluator iter-1 findings #2 and #3).
+        // must NOT perform any @mention stripping itself.
         var context = new CommandContext
         {
             NormalizedText = normalizedText,
@@ -284,16 +272,6 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 
         await _commandDispatcher.DispatchAsync(context, cancellationToken).ConfigureAwait(false);
     }
-
-    /// <summary>
-    /// Returns <c>true</c> when <paramref name="commandVerb"/> matches one of the
-    /// canonical command verbs in <see cref="KnownCommandVerbs"/>. Used to gate role-scoped
-    /// RBAC (per <c>architecture.md</c> §5.2) so unrecognised free-text input flows to the
-    /// dispatcher's <c>TextEvent</c> path (per <c>implementation-plan.md</c> §3.2 step 7)
-    /// instead of being rejected by a default-deny authorization stub.
-    /// </summary>
-    private static bool IsCanonicalVerb(string commandVerb)
-        => !string.IsNullOrEmpty(commandVerb) && KnownCommandVerbs.Contains(commandVerb);
 
     /// <inheritdoc />
     protected override async Task OnTeamsMembersAddedAsync(
@@ -317,11 +295,15 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         var tenantId = ExtractTenantId(activity);
         var correlationId = GetCorrelationId(turnContext);
 
+        // Pass the SDK-supplied teamInfo as a hint so PersistConversationReferenceAsync
+        // classifies the install as team-scope even when Teams omits Channel.Id from the
+        // ChannelData payload (iter-1 evaluator feedback item #2).
         await PersistConversationReferenceAsync(
             turnContext,
             resolvedIdentity: null,
             tenantId: tenantId,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken: cancellationToken,
+            teamInfoHint: teamInfo).ConfigureAwait(false);
 
         await LogInstallAuditAsync(
             correlationId: correlationId,
@@ -545,9 +527,20 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             }
 
             var raw = token.ToString();
-            if (!string.IsNullOrWhiteSpace(raw))
+            if (string.IsNullOrWhiteSpace(raw))
             {
-                return raw;
+                continue;
+            }
+
+            // Iter-4 hardening: defensively trim incidental whitespace so an upstream
+            // value like " corr-abc " does not propagate through to the dispatched
+            // CommandContext, audit entries, and structured-log fields. Distributed-trace
+            // joins (Application Insights / Kusto) rely on byte-exact equality, so a
+            // padded value silently shears the trace.
+            var trimmed = raw.Trim();
+            if (trimmed.Length > 0)
+            {
+                return trimmed;
             }
         }
 
@@ -596,9 +589,13 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
     }
 
     /// <summary>
-    /// Classify the activity scope by inspecting the Teams channel data. Team scope is
-    /// indicated by either a non-empty Team or Channel record; personal scope is the
-    /// fallback.
+    /// Classify the activity scope by inspecting the Teams channel data and conversation
+    /// metadata. Team scope is indicated by ANY of: a non-empty <c>TeamsChannelData.Team</c>
+    /// record, a non-empty <c>TeamsChannelData.Channel</c> record, OR a
+    /// <c>Conversation.ConversationType == "channel"</c> hint. Personal scope is the
+    /// fallback. Adding the conversation-type check ensures team install/members-added
+    /// events without an explicit <c>ChannelData.Channel.Id</c> are still recognised as
+    /// team-scope (see item #2 in iter-1 evaluator feedback).
     /// </summary>
     private static bool IsTeamScope(Activity? activity)
     {
@@ -608,8 +605,16 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         }
 
         var channelData = activity.GetChannelData<TeamsChannelData>();
-        return !string.IsNullOrEmpty(channelData?.Team?.Id)
-            || !string.IsNullOrEmpty(channelData?.Channel?.Id);
+        if (!string.IsNullOrEmpty(channelData?.Team?.Id)
+            || !string.IsNullOrEmpty(channelData?.Channel?.Id))
+        {
+            return true;
+        }
+
+        return string.Equals(
+            activity.Conversation?.ConversationType,
+            "channel",
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private static string StripRecipientMention(ITurnContext<IMessageActivity> turnContext)
@@ -650,11 +655,204 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         return firstSpace < 0 ? lower : lower[..firstSpace];
     }
 
+    /// <summary>
+    /// Map the canonical command verb to the <see cref="MessengerEvent.EventType"/>
+    /// discriminator carried by the published <see cref="CommandEvent"/>. Aligned with
+    /// <c>architecture.md</c> §3.1 and the documentation strings on
+    /// <see cref="MessengerEventTypes"/>:
+    /// <list type="bullet">
+    /// <item><description><c>agent ask</c> → <see cref="MessengerEventTypes.AgentTaskRequest"/>.</description></item>
+    /// <item><description><c>agent status</c>, bare <c>approve</c>, bare <c>reject</c> → <see cref="MessengerEventTypes.Command"/>.</description></item>
+    /// <item><description><c>escalate</c> → <see cref="MessengerEventTypes.Escalation"/>.</description></item>
+    /// <item><description><c>pause</c> → <see cref="MessengerEventTypes.PauseAgent"/>.</description></item>
+    /// <item><description><c>resume</c> → <see cref="MessengerEventTypes.ResumeAgent"/>.</description></item>
+    /// </list>
+    /// Returns <c>null</c> when the verb does not match a known command — those inputs
+    /// fall through to <see cref="ICommandDispatcher"/>, which is responsible for
+    /// publishing a <see cref="TextEvent"/> per <c>implementation-plan.md</c> §3.2.
+    /// </summary>
+    private static string? MapVerbToEventType(string commandVerb)
+    {
+        if (string.IsNullOrEmpty(commandVerb))
+        {
+            return null;
+        }
+
+        return commandVerb switch
+        {
+            "agent ask" => MessengerEventTypes.AgentTaskRequest,
+            "agent status" => MessengerEventTypes.Command,
+            "approve" => MessengerEventTypes.Command,
+            "reject" => MessengerEventTypes.Command,
+            "escalate" => MessengerEventTypes.Escalation,
+            "pause" => MessengerEventTypes.PauseAgent,
+            "resume" => MessengerEventTypes.ResumeAgent,
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Classify the inbound activity's origin for the
+    /// <see cref="MessengerEvent.Source"/> field. Returns
+    /// <see cref="MessengerEventSources.TeamChannel"/> when the Teams channel data carries
+    /// a non-empty team or channel ID; otherwise returns
+    /// <see cref="MessengerEventSources.PersonalChat"/>.
+    /// </summary>
+    private static string ClassifyEventSource(Activity? activity)
+        => IsTeamScope(activity) ? MessengerEventSources.TeamChannel : MessengerEventSources.PersonalChat;
+
+    /// <summary>
+    /// Publish a <see cref="CommandEvent"/> to the shared in-process inbound channel for
+    /// consumption by <c>TeamsMessengerConnector.ReceiveAsync</c> per
+    /// <c>implementation-plan.md</c> §2.2 step 1 (dependency #8) and §1.2 — the activity
+    /// handler is the producer for recognized command-verb events. Unknown verbs are
+    /// skipped here and fall through to <see cref="ICommandDispatcher"/>, which publishes
+    /// a <see cref="TextEvent"/> for unrecognized input (Stage 3.2).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Iter-2 item #1 — propagate publish failures.</b> Failures are <b>not</b>
+    /// swallowed: silently logging a publish failure would let
+    /// <c>TeamsMessengerConnector.ReceiveAsync</c> miss the command event even though the
+    /// activity-handler turn reported success — violating the inbound-handoff contract.
+    /// Any exception propagates and is surfaced to the bot framework, which returns a
+    /// 5xx to the channel so the upstream Teams service can retry per its normal
+    /// reliability semantics. Because publish runs BEFORE
+    /// <see cref="ICommandDispatcher.DispatchAsync"/>, a publish failure also prevents
+    /// dispatch, so the two paths cannot diverge.
+    /// </para>
+    /// <para>
+    /// <b>Iter-2 item #2 — validation parity with the dispatcher.</b> Only canonically
+    /// valid commands are published, matching the contract that the future
+    /// <see cref="ICommandDispatcher"/> (Stage 3.2) parser enforces. In particular,
+    /// <c>agent ask</c> requires a non-empty body per <c>e2e-scenarios.md</c> §Personal
+    /// Chat (lines 24–34) and <c>architecture.md</c> §3.1 — bare <c>agent ask</c> is
+    /// syntactically recognized but semantically invalid, so it falls through to the
+    /// dispatcher's <see cref="TextEvent"/> path instead of entering the inbound queue
+    /// with an invalid <see cref="MessengerEventTypes.AgentTaskRequest"/> payload. See
+    /// <see cref="IsPublishableCommand"/> for the full parity rules.
+    /// </para>
+    /// </remarks>
+    private async Task PublishInboundCommandEventAsync(
+        Activity? activity,
+        string normalizedText,
+        string commandVerb,
+        string correlationId,
+        string aadObjectId,
+        CancellationToken cancellationToken)
+    {
+        var eventType = MapVerbToEventType(commandVerb);
+        if (eventType is null)
+        {
+            // Unknown verb — let CommandDispatcher (Stage 3.2) publish TextEvent.
+            return;
+        }
+
+        var body = ExtractCommandBody(normalizedText, commandVerb);
+
+        // Validation parity (iter-2 item #2). When a verb is syntactically recognized
+        // but the parsed payload is not canonically valid, defer to the dispatcher's
+        // unrecognized-input path so the inbound queue never carries a malformed event.
+        if (!IsPublishableCommand(eventType, body))
+        {
+            _logger.LogDebug(
+                "Skipping inbound publish for verb '{Verb}' — payload did not satisfy validation parity for event type '{EventType}' (correlation {CorrelationId}).",
+                commandVerb,
+                eventType,
+                correlationId);
+            return;
+        }
+
+        var parsed = new ParsedCommand(
+            CommandType: commandVerb,
+            Payload: body,
+            CorrelationId: correlationId);
+
+        var commandEvent = new CommandEvent(eventType)
+        {
+            EventId = Guid.NewGuid().ToString(),
+            CorrelationId = correlationId,
+            Messenger = "Teams",
+            ExternalUserId = aadObjectId,
+            ActivityId = activity?.Id,
+            Source = ClassifyEventSource(activity),
+            Timestamp = DateTimeOffset.UtcNow,
+            Payload = parsed,
+        };
+
+        await _inboundEventPublisher
+            .PublishAsync(commandEvent, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Validation parity check between the handler's publish path and the canonical
+    /// <see cref="ICommandDispatcher"/> contract (Stage 3.2). Returns <c>true</c> only
+    /// when the (recognized verb, extracted body) pair produces a canonically valid
+    /// <see cref="CommandEvent"/> payload per <c>architecture.md</c> §3.1.
+    /// </summary>
+    /// <remarks>
+    /// The only verb requiring a body to be canonically valid is <c>agent ask</c> —
+    /// <see cref="MessengerEventTypes.AgentTaskRequest"/> is defined as
+    /// <c>agent ask &lt;text&gt;</c> by <c>e2e-scenarios.md</c> §Personal Chat (lines
+    /// 24–34) and <c>architecture.md</c> §3.1, both of which require a non-empty
+    /// <c>Payload.Body</c>. All other canonical verbs (<c>agent status</c>,
+    /// <c>approve</c>, <c>reject</c>, <c>escalate</c>, <c>pause</c>, <c>resume</c>) are
+    /// valid bare or with an optional body argument (for example,
+    /// <c>approve &lt;questionId&gt;</c>) per <c>architecture.md</c> §3.1 / §5.2 and the
+    /// <c>e2e-scenarios.md</c> §Approval / §Escalation / §Pause / §Resume scenarios.
+    /// </remarks>
+    private static bool IsPublishableCommand(string eventType, string body)
+    {
+        if (string.Equals(eventType, MessengerEventTypes.AgentTaskRequest, StringComparison.Ordinal))
+        {
+            return !string.IsNullOrWhiteSpace(body);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Persist the conversation reference attached to the current activity using the
+    /// scope-keying model described in <c>architecture.md</c> §3.2 / §4.2:
+    /// <list type="bullet">
+    /// <item><description>
+    /// <b>Personal scope</b> — natural key <c>(TenantId, AadObjectId)</c>. <c>TeamId</c>
+    /// and <c>ChannelId</c> are null; <c>InternalUserId</c> is populated when identity
+    /// resolution ran.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Team scope</b> — natural key <c>(TenantId, ChannelId)</c>. <c>AadObjectId</c>
+    /// and <c>InternalUserId</c> are null; <c>TeamId</c> is preserved so team-uninstall
+    /// fan-out (<see cref="OnTeamsMembersRemovedAsync"/>) can enumerate every channel.
+    /// </description></item>
+    /// </list>
+    /// </summary>
+    /// <param name="turnContext">Current turn context.</param>
+    /// <param name="resolvedIdentity">Resolved identity from <see cref="IIdentityResolver"/>;
+    /// <c>null</c> on install lifecycle events that skip identity resolution.</param>
+    /// <param name="tenantId">Tenant ID extracted from <c>ChannelData.tenant.id</c>.</param>
+    /// <param name="cancellationToken">Turn cancellation token.</param>
+    /// <param name="teamInfoHint">Optional <see cref="TeamInfo"/> handed to
+    /// <see cref="OnTeamsMembersAddedAsync"/> by the Teams SDK. When provided it forces a
+    /// team-scope classification even when <c>ChannelData.Team</c> /
+    /// <c>ChannelData.Channel</c> are not populated, which addresses iter-1 evaluator
+    /// item #2 (team installs without <c>ChannelData.Channel.Id</c> were previously
+    /// saved as personal references keyed by the installer's AAD object ID).</param>
+    /// <remarks>
+    /// When the activity is team-scope but <c>ChannelData.Channel.Id</c> is empty (Teams
+    /// omits it on some team-level install / members-added events), the method falls
+    /// back to <c>Activity.Conversation.Id</c> as the effective channel ID. In Teams
+    /// channel conversations the <c>Conversation.Id</c> is the
+    /// <c>19:xxx@thread.tacv2</c> channel-thread ID, which is the same value the store
+    /// uses as the channel key elsewhere.
+    /// </remarks>
     private async Task PersistConversationReferenceAsync(
         ITurnContext turnContext,
         UserIdentity? resolvedIdentity,
         string tenantId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TeamInfo? teamInfoHint = null)
     {
         var activity = turnContext.Activity as Activity;
         if (activity is null)
@@ -664,28 +862,38 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 
         var conversationReference = activity.GetConversationReference();
         var nowUtc = DateTimeOffset.UtcNow;
-        var channelId = ExtractChannelId(activity);
-        var teamId = ExtractTeamId(activity);
+        var explicitChannelId = ExtractChannelId(activity);
+        var explicitTeamId = ExtractTeamId(activity);
         var fromAadObjectId = activity.From?.AadObjectId;
 
-        // Channel-scope references have a natural (TenantId, ChannelId) key — they must
-        // NOT carry the installer/sender AAD object ID (per TeamsConversationReference
-        // contract). Personal references key on (TenantId, AadObjectId) and leave Team /
-        // Channel null.
-        var isChannelScope = !string.IsNullOrEmpty(channelId);
-        var aadObjectId = isChannelScope ? null : fromAadObjectId;
+        // Team scope is signalled by: the SDK-supplied TeamInfo argument (install/
+        // members-added), Team/Channel records in TeamsChannelData, OR a
+        // Conversation.ConversationType == "channel" hint. Any one is sufficient.
+        var isTeamScope = teamInfoHint is not null || IsTeamScope(activity);
+
+        // When team-scope but channelData omits Channel.Id, fall back to Conversation.Id
+        // (the channel-thread ID Teams uses as the channel's stable identifier).
+        var channelId = isTeamScope
+            ? (string.IsNullOrEmpty(explicitChannelId) ? activity.Conversation?.Id : explicitChannelId)
+            : null;
+
+        var teamId = isTeamScope
+            ? (teamInfoHint?.Id ?? explicitTeamId)
+            : null;
+
+        var aadObjectId = isTeamScope ? null : fromAadObjectId;
 
         TeamsConversationReference? existing = null;
-        if (isChannelScope)
+        if (isTeamScope && !string.IsNullOrEmpty(channelId))
         {
             existing = await _conversationReferenceStore
                 .GetByChannelIdAsync(tenantId, channelId!, cancellationToken)
                 .ConfigureAwait(false);
         }
-        else if (!string.IsNullOrEmpty(aadObjectId))
+        else if (!isTeamScope && !string.IsNullOrEmpty(aadObjectId))
         {
             existing = await _conversationReferenceStore
-                .GetByAadObjectIdAsync(tenantId, aadObjectId, cancellationToken)
+                .GetByAadObjectIdAsync(tenantId, aadObjectId!, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -697,13 +905,13 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             AadObjectId = aadObjectId,
             // Preserve a previously-mapped InternalUserId if identity resolution didn't
             // run (install path); otherwise overwrite with the freshly resolved value.
-            // Channel-scope refs never carry an InternalUserId (no single user owns a
+            // Team-scope refs never carry an InternalUserId (no single user owns a
             // channel reference).
-            InternalUserId = isChannelScope
+            InternalUserId = isTeamScope
                 ? null
                 : (resolvedIdentity?.InternalUserId ?? existing?.InternalUserId),
             ChannelId = channelId,
-            TeamId = isChannelScope ? teamId : null,
+            TeamId = teamId,
             ServiceUrl = conversationReference?.ServiceUrl ?? string.Empty,
             ConversationId = conversationReference?.Conversation?.Id ?? activity.Conversation?.Id ?? string.Empty,
             BotId = conversationReference?.Bot?.Id ?? activity.Recipient?.Id ?? string.Empty,
@@ -865,27 +1073,19 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         string tenantId,
         string actorId,
         string commandVerb,
-        bool isCanonicalVerb,
         string? conversationId,
         string normalizedText,
         CancellationToken cancellationToken)
     {
         // Per `e2e-scenarios.md` §Compliance — Immutable Audit Trail, scenario
         // "All inbound commands are audit-logged":
-        //   Action       = <canonical command verb> (e.g. "agent ask") OR "(text)" for
-        //                  unrecognised free text routed to the dispatcher's TextEvent
-        //                  path (no new AuditEventType is invented — the canonical set is
-        //                  fixed at seven per tech-spec §4.3).
-        //   PayloadJson  = {"body":"<remainder after the verb>"} for canonical commands;
-        //                  {"body":"<full normalized text>"} for non-canonical input so
-        //                  the audit record captures what the user actually typed.
+        //   Action       = <canonical command verb> (e.g. "agent ask")
+        //   PayloadJson  = {"body":"<remainder after the verb>"}
         // The earlier implementation-specific shape ({command, normalizedText}) did not
         // conform to the enterprise-reviewable audit contract — corrected here so the
         // `SqlAuditLogger` (Stage 5.2) and downstream compliance tooling can rely on the
         // canonical field layout.
-        var body = isCanonicalVerb
-            ? ExtractCommandBody(normalizedText, commandVerb)
-            : (normalizedText ?? string.Empty).Trim();
+        var body = ExtractCommandBody(normalizedText, commandVerb);
         var payload = JsonSerializer.Serialize(new { body }, PayloadJsonOptions);
 
         var entry = BuildAuditEntry(
@@ -1000,9 +1200,8 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 
         var reply = Activity.CreateMessageActivity();
         reply.Attachments = new List<Attachment> { attachment };
-        // Plain-text fallback string kept on Activity.Text for channels and surfaces
-        // (mobile lock-screen banners, accessibility readers, low-bandwidth clients)
-        // that cannot render an Adaptive Card attachment.
+        // Plain-text summary kept so channels that cannot render Adaptive Cards still
+        // see a sensible fallback string.
         reply.Text = reason;
         return reply;
     }
