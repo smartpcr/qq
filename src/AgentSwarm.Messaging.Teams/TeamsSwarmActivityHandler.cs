@@ -1025,8 +1025,9 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 
         var reply = Activity.CreateMessageActivity();
         reply.Attachments = new List<Attachment> { attachment };
-        // Plain-text summary kept so channels that cannot render Adaptive Cards still
-        // see a sensible fallback string.
+        // Plain-text fallback string kept on Activity.Text for channels and surfaces
+        // (mobile lock-screen banners, accessibility readers, low-bandwidth clients)
+        // that cannot render an Adaptive Card attachment.
         reply.Text = reason;
         return reply;
     }

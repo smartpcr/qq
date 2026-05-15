@@ -475,6 +475,7 @@ Summary of agent/swarm status for rendering a status card via `IAdaptiveCardRend
 | `CurrentState` | `string` | Agent lifecycle state: `Idle`, `Working`, `Blocked`, `Paused`, `Error`. |
 | `ActiveTaskCount` | `int` | Number of tasks currently assigned. |
 | `LastActivityAt` | `DateTimeOffset` | UTC time of the agent's most recent activity. |
+| `ProgressPercent` | `int?` | Optional progress indicator (0–100). When non-null the renderer adds a `Progress` fact to the card; when null the renderer omits it (per `src/AgentSwarm.Messaging.Teams/Cards/AdaptiveCardBuilder.cs:124-128`). |
 | `Summary` | `string` | Free-text status description from the agent. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
 
@@ -485,9 +486,11 @@ Summary of an incident for rendering an incident alert card via `IAdaptiveCardRe
 | Field | Type | Description |
 |---|---|---|
 | `IncidentId` | `string` | Unique incident identifier. |
+| `QuestionId` | `string` | Per-acknowledger `AgentQuestion.QuestionId` embedded in the card's `Action.Submit` payload. The orchestrator creates one `AgentQuestion` per acknowledger / escalator (following the same first-writer-wins single-decision lifecycle as approvals — see §6.3 step 4) and renders one `IncidentSummary` per recipient, each carrying its own per-recipient `QuestionId` so Stage 3.3's `CardActionHandler` can resolve the originating question on the inbound round-trip. |
 | `TaskId` | `string` | Originating task. |
 | `AgentId` | `string` | Agent that raised the incident. |
-| `Severity` | `string` | `Info`, `Warning`, `Error`, `Critical`. |
+| `AffectedAgents` | `IReadOnlyList<string>` | Identifiers of all agents impacted by this incident — typically a superset of `AgentId`. Rendered into the card's `Affected agents` fact (per `src/AgentSwarm.Messaging.Teams/Cards/AdaptiveCardBuilder.cs:163-175`). |
+| `Severity` | `string` | `Info`, `Warning`, `Error`, `Critical` (the canonical `MessageSeverities.All` vocabulary). |
 | `Title` | `string` | Short incident title for the card header. |
 | `Description` | `string` | Detailed incident description. |
 | `OccurredAt` | `DateTimeOffset` | UTC time the incident was detected. |
@@ -495,19 +498,29 @@ Summary of an incident for rendering an incident alert card via `IAdaptiveCardRe
 
 #### ReleaseGateRequest
 
-Request to render a release-gate approval card via `IAdaptiveCardRenderer.RenderReleaseGateCard`. This entity carries gate-level metadata that the orchestrator uses to create per-approver `AgentQuestion` records (see §6.3.1 for the multi-approver modeling strategy).
+Request to render a release-gate approval card via `IAdaptiveCardRenderer.RenderReleaseGateCard`. **Construction order** (per §6.3.1 multi-approver modeling): the orchestrator FIRST creates per-approver `AgentQuestion` records (one per required approver, each with its own `QuestionId` and `TargetUserId`), THEN constructs one `ReleaseGateRequest` per approver carrying that approver's `QuestionId` plus the shared gate metadata (`GateName`, `ReleaseVersion`, `Environment`, `GateConditions`, `GateStatus`). Each per-approver `ReleaseGateRequest` is rendered into a separate Adaptive Card so Stage 3.3's `CardActionHandler` can run the standard single-decision first-writer-wins lifecycle independently for each approver. `ReleaseGateRequest` is therefore a **per-approver render input**, not a shared gate-state record.
 
 | Field | Type | Description |
 |---|---|---|
 | `GateId` | `string` | Unique release-gate identifier. |
+| `QuestionId` | `string` | Per-approver `AgentQuestion.QuestionId` embedded in the card's action payload. Per §6.3.1 (multi-approver release gates), the orchestrator creates one `AgentQuestion` per required approver and the same `ReleaseGateRequest` metadata is rendered into N cards, each carrying its own per-approver `QuestionId` so Stage 3.3's `CardActionHandler` can run the standard single-decision first-writer-wins lifecycle independently for each approver. |
 | `TaskId` | `string` | Associated deployment/release task. |
 | `GateName` | `string` | Human-readable gate name (e.g., "Production Deploy Gate"). |
+| `ReleaseVersion` | `string` | The release / build version the gate is guarding (e.g., `v1.42.0`, `build-#7421`). |
 | `Environment` | `string` | Target environment: `Staging`, `Production`, etc. |
-| `RequiredApprovals` | `int` | Number of approvals needed to open the gate. |
-| `CurrentApprovals` | `int` | Number of approvals received so far. |
-| `Approvers` | `IReadOnlyList<string>` | Internal user IDs of designated approvers. |
+| `GateConditions` | `IReadOnlyList<ReleaseGateCondition>` | Ordered checklist of gate conditions and their satisfaction status — rendered as a fact set on the card (see `ReleaseGateCondition` below). |
+| `GateStatus` | `string` | Indicator of the gate's current aggregate state — e.g., `Pending`, `Approved`, `Rejected`, `Deferred`. Set by the orchestrator's workflow layer after aggregating per-approver `HumanDecisionEvent` records (see §6.3.1). |
 | `Deadline` | `DateTimeOffset` | Gate expiration deadline. |
 | `CorrelationId` | `string` | End-to-end trace ID. |
+
+> **Multi-approver modeling — no threshold counters on this record.** Earlier drafts of this table included `RequiredApprovals: int`, `CurrentApprovals: int`, and `Approvers: IReadOnlyList<string>` fields to model an N-of-M approval rollup directly on `ReleaseGateRequest`. Those fields were removed in Stage 3.1 because release-gate approval threshold aggregation lives in the orchestrator's workflow layer, NOT in the card payload (per `implementation-plan.md` §3.1 step 5 and §6.3.1 of this document). The card template renders identically for each per-approver `AgentQuestion`; the "N of M approvers must approve" rollup is computed by the orchestrator and surfaced via `GateStatus`. Stage 3.3's `CardActionHandler` processes each approver's card action independently using the per-approver `QuestionId`.
+
+##### ReleaseGateCondition
+
+| Field | Type | Description |
+|---|---|---|
+| `Name` | `string` | Display name for the condition (e.g., "All tests pass", "Security scan clean"). |
+| `Satisfied` | `bool` | `true` when the condition has been met; `false` when still outstanding. |
 
 ### 3.4 Entity Relationship Diagram
 
@@ -1004,7 +1017,7 @@ Release gates requiring multiple approvers (e.g., "2 of 3 approvers must approve
 5. The orchestrator's workflow layer tracks the approval threshold and **aggregates** individual `HumanDecisionEvent` records. Once the required number of approvals is met, the orchestrator transitions the release gate to approved.
 6. If either approver double-taps their own card, the standard first-writer-wins idempotency rejects the duplicate (same as §6.3 step 5).
 
-This modeling aligns with `e2e-scenarios.md` §Concurrent approvals for a multi-approver release gate (lines 967–981), which explicitly defines separate `AgentQuestion` records per approver with threshold aggregation at the orchestration layer. The `ReleaseGateRequest` entity (§3.3) carries the gate metadata that the orchestrator uses to create and track the per-approver questions.
+This modeling aligns with `e2e-scenarios.md` §Concurrent approvals for a multi-approver release gate (lines 967–981), which explicitly defines separate `AgentQuestion` records per approver with threshold aggregation at the orchestration layer. **Construction order**: the orchestrator FIRST creates the per-approver `AgentQuestion` records (one per required approver, each with its own `QuestionId` / `TargetUserId`), THEN constructs one `ReleaseGateRequest` per approver carrying that approver's `QuestionId` plus the shared gate metadata (see §3.3 `ReleaseGateRequest`). Each per-approver `ReleaseGateRequest` is then rendered into a separate Adaptive Card. The `ReleaseGateRequest` entity is therefore a per-approver render input — not a shared gate-state record — and threshold aggregation across the per-approver `HumanDecisionEvent` records remains in the orchestrator's workflow layer.
 
 ### 6.4 Scenario: Unauthorized tenant/user is rejected
 
