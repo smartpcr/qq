@@ -189,11 +189,32 @@ internal static class TestDoubles
     {
         public Dictionary<string, TeamsConversationReference> PreloadByConversationId { get; } = new(StringComparer.Ordinal);
         public List<string> Lookups { get; } = new();
+        public List<(string TenantId, string ConversationId)> TenantAwareLookups { get; } = new();
 
         public Task<TeamsConversationReference?> GetByConversationIdAsync(string conversationId, CancellationToken ct)
         {
             Lookups.Add(conversationId);
             PreloadByConversationId.TryGetValue(conversationId, out var hit);
+            return Task.FromResult<TeamsConversationReference?>(hit);
+        }
+
+        public Task<TeamsConversationReference?> GetByConversationIdAsync(string tenantId, string conversationId, CancellationToken ct)
+        {
+            if (string.IsNullOrEmpty(tenantId))
+            {
+                throw new ArgumentException("Tenant ID must be a non-empty string.", nameof(tenantId));
+            }
+            if (string.IsNullOrEmpty(conversationId))
+            {
+                throw new ArgumentException("Conversation ID must be a non-empty string.", nameof(conversationId));
+            }
+
+            TenantAwareLookups.Add((tenantId, conversationId));
+            PreloadByConversationId.TryGetValue(conversationId, out var hit);
+            if (hit is not null && !string.Equals(hit.TenantId, tenantId, StringComparison.Ordinal))
+            {
+                hit = null;
+            }
             return Task.FromResult<TeamsConversationReference?>(hit);
         }
     }

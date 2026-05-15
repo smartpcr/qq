@@ -12,6 +12,13 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.10" />
+    <!--
+      The SqlServer provider is referenced privately by the production project but the
+      generated migration snapshot calls SqlServerModelBuilderExtensions.UseIdentityColumns,
+      so the snapshot assembly fails to load at test-time without it. Pulled in here purely
+      for the migration-drift regression test in TeamsConversationReferenceDbContextSchemaTests.
+    -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.10" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
     <PackageReference Include="xunit" Version="2.5.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />

@@ -107,6 +107,38 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
                 nameof(reference));
         }
 
+        // Validate the Bot Framework routing fields up front so caller bugs surface as a
+        // clear ArgumentException at the API boundary instead of a generic DbUpdateException
+        // from EF Core when the underlying NOT NULL constraints reject the row. ServiceUrl
+        // and ConversationId are also the two values the proactive-send code path
+        // (TeamsMessengerConnector.SendMessageAsync via GetByConversationIdAsync) reads
+        // back; storing nulls would silently break proactive routing for the affected
+        // reference. BotId is required to reconstitute the outbound TurnContext.
+        if (string.IsNullOrEmpty(reference.ServiceUrl))
+        {
+            throw new ArgumentException(
+                "TeamsConversationReference.ServiceUrl must be a non-empty string — Bot " +
+                "Framework requires a service URL to dispatch outbound activities.",
+                nameof(reference));
+        }
+
+        if (string.IsNullOrEmpty(reference.ConversationId))
+        {
+            throw new ArgumentException(
+                "TeamsConversationReference.ConversationId must be a non-empty string — " +
+                "the conversation ID is the proactive-routing key used by " +
+                "GetByConversationIdAsync to resolve outbound messages back to this reference.",
+                nameof(reference));
+        }
+
+        if (string.IsNullOrEmpty(reference.BotId))
+        {
+            throw new ArgumentException(
+                "TeamsConversationReference.BotId must be a non-empty string — the bot ID " +
+                "is required to reconstitute the outbound TurnContext for proactive sends.",
+                nameof(reference));
+        }
+
         for (var attempt = 1; ; attempt++)
         {
             await using var context = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
@@ -430,34 +462,24 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
     /// <inheritdoc />
     /// <remarks>
     /// <para>
-    /// <b>Known tenant-isolation gap (accepted):</b> this is the only query on the store
-    /// that does not accept a <c>tenantId</c> parameter, so the lookup is not tenant-scoped
-    /// like every other read (which honour the FR-006 multi-tenant isolation requirement).
-    /// The gap is intentional and structural, not an oversight: the sole consumer is
-    /// <see cref="IConversationReferenceRouter.RouteAsync"/> invoked from
-    /// <c>TeamsMessengerConnector.SendMessageAsync</c>, whose only correlation handle is
-    /// <c>MessengerMessage.ConversationId</c>. <c>MessengerMessage</c> deliberately carries
-    /// no <c>TenantId</c> field today (it is messenger-platform-agnostic), so the caller
-    /// has no tenant context to pass through. Adding a required <c>tenantId</c> parameter
-    /// here would force every messenger to teach its message contract about Entra tenants,
-    /// which is out of scope for the proactive-messaging stage.
+    /// <b>Legacy tenantless lookup.</b> This overload does not apply a tenant filter and is
+    /// retained only for back-compat with consumers that have not yet adopted the
+    /// tenant-aware overload
+    /// <see cref="GetByConversationIdAsync(string, string, CancellationToken)"/>. Production
+    /// callers (notably <c>TeamsMessengerConnector.SendMessageAsync</c>) SHOULD invoke the
+    /// tenant-aware variant whenever a tenant context is available
+    /// (<c>TeamsMessagingOptions.MicrosoftAppTenantId</c> in single-tenant deployments,
+    /// or future per-message tenant plumbing in multi-tenant deployments).
     /// </para>
     /// <para>
-    /// <b>Why this is safe in practice:</b> Bot Framework <c>ConversationId</c> values are
-    /// generated server-side per (tenant, conversation) pair and are practically unique
-    /// across tenants for the lifetime of a conversation; the filtered <c>IsActive = 1</c>
-    /// predicate further narrows the candidate set, and the <c>(AadObjectId, TenantId)</c>
-    /// and <c>(ChannelId, TenantId)</c> unique indexes guard upstream writes. A collision
-    /// would require two tenants' Bot Framework conversations to coincidentally share an
-    /// opaque ID, which the platform does not produce.
-    /// </para>
-    /// <para>
-    /// <b>Forward path:</b> when <c>MessengerMessage</c> grows a <c>TenantId</c> (or an
-    /// equivalent platform-context field — see the doc on
-    /// <c>IConversationReferenceRouter</c>), tighten this method to accept and apply that
-    /// tenant filter so the defense-in-depth posture matches the rest of the store. Until
-    /// then the gap is documented here so future readers do not mistake it for a missed
-    /// security check.
+    /// <b>Why a cross-tenant collision is plausible:</b> Bot Framework <c>ConversationId</c>
+    /// values are generated server-side and the platform does NOT guarantee global
+    /// uniqueness across Entra ID tenants. The <c>(AadObjectId, TenantId)</c> and
+    /// <c>(ChannelId, TenantId)</c> unique indexes guard upstream writes, but a row with
+    /// the same <c>ConversationId</c> can coexist in two distinct tenants — this method
+    /// would return whichever the database surfaces first, which is a cross-tenant
+    /// isolation gap. The tenant-aware overload closes that gap with a server-side filter
+    /// using the <c>IX_ConversationReferences_ConversationId</c> filtered index.
     /// </para>
     /// </remarks>
     public async Task<TeamsConversationReference?> GetByConversationIdAsync(string conversationId, CancellationToken ct)
@@ -471,6 +493,55 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
         var entity = await context.ConversationReferences
             .AsNoTracking()
             .FirstOrDefaultAsync(e => e.ConversationId == conversationId && e.IsActive, ct)
+            .ConfigureAwait(false);
+
+        return entity is null ? null : Map(entity);
+    }
+
+    /// <summary>
+    /// Tenant-aware override of
+    /// <see cref="IConversationReferenceRouter.GetByConversationIdAsync(string, string, CancellationToken)"/>.
+    /// Applies the tenant predicate as part of the database query so the
+    /// <c>IX_ConversationReferences_ConversationId</c> filtered index can seek directly to
+    /// the active row in the requested tenant, and a cross-tenant row that happens to
+    /// share a Bot Framework <c>ConversationId</c> is excluded by the seek rather than
+    /// surfaced and then discarded by an in-memory post-filter.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the canonical proactive-hot-path lookup that
+    /// <c>TeamsMessengerConnector.SendMessageAsync</c> should call when a tenant context
+    /// is available (single-tenant deployments via
+    /// <see cref="TeamsMessagingOptions.MicrosoftAppTenantId"/>, or future multi-tenant
+    /// configurations that plumb tenant through the outbound message). The method
+    /// satisfies the FR-006 multi-tenant isolation requirement at the persistence boundary.
+    /// </para>
+    /// </remarks>
+    /// <param name="tenantId">Entra ID tenant that scopes the lookup.</param>
+    /// <param name="conversationId">Bot Framework <c>ConversationId</c>.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The matching active reference, or <c>null</c>.</returns>
+    public async Task<TeamsConversationReference?> GetByConversationIdAsync(
+        string tenantId,
+        string conversationId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(tenantId))
+        {
+            throw new ArgumentException("Tenant ID must be a non-empty string.", nameof(tenantId));
+        }
+
+        if (string.IsNullOrEmpty(conversationId))
+        {
+            throw new ArgumentException("Conversation ID must be a non-empty string.", nameof(conversationId));
+        }
+
+        await using var context = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
+        var entity = await context.ConversationReferences
+            .AsNoTracking()
+            .FirstOrDefaultAsync(
+                e => e.ConversationId == conversationId && e.TenantId == tenantId && e.IsActive,
+                ct)
             .ConfigureAwait(false);
 
         return entity is null ? null : Map(entity);

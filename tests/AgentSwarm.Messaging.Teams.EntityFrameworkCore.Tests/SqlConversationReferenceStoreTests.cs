@@ -556,4 +556,414 @@ public class SqlConversationReferenceStoreTests
             Assert.True(entity.IsActive);
         }
     }
+
+    [Theory(DisplayName = "SaveOrUpdate rejects references with null/empty ServiceUrl (Bot Framework routing requirement)")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task SaveOrUpdate_RejectsReferenceWithEmptyServiceUrl(string? serviceUrl)
+    {
+        await using var fixture = new StoreFixture();
+        var reference = TeamsConversationReferenceFactory.UserScoped(serviceUrl: serviceUrl!);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Store.SaveOrUpdateAsync(reference, CancellationToken.None));
+        Assert.Contains("ServiceUrl", ex.Message, StringComparison.Ordinal);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Theory(DisplayName = "SaveOrUpdate rejects references with null/empty ConversationId (proactive-routing key)")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task SaveOrUpdate_RejectsReferenceWithEmptyConversationId(string? conversationId)
+    {
+        await using var fixture = new StoreFixture();
+        var reference = TeamsConversationReferenceFactory.UserScoped(conversationId: conversationId!);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Store.SaveOrUpdateAsync(reference, CancellationToken.None));
+        Assert.Contains("ConversationId", ex.Message, StringComparison.Ordinal);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Theory(DisplayName = "SaveOrUpdate rejects references with null/empty BotId (TurnContext reconstitution)")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task SaveOrUpdate_RejectsReferenceWithEmptyBotId(string? botId)
+    {
+        await using var fixture = new StoreFixture();
+        var reference = TeamsConversationReferenceFactory.UserScoped(botId: botId!);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Store.SaveOrUpdateAsync(reference, CancellationToken.None));
+        Assert.Contains("BotId", ex.Message, StringComparison.Ordinal);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "MarkInactiveByChannelAsync is a no-op for nonexistent channel")]
+    public async Task MarkInactiveByChannel_OnMissingRow_NoOp()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.MarkInactiveByChannelAsync("tenant-1", "channel-missing", CancellationToken.None);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "DeleteAsync is a no-op for nonexistent user-scoped reference")]
+    public async Task Delete_OnMissingRow_NoOp()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.DeleteAsync("tenant-1", "aad-user-missing", CancellationToken.None);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "DeleteByChannelAsync is a no-op for nonexistent channel-scoped reference")]
+    public async Task DeleteByChannel_OnMissingRow_NoOp()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.DeleteByChannelAsync("tenant-1", "channel-missing", CancellationToken.None);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "GetActiveChannelsByTeamIdAsync filters out inactive channels")]
+    public async Task GetActiveChannelsByTeamId_FiltersInactiveChannels()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.ChannelScoped(channelId: "channel-active", teamId: "team-platform"),
+            CancellationToken.None);
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.ChannelScoped(channelId: "channel-inactive", teamId: "team-platform"),
+            CancellationToken.None);
+
+        // Soft-delete one of the channels in the team.
+        await fixture.Store.MarkInactiveByChannelAsync("tenant-1", "channel-inactive", CancellationToken.None);
+
+        var teamChannels = await fixture.Store.GetActiveChannelsByTeamIdAsync(
+            "tenant-1",
+            "team-platform",
+            CancellationToken.None);
+
+        Assert.Single(teamChannels);
+        Assert.Equal("channel-active", teamChannels[0].ChannelId);
+        Assert.DoesNotContain(teamChannels, c => c.ChannelId == "channel-inactive");
+    }
+
+    [Fact(DisplayName = "GetActiveChannelsByTeamIdAsync excludes user-scoped rows (defense against scope cross-contamination)")]
+    public async Task GetActiveChannelsByTeamId_ExcludesUserScopedRows()
+    {
+        // The query must filter on ChannelId != null even when a user-scoped row's TenantId
+        // matches, because a careless implementation that omitted the ChannelId predicate
+        // would surface personal-chat references as "channel" references and let the team
+        // uninstall flow soft-delete a user's personal conversation by accident.
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.ChannelScoped(channelId: "channel-real", teamId: "team-platform"),
+            CancellationToken.None);
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(aadObjectId: "aad-user-1"),
+            CancellationToken.None);
+
+        var teamChannels = await fixture.Store.GetActiveChannelsByTeamIdAsync(
+            "tenant-1",
+            "team-platform",
+            CancellationToken.None);
+
+        Assert.Single(teamChannels);
+        Assert.Equal("channel-real", teamChannels[0].ChannelId);
+        Assert.All(teamChannels, c => Assert.NotNull(c.ChannelId));
+        Assert.All(teamChannels, c => Assert.Null(c.AadObjectId));
+    }
+
+    [Fact(DisplayName = "GetByConversationIdAsync filters out inactive references (Stage 4.2 hot path active-only contract)")]
+    public async Task GetByConversationId_FiltersOutInactiveReferences()
+    {
+        // SqlConversationReferenceStore.GetByConversationIdAsync is the router lookup used
+        // by TeamsMessengerConnector on every outbound proactive send. The store filters on
+        // IsActive = true so a reference that has been marked inactive (e.g. by the
+        // uninstall flow or by a Stage 4.2 stale-reference detector) is no longer
+        // discoverable through the router — without this filter, the connector would
+        // attempt a 403/404-producing send against a dead conversation.
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(
+                aadObjectId: "aad-user-router",
+                conversationId: "a:conversation-router-inactive"),
+            CancellationToken.None);
+
+        await fixture.Store.MarkInactiveAsync("tenant-1", "aad-user-router", CancellationToken.None);
+
+        var loaded = await fixture.Store.GetByConversationIdAsync(
+            "a:conversation-router-inactive",
+            CancellationToken.None);
+
+        Assert.Null(loaded);
+    }
+
+    [Theory(DisplayName = "Reader methods reject null/empty tenant ID (FR-006 multi-tenant isolation)")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task Readers_RejectNullOrEmptyTenant(string? tenantId)
+    {
+        await using var fixture = new StoreFixture();
+        var store = fixture.Store;
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetAsync(tenantId!, "aad-1", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetByAadObjectIdAsync(tenantId!, "aad-1", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetByInternalUserIdAsync(tenantId!, "internal-1", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetByChannelIdAsync(tenantId!, "channel-1", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetActiveChannelsByTeamIdAsync(tenantId!, "team-1", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetAllActiveAsync(tenantId!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.IsActiveAsync(tenantId!, "aad-1", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.IsActiveByInternalUserIdAsync(tenantId!, "internal-1", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.IsActiveByChannelAsync(tenantId!, "channel-1", CancellationToken.None));
+    }
+
+    [Theory(DisplayName = "Reader/writer methods reject null/empty natural-key argument")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task LookupAndMutation_RejectNullOrEmptyKey(string? key)
+    {
+        await using var fixture = new StoreFixture();
+        var store = fixture.Store;
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetByAadObjectIdAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetByInternalUserIdAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetByChannelIdAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.GetActiveChannelsByTeamIdAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.IsActiveAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.IsActiveByInternalUserIdAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.IsActiveByChannelAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.MarkInactiveAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.MarkInactiveByChannelAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.DeleteAsync("tenant-1", key!, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.DeleteByChannelAsync("tenant-1", key!, CancellationToken.None));
+    }
+
+    [Theory(DisplayName = "GetByConversationIdAsync rejects null/empty conversation ID")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task GetByConversationId_RejectsNullOrEmpty(string? conversationId)
+    {
+        await using var fixture = new StoreFixture();
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Store.GetByConversationIdAsync(conversationId!, CancellationToken.None));
+    }
+
+    [Fact(DisplayName = "SaveOrUpdateAsync rejects null reference argument")]
+    public async Task SaveOrUpdate_RejectsNullReference()
+    {
+        await using var fixture = new StoreFixture();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => fixture.Store.SaveOrUpdateAsync(null!, CancellationToken.None));
+    }
+
+    [Fact(DisplayName = "MarkInactiveAsync re-marking an already-inactive reference refreshes DeactivatedAt")]
+    public async Task MarkInactive_OnAlreadyInactive_RefreshesDeactivatedAt()
+    {
+        // The current contract is "mark inactive, idempotently, stamping the most recent
+        // uninstall timestamp." A second uninstall event for the same reference must not
+        // raise — Bot Framework is at-least-once and the bot can legitimately receive a
+        // duplicate `removed` activity. The DeactivatedAt timestamp moves forward to the
+        // newest event so audit history reflects the most-recent uninstall.
+        var time = new FakeTimeProvider(new DateTimeOffset(2026, 5, 14, 10, 0, 0, TimeSpan.Zero));
+        await using var fixture = new StoreFixture(time);
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(aadObjectId: "aad-user-double-uninstall"),
+            CancellationToken.None);
+
+        time.Advance(TimeSpan.FromMinutes(1));
+        await fixture.Store.MarkInactiveAsync("tenant-1", "aad-user-double-uninstall", CancellationToken.None);
+        var firstMark = new DateTimeOffset(2026, 5, 14, 10, 1, 0, TimeSpan.Zero);
+
+        time.Advance(TimeSpan.FromMinutes(5));
+        await fixture.Store.MarkInactiveAsync("tenant-1", "aad-user-double-uninstall", CancellationToken.None);
+        var secondMark = new DateTimeOffset(2026, 5, 14, 10, 6, 0, TimeSpan.Zero);
+
+        await using var verify = fixture.CreateContext();
+        var entity = await verify.ConversationReferences
+            .SingleAsync(e => e.AadObjectId == "aad-user-double-uninstall");
+
+        Assert.False(entity.IsActive);
+        Assert.NotEqual(firstMark, entity.DeactivatedAt);
+        Assert.Equal(secondMark, entity.DeactivatedAt);
+        Assert.Equal(ConversationReferenceDeactivationReasons.Uninstalled, entity.DeactivationReason);
+    }
+
+    [Fact(DisplayName = "Reader methods observe cancellation tokens cancelled prior to the call")]
+    public async Task Readers_ObserveCancellation()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(aadObjectId: "aad-cancel"),
+            CancellationToken.None);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var ct = cts.Token;
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => fixture.Store.GetAsync("tenant-1", "aad-cancel", ct));
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => fixture.Store.GetByAadObjectIdAsync("tenant-1", "aad-cancel", ct));
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => fixture.Store.GetAllActiveAsync("tenant-1", ct));
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => fixture.Store.IsActiveAsync("tenant-1", "aad-cancel", ct));
+    }
+
+    [Fact(DisplayName = "GetByConversationIdAsync (tenant-aware) excludes cross-tenant collisions on shared conversation IDs")]
+    public async Task GetByConversationId_TenantAware_FiltersCrossTenantCollision()
+    {
+        // FR-006 multi-tenant isolation: Bot Framework ConversationId values are NOT
+        // guaranteed globally unique across Entra ID tenants. Two tenants can host
+        // separate conversations that happen to share the same opaque ConversationId
+        // string. The tenant-aware overload MUST seek by (ConversationId, TenantId)
+        // server-side so the proactive-send path never routes a message into the wrong
+        // tenant on a coincidental ID match.
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(
+                tenantId: "tenant-1",
+                aadObjectId: "aad-user-in-t1",
+                conversationId: "shared:conversation-id",
+                referenceJson: "{\"tenant\":\"1\"}"),
+            CancellationToken.None);
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(
+                tenantId: "tenant-2",
+                aadObjectId: "aad-user-in-t2",
+                conversationId: "shared:conversation-id",
+                referenceJson: "{\"tenant\":\"2\"}"),
+            CancellationToken.None);
+
+        IConversationReferenceRouter router = fixture.Store;
+
+        var t1Hit = await router.GetByConversationIdAsync(
+            "tenant-1",
+            "shared:conversation-id",
+            CancellationToken.None);
+        var t2Hit = await router.GetByConversationIdAsync(
+            "tenant-2",
+            "shared:conversation-id",
+            CancellationToken.None);
+
+        Assert.NotNull(t1Hit);
+        Assert.Equal("tenant-1", t1Hit!.TenantId);
+        Assert.Equal("aad-user-in-t1", t1Hit.AadObjectId);
+        Assert.Equal("{\"tenant\":\"1\"}", t1Hit.ReferenceJson);
+
+        Assert.NotNull(t2Hit);
+        Assert.Equal("tenant-2", t2Hit!.TenantId);
+        Assert.Equal("aad-user-in-t2", t2Hit.AadObjectId);
+        Assert.Equal("{\"tenant\":\"2\"}", t2Hit.ReferenceJson);
+    }
+
+    [Fact(DisplayName = "GetByConversationIdAsync (tenant-aware) returns null when tenant does not match the stored row")]
+    public async Task GetByConversationId_TenantAware_ReturnsNullWhenTenantMismatches()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(
+                tenantId: "tenant-1",
+                aadObjectId: "aad-isolated",
+                conversationId: "a:isolated-conv"),
+            CancellationToken.None);
+
+        IConversationReferenceRouter router = fixture.Store;
+
+        var hit = await router.GetByConversationIdAsync(
+            "tenant-2",
+            "a:isolated-conv",
+            CancellationToken.None);
+
+        Assert.Null(hit);
+    }
+
+    [Fact(DisplayName = "GetByConversationIdAsync (tenant-aware) filters out inactive references on the hot path")]
+    public async Task GetByConversationId_TenantAware_FiltersOutInactiveReferences()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.UserScoped(
+                tenantId: "tenant-1",
+                aadObjectId: "aad-inactive-router",
+                conversationId: "a:tenant-aware-inactive"),
+            CancellationToken.None);
+
+        await fixture.Store.MarkInactiveAsync(
+            "tenant-1",
+            "aad-inactive-router",
+            CancellationToken.None);
+
+        IConversationReferenceRouter router = fixture.Store;
+
+        var hit = await router.GetByConversationIdAsync(
+            "tenant-1",
+            "a:tenant-aware-inactive",
+            CancellationToken.None);
+
+        Assert.Null(hit);
+    }
+
+    [Theory(DisplayName = "GetByConversationIdAsync (tenant-aware) rejects null/empty tenant ID or conversation ID")]
+    [InlineData(null, "a:conv")]
+    [InlineData("", "a:conv")]
+    [InlineData("tenant-1", null)]
+    [InlineData("tenant-1", "")]
+    public async Task GetByConversationId_TenantAware_RejectsNullOrEmpty(string? tenantId, string? conversationId)
+    {
+        await using var fixture = new StoreFixture();
+        IConversationReferenceRouter router = fixture.Store;
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => router.GetByConversationIdAsync(tenantId!, conversationId!, CancellationToken.None));
+    }
 }
