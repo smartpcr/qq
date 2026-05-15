@@ -32,29 +32,40 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 /// <b>Reservation lifecycle on failure.</b> The behaviour differs by
 /// failure mode (per the Stage 2.2 brief Step 2 and Scenario 4):
 /// <list type="bullet">
-///   <item><description><b>Caught post-reservation exception</b> — once
-///   <see cref="IDeduplicationService.TryReserveAsync"/> succeeds, EVERY
-///   subsequent stage (parse, authorize, disambiguation-store write,
-///   inline-button construction, role enforcement, the route switch
-///   itself, and the post-route <see cref="IDeduplicationService.MarkProcessedAsync"/>
-///   call) executes inside a single <c>try</c> that releases the
-///   reservation before re-throwing. The narrower "wrap only the route
-///   switch" shape would leak the reservation whenever a stage between
-///   <c>TryReserveAsync</c> and the route — e.g. a transient
-///   <see cref="IUserAuthorizationService.AuthorizeAsync"/> network
-///   failure, a duplicate-token write in
-///   <see cref="IPendingDisambiguationStore.StoreAsync"/>, or
-///   <see cref="InlineButton.MaxCallbackDataBytes"/> validation
-///   throwing on an oversized workspace id — threw. The webhook
-///   controller would then surface a 500, Telegram would redeliver the
-///   same update, <c>TryReserveAsync</c> would return <c>false</c>, and
-///   the event would be silently dropped as a duplicate without ever
-///   reaching a handler. Widening the catch closes that gap so the
-///   brief's "subsequent delivery of evt-1 is processed normally (not
-///   short-circuited as duplicate)" invariant holds for any caught
-///   throw — not just exceptions emitted from the routed handler. The
-///   throw still propagates so the webhook controller can transition
-///   the corresponding <c>InboundUpdate</c> row to <c>Failed</c>.
+///   <item><description><b>Caught exception in any post-reservation
+///   stage up to and including the routed handler call</b> — the
+///   pipeline calls
+///   <see cref="IDeduplicationService.ReleaseReservationAsync"/> inside
+///   a <c>catch</c> and then re-throws. The release-on-throw scope
+///   covers EVERY stage between the successful
+///   <see cref="IDeduplicationService.TryReserveAsync"/> and the
+///   routed handler completing: command parse, authorization round-
+///   trip, pending-disambiguation persistence, inline-button
+///   construction (which can reject an oversized workspace id),
+///   role enforcement, and the routed handler itself. A transient
+///   failure in any of them — e.g. a network blip in
+///   <see cref="IUserAuthorizationService.AuthorizeAsync"/>, a
+///   collision in
+///   <see cref="IPendingDisambiguationStore.StoreAsync"/>, an
+///   <see cref="InlineButton"/> argument exception — therefore releases
+///   the reservation so a subsequent live re-delivery's
+///   <see cref="IDeduplicationService.TryReserveAsync"/> succeeds and
+///   the event is processed normally. This satisfies the brief's
+///   "subsequent delivery of evt-1 is processed normally (not short-
+///   circuited as duplicate)" invariant for the full pipeline, not
+///   just the handler. The throw still propagates so the webhook
+///   controller can transition the corresponding <c>InboundUpdate</c>
+///   row to <c>Failed</c>.</description></item>
+///   <item><description><b>Caught exception in
+///   <see cref="IDeduplicationService.MarkProcessedAsync"/></b> —
+///   intentionally NOT covered by release-on-throw. Releasing after
+///   the handler has already run would let the next live re-delivery
+///   re-reserve and re-invoke the handler, causing double execution
+///   for non-idempotent commands (e.g. <c>/ask</c> creating a new
+///   task). Holding the reservation instead means the retry short-
+///   circuits at the dedup gate, the handler runs at most once, and
+///   the Stage 2.4 durable <c>InboundUpdate</c> row remains the
+///   canonical recovery handle for any operator-visible gap.
 ///   </description></item>
 ///   <item><description><b>Uncaught crash</b> (process exits or the
 ///   <c>catch</c> block itself fails) — neither
@@ -67,15 +78,8 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 ///   handler on a crash" race the implementation-plan addresses is
 ///   still closed: the only path that re-opens the gate is a successful
 ///   <see cref="IDeduplicationService.ReleaseReservationAsync"/> call,
-///   which only executes after a caught exception in a single
-///   pod.</description></item>
-///   <item><description><b>Operator cancellation</b>
-///   (<see cref="OperationCanceledException"/>) — the catch's exception
-///   filter deliberately lets <c>OperationCanceledException</c>
-///   propagate WITHOUT releasing. Cancellation means the caller asked
-///   us to stop, not that the event is retryable. The reservation
-///   remains held; the durable <c>InboundUpdate</c> sweep is again
-///   the recovery primitive.</description></item>
+///   which only executes after a caught post-reservation exception in
+///   a single pod.</description></item>
 ///   <item><description><b>Handler returns
 ///   <see cref="CommandResult.Success"/>=<c>false</c></b> — the
 ///   pipeline calls <see cref="IDeduplicationService.MarkProcessedAsync"/>
@@ -92,25 +96,33 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 ///   marker is symmetric with the success path. The durable
 ///   <c>InboundUpdate</c> row's terminal state is similarly aligned
 ///   by the Stage 2.4 webhook controller.</description></item>
-///   <item><description><b>Normal denials</b> (parse-empty, parse-
-///   invalid, authorize-denied, role-denied) and the multi-workspace
-///   prompt — these return normally with
-///   <see cref="PipelineResult.Handled"/>=<c>true</c> and a denial /
-///   prompt text. The catch does NOT fire (no throw), so the
-///   reservation is intentionally LEFT HELD. This is the canonical
-///   way to short-circuit a live re-delivery and stop the operator
-///   from seeing the same denial / prompt response repeated when
-///   Telegram redelivers the same update.</description></item>
 /// </list>
+/// </para>
+/// <para>
+/// <b>Normal-return early exits do NOT release.</b> The parse, authz,
+/// multi-workspace prompt, role-enforcement, and unsupported-event-
+/// type stages all reach their early exits via <c>return</c>, not via
+/// <c>throw</c>. They therefore leave the reservation in place
+/// deliberately: the operator has already received a definitive
+/// response (denial text, disambiguation prompt, or no response at
+/// all) and a Telegram retry of the same <c>EventId</c> must short-
+/// circuit as a duplicate so the operator does not see the same
+/// response repeated. This is the same TERMINAL semantics used for
+/// <see cref="CommandResult.Success"/>=<c>false</c>, just expressed
+/// via the held reservation rather than an explicit mark-processed
+/// call (the brief permits either; future hardening may add a
+/// mark-processed write to make the terminal state survive Stage 4.3
+/// distributed-cache TTL).
 /// </para>
 /// <para>
 /// <b>Concurrency property preserved.</b> The atomic-winner-per-
 /// concurrent-burst guarantee is unaffected by release-on-throw: the
-/// release executes sequentially AFTER the winner's stage that threw;
-/// during the in-flight burst every concurrent caller still sees a
-/// single <c>true</c> from <see cref="IDeduplicationService.TryReserveAsync"/>.
-/// Subsequent (post-completion) callers may succeed only when the
-/// prior winner caught an exception.
+/// release executes sequentially AFTER the winner's pipeline path
+/// faults; during the in-flight burst every concurrent caller still
+/// sees a single <c>true</c> from <see cref="IDeduplicationService.TryReserveAsync"/>.
+/// Subsequent (post-faulted-completion) callers may succeed only when
+/// the prior winner caught an exception in the release-on-throw
+/// scope.
 /// </para>
 /// <para>
 /// <b>Unknown events bypass dedup and authz.</b> An
@@ -240,29 +252,39 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             };
         }
 
-        // Release-on-throw guard spans EVERY stage after the reservation is
-        // taken — parse, authorize, disambiguation-store write, inline-button
-        // construction, role enforcement, the route switch, and the post-
-        // route MarkProcessedAsync. The Stage 2.2 brief Scenario 4 invariant
-        // ("subsequent delivery of evt-1 is processed normally, not short-
-        // circuited as duplicate") applies to ANY caught post-reservation
-        // throw, not just exceptions emitted from the routed handler. A
-        // narrower wrap-only-the-switch shape leaks the reservation when an
-        // earlier stage throws (transient authorize call, duplicate-token
-        // store write, oversized-workspace-id button validation, …); the
-        // webhook controller would surface a 500, Telegram would redeliver,
-        // TryReserveAsync would return false, and the event would be
-        // silently dropped without ever invoking a handler.
+        // Release-on-throw scope: EVERY post-reservation stage up to and
+        // including the routed handler call runs under this catch so that
+        // a transient failure in ANY of them releases the reservation and
+        // lets the next live re-delivery be processed normally (Stage 2.2
+        // brief Step 2 / Scenario 4). Concrete failure modes this widened
+        // scope guards against (and the narrower handler-only scope did
+        // not):
+        //   * _authz.AuthorizeAsync transient network exception
+        //   * _pendingDisambiguations.StoreAsync rejecting a duplicate
+        //     token (a freshly-regenerated token on retry will succeed)
+        //   * PipelineResponses.MultiWorkspaceButtons throwing because
+        //     an InlineButton callback_data payload exceeds the 64-byte
+        //     Telegram budget (e.g. an oversized workspace id)
+        //   * _parser.Parse throwing on a pathological RawCommand
+        //   * the routed handler itself
+        // Early-return paths (Denial, multi-workspace prompt,
+        // unsupported-event-type fallback) exit through normal
+        // <c>return</c> statements — the catch deliberately does not
+        // fire for them, so the reservation stays in place and a
+        // Telegram retry of the same EventId short-circuits as a
+        // duplicate (TERMINAL semantics, see <remarks>).
         //
-        // Normal returns inside this try (denials, the multi-workspace
-        // prompt, the success path) do NOT trigger the catch and
-        // deliberately leave the reservation held — that is how the
-        // pipeline prevents the same denial / prompt response from being
-        // re-sent on a live re-delivery.
+        // MarkProcessedAsync intentionally runs OUTSIDE this scope so
+        // that a transient mark-processed failure does NOT release the
+        // reservation and cause double handler execution on retry — the
+        // handler has already run by then, and at-most-once is more
+        // important than fresh-retry for the post-handler marker.
         //
-        // The catch filter deliberately excludes OperationCanceledException
-        // (caller asked us to stop) — those propagate without release;
-        // Stage 2.4's InboundUpdate sweep is the recovery primitive there.
+        // The throw still propagates so the webhook controller can mark
+        // the InboundUpdate row Failed. An uncaught crash (process
+        // exit) leaves the reservation held — Stage 2.4's sweep
+        // recovers via the durable InboundUpdate row.
+        CommandResult result;
         try
         {
             // Stage: parse (only meaningful for Command events).
@@ -398,15 +420,8 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                 }
             }
 
-            // Stage: route. An exception from the routed handler is caught
-            // by the outer try and triggers ReleaseReservationAsync so the
-            // next live re-delivery is processed normally (Stage 2.2 brief
-            // Step 2 / Scenario 4); the throw still propagates so the
-            // webhook controller can mark the InboundUpdate row Failed. An
-            // uncaught crash (process exit) leaves the reservation held —
-            // Stage 2.4's sweep recovers via the durable InboundUpdate row.
+            // Stage: route.
             LogStage(messengerEvent, "route");
-            CommandResult result;
             switch (messengerEvent.EventType)
             {
                 case EventType.Command:
@@ -434,64 +449,6 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                         CorrelationId = messengerEvent.CorrelationId,
                     };
             }
-
-            // Stage: handler-result. Inspect CommandResult.Success to drive
-            // the operator-facing response shape. Dedup-wise the contract is
-            // hybrid: throw = retryable (release-on-throw, caught below),
-            // return = terminal (mark processed regardless of Success). A
-            // handler that returns Success=false has run to completion and
-            // delivered a definitive failure response to the operator, so
-            // the pipeline marks the event processed exactly as it does on
-            // the success path. PipelineResult.Succeeded still reflects the
-            // handler's failure so observability can alert; only the dedup
-            // marker is symmetric. Pinned by
-            // Pipeline_OnHandlerReturnsFailure_MarksProcessed_AndSurfacesError
-            // and Pipeline_OnHandlerReturnsFailure_NextDeliveryShortCircuits.
-            LogStage(messengerEvent, "handler-result");
-            if (!result.Success)
-            {
-                var failureText = string.IsNullOrEmpty(result.ResponseText)
-                    ? PipelineResponses.HandlerFailureFallback
-                    : result.ResponseText;
-                _logger.LogWarning(
-                    "Pipeline handler returned failure. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} ErrorCode={ErrorCode}",
-                    messengerEvent.CorrelationId,
-                    messengerEvent.EventId,
-                    "handler-failure",
-                    result.ErrorCode);
-
-                // TERMINAL: mark processed even on Success=false so live
-                // re-deliveries short-circuit at the dedup gate. The
-                // processed marker is the canonical "done" signal that
-                // survives the Stage 4.3 distributed-cache TTL — relying on
-                // the bare reservation alone would let the gate re-open
-                // when the reservation expired and re-issue the same
-                // failure response to the operator.
-                LogStage(messengerEvent, "mark-processed");
-                await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
-
-                return new PipelineResult
-                {
-                    Handled = true,
-                    Succeeded = false,
-                    ResponseText = failureText,
-                    ErrorCode = result.ErrorCode,
-                    CorrelationId = messengerEvent.CorrelationId,
-                };
-            }
-
-            // Stage: post-success processed marker (distinct from the
-            // reservation set at the dedup stage).
-            LogStage(messengerEvent, "mark-processed");
-            await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
-
-            return new PipelineResult
-            {
-                Handled = true,
-                Succeeded = true,
-                ResponseText = result.ResponseText,
-                CorrelationId = messengerEvent.CorrelationId,
-            };
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -522,6 +479,72 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             }
             throw;
         }
+
+        // Stage: handler-result. Inspect CommandResult.Success to drive
+        // the operator-facing response shape. Dedup-wise the contract is
+        // hybrid: throw = retryable (release-on-throw, caught above),
+        // return = terminal (mark processed regardless of Success). A
+        // handler that returns Success=false has run to completion and
+        // delivered a definitive failure response to the operator, so
+        // the pipeline marks the event processed exactly as it does on
+        // the success path. PipelineResult.Succeeded still reflects the
+        // handler's failure so observability can alert; only the dedup
+        // marker is symmetric. Pinned by
+        // Pipeline_OnHandlerReturnsFailure_MarksProcessed_AndSurfacesError
+        // and Pipeline_OnHandlerReturnsFailure_NextDeliveryShortCircuits.
+        //
+        // NB: the MarkProcessedAsync calls below run OUTSIDE the
+        // release-on-throw scope by design. If MarkProcessedAsync throws,
+        // the reservation persists and the next Telegram retry short-
+        // circuits at the dedup gate — preferable to releasing here
+        // (which would re-run a non-idempotent handler). The Stage 2.4
+        // durable InboundUpdate row remains the canonical recovery
+        // handle for any operator-visible gap.
+        LogStage(messengerEvent, "handler-result");
+        if (!result.Success)
+        {
+            var failureText = string.IsNullOrEmpty(result.ResponseText)
+                ? PipelineResponses.HandlerFailureFallback
+                : result.ResponseText;
+            _logger.LogWarning(
+                "Pipeline handler returned failure. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} ErrorCode={ErrorCode}",
+                messengerEvent.CorrelationId,
+                messengerEvent.EventId,
+                "handler-failure",
+                result.ErrorCode);
+
+            // TERMINAL: mark processed even on Success=false so live
+            // re-deliveries short-circuit at the dedup gate. The
+            // processed marker is the canonical "done" signal that
+            // survives the Stage 4.3 distributed-cache TTL — relying on
+            // the bare reservation alone would let the gate re-open
+            // when the reservation expired and re-issue the same
+            // failure response to the operator.
+            LogStage(messengerEvent, "mark-processed");
+            await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
+
+            return new PipelineResult
+            {
+                Handled = true,
+                Succeeded = false,
+                ResponseText = failureText,
+                ErrorCode = result.ErrorCode,
+                CorrelationId = messengerEvent.CorrelationId,
+            };
+        }
+
+        // Stage: post-success processed marker (distinct from the
+        // reservation set at the dedup stage).
+        LogStage(messengerEvent, "mark-processed");
+        await _dedup.MarkProcessedAsync(messengerEvent.EventId, ct).ConfigureAwait(false);
+
+        return new PipelineResult
+        {
+            Handled = true,
+            Succeeded = true,
+            ResponseText = result.ResponseText,
+            CorrelationId = messengerEvent.CorrelationId,
+        };
     }
 
     /// <summary>
