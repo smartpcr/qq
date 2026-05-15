@@ -556,4 +556,110 @@ public class SqlConversationReferenceStoreTests
             Assert.True(entity.IsActive);
         }
     }
+
+    [Theory(DisplayName = "SaveOrUpdate rejects references with null/empty ServiceUrl (Bot Framework routing requirement)")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task SaveOrUpdate_RejectsReferenceWithEmptyServiceUrl(string? serviceUrl)
+    {
+        await using var fixture = new StoreFixture();
+        var reference = TeamsConversationReferenceFactory.UserScoped(serviceUrl: serviceUrl!);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Store.SaveOrUpdateAsync(reference, CancellationToken.None));
+        Assert.Contains("ServiceUrl", ex.Message, StringComparison.Ordinal);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Theory(DisplayName = "SaveOrUpdate rejects references with null/empty ConversationId (proactive-routing key)")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task SaveOrUpdate_RejectsReferenceWithEmptyConversationId(string? conversationId)
+    {
+        await using var fixture = new StoreFixture();
+        var reference = TeamsConversationReferenceFactory.UserScoped(conversationId: conversationId!);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Store.SaveOrUpdateAsync(reference, CancellationToken.None));
+        Assert.Contains("ConversationId", ex.Message, StringComparison.Ordinal);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Theory(DisplayName = "SaveOrUpdate rejects references with null/empty BotId (TurnContext reconstitution)")]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task SaveOrUpdate_RejectsReferenceWithEmptyBotId(string? botId)
+    {
+        await using var fixture = new StoreFixture();
+        var reference = TeamsConversationReferenceFactory.UserScoped(botId: botId!);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Store.SaveOrUpdateAsync(reference, CancellationToken.None));
+        Assert.Contains("BotId", ex.Message, StringComparison.Ordinal);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "MarkInactiveByChannelAsync is a no-op for nonexistent channel")]
+    public async Task MarkInactiveByChannel_OnMissingRow_NoOp()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.MarkInactiveByChannelAsync("tenant-1", "channel-missing", CancellationToken.None);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "DeleteAsync is a no-op for nonexistent user-scoped reference")]
+    public async Task Delete_OnMissingRow_NoOp()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.DeleteAsync("tenant-1", "aad-user-missing", CancellationToken.None);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "DeleteByChannelAsync is a no-op for nonexistent channel-scoped reference")]
+    public async Task DeleteByChannel_OnMissingRow_NoOp()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.DeleteByChannelAsync("tenant-1", "channel-missing", CancellationToken.None);
+
+        await using var verify = fixture.CreateContext();
+        Assert.Equal(0, await verify.ConversationReferences.CountAsync());
+    }
+
+    [Fact(DisplayName = "GetActiveChannelsByTeamIdAsync filters out inactive channels")]
+    public async Task GetActiveChannelsByTeamId_FiltersInactiveChannels()
+    {
+        await using var fixture = new StoreFixture();
+
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.ChannelScoped(channelId: "channel-active", teamId: "team-platform"),
+            CancellationToken.None);
+        await fixture.Store.SaveOrUpdateAsync(
+            TeamsConversationReferenceFactory.ChannelScoped(channelId: "channel-inactive", teamId: "team-platform"),
+            CancellationToken.None);
+
+        // Soft-delete one of the channels in the team.
+        await fixture.Store.MarkInactiveByChannelAsync("tenant-1", "channel-inactive", CancellationToken.None);
+
+        var teamChannels = await fixture.Store.GetActiveChannelsByTeamIdAsync(
+            "tenant-1",
+            "team-platform",
+            CancellationToken.None);
+
+        Assert.Single(teamChannels);
+        Assert.Equal("channel-active", teamChannels[0].ChannelId);
+        Assert.DoesNotContain(teamChannels, c => c.ChannelId == "channel-inactive");
+    }
 }

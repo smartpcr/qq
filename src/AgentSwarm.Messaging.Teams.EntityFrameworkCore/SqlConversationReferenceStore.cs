@@ -107,6 +107,38 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
                 nameof(reference));
         }
 
+        // Validate the Bot Framework routing fields up front so caller bugs surface as a
+        // clear ArgumentException at the API boundary instead of a generic DbUpdateException
+        // from EF Core when the underlying NOT NULL constraints reject the row. ServiceUrl
+        // and ConversationId are also the two values the proactive-send code path
+        // (TeamsMessengerConnector.SendMessageAsync via GetByConversationIdAsync) reads
+        // back; storing nulls would silently break proactive routing for the affected
+        // reference. BotId is required to reconstitute the outbound TurnContext.
+        if (string.IsNullOrEmpty(reference.ServiceUrl))
+        {
+            throw new ArgumentException(
+                "TeamsConversationReference.ServiceUrl must be a non-empty string — Bot " +
+                "Framework requires a service URL to dispatch outbound activities.",
+                nameof(reference));
+        }
+
+        if (string.IsNullOrEmpty(reference.ConversationId))
+        {
+            throw new ArgumentException(
+                "TeamsConversationReference.ConversationId must be a non-empty string — " +
+                "the conversation ID is the proactive-routing key used by " +
+                "GetByConversationIdAsync to resolve outbound messages back to this reference.",
+                nameof(reference));
+        }
+
+        if (string.IsNullOrEmpty(reference.BotId))
+        {
+            throw new ArgumentException(
+                "TeamsConversationReference.BotId must be a non-empty string — the bot ID " +
+                "is required to reconstitute the outbound TurnContext for proactive sends.",
+                nameof(reference));
+        }
+
         for (var attempt = 1; ; attempt++)
         {
             await using var context = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
