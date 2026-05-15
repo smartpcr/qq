@@ -11,7 +11,9 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{73B7DD66
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Abstractions.Tests", "tests\AgentSwarm.Messaging.Abstractions.Tests\AgentSwarm.Messaging.Abstractions.Tests.csproj", "{06BFFF8F-933B-47A1-9556-46B515E26B80}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Teams.Manifest.Tests", "tests\AgentSwarm.Messaging.Teams.Manifest.Tests\AgentSwarm.Messaging.Teams.Manifest.Tests.csproj", "{CA6C37C8-CE97-4307-BDE5-2D7398829835}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Teams", "src\AgentSwarm.Messaging.Teams\AgentSwarm.Messaging.Teams.csproj", "{DB0AE3E6-1217-40A5-B0CD-AD63ED69D93E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Teams.Tests", "tests\AgentSwarm.Messaging.Teams.Tests\AgentSwarm.Messaging.Teams.Tests.csproj", "{F9C2D717-7B12-4FD3-A056-5EAEE6CBE017}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -30,14 +32,19 @@ Global
 		{06BFFF8F-933B-47A1-9556-46B515E26B80}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{06BFFF8F-933B-47A1-9556-46B515E26B80}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{06BFFF8F-933B-47A1-9556-46B515E26B80}.Release|Any CPU.Build.0 = Release|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DB0AE3E6-1217-40A5-B0CD-AD63ED69D93E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DB0AE3E6-1217-40A5-B0CD-AD63ED69D93E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DB0AE3E6-1217-40A5-B0CD-AD63ED69D93E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DB0AE3E6-1217-40A5-B0CD-AD63ED69D93E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F9C2D717-7B12-4FD3-A056-5EAEE6CBE017}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F9C2D717-7B12-4FD3-A056-5EAEE6CBE017}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F9C2D717-7B12-4FD3-A056-5EAEE6CBE017}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F9C2D717-7B12-4FD3-A056-5EAEE6CBE017}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{D4ED5193-0AD2-4567-96C4-2808E2420933} = {63C0970D-7B73-4144-9020-8F5913C4F943}
 		{06BFFF8F-933B-47A1-9556-46B515E26B80} = {73B7DD66-2EE7-46E8-8F29-F9A93CF89517}
-		{CA6C37C8-CE97-4307-BDE5-2D7398829835} = {73B7DD66-2EE7-46E8-8F29-F9A93CF89517}
+		{DB0AE3E6-1217-40A5-B0CD-AD63ED69D93E} = {63C0970D-7B73-4144-9020-8F5913C4F943}
+		{F9C2D717-7B12-4FD3-A056-5EAEE6CBE017} = {73B7DD66-2EE7-46E8-8F29-F9A93CF89517}
 	EndGlobalSection
 EndGlobal
