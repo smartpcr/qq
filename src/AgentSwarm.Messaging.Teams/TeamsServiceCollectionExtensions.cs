@@ -1,6 +1,7 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
+using AgentSwarm.Messaging.Teams.Extensions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -108,6 +109,7 @@ public static class TeamsServiceCollectionExtensions
 
         services.AddInProcessInboundEventChannel();
         services.AddTeamsCommandDispatcher();
+        services.TryAddSingleton<IMessageExtensionHandler, MessageExtensionHandler>();
         services.TryAddSingleton<TeamsMessengerConnector>();
         services.TryAddKeyedSingleton<IMessengerConnector>(
             MessengerKey,

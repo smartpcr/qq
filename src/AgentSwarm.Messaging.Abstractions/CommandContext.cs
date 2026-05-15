@@ -80,4 +80,29 @@ public sealed record CommandContext
     /// commands (e.g. bare <c>"approve"</c>), the value is the empty string.
     /// </remarks>
     public string? CommandArguments { get; init; }
+
+    /// <summary>
+    /// Origination hint set by inbound producers that already know the canonical
+    /// <see cref="MessengerEventSources"/> value to stamp on the published
+    /// <see cref="MessengerEvent.Source"/>. Used by the Stage 3.4 message-extension path
+    /// (<c>MessageExtensionHandler</c>) so the resulting <see cref="CommandEvent"/> carries
+    /// <see cref="MessengerEventSources.MessageAction"/> regardless of the underlying
+    /// conversation type. When <c>null</c>, downstream handlers fall back to deriving the
+    /// source from the turn context (<c>PersonalChat</c> vs <c>TeamChannel</c>) per
+    /// <c>architecture.md</c> §3.1.
+    /// </summary>
+    public string? Source { get; init; }
+
+    /// <summary>
+    /// When <c>true</c>, downstream <see cref="ICommandHandler"/> implementations skip
+    /// sending an outbound chat reply through <see cref="TurnContext"/>. Set by inbound
+    /// producers that own the user-facing response themselves — for example, the Stage 3.4
+    /// message-extension handler returns its confirmation card via the
+    /// <c>MessagingExtensionActionResponse</c> invoke reply rather than a channel-thread
+    /// message (per <c>architecture.md</c> §2.15 and <c>e2e-scenarios.md</c> §Message
+    /// Actions: "message extensions return a confirmation card response, not a channel
+    /// thread reply"). Defaults to <c>false</c> so existing call sites (
+    /// <c>OnMessageActivityAsync</c>) continue to receive their per-handler reply card.
+    /// </summary>
+    public bool SuppressReply { get; init; }
 }

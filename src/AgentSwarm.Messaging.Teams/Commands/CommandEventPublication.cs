@@ -44,6 +44,14 @@ internal static class CommandEventPublication
 
     public static Task SendReplyAsync(CommandContext context, Microsoft.Bot.Schema.IMessageActivity reply, CancellationToken ct)
     {
+        // Honour the producer's explicit suppression flag — the Stage 3.4 message-extension
+        // path owns its own user-facing response (the MessagingExtensionActionResponse
+        // invoke reply) and must not also post a chat-thread message via the turn context.
+        if (context.SuppressReply)
+        {
+            return Task.CompletedTask;
+        }
+
         if (context.TurnContext is ITurnContext turnContext)
         {
             return turnContext.SendActivityAsync(reply, ct);
@@ -65,6 +73,14 @@ internal static class CommandEventPublication
     /// </summary>
     /// <remarks>
     /// <para>
+    /// When the upstream producer has already pinned the canonical source value (for
+    /// example, the Stage 3.4 message-extension handler sets
+    /// <see cref="CommandContext.Source"/> to <see cref="MessengerEventSources.MessageAction"/>),
+    /// the explicit hint wins. This preserves the
+    /// <see cref="MessengerEventSources.MessageAction"/> origination on forwarded messages
+    /// regardless of the underlying conversation type (personal vs channel).
+    /// </para>
+    /// <para>
     /// Reads <c>ConversationType</c> from the Bot Framework <see cref="ITurnContext"/>
     /// hanging off <see cref="CommandContext.TurnContext"/>. The cast mirrors
     /// <see cref="SendReplyAsync"/> so we keep the Bot-Framework dependency confined to
@@ -79,6 +95,13 @@ internal static class CommandEventPublication
     /// </remarks>
     private static string? ResolveEventSource(CommandContext context)
     {
+        // Producer-supplied hint wins — message-extension forwards stamp Source = MessageAction
+        // up front so the published CommandEvent carries the correct origination.
+        if (!string.IsNullOrEmpty(context.Source))
+        {
+            return context.Source;
+        }
+
         if (context.TurnContext is not ITurnContext turnContext)
         {
             return null;
