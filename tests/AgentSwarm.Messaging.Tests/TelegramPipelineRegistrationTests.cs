@@ -1,0 +1,82 @@
+using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Telegram;
+using AgentSwarm.Messaging.Telegram.Pipeline;
+using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
+using FluentAssertions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace AgentSwarm.Messaging.Tests;
+
+/// <summary>
+/// Locks the Stage 2.2 DI surface added by
+/// <see cref="TelegramServiceCollectionExtensions.AddTelegram"/>: the
+/// inbound pipeline and its five stub dependencies must register so that
+/// downstream Phase 3/4 stages can replace them with last-wins semantics.
+/// </summary>
+public class TelegramPipelineRegistrationTests
+{
+    private const string SampleToken = "1234567890:AAH9hyTeleGramSecRetToken_test_value_only";
+
+    [Theory]
+    [InlineData(typeof(IDeduplicationService), typeof(InMemoryDeduplicationService))]
+    [InlineData(typeof(IPendingQuestionStore), typeof(InMemoryPendingQuestionStore))]
+    [InlineData(typeof(IPendingDisambiguationStore), typeof(InMemoryPendingDisambiguationStore))]
+    [InlineData(typeof(ICommandParser), typeof(StubCommandParser))]
+    [InlineData(typeof(ICommandRouter), typeof(StubCommandRouter))]
+    [InlineData(typeof(ICallbackHandler), typeof(StubCallbackHandler))]
+    [InlineData(typeof(ITelegramUpdatePipeline), typeof(TelegramUpdatePipeline))]
+    public void AddTelegram_RegistersStage22Service(Type serviceType, Type implementationType)
+    {
+        var services = BuildServices();
+
+        var descriptor = services.FirstOrDefault(d => d.ServiceType == serviceType);
+
+        descriptor.Should().NotBeNull(
+            "{0} must be registered by AddTelegram so the Stage 2.2 inbound pipeline composes",
+            serviceType.FullName);
+        descriptor!.ImplementationType.Should().Be(implementationType);
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton,
+            "stub dependencies hold in-memory state that must survive between pipeline invocations");
+    }
+
+    [Fact]
+    public void AddTelegram_RegistersTimeProvider()
+    {
+        var services = BuildServices();
+
+        var descriptor = services.FirstOrDefault(d => d.ServiceType == typeof(TimeProvider));
+
+        descriptor.Should().NotBeNull(
+            "Stage 2.2 pipeline depends on TimeProvider for disambiguation TTL stamping");
+        descriptor!.Lifetime.Should().Be(ServiceLifetime.Singleton);
+        // TimeProvider.System is a static instance; AddTelegram registers
+        // it as an instance (no implementation type). TryAddSingleton
+        // semantics let tests substitute a FakeTimeProvider before
+        // calling AddTelegram.
+        descriptor.ImplementationInstance.Should().BeSameAs(TimeProvider.System);
+    }
+
+    [Fact]
+    public void AddTelegram_DoesNotRegisterUserAuthorizationService()
+    {
+        var services = BuildServices();
+
+        services.Should().NotContain(d => d.ServiceType == typeof(global::AgentSwarm.Messaging.Core.IUserAuthorizationService),
+            "IUserAuthorizationService is a Phase 4 concern and is intentionally not stubbed by AddTelegram; "
+            + "leaving it unregistered makes a missing authorization service a loud bootstrap failure rather than a silent allow-everything stub");
+    }
+
+    private static ServiceCollection BuildServices()
+    {
+        var services = new ServiceCollection();
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Telegram:BotToken"] = SampleToken,
+            })
+            .Build();
+        services.AddTelegram(config);
+        return services;
+    }
+}

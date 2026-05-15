@@ -788,6 +788,18 @@ public class ConnectorContractTests
         public Task<bool> TryReserveAsync(string eventId, CancellationToken ct) =>
             Task.FromResult(_seen.TryAdd(eventId, 0));
 
+        public Task ReleaseReservationAsync(string eventId, CancellationToken ct)
+        {
+            // Test-double: this minimal stub does not separate
+            // "reserved" from "processed" buckets, so release simply
+            // removes the reservation. The richer
+            // InMemoryDeduplicationService inside the Telegram project
+            // adds the sticky-processed guard (a release after
+            // MarkProcessedAsync becomes a no-op).
+            _seen.TryRemove(eventId, out _);
+            return Task.CompletedTask;
+        }
+
         public Task<bool> IsProcessedAsync(string eventId, CancellationToken ct) =>
             Task.FromResult(_seen.ContainsKey(eventId));
 
