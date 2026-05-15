@@ -92,6 +92,23 @@ public sealed class PackagingScriptSmokeTests : IDisposable
     }
 
     [Fact]
+    public void PackagingScript_ZipIconsAreRealPngsAndPreserveSourceBytes()
+    {
+        // Teams refuses to sideload a package whose icon files are not real
+        // PNGs (e.g. a UTF-8 text pipeline rewrote 0x89 to 0xEF 0xBF 0xBD).
+        // Compress-Archive would silently produce such a zip if the source
+        // icons were corrupted, OR if a future maintainer adds a step that
+        // routes the icons through a text-mode read/write. Guard against
+        // both: assert the icons inside the zip start with the canonical PNG
+        // signature AND are byte-identical to the source icons on disk.
+        var result = this.RunPackaging(SampleAppId, SampleVersion, SampleBotDomain);
+        using var archive = ZipFile.OpenRead(result.ZipPath);
+
+        AssertZipEntryIsPngMatchingSource(archive, "color.png", ManifestFixture.ColorIconPath);
+        AssertZipEntryIsPngMatchingSource(archive, "outline.png", ManifestFixture.OutlineIconPath);
+    }
+
+    [Fact]
     public void PackagingScript_SubstitutesAppIdAcrossEveryRequiredIdSite()
     {
         // The Teams sideloading contract is: every id site in the manifest
@@ -328,6 +345,36 @@ public sealed class PackagingScriptSmokeTests : IDisposable
         }
 
         return new PackagingResult(outputZip, tempDir, stdout, stderr);
+    }
+
+    private static void AssertZipEntryIsPngMatchingSource(ZipArchive archive, string entryName, string sourcePath)
+    {
+        var entry = archive.GetEntry(entryName)
+            ?? throw new Xunit.Sdk.XunitException($"Zip is missing '{entryName}'.");
+
+        byte[] zipBytes;
+        using (var stream = entry.Open())
+        using (var memory = new MemoryStream())
+        {
+            stream.CopyTo(memory);
+            zipBytes = memory.ToArray();
+        }
+
+        // PNG signature: 0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A
+        byte[] pngSignature = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        Assert.True(
+            zipBytes.Length >= pngSignature.Length,
+            $"'{entryName}' inside the zip is too short to hold a PNG signature (length {zipBytes.Length}).");
+        for (var i = 0; i < pngSignature.Length; i++)
+        {
+            Assert.True(
+                zipBytes[i] == pngSignature[i],
+                $"'{entryName}' inside the zip is not a PNG at offset {i}: " +
+                $"got 0x{zipBytes[i]:X2}, expected 0x{pngSignature[i]:X2}.");
+        }
+
+        var sourceBytes = File.ReadAllBytes(sourcePath);
+        Assert.Equal(sourceBytes, zipBytes);
     }
 
     private static void TryDeleteDirectory(string dir)
