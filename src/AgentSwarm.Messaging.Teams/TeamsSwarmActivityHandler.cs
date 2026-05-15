@@ -86,14 +86,15 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 #pragma warning disable IDE0052 // dependency retained for backward compat; per impl-plan §3.2 step 7 the CommandDispatcher (not this handler) owns inbound event publication.
     private readonly IInboundEventPublisher _inboundEventPublisher;
 #pragma warning restore IDE0052
+    private readonly Extensions.IMessageExtensionHandler _messageExtensionHandler;
     private readonly ILogger<TeamsSwarmActivityHandler> _logger;
 
     /// <summary>
-    /// Construct the handler with the nine required dependencies per
-    /// <c>implementation-plan.md</c> §2.2 step 1. All arguments are required — every
-    /// constructor parameter is null-guarded so DI mis-registration fails loudly at
-    /// startup rather than producing a <see cref="NullReferenceException"/> deep inside an
-    /// activity callback.
+    /// Construct the handler with the ten required dependencies per
+    /// <c>implementation-plan.md</c> §2.2 step 1 and Stage 3.4 step 2. All arguments are
+    /// required — every constructor parameter is null-guarded so DI mis-registration
+    /// fails loudly at startup rather than producing a <see cref="NullReferenceException"/>
+    /// deep inside an activity callback.
     /// </summary>
     public TeamsSwarmActivityHandler(
         IConversationReferenceStore conversationReferenceStore,
@@ -104,6 +105,7 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         IAuditLogger auditLogger,
         ICardActionHandler cardActionHandler,
         IInboundEventPublisher inboundEventPublisher,
+        Extensions.IMessageExtensionHandler messageExtensionHandler,
         ILogger<TeamsSwarmActivityHandler> logger)
     {
         _conversationReferenceStore = conversationReferenceStore ?? throw new ArgumentNullException(nameof(conversationReferenceStore));
@@ -114,6 +116,7 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         _auditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
         _cardActionHandler = cardActionHandler ?? throw new ArgumentNullException(nameof(cardActionHandler));
         _inboundEventPublisher = inboundEventPublisher ?? throw new ArgumentNullException(nameof(inboundEventPublisher));
+        _messageExtensionHandler = messageExtensionHandler ?? throw new ArgumentNullException(nameof(messageExtensionHandler));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -525,6 +528,37 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         }
 
         return _cardActionHandler.HandleAsync(turnContext, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Stage 3.4 step 2 — delegates Teams message-extension <c>submitAction</c> invokes
+    /// (for example, the user right-clicks a message and selects the "Forward to Agent"
+    /// message action) to the injected
+    /// <see cref="Extensions.IMessageExtensionHandler"/>. The handler extracts the
+    /// forwarded message text, dispatches it through
+    /// <see cref="ICommandDispatcher.DispatchAsync"/> as an <c>AgentTaskRequest</c>
+    /// command event with <see cref="MessengerEventSources.MessageAction"/>, logs an
+    /// <see cref="AuditEventTypes.MessageActionReceived"/> audit entry, and returns the
+    /// task-submitted confirmation card via the
+    /// <see cref="MessagingExtensionActionResponse"/> invoke reply.
+    /// </remarks>
+    protected override Task<MessagingExtensionActionResponse> OnTeamsMessagingExtensionSubmitActionAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        MessagingExtensionAction action,
+        CancellationToken cancellationToken)
+    {
+        if (turnContext is null)
+        {
+            throw new ArgumentNullException(nameof(turnContext));
+        }
+
+        if (action is null)
+        {
+            throw new ArgumentNullException(nameof(action));
+        }
+
+        return _messageExtensionHandler.HandleAsync(turnContext, action, cancellationToken);
     }
 
     private static string ExtractCorrelationId(Activity? activity)
