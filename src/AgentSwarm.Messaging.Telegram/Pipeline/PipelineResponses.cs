@@ -1,3 +1,4 @@
+using System.Text;
 using AgentSwarm.Messaging.Abstractions;
 
 namespace AgentSwarm.Messaging.Telegram.Pipeline;
@@ -49,19 +50,29 @@ internal static class PipelineResponses
         "Command failed – please try again or contact your administrator.";
 
     /// <summary>
-    /// Sentinel appended to a workspace-id label when it is truncated to
-    /// fit <see cref="InlineButton.MaxLabelBytes"/>. U+2026 HORIZONTAL
-    /// ELLIPSIS encodes to 3 UTF-8 bytes, so the truncated prefix budget
-    /// is <c>MaxLabelBytes - 3</c>.
+    /// U+2026 HORIZONTAL ELLIPSIS appended by
+    /// <see cref="TruncateLabelForUtf8Budget"/> to signal that an
+    /// operator-facing label was clipped to fit Telegram's
+    /// <c>InlineKeyboardButton.text</c> byte cap. Encodes to exactly
+    /// 3 UTF-8 bytes (<c>0xE2 0x80 0xA6</c>); see
+    /// <see cref="EllipsisUtf8ByteCount"/>.
     /// </summary>
-    internal const string LabelTruncationEllipsis = "\u2026";
+    internal const string TruncationEllipsis = "\u2026";
+
+    /// <summary>
+    /// UTF-8 byte length of <see cref="TruncationEllipsis"/>. Cached as a
+    /// constant so the truncation hot path does not re-measure the
+    /// suffix per button.
+    /// </summary>
+    internal const int EllipsisUtf8ByteCount = 3;
 
     /// <summary>
     /// Builds the workspace-selection inline keyboard surfaced when an
     /// operator has more than one <c>OperatorBinding</c> for the same
     /// (user, chat) pair. Each binding becomes one button whose
-    /// <see cref="InlineButton.Label"/> is the workspace identifier (with
-    /// defensive UTF-8 truncation — see remarks) and whose
+    /// <see cref="InlineButton.Label"/> is the workspace identifier
+    /// (truncated to fit Telegram's 64-byte label cap if needed; see
+    /// <see cref="TruncateLabelForUtf8Budget"/>) and whose
     /// <see cref="InlineButton.CallbackData"/> is
     /// <c>ws:&lt;token&gt;:&lt;index&gt;</c> — where <c>index</c> is the
     /// 0-based position of the binding in <paramref name="workspaceIds"/>.
@@ -92,26 +103,20 @@ internal static class PipelineResponses
     /// count, leaving ample headroom under the 64-byte cap.
     /// </para>
     /// <para>
-    /// <b>Defensive label truncation.</b> The human-facing
-    /// <see cref="InlineButton.Label"/> still carries the workspace id so
-    /// the operator sees what they are picking, but Label has its own
-    /// independent 64-byte UTF-8 budget enforced by
-    /// <see cref="InlineButton"/>. A workspace id that exceeds that cap
-    /// would otherwise throw <see cref="ArgumentException"/> from the
-    /// init validator — and this builder is invoked from
-    /// <c>TelegramUpdatePipeline.ProcessAsync</c> AFTER
-    /// <c>IDeduplicationService.TryReserveAsync</c> has succeeded but
-    /// BEFORE the route-stage try/catch that releases the reservation on
-    /// throw, so a raw throw here would leak the reservation and silently
-    /// drop the next live re-delivery as a duplicate. To make this
-    /// builder total on its inputs, oversized workspace ids are clamped
-    /// to <see cref="InlineButton.MaxLabelBytes"/> by
-    /// <see cref="ClampLabelToMaxBytes"/> — keeping the longest whole-Rune
-    /// prefix that fits in <c>MaxLabelBytes - 3</c> bytes and appending
-    /// <see cref="LabelTruncationEllipsis"/>. The wire identity used by
-    /// Stage 3.3 is unaffected because resolution is by index against
-    /// <see cref="PendingDisambiguation.CandidateWorkspaceIds"/>, which
-    /// stores the un-truncated id.
+    /// <b>Label byte cap.</b> <see cref="InlineButton.Label"/> carries
+    /// its own (independent) 64-byte budget enforced by the
+    /// <c>InlineButton</c> setter. Workspace ids are tenant-supplied
+    /// strings of unconstrained length; iter-4 review pinned that
+    /// piping them verbatim into <see cref="InlineButton.Label"/> would
+    /// throw <see cref="ArgumentException"/> for any id beyond the cap,
+    /// AND — because this method runs OUTSIDE
+    /// <see cref="TelegramUpdatePipeline"/>'s route-stage try/catch —
+    /// would also leak the dedup reservation taken at the dedup stage,
+    /// silently dropping the next live re-delivery. The label is now
+    /// clipped via <see cref="TruncateLabelForUtf8Budget"/> at a
+    /// whole-Rune boundary with an ellipsis suffix, so an oversize id
+    /// still produces a valid (if shortened) prompt rather than
+    /// crashing the pipeline.
     /// </para>
     /// <para>
     /// <b>Tampering rejection (Stage 3.3 contract).</b> A non-numeric
@@ -146,7 +151,7 @@ internal static class PipelineResponses
         {
             buttons[i] = new InlineButton
             {
-                Label = ClampLabelToMaxBytes(workspaceIds[i]),
+                Label = TruncateLabelForUtf8Budget(workspaceIds[i], InlineButton.MaxLabelBytes),
                 CallbackData = string.Create(
                     System.Globalization.CultureInfo.InvariantCulture,
                     $"{WorkspaceCallbackDataPrefix}{token}:{i}"),
@@ -156,47 +161,70 @@ internal static class PipelineResponses
     }
 
     /// <summary>
-    /// Clamps <paramref name="value"/> so its UTF-8 byte length is at
-    /// most <see cref="InlineButton.MaxLabelBytes"/>. If truncation is
-    /// required, the result is the longest whole-Rune prefix of
-    /// <paramref name="value"/> that fits in
-    /// <c>MaxLabelBytes - 3</c> UTF-8 bytes, followed by
-    /// <see cref="LabelTruncationEllipsis"/>. Truncation is enumerated
-    /// over <see cref="System.Text.Rune"/> values so a multi-byte UTF-8
-    /// sequence (including surrogate-pair code points) is never split
-    /// mid-byte. Empty/null input is returned unchanged so the
-    /// downstream <see cref="InlineButton.Label"/> init validator can
-    /// surface its existing "must be non-empty" diagnostic.
+    /// Returns <paramref name="label"/> verbatim if it already fits in
+    /// <paramref name="maxBytes"/> UTF-8 bytes; otherwise returns the
+    /// longest whole-Rune prefix that, when followed by
+    /// <see cref="TruncationEllipsis"/>, still fits in
+    /// <paramref name="maxBytes"/>.
     /// </summary>
-    private static string ClampLabelToMaxBytes(string value)
+    /// <remarks>
+    /// <para>
+    /// Clipping happens at Unicode scalar boundaries (via
+    /// <see cref="Rune.EnumerateRunes(string)"/>), never mid-codepoint,
+    /// so the truncated label is always well-formed UTF-8 and never
+    /// splits a surrogate pair or a multi-byte sequence. Each <see cref="Rune"/>
+    /// reports its UTF-8 byte length through
+    /// <see cref="Rune.Utf8SequenceLength"/>, which the loop sums until
+    /// the next character would breach the
+    /// <c>maxBytes - </c><see cref="EllipsisUtf8ByteCount"/> budget.
+    /// </para>
+    /// <para>
+    /// The empty string is returned when <paramref name="maxBytes"/> is
+    /// smaller than <see cref="EllipsisUtf8ByteCount"/> — a pathological
+    /// budget the pipeline never passes (callers use
+    /// <see cref="InlineButton.MaxLabelBytes"/> = 64) but which is
+    /// handled defensively so the helper can be reused with any cap.
+    /// Null or empty input is passed through unchanged so the caller's
+    /// downstream non-empty validation (in <see cref="InlineButton"/>)
+    /// continues to fire on genuinely-missing data.
+    /// </para>
+    /// </remarks>
+    /// <param name="label">Operator-facing label to fit within the cap.</param>
+    /// <param name="maxBytes">
+    /// Maximum UTF-8 byte length allowed by the downstream consumer
+    /// (Telegram's <c>InlineKeyboardButton.text</c> field caps at 64).
+    /// </param>
+    internal static string TruncateLabelForUtf8Budget(string label, int maxBytes)
     {
-        if (string.IsNullOrEmpty(value))
+        if (string.IsNullOrEmpty(label))
         {
-            return value;
+            return label;
         }
 
-        var utf8 = System.Text.Encoding.UTF8;
-        if (utf8.GetByteCount(value) <= InlineButton.MaxLabelBytes)
+        if (Encoding.UTF8.GetByteCount(label) <= maxBytes)
         {
-            return value;
+            return label;
         }
 
-        var ellipsisBytes = utf8.GetByteCount(LabelTruncationEllipsis);
-        var budget = InlineButton.MaxLabelBytes - ellipsisBytes;
+        var budget = maxBytes - EllipsisUtf8ByteCount;
+        if (budget <= 0)
+        {
+            return string.Empty;
+        }
 
-        var sb = new System.Text.StringBuilder(value.Length);
         var consumed = 0;
-        foreach (var rune in value.EnumerateRunes())
+        var charCutoff = 0;
+        foreach (var rune in label.EnumerateRunes())
         {
-            var size = rune.Utf8SequenceLength;
-            if (consumed + size > budget)
+            var runeBytes = rune.Utf8SequenceLength;
+            if (consumed + runeBytes > budget)
             {
                 break;
             }
-            sb.Append(rune.ToString());
-            consumed += size;
+            consumed += runeBytes;
+            charCutoff += rune.Utf16SequenceLength;
         }
-        sb.Append(LabelTruncationEllipsis);
-        return sb.ToString();
+
+        return string.Concat(label.AsSpan(0, charCutoff), TruncationEllipsis);
     }
 }
