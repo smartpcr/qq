@@ -265,6 +265,35 @@ public sealed class TeamsSwarmActivityHandlerTests
     }
 
     [Fact]
+    public async Task OnTeamsMembersAddedAsync_TeamInstallWithoutChannelId_PersistsTeamScopeReferenceKeyedByConversationId()
+    {
+        // Iter-2 evaluator feedback item #2: a team install/members-added event with
+        // TeamInfo / channelData.team.id but no channelData.channel.id was previously
+        // saved as a PERSONAL reference keyed by the installer's AAD object ID.
+        // Expected behaviour:
+        //   - Reference is classified as team-scope
+        //   - ChannelId falls back to Conversation.Id (Teams channel-thread ID)
+        //   - TeamId is populated from channelData.team.id / TeamInfo
+        //   - AadObjectId and InternalUserId are NULL (team refs are not user-keyed)
+        //   - No personal record is created keyed by the installer AAD
+        var harness = Build();
+        const string teamId = "team-no-channel-id-001";
+        const string conversationId = "19:team-conv-no-channel-id@thread.tacv2";
+        var activity = NewTeamMembersAddedActivity(teamId, conversationId: conversationId);
+
+        await ProcessAsync(harness, activity);
+
+        var saved = Assert.Single(harness.Store.Saved);
+        Assert.Equal(TenantId, saved.TenantId);
+        Assert.Null(saved.AadObjectId);
+        Assert.Null(saved.InternalUserId);
+        Assert.Equal(conversationId, saved.ChannelId);
+        Assert.Equal(teamId, saved.TeamId);
+        Assert.True(saved.IsActive);
+        Assert.NotEqual("aad-obj-team-installer", saved.AadObjectId ?? string.Empty);
+    }
+
+    [Fact]
     public async Task OnTeamsMembersAddedAsync_DoesNotInvokeIdentityResolver_TwoTierAuthorization()
     {
         var harness = Build();

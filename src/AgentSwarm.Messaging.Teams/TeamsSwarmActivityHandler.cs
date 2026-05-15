@@ -295,11 +295,15 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         var tenantId = ExtractTenantId(activity);
         var correlationId = GetCorrelationId(turnContext);
 
+        // Pass the SDK-supplied teamInfo as a hint so PersistConversationReferenceAsync
+        // classifies the install as team-scope even when Teams omits Channel.Id from the
+        // ChannelData payload (iter-1 evaluator feedback item #2).
         await PersistConversationReferenceAsync(
             turnContext,
             resolvedIdentity: null,
             tenantId: tenantId,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken: cancellationToken,
+            teamInfoHint: teamInfo).ConfigureAwait(false);
 
         await LogInstallAuditAsync(
             correlationId: correlationId,
@@ -574,9 +578,13 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
     }
 
     /// <summary>
-    /// Classify the activity scope by inspecting the Teams channel data. Team scope is
-    /// indicated by either a non-empty Team or Channel record; personal scope is the
-    /// fallback.
+    /// Classify the activity scope by inspecting the Teams channel data and conversation
+    /// metadata. Team scope is indicated by ANY of: a non-empty <c>TeamsChannelData.Team</c>
+    /// record, a non-empty <c>TeamsChannelData.Channel</c> record, OR a
+    /// <c>Conversation.ConversationType == "channel"</c> hint. Personal scope is the
+    /// fallback. Adding the conversation-type check ensures team install/members-added
+    /// events without an explicit <c>ChannelData.Channel.Id</c> are still recognised as
+    /// team-scope (see item #2 in iter-1 evaluator feedback).
     /// </summary>
     private static bool IsTeamScope(Activity? activity)
     {
@@ -586,8 +594,16 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         }
 
         var channelData = activity.GetChannelData<TeamsChannelData>();
-        return !string.IsNullOrEmpty(channelData?.Team?.Id)
-            || !string.IsNullOrEmpty(channelData?.Channel?.Id);
+        if (!string.IsNullOrEmpty(channelData?.Team?.Id)
+            || !string.IsNullOrEmpty(channelData?.Channel?.Id))
+        {
+            return true;
+        }
+
+        return string.Equals(
+            activity.Conversation?.ConversationType,
+            "channel",
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private static string StripRecipientMention(ITurnContext<IMessageActivity> turnContext)
@@ -680,9 +696,32 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
     /// <c>implementation-plan.md</c> §2.2 step 1 (dependency #8) and §1.2 — the activity
     /// handler is the producer for recognized command-verb events. Unknown verbs are
     /// skipped here and fall through to <see cref="ICommandDispatcher"/>, which publishes
-    /// a <see cref="TextEvent"/> for unrecognized input (Stage 3.2). Publish failures are
-    /// logged and swallowed so a channel-layer fault does not break in-process dispatch.
+    /// a <see cref="TextEvent"/> for unrecognized input (Stage 3.2).
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Iter-2 item #1 — propagate publish failures.</b> Failures are <b>not</b>
+    /// swallowed: silently logging a publish failure would let
+    /// <c>TeamsMessengerConnector.ReceiveAsync</c> miss the command event even though the
+    /// activity-handler turn reported success — violating the inbound-handoff contract.
+    /// Any exception propagates and is surfaced to the bot framework, which returns a
+    /// 5xx to the channel so the upstream Teams service can retry per its normal
+    /// reliability semantics. Because publish runs BEFORE
+    /// <see cref="ICommandDispatcher.DispatchAsync"/>, a publish failure also prevents
+    /// dispatch, so the two paths cannot diverge.
+    /// </para>
+    /// <para>
+    /// <b>Iter-2 item #2 — validation parity with the dispatcher.</b> Only canonically
+    /// valid commands are published, matching the contract that the future
+    /// <see cref="ICommandDispatcher"/> (Stage 3.2) parser enforces. In particular,
+    /// <c>agent ask</c> requires a non-empty body per <c>e2e-scenarios.md</c> §Personal
+    /// Chat (lines 24–34) and <c>architecture.md</c> §3.1 — bare <c>agent ask</c> is
+    /// syntactically recognized but semantically invalid, so it falls through to the
+    /// dispatcher's <see cref="TextEvent"/> path instead of entering the inbound queue
+    /// with an invalid <see cref="MessengerEventTypes.AgentTaskRequest"/> payload. See
+    /// <see cref="IsPublishableCommand"/> for the full parity rules.
+    /// </para>
+    /// </remarks>
     private async Task PublishInboundCommandEventAsync(
         Activity? activity,
         string normalizedText,
@@ -699,6 +738,20 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         }
 
         var body = ExtractCommandBody(normalizedText, commandVerb);
+
+        // Validation parity (iter-2 item #2). When a verb is syntactically recognized
+        // but the parsed payload is not canonically valid, defer to the dispatcher's
+        // unrecognized-input path so the inbound queue never carries a malformed event.
+        if (!IsPublishableCommand(eventType, body))
+        {
+            _logger.LogDebug(
+                "Skipping inbound publish for verb '{Verb}' — payload did not satisfy validation parity for event type '{EventType}' (correlation {CorrelationId}).",
+                commandVerb,
+                eventType,
+                correlationId);
+            return;
+        }
+
         var parsed = new ParsedCommand(
             CommandType: commandVerb,
             Payload: body,
@@ -716,30 +769,79 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             Payload = parsed,
         };
 
-        try
-        {
-            await _inboundEventPublisher
-                .PublishAsync(commandEvent, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            // The in-process channel publisher should not fail under normal conditions
-            // (unbounded channel, no IO). Logging keeps the failure visible without
-            // breaking in-process dispatch for the same turn.
-            _logger.LogWarning(
-                ex,
-                "Failed to publish CommandEvent (correlation {CorrelationId}, verb {Verb}).",
-                correlationId,
-                commandVerb);
-        }
+        await _inboundEventPublisher
+            .PublishAsync(commandEvent, cancellationToken)
+            .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Validation parity check between the handler's publish path and the canonical
+    /// <see cref="ICommandDispatcher"/> contract (Stage 3.2). Returns <c>true</c> only
+    /// when the (recognized verb, extracted body) pair produces a canonically valid
+    /// <see cref="CommandEvent"/> payload per <c>architecture.md</c> §3.1.
+    /// </summary>
+    /// <remarks>
+    /// The only verb requiring a body to be canonically valid is <c>agent ask</c> —
+    /// <see cref="MessengerEventTypes.AgentTaskRequest"/> is defined as
+    /// <c>agent ask &lt;text&gt;</c> by <c>e2e-scenarios.md</c> §Personal Chat (lines
+    /// 24–34) and <c>architecture.md</c> §3.1, both of which require a non-empty
+    /// <c>Payload.Body</c>. All other canonical verbs (<c>agent status</c>,
+    /// <c>approve</c>, <c>reject</c>, <c>escalate</c>, <c>pause</c>, <c>resume</c>) are
+    /// valid bare or with an optional body argument (for example,
+    /// <c>approve &lt;questionId&gt;</c>) per <c>architecture.md</c> §3.1 / §5.2 and the
+    /// <c>e2e-scenarios.md</c> §Approval / §Escalation / §Pause / §Resume scenarios.
+    /// </remarks>
+    private static bool IsPublishableCommand(string eventType, string body)
+    {
+        if (string.Equals(eventType, MessengerEventTypes.AgentTaskRequest, StringComparison.Ordinal))
+        {
+            return !string.IsNullOrWhiteSpace(body);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Persist the conversation reference attached to the current activity using the
+    /// scope-keying model described in <c>architecture.md</c> §3.2 / §4.2:
+    /// <list type="bullet">
+    /// <item><description>
+    /// <b>Personal scope</b> — natural key <c>(TenantId, AadObjectId)</c>. <c>TeamId</c>
+    /// and <c>ChannelId</c> are null; <c>InternalUserId</c> is populated when identity
+    /// resolution ran.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Team scope</b> — natural key <c>(TenantId, ChannelId)</c>. <c>AadObjectId</c>
+    /// and <c>InternalUserId</c> are null; <c>TeamId</c> is preserved so team-uninstall
+    /// fan-out (<see cref="OnTeamsMembersRemovedAsync"/>) can enumerate every channel.
+    /// </description></item>
+    /// </list>
+    /// </summary>
+    /// <param name="turnContext">Current turn context.</param>
+    /// <param name="resolvedIdentity">Resolved identity from <see cref="IIdentityResolver"/>;
+    /// <c>null</c> on install lifecycle events that skip identity resolution.</param>
+    /// <param name="tenantId">Tenant ID extracted from <c>ChannelData.tenant.id</c>.</param>
+    /// <param name="cancellationToken">Turn cancellation token.</param>
+    /// <param name="teamInfoHint">Optional <see cref="TeamInfo"/> handed to
+    /// <see cref="OnTeamsMembersAddedAsync"/> by the Teams SDK. When provided it forces a
+    /// team-scope classification even when <c>ChannelData.Team</c> /
+    /// <c>ChannelData.Channel</c> are not populated, which addresses iter-1 evaluator
+    /// item #2 (team installs without <c>ChannelData.Channel.Id</c> were previously
+    /// saved as personal references keyed by the installer's AAD object ID).</param>
+    /// <remarks>
+    /// When the activity is team-scope but <c>ChannelData.Channel.Id</c> is empty (Teams
+    /// omits it on some team-level install / members-added events), the method falls
+    /// back to <c>Activity.Conversation.Id</c> as the effective channel ID. In Teams
+    /// channel conversations the <c>Conversation.Id</c> is the
+    /// <c>19:xxx@thread.tacv2</c> channel-thread ID, which is the same value the store
+    /// uses as the channel key elsewhere.
+    /// </remarks>
     private async Task PersistConversationReferenceAsync(
         ITurnContext turnContext,
         UserIdentity? resolvedIdentity,
         string tenantId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TeamInfo? teamInfoHint = null)
     {
         var activity = turnContext.Activity as Activity;
         if (activity is null)
@@ -749,28 +851,38 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 
         var conversationReference = activity.GetConversationReference();
         var nowUtc = DateTimeOffset.UtcNow;
-        var channelId = ExtractChannelId(activity);
-        var teamId = ExtractTeamId(activity);
+        var explicitChannelId = ExtractChannelId(activity);
+        var explicitTeamId = ExtractTeamId(activity);
         var fromAadObjectId = activity.From?.AadObjectId;
 
-        // Channel-scope references have a natural (TenantId, ChannelId) key — they must
-        // NOT carry the installer/sender AAD object ID (per TeamsConversationReference
-        // contract). Personal references key on (TenantId, AadObjectId) and leave Team /
-        // Channel null.
-        var isChannelScope = !string.IsNullOrEmpty(channelId);
-        var aadObjectId = isChannelScope ? null : fromAadObjectId;
+        // Team scope is signalled by: the SDK-supplied TeamInfo argument (install/
+        // members-added), Team/Channel records in TeamsChannelData, OR a
+        // Conversation.ConversationType == "channel" hint. Any one is sufficient.
+        var isTeamScope = teamInfoHint is not null || IsTeamScope(activity);
+
+        // When team-scope but channelData omits Channel.Id, fall back to Conversation.Id
+        // (the channel-thread ID Teams uses as the channel's stable identifier).
+        var channelId = isTeamScope
+            ? (string.IsNullOrEmpty(explicitChannelId) ? activity.Conversation?.Id : explicitChannelId)
+            : null;
+
+        var teamId = isTeamScope
+            ? (teamInfoHint?.Id ?? explicitTeamId)
+            : null;
+
+        var aadObjectId = isTeamScope ? null : fromAadObjectId;
 
         TeamsConversationReference? existing = null;
-        if (isChannelScope)
+        if (isTeamScope && !string.IsNullOrEmpty(channelId))
         {
             existing = await _conversationReferenceStore
                 .GetByChannelIdAsync(tenantId, channelId!, cancellationToken)
                 .ConfigureAwait(false);
         }
-        else if (!string.IsNullOrEmpty(aadObjectId))
+        else if (!isTeamScope && !string.IsNullOrEmpty(aadObjectId))
         {
             existing = await _conversationReferenceStore
-                .GetByAadObjectIdAsync(tenantId, aadObjectId, cancellationToken)
+                .GetByAadObjectIdAsync(tenantId, aadObjectId!, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -782,13 +894,13 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             AadObjectId = aadObjectId,
             // Preserve a previously-mapped InternalUserId if identity resolution didn't
             // run (install path); otherwise overwrite with the freshly resolved value.
-            // Channel-scope refs never carry an InternalUserId (no single user owns a
+            // Team-scope refs never carry an InternalUserId (no single user owns a
             // channel reference).
-            InternalUserId = isChannelScope
+            InternalUserId = isTeamScope
                 ? null
                 : (resolvedIdentity?.InternalUserId ?? existing?.InternalUserId),
             ChannelId = channelId,
-            TeamId = isChannelScope ? teamId : null,
+            TeamId = teamId,
             ServiceUrl = conversationReference?.ServiceUrl ?? string.Empty,
             ConversationId = conversationReference?.Conversation?.Id ?? activity.Conversation?.Id ?? string.Empty,
             BotId = conversationReference?.Bot?.Id ?? activity.Recipient?.Id ?? string.Empty,

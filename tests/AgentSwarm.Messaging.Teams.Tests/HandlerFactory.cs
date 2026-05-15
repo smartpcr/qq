@@ -151,6 +151,63 @@ internal static class HandlerFactory
         return activity;
     }
 
+    /// <summary>
+    /// Build a team-scope members-added activity simulating a Teams install where the
+    /// SDK populates <c>ChannelData.team.id</c> and the <c>TeamInfo</c> handler argument
+    /// but <b>omits</b> <c>ChannelData.channel.id</c>. Used by the regression test for
+    /// iter-1 evaluator feedback item #2 (team installs without channel ID were
+    /// previously misclassified as personal references keyed by the installer AAD).
+    /// </summary>
+    /// <param name="teamId">Team ID surfaced in <c>ChannelData.team.id</c> and the
+    /// dispatched <see cref="TeamInfo"/>.</param>
+    /// <param name="conversationId">Conversation ID — defaults to a Teams channel-thread
+    /// shape <c>19:xxx@thread.tacv2</c>, which is what the handler falls back to as the
+    /// effective channel ID.</param>
+    /// <param name="channelId">Optional explicit <c>ChannelData.channel.id</c>. When
+    /// <c>null</c> (the default), the channel record is omitted entirely so the handler
+    /// must rely on the team scope hint + conversation ID fallback.</param>
+    public static Activity NewTeamMembersAddedActivity(
+        string teamId,
+        string conversationId = "19:team-conv-no-channel-id@thread.tacv2",
+        string? channelId = null)
+    {
+        var activity = new Activity(ActivityTypes.ConversationUpdate)
+        {
+            Id = Guid.NewGuid().ToString(),
+            ChannelId = "msteams",
+            ServiceUrl = "https://smba.trafficmanager.net/amer/",
+            From = new ChannelAccount(id: "29:team-installer", name: "Team Installer") { AadObjectId = "aad-obj-team-installer" },
+            Recipient = new ChannelAccount(id: BotId, name: BotName),
+            Conversation = new ConversationAccount(id: conversationId) { TenantId = TenantId, ConversationType = "channel" },
+            MembersAdded = new List<ChannelAccount>
+            {
+                new ChannelAccount(id: BotId, name: BotName),
+            },
+        };
+
+        // ChannelData carries tenant + team but NOT channel — simulating Teams payloads
+        // that omit Channel.Id on team-level install events.
+        if (channelId is null)
+        {
+            activity.ChannelData = JObject.FromObject(new
+            {
+                tenant = new { id = TenantId },
+                team = new { id = teamId },
+            });
+        }
+        else
+        {
+            activity.ChannelData = JObject.FromObject(new
+            {
+                tenant = new { id = TenantId },
+                team = new { id = teamId },
+                channel = new { id = channelId },
+            });
+        }
+
+        return activity;
+    }
+
     public static Activity NewMembersRemovedPersonalActivity(string aadObjectId)
     {
         var activity = new Activity(ActivityTypes.ConversationUpdate)

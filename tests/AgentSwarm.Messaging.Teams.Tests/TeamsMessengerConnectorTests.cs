@@ -140,6 +140,138 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Equal(activity.Id, commandEvent.ActivityId);
     }
 
+    /// <summary>
+    /// Regression coverage for iter-1 evaluator feedback item #4: the
+    /// <c>TeamsSwarmActivityHandler.MapVerbToEventType</c> table must publish the
+    /// correct <see cref="MessengerEvent.EventType"/> discriminator for every
+    /// canonical command verb (<c>architecture.md</c> §3.1 / §5.2). A theory
+    /// drives one activity per verb through the real handler → real publisher →
+    /// real connector pipeline so the discriminator mapping cannot regress
+    /// silently. <c>agent status</c> is exercised by the explicit fact above; the
+    /// remaining six verbs are covered here.
+    /// </summary>
+    [Theory]
+    [InlineData("agent ask plan migration", "agent ask", MessengerEventTypes.AgentTaskRequest, "plan migration")]
+    [InlineData("approve question Q-42", "approve", MessengerEventTypes.Command, "question Q-42")]
+    [InlineData("reject question Q-42", "reject", MessengerEventTypes.Command, "question Q-42")]
+    [InlineData("escalate to oncall", "escalate", MessengerEventTypes.Escalation, "to oncall")]
+    [InlineData("pause agent-build", "pause", MessengerEventTypes.PauseAgent, "agent-build")]
+    [InlineData("resume agent-build", "resume", MessengerEventTypes.ResumeAgent, "agent-build")]
+    public async Task ReceiveAsync_AfterHandlerProcessesActivity_PublishesCommandEventWithMappedEventType(
+        string text,
+        string expectedVerb,
+        string expectedEventType,
+        string expectedPayload)
+    {
+        var publisher = new ChannelInboundEventPublisher();
+        var harness = ConnectorHarness.Build(reader: publisher);
+        var handlerHarness = HandlerFactory.Build(publisher);
+        HandlerFactory.MapDave(handlerHarness.IdentityResolver);
+        var correlationId = "corr-verb-" + expectedVerb.Replace(' ', '-');
+        var activity = HandlerFactory.NewPersonalMessage(text, correlationId: correlationId);
+
+        await HandlerFactory.ProcessAsync(handlerHarness, activity);
+
+        var received = await harness.Connector.ReceiveAsync(CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+
+        var commandEvent = Assert.IsType<CommandEvent>(received);
+        Assert.Equal(expectedEventType, commandEvent.EventType);
+        Assert.Equal(expectedVerb, commandEvent.Payload.CommandType);
+        Assert.Equal(expectedPayload, commandEvent.Payload.Payload);
+        Assert.Equal(correlationId, commandEvent.CorrelationId);
+        Assert.Equal("Teams", commandEvent.Messenger);
+        Assert.Equal("aad-obj-dave-001", commandEvent.ExternalUserId);
+        Assert.Equal(MessengerEventSources.PersonalChat, commandEvent.Source);
+        Assert.Equal(activity.Id, commandEvent.ActivityId);
+    }
+
+    /// <summary>
+    /// E2E coverage for iter-2 evaluator feedback item #3 — channel mention source
+    /// classification. A team-channel <c>@AgentBot agent ask &lt;text&gt;</c> message
+    /// must round-trip through the handler → publisher → connector pipeline with the
+    /// canonical envelope carrying <see cref="MessengerEventSources.TeamChannel"/>, the
+    /// <c>@mention</c> stripped, and the post-mention text preserved as the body.
+    /// Aligns with <c>e2e-scenarios.md</c> §Personal Chat — Team Channel Mention
+    /// (lines 43–54).
+    /// </summary>
+    [Fact]
+    public async Task ReceiveAsync_AfterHandlerProcessesChannelMentionActivity_PublishesCommandEventWithTeamChannelSource()
+    {
+        var publisher = new ChannelInboundEventPublisher();
+        var harness = ConnectorHarness.Build(reader: publisher);
+        var handlerHarness = HandlerFactory.Build(publisher);
+        HandlerFactory.MapDave(handlerHarness.IdentityResolver, "aad-obj-bob-002");
+        var activity = HandlerFactory.NewChannelMentionMessage(
+            "<at>AgentBot</at> agent ask design persistence layer");
+
+        await HandlerFactory.ProcessAsync(handlerHarness, activity);
+
+        var received = await harness.Connector.ReceiveAsync(CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+
+        var commandEvent = Assert.IsType<CommandEvent>(received);
+        Assert.Equal(MessengerEventTypes.AgentTaskRequest, commandEvent.EventType);
+        Assert.Equal("agent ask", commandEvent.Payload.CommandType);
+        Assert.Equal("design persistence layer", commandEvent.Payload.Payload);
+        Assert.Equal(MessengerEventSources.TeamChannel, commandEvent.Source);
+        Assert.Equal("aad-obj-bob-002", commandEvent.ExternalUserId);
+        Assert.Equal("Teams", commandEvent.Messenger);
+        Assert.Equal(activity.Id, commandEvent.ActivityId);
+    }
+
+    /// <summary>
+    /// E2E negative coverage for iter-2 evaluator feedback item #2 — bare
+    /// <c>agent ask</c> is syntactically recognized but semantically invalid
+    /// (<see cref="MessengerEventTypes.AgentTaskRequest"/> requires a non-empty body
+    /// per <c>e2e-scenarios.md</c> §Personal Chat lines 24–34). The handler MUST NOT
+    /// publish a <see cref="CommandEvent"/> in this case; the inbound queue stays
+    /// empty so the dispatcher's <see cref="TextEvent"/> path handles the malformed
+    /// command. Asserted by timing-out the <c>ReceiveAsync</c> wait — a successful
+    /// <c>TimeoutException</c> proves nothing was enqueued.
+    /// </summary>
+    [Fact]
+    public async Task ReceiveAsync_AfterHandlerProcessesBareAgentAsk_DoesNotEnqueueCommandEvent()
+    {
+        var publisher = new ChannelInboundEventPublisher();
+        var harness = ConnectorHarness.Build(reader: publisher);
+        var handlerHarness = HandlerFactory.Build(publisher);
+        HandlerFactory.MapDave(handlerHarness.IdentityResolver);
+        var activity = HandlerFactory.NewPersonalMessage("agent ask");
+
+        await HandlerFactory.ProcessAsync(handlerHarness, activity);
+
+        // Use a short timeout — successful behaviour is "nothing arrives".
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => harness.Connector.ReceiveAsync(CancellationToken.None)
+                       .WaitAsync(TimeSpan.FromMilliseconds(250)));
+    }
+
+    /// <summary>
+    /// E2E negative coverage for iter-2 evaluator feedback item #3 — unmapped users
+    /// (identity resolver returns <c>null</c>) are rejected before the publish step;
+    /// no <see cref="CommandEvent"/> reaches the inbound channel. Documents the
+    /// gateway invariant that command events are emitted ONLY for authenticated +
+    /// authorized actors.
+    /// </summary>
+    [Fact]
+    public async Task ReceiveAsync_AfterHandlerProcessesUnmappedUserActivity_DoesNotEnqueueCommandEvent()
+    {
+        var publisher = new ChannelInboundEventPublisher();
+        var harness = ConnectorHarness.Build(reader: publisher);
+        var handlerHarness = HandlerFactory.Build(publisher);
+        // No MapDave call — eve@external.com is not in the identity resolver.
+        var activity = HandlerFactory.NewPersonalMessage(
+            "agent ask analyse incident",
+            aadObjectId: "aad-obj-eve-external");
+
+        await HandlerFactory.ProcessAsync(handlerHarness, activity);
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => harness.Connector.ReceiveAsync(CancellationToken.None)
+                       .WaitAsync(TimeSpan.FromMilliseconds(250)));
+    }
+
     [Fact]
     public async Task SendQuestionAsync_HappyPath_PersistsQuestionUpdatesConversationIdAndSavesCardState()
     {
