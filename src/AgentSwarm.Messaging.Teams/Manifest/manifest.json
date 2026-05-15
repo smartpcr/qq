@@ -51,7 +51,15 @@
             "commandBox"
           ],
           "fetchTask": false,
-          "initialRun": false
+          "initialRun": false,
+          "parameters": [
+            {
+              "name": "instruction",
+              "title": "Instruction",
+              "description": "Task or message to forward to the AgentSwarm orchestrator. Optional when forwarding a message; required when invoked from the command box.",
+              "inputType": "text"
+            }
+          ]
         }
       ]
     }
