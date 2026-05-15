@@ -27,18 +27,29 @@ internal static class HandlerFactory
         AlwaysAuthorizationService Authorization,
         RecordingAuditLogger AuditLogger,
         RecordingCardActionHandler CardHandler,
-        RecordingInboundEventPublisher EventPublisher,
+        IInboundEventPublisher EventPublisher,
         InertBotAdapter Adapter);
 
-    public static Harness Build()
+    public static Harness Build() => Build(new RecordingInboundEventPublisher());
+
+    /// <summary>
+    /// Build a handler harness whose inbound-event publisher is the supplied instance.
+    /// Used by Stage 2.3 connector end-to-end tests to wire the activity handler's
+    /// inbound publisher to the same <see cref="ChannelInboundEventPublisher"/> the
+    /// connector reads from, so a real <c>OnMessageActivityAsync</c> -> publisher ->
+    /// <c>TeamsMessengerConnector.ReceiveAsync</c> round-trip can be exercised without
+    /// test-side shortcuts.
+    /// </summary>
+    public static Harness Build(IInboundEventPublisher eventPublisher)
     {
+        if (eventPublisher is null) throw new ArgumentNullException(nameof(eventPublisher));
+
         var store = new RecordingConversationReferenceStore();
         var dispatcher = new RecordingCommandDispatcher();
         var identityResolver = new FakeIdentityResolver();
         var authorization = new AlwaysAuthorizationService();
         var auditLogger = new RecordingAuditLogger();
         var cardHandler = new RecordingCardActionHandler();
-        var eventPublisher = new RecordingInboundEventPublisher();
         var handler = new TeamsSwarmActivityHandler(
             store,
             dispatcher,

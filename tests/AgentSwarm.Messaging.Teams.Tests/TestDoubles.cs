@@ -177,4 +177,24 @@ internal static class TestDoubles
             return Task.CompletedTask;
         }
     }
+
+    /// <summary>
+    /// Recording <see cref="IConversationReferenceRouter"/> used by Stage 2.3 connector
+    /// tests. The router is a separate interface from
+    /// <see cref="IConversationReferenceStore"/> so the canonical store contract (defined
+    /// in <c>implementation-plan.md</c> §2.1) is not widened with a non-canonical
+    /// <c>GetByConversationIdAsync</c> method.
+    /// </summary>
+    public sealed class RecordingConversationReferenceRouter : IConversationReferenceRouter
+    {
+        public Dictionary<string, TeamsConversationReference> PreloadByConversationId { get; } = new(StringComparer.Ordinal);
+        public List<string> Lookups { get; } = new();
+
+        public Task<TeamsConversationReference?> GetByConversationIdAsync(string conversationId, CancellationToken ct)
+        {
+            Lookups.Add(conversationId);
+            PreloadByConversationId.TryGetValue(conversationId, out var hit);
+            return Task.FromResult<TeamsConversationReference?>(hit);
+        }
+    }
 }

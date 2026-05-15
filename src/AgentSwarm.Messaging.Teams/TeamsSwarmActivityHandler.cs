@@ -113,12 +113,6 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         _cardActionHandler = cardActionHandler ?? throw new ArgumentNullException(nameof(cardActionHandler));
         _inboundEventPublisher = inboundEventPublisher ?? throw new ArgumentNullException(nameof(inboundEventPublisher));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-
-        // Reference IInboundEventPublisher to silence the "assigned but never used" analyzer
-        // warning — the field is wired here so Stage 3.2's CommandDispatcher can later
-        // publish through it. Removing it from the ctor surface would force a breaking
-        // change at that point.
-        _ = _inboundEventPublisher;
     }
 
     /// <inheritdoc />
@@ -247,6 +241,21 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             resolvedIdentity,
             tenantId,
             cancellationToken).ConfigureAwait(false);
+
+        // (4.5) Publish a CommandEvent to the shared in-process inbound channel for
+        // consumption by TeamsMessengerConnector.ReceiveAsync. Per
+        // implementation-plan.md §1.2 and §2.2 step 1 (dependency #8), the handler is the
+        // producer for recognized command-verb events; CommandDispatcher (Stage 3.2) is
+        // the producer for TextEvent / DecisionEvent. Unknown verbs are not published as
+        // CommandEvent here — they fall through to the dispatcher, which publishes
+        // TextEvent per impl-plan §3.2 unrecognized-input step.
+        await PublishInboundCommandEventAsync(
+            activity: activity,
+            normalizedText: normalizedText,
+            commandVerb: commandVerb,
+            correlationId: correlationId,
+            aadObjectId: aadObjectId,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
 
         // (5) Dispatch to the command dispatcher with a fully populated CommandContext.
         // Per impl-plan §2.2 step 2, CommandDispatcher receives ALREADY-CLEANED text and
@@ -617,6 +626,113 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         // still receives a non-empty string. The default-deny stub rejects either way.
         var firstSpace = lower.IndexOf(' ');
         return firstSpace < 0 ? lower : lower[..firstSpace];
+    }
+
+    /// <summary>
+    /// Map the canonical command verb to the <see cref="MessengerEvent.EventType"/>
+    /// discriminator carried by the published <see cref="CommandEvent"/>. Aligned with
+    /// <c>architecture.md</c> §3.1 and the documentation strings on
+    /// <see cref="MessengerEventTypes"/>:
+    /// <list type="bullet">
+    /// <item><description><c>agent ask</c> → <see cref="MessengerEventTypes.AgentTaskRequest"/>.</description></item>
+    /// <item><description><c>agent status</c>, bare <c>approve</c>, bare <c>reject</c> → <see cref="MessengerEventTypes.Command"/>.</description></item>
+    /// <item><description><c>escalate</c> → <see cref="MessengerEventTypes.Escalation"/>.</description></item>
+    /// <item><description><c>pause</c> → <see cref="MessengerEventTypes.PauseAgent"/>.</description></item>
+    /// <item><description><c>resume</c> → <see cref="MessengerEventTypes.ResumeAgent"/>.</description></item>
+    /// </list>
+    /// Returns <c>null</c> when the verb does not match a known command — those inputs
+    /// fall through to <see cref="ICommandDispatcher"/>, which is responsible for
+    /// publishing a <see cref="TextEvent"/> per <c>implementation-plan.md</c> §3.2.
+    /// </summary>
+    private static string? MapVerbToEventType(string commandVerb)
+    {
+        if (string.IsNullOrEmpty(commandVerb))
+        {
+            return null;
+        }
+
+        return commandVerb switch
+        {
+            "agent ask" => MessengerEventTypes.AgentTaskRequest,
+            "agent status" => MessengerEventTypes.Command,
+            "approve" => MessengerEventTypes.Command,
+            "reject" => MessengerEventTypes.Command,
+            "escalate" => MessengerEventTypes.Escalation,
+            "pause" => MessengerEventTypes.PauseAgent,
+            "resume" => MessengerEventTypes.ResumeAgent,
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Classify the inbound activity's origin for the
+    /// <see cref="MessengerEvent.Source"/> field. Returns
+    /// <see cref="MessengerEventSources.TeamChannel"/> when the Teams channel data carries
+    /// a non-empty team or channel ID; otherwise returns
+    /// <see cref="MessengerEventSources.PersonalChat"/>.
+    /// </summary>
+    private static string ClassifyEventSource(Activity? activity)
+        => IsTeamScope(activity) ? MessengerEventSources.TeamChannel : MessengerEventSources.PersonalChat;
+
+    /// <summary>
+    /// Publish a <see cref="CommandEvent"/> to the shared in-process inbound channel for
+    /// consumption by <c>TeamsMessengerConnector.ReceiveAsync</c> per
+    /// <c>implementation-plan.md</c> §2.2 step 1 (dependency #8) and §1.2 — the activity
+    /// handler is the producer for recognized command-verb events. Unknown verbs are
+    /// skipped here and fall through to <see cref="ICommandDispatcher"/>, which publishes
+    /// a <see cref="TextEvent"/> for unrecognized input (Stage 3.2). Publish failures are
+    /// logged and swallowed so a channel-layer fault does not break in-process dispatch.
+    /// </summary>
+    private async Task PublishInboundCommandEventAsync(
+        Activity? activity,
+        string normalizedText,
+        string commandVerb,
+        string correlationId,
+        string aadObjectId,
+        CancellationToken cancellationToken)
+    {
+        var eventType = MapVerbToEventType(commandVerb);
+        if (eventType is null)
+        {
+            // Unknown verb — let CommandDispatcher (Stage 3.2) publish TextEvent.
+            return;
+        }
+
+        var body = ExtractCommandBody(normalizedText, commandVerb);
+        var parsed = new ParsedCommand(
+            CommandType: commandVerb,
+            Payload: body,
+            CorrelationId: correlationId);
+
+        var commandEvent = new CommandEvent(eventType)
+        {
+            EventId = Guid.NewGuid().ToString(),
+            CorrelationId = correlationId,
+            Messenger = "Teams",
+            ExternalUserId = aadObjectId,
+            ActivityId = activity?.Id,
+            Source = ClassifyEventSource(activity),
+            Timestamp = DateTimeOffset.UtcNow,
+            Payload = parsed,
+        };
+
+        try
+        {
+            await _inboundEventPublisher
+                .PublishAsync(commandEvent, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The in-process channel publisher should not fail under normal conditions
+            // (unbounded channel, no IO). Logging keeps the failure visible without
+            // breaking in-process dispatch for the same turn.
+            _logger.LogWarning(
+                ex,
+                "Failed to publish CommandEvent (correlation {CorrelationId}, verb {Verb}).",
+                correlationId,
+                commandVerb);
+        }
     }
 
     private async Task PersistConversationReferenceAsync(
