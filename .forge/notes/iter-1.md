@@ -1,102 +1,150 @@
-# Iter notes — Stage 2.1 Telegram Bot Client Wrapper (iter 8, first impl)
+# Iter notes — Stage 2.3 Outbound Message Sender (this iter)
+
+## What this iter did
+First-pass implementation of Stage 2.3 (Outbound Message Sender) per
+`implementation-plan.md` lines 149–174. Prior iters in the archive
+(iter-2..7) were about Stage 1.x / 2.1 / 2.2 doc & test alignment, not
+Stage 2.3 production code, so this iter is implementation-from-scratch
+for the sender + rate limiter + message-id tracker + tests.
 
 ## Files touched this iter
-- `src/AgentSwarm.Messaging.Telegram/TelegramOptions.cs` (NEW) — POCO
-  with `BotToken`, `WebhookUrl`, `UsePolling`, `AllowedUserIds`
-  (`List<long>`), `SecretToken`; `ToString()` emits `[REDACTED]` for both
-  secret fields, `[NOT SET]` when empty, null-safe `AllowedUserIds.Count`.
-- `src/AgentSwarm.Messaging.Telegram/TelegramOptionsValidator.cs` (NEW)
-  — `internal sealed IValidateOptions<TelegramOptions>`; rejects
-  null/empty/whitespace `BotToken` with explanatory message naming
-  Key Vault / env / user-secrets.
-- `src/AgentSwarm.Messaging.Telegram/TelegramBotClientFactory.cs` (NEW)
-  — uses `IOptions<TelegramOptions>` (not `IOptionsMonitor`, per rubber-
-  duck #2 — singleton client cannot honour hot reload). Pulls named
-  `HttpClient` via `IHttpClientFactory` so later stages can chain Polly.
-  Defensive `InvalidOperationException` if token missing.
-- `src/AgentSwarm.Messaging.Telegram/TelegramServiceCollectionExtensions.cs`
-  (NEW) — `AddTelegram(IServiceCollection, IConfiguration)` registers
-  options + `ValidateOnStart()`, validator, `AddHttpClient`, factory
-  singleton, `ITelegramBotClient` singleton via factory; null-guards on
-  both args.
-- `src/AgentSwarm.Messaging.Telegram/AgentSwarm.Messaging.Telegram.csproj`
-  — added `Microsoft.Extensions.Hosting`, `Http`,
-  `Options.ConfigurationExtensions`, plus `InternalsVisibleTo` for the
-  test project (validator stays internal).
-- `src/AgentSwarm.Messaging.Worker/Program.cs` — call `AddTelegram`.
-- `src/AgentSwarm.Messaging.Worker/appsettings.json` — empty
-  `Telegram` section (intentionally empty `BotToken` so dev startup
-  fails fast unless token is supplied via secrets/env, per brief).
-- `src/AgentSwarm.Messaging.Worker/appsettings.Development.json` —
-  `UsePolling: true` for local dev.
-- `tests/AgentSwarm.Messaging.Tests/TelegramOptionsTests.cs` (NEW) —
-  14 tests covering ToString redaction (incl. null-safe path), validator
-  pass/fail (incl. whitespace `[Theory]`), `Host.StartAsync` fail-fast,
-  config-binding coverage of all five fields, DI registration shape,
-  singleton lifetime, ctor null-guards on both args.
-- `src/AgentSwarm.Messaging.Core/OutboundMessage.cs` — STUBBED to remove
-  duplicate types. This file was a leftover from Stage 1.4's "relocate to
-  Abstractions" (per implementation-plan §1.2 line 48 + Abstractions
-  XML doc). The duplicate definitions of `OutboundMessage` +
-  `OutboundSourceType` + `OutboundMessageStatus` caused CS0104 in
-  `tests/...OutboundContractTests.cs:462`, breaking the build gate on
-  arrival. File reduced to one-line `namespace AgentSwarm.Messaging.Core;`
-  with a NOTE comment explaining the relocation; no source file removed.
+
+### New production files (under `src/AgentSwarm.Messaging.Telegram/`)
+- `RateLimitOptions.cs` — POCO bound from `Telegram:RateLimits`
+  (GlobalPerSecond=30, GlobalBurstCapacity=30, PerChatPerMinute=20,
+  PerChatBurstCapacity=5) per architecture.md §10.4.
+- `IDelayProvider.cs` + `TaskDelayProvider` — abstraction over
+  `Task.Delay` so the 429 retry path and the rate-limiter refill loop
+  are observable in tests (no real sleep).
+- `ITelegramRateLimiter.cs` — single-method interface
+  `AcquireAsync(chatId, ct)`.
+- `TokenBucketRateLimiter.cs` — dual-bucket impl. Global bucket
+  capacity = `GlobalBurstCapacity`, refill = `GlobalPerSecond / s`.
+  Per-chat bucket capacity = `PerChatBurstCapacity`, refill =
+  `PerChatPerMinute / 60` per second. On exhaustion, computes
+  time-until-next-token and awaits `IDelayProvider.DelayAsync`. Uses
+  `TimeProvider.GetTimestamp` / `GetElapsedTime` for refill math.
+- `ITelegramApiClient.cs` (public) + `TelegramBotApiClient.cs` — thin
+  wrapper around `ITelegramBotClient.SendMessage(...)` so tests can
+  fake the static extension method. Made `public` to satisfy CS0051
+  (consumed by public `TelegramMessageSender` ctor).
+- `IMessageIdTracker.cs` + `InMemoryMessageIdTracker` — maps
+  `CorrelationId → Telegram message id` via `ConcurrentDictionary` for
+  Stage 3.x reply correlation.
+- `MarkdownV2Escaper.cs` — escapes the 18 Telegram MarkdownV2 special
+  chars (`_ * [ ] ( ) ~ \` > # + - = | { } . !`) plus backslash.
+- `TelegramMessageSender.cs` — Stage 2.3 centrepiece. Implements
+  `IMessageSender`; renders `AgentQuestion` with severity badge,
+  expires-in countdown, default-action label, MarkdownV2-escaped body,
+  inline keyboard, trace footer. Caches each `HumanAction` to
+  `IDistributedCache` keyed `QuestionId:ActionId` with
+  AbsoluteExpiration = `ExpiresAt + 5min`. Acquires rate-limiter token
+  before each chunk. 429 retry uses `ApiRequestException.Parameters
+  .RetryAfter`. Splits payloads > 4096 chars at paragraph/line
+  boundaries, footer included per chunk.
+
+### New test files
+- `tests/AgentSwarm.Messaging.Tests/TelegramMessageSenderTests.cs`
+  — 9 tests pinning all 8 implementation-plan Stage 2.3 scenarios +
+  null-guard test. Uses `RecordingApiClient`, `RecordingDelayProvider`,
+  `SyntheticDelayProvider`, `RecordingRateLimiter`, `StubTimeProvider`,
+  `RecordingDistributedCache`.
+
+### Modified production files
+- `src/AgentSwarm.Messaging.Telegram/AgentSwarm.Messaging.Telegram
+  .csproj` — added `Microsoft.Extensions.Caching.Abstractions` and
+  `Microsoft.Extensions.Caching.Memory` package refs.
+- `src/AgentSwarm.Messaging.Telegram/TelegramServiceCollectionExtensions
+  .cs` — Stage 2.3 DI wiring: binds `RateLimitOptions`, adds
+  `AddDistributedMemoryCache()`, registers `TimeProvider.System`,
+  `IDelayProvider→TaskDelayProvider`,
+  `ITelegramRateLimiter→TokenBucketRateLimiter`,
+  `ITelegramApiClient→TelegramBotApiClient`,
+  `IMessageIdTracker→InMemoryMessageIdTracker`, and the sender as
+  both `TelegramMessageSender` + `IMessageSender` (same singleton).
+- `src/AgentSwarm.Messaging.Telegram/TelegramBotClientFactory.cs` —
+  fixed PRE-EXISTING build break: added `public const string
+  HttpClientName = "Telegram.Bot"` (referenced by the DI extension at
+  line 52 but never defined), changed ctor to
+  `(IOptions<TelegramOptions>, IHttpClientFactory)` to match
+  `TelegramOptionsTests` expectations, error message now reads
+  `"Telegram:BotToken is not configured."` to satisfy the
+  `*Telegram:BotToken*` wildcard in the existing test.
+- `src/AgentSwarm.Messaging.Worker/appsettings.json` — added
+  `Telegram:RateLimits` section with default values.
 
 ## Decisions made this iter
-- **Fixed inherited build break rather than blocking on it.** The
-  duplicate `OutboundMessage` was an unambiguous leftover (docs +
-  XML comment both point at Abstractions as canonical) and the build
-  gate would have rejected my workstream regardless. Stubbing the Core
-  file (no deletion) keeps the change reversible and surgical, and the
-  rubber-duck agreed the file-stub approach is correct.
-- **`IOptions<TelegramOptions>` in factory, not `IOptionsMonitor`** —
-  rubber-duck #2: an `IOptionsMonitor` would be misleading because the
-  `ITelegramBotClient` is a singleton, so a hot-rotated token never
-  reaches a new client instance. Stage 2.1 brief asks for "configured
-  client", not rotation.
-- **`List<long>` for `AllowedUserIds`** (rubber-duck #3) — concrete
-  collection binds predictably; downstream stages copy to `HashSet`
-  where lookup speed matters.
-- **`InternalsVisibleTo` for validator** — keeps it `internal sealed`
-  (it's an implementation detail) while letting tests exercise the
-  validator's behavior directly via `[Theory]`. The DI surface is also
-  asserted (`IValidateOptions<TelegramOptions>` resolves to the
-  concrete type), pinning the wiring as well.
-- **Validator rejects whitespace, not just null/empty.** Brief says
-  "rejects empty/null tokens"; whitespace is operationally equivalent
-  to empty (Telegram refuses the request with the same auth error).
-  Defensive widening is cheap and the test theory covers all four
-  shapes.
-- **`Host.StartAsync()` assertion** (rubber-duck #5) — earlier draft
-  considered `IOptions<T>.Value` accessor, which only proves lazy
-  validation; the brief says "host startup fails". `StartAsync()` is
-  what `ValidateOnStart()` actually wires into.
-- **`HttpClient` via `IHttpClientFactory`, not directly constructed**
-  — gives Stage 2.3 a clean hook (`AddHttpClient(name).AddPolicyHandler(…)`)
-  without touching this factory.
+- **ITelegramApiClient is `public`.** Telegram.Bot exposes
+  `SendMessage` as a static extension on `ITelegramBotClient`, which
+  is unmockable. I introduced a public interface wrapper instead of
+  internal. Internal would have raised CS0051 (inconsistent
+  accessibility) once the public sender ctor took an `ITelegramApiClient`
+  parameter. Making the interface public is the smaller blast radius.
+- **Two delay-provider fakes (`RecordingDelayProvider`,
+  `SyntheticDelayProvider`).** The 429 retry test needs delays to
+  complete instantly so the test step doesn't block; the rate-limiter
+  test needs delays to *advance the clock* so the bucket refills and
+  the limiter loop can terminate. One fake can't satisfy both
+  observable behaviours without a state-machine, so I split them.
+- **`RecordingDistributedCache` for the cache-expiry test, not
+  `MemoryDistributedCache`.** `MemoryDistributedCache` uses real wall
+  clock for AbsoluteExpiration; my `StubTimeProvider` only drives the
+  sender's "now" reading, not the cache's. A recording fake captures
+  the `DistributedCacheEntryOptions` passed in and lets me assert
+  `AbsoluteExpiration == ExpiresAt + 5min` directly, which is what
+  the implementation-plan asks the test to verify.
+- **`SendTextAsync(chatId, text, correlationId, ct)` overload only
+  on the concrete sender, not on `IMessageSender`.** `IMessageSender`
+  is fixed by Stage 1.4 and has the two-arg `SendTextAsync(chatId,
+  text, ct)` signature. The connector + the chunk-splitter need to
+  carry a `CorrelationId` through to the footer + message-id tracker,
+  so the concrete class gets an extra overload while the cross-stage
+  contract stays untouched.
+- **Cache key format `QuestionId:ActionId`.** Stage 1.3's
+  `CallbackDataValidation` already pins this format with no colon in
+  either component; reusing the colon as the cache-key separator
+  matches the wire callback_data format exactly.
 
 ## Dead ends tried this iter
-- First test build failed with CS0122 — validator was `internal` but I
-  wrote unit-test `new TelegramOptionsValidator()` directly. Fixed by
-  adding `InternalsVisibleTo` to the Telegram csproj rather than
-  weakening the validator visibility.
+- First try at the cache-expiry test used a real
+  `MemoryDistributedCache` plus `StubTimeProvider.Advance(34min)`,
+  expecting the cache to observe the advance. It did not — the cache
+  uses its own wall clock. Switched to `RecordingDistributedCache`
+  that captures the options object instead.
+- First try had `RecordingDelayProvider` use a TCS to block the
+  caller (so the rate-limiter test could await the limiter's
+  block-wait). But the 429 retry test then hung waiting on the same
+  TCS. Split into two fakes (above).
+- First test build hit `BeLessOrEqualTo` (does not exist on
+  `NumericAssertions<int>` in FluentAssertions 6.x) — switched to
+  `BeLessThanOrEqualTo`.
 
 ## Open questions surfaced this iter
-- None blocking. The brief's "target files" list mentions
-  `tests/AgentSwarm.Messaging.IntegrationTests/...csproj` and
-  `docker-compose.yml`, but neither exists in the repo and neither is
-  needed by the Stage 2.1 implementation-plan steps. Treated them as
-  forward-looking placeholders (rubber-duck confirmed).
+- None. The brief was specific about the 9 impl steps + 8 scenarios
+  and the architecture refs (§5.2 cache grace, §10.3 timeout,
+  §10.4 rate limit) covered all the math.
 
-## What's still left (Stage 2.2+)
-- Stage 2.2: `TelegramUpdatePipeline` implementing
-  `ITelegramUpdatePipeline` with dedup/auth/parse/route stages.
-- Stage 2.3: `TelegramMessageSender` (text + question rendering, inline
-  keyboards, rate limiter, message splitting).
-- Stage 2.4: Webhook endpoint + `InboundUpdate` persistence +
+## Verification
+- `dotnet build --nologo --verbosity minimal` → 0 errors, 0 warnings.
+- `dotnet test --no-build --nologo --verbosity minimal` →
+  185 passed / 0 failed (all suites, including the 9 new Stage 2.3
+  tests and the 5 pre-existing `TelegramOptionsTests` that the
+  factory-fixup unblocked).
+
+## What's still left (Stage 2.4+)
+- Stage 2.4: webhook endpoint + `InboundUpdate` persistence +
   `InboundRecoverySweep`.
-- Stage 2.5: Polling service + UsePolling/WebhookUrl mutual-exclusion
+- Stage 2.5: polling service + UsePolling/WebhookUrl mutual-exclusion
   validator.
 - Stage 2.6: `TelegramMessengerConnector` glue implementing
-  `IMessengerConnector`.
+  `IMessengerConnector` (binds the sender to the connector surface).
+- Stage 3.3: `CallbackQueryHandler` reads the cached `HumanAction`
+  from `IDistributedCache` keyed `QuestionId:ActionId` — the writes
+  added this iter are the producer half of that contract.
+- Stage 3.5: `PendingQuestionRecord.DefaultActionId` should be
+  denormalised by the sender into the persistence record. The
+  sender already reads `AgentQuestionEnvelope.ProposedDefaultActionId`
+  and includes it in the rendered body; persisting it into
+  `PendingQuestionRecord` is a Stage 3.5 concern (mapper) per the
+  brief's "denormalize ... into PendingQuestionRecord.DefaultActionId
+  (Stage 3.5) for efficient timeout polling" wording.

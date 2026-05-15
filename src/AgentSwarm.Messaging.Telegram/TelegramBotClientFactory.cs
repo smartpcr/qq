@@ -6,7 +6,6 @@
 
 using System;
 using System.Net.Http;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
 
@@ -26,35 +25,35 @@ public interface ITelegramBotClientFactory
 /// <inheritdoc cref="ITelegramBotClientFactory"/>
 public sealed class TelegramBotClientFactory : ITelegramBotClientFactory
 {
-    private readonly IOptionsMonitor<TelegramOptions> _options;
-    private readonly IHttpClientFactory? _httpClientFactory;
-    private readonly ILogger<TelegramBotClientFactory> _logger;
+    /// <summary>
+    /// Named <see cref="HttpClient"/> registration used by the factory and
+    /// referenced from <see cref="TelegramServiceCollectionExtensions.AddTelegram"/>.
+    /// </summary>
+    public const string HttpClientName = "Telegram.Bot";
+
+    private readonly IOptions<TelegramOptions> _options;
+    private readonly IHttpClientFactory _httpClientFactory;
 
     public TelegramBotClientFactory(
-        IOptionsMonitor<TelegramOptions> options,
-        ILogger<TelegramBotClientFactory> logger,
-        IHttpClientFactory? httpClientFactory = null)
+        IOptions<TelegramOptions> options,
+        IHttpClientFactory httpClientFactory)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _httpClientFactory = httpClientFactory;
+        _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
     }
 
     public ITelegramBotClient Create()
     {
-        var opts = _options.CurrentValue;
+        var opts = _options.Value;
 
         if (string.IsNullOrWhiteSpace(opts.BotToken))
         {
             // Guard: validator should have already caught this at startup, but defend in depth.
             throw new InvalidOperationException(
-                "TelegramOptions.BotToken is not configured. Refusing to create Telegram bot client.");
+                "Telegram:BotToken is not configured. Refusing to create Telegram bot client.");
         }
 
-        // IMPORTANT: log the redacted options view only — never the raw token.
-        _logger.LogInformation("Creating Telegram bot client. Options: {Options}", opts);
-
-        HttpClient? httpClient = _httpClientFactory?.CreateClient("Telegram.Bot");
+        HttpClient httpClient = _httpClientFactory.CreateClient(HttpClientName);
         return new TelegramBotClient(opts.BotToken, httpClient);
     }
 }
