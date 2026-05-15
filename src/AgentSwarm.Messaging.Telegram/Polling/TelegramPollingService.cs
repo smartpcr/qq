@@ -61,11 +61,46 @@ namespace AgentSwarm.Messaging.Telegram.Polling;
 /// host on a misconfiguration. The mutual-exclusion guard already
 /// rejects an outright missing token at startup.
 /// </para>
+/// <para>
+/// <b>Poison-update guard (FR-005 minimum DLQ for polling mode).</b>
+/// Without a bounded retry budget a single permanently-failing update
+/// — a malformed payload that crashes the mapper, a deterministic
+/// pipeline bug, etc. — would head-of-line-block every subsequent
+/// update because the offset never advances and the next
+/// <c>getUpdates</c> re-fetches the same poison record forever. The
+/// loop tracks consecutive failures per <c>update.Id</c> in an
+/// in-memory counter; once an update has failed
+/// <see cref="MaxPoisonUpdateAttempts"/> times in a row it is logged at
+/// <see cref="LogLevel.Critical"/> (carrying forensic context — chat
+/// id, sender id, attempt count — so an operator alert or a downstream
+/// DLQ exporter can pick it up) and the offset advances past it so the
+/// rest of the queue drains. A genuine transient failure that recovers
+/// before the threshold clears its counter on the next successful
+/// processing, so this guard does not interfere with the normal
+/// at-least-once retry path. Webhook mode does not need this guard
+/// because the durable <c>InboundUpdate</c> sweep already provides a
+/// DLQ at the persistence layer; a follow-up phase will wire polling
+/// mode into that same durable store, at which point this Critical
+/// log becomes the alerting hook in front of the persistent DLQ.
+/// </para>
 /// </remarks>
 internal sealed class TelegramPollingService : BackgroundService
 {
     /// <summary>How long to wait after a transient poll failure before retrying.</summary>
     internal static readonly TimeSpan DefaultTransientBackoff = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Default number of consecutive failures tolerated for a single
+    /// <c>update.Id</c> before the polling loop declares the update a
+    /// poison record, logs at <see cref="LogLevel.Critical"/>, and
+    /// advances the offset to unblock head-of-line. Five attempts at
+    /// the default <see cref="DefaultTransientBackoff"/> (5s) gives a
+    /// real transient failure ~25 seconds to recover before the update
+    /// is treated as poisoned, which is comfortably larger than the
+    /// typical Telegram-side blip while still bounding the starvation
+    /// window for everything queued behind it.
+    /// </summary>
+    internal const int DefaultMaxPoisonUpdateAttempts = 5;
 
     /// <summary>
     /// Overridable backoff after a transient poll failure or a broken
@@ -75,6 +110,16 @@ internal sealed class TelegramPollingService : BackgroundService
     /// initializer syntax to shorten the delay so the suite is fast.
     /// </summary>
     internal TimeSpan TransientBackoff { get; init; } = DefaultTransientBackoff;
+
+    /// <summary>
+    /// Overridable retry budget for the poison-update guard. Production
+    /// callers pick up <see cref="DefaultMaxPoisonUpdateAttempts"/> via
+    /// the DI default; tests use the <c>init</c> seam to shrink the
+    /// threshold and verify the skip path quickly. Values are clamped
+    /// to <c>&gt;= 1</c> at use, so a misconfigured zero/negative still
+    /// admits at least one attempt before declaring the update poisoned.
+    /// </summary>
+    internal int MaxPoisonUpdateAttempts { get; init; } = DefaultMaxPoisonUpdateAttempts;
 
     private readonly ITelegramUpdatePoller _poller;
     private readonly ITelegramUpdatePipeline _pipeline;
@@ -108,14 +153,27 @@ internal sealed class TelegramPollingService : BackgroundService
         }
 
         var timeout = ResolvePollingTimeout(opts);
+        var poisonThreshold = Math.Max(1, MaxPoisonUpdateAttempts);
         _logger.LogInformation(
-            "Telegram polling service starting. PollingTimeoutSeconds={Timeout}", timeout);
+            "Telegram polling service starting. PollingTimeoutSeconds={Timeout} MaxPoisonUpdateAttempts={MaxAttempts}",
+            timeout,
+            poisonThreshold);
 
         // `offset` is declared BEFORE the startup webhook clear so that the
         // finally block can log the final offset even if cancellation fires
         // during the DeleteWebhookAsync call (covered by
         // TelegramPollingServiceTests.ExecuteAsync_LogsFinalOffset_WhenCancelledDuringWebhookClear).
         int? offset = null;
+
+        // Per-update.Id consecutive-failure counter that backs the
+        // poison-update DLQ guard. The dictionary stays bounded because
+        // entries are removed on either (a) successful processing of that
+        // update, or (b) the poison-skip path advancing past it — so it
+        // never retains rows for already-acked updates. The polling loop
+        // runs on a single execution thread so no synchronisation is
+        // needed around this dictionary.
+        var failedAttempts = new Dictionary<int, int>();
+
         try
         {
             await TryClearStaleWebhookAsync(stoppingToken).ConfigureAwait(false);
@@ -168,7 +226,8 @@ internal sealed class TelegramPollingService : BackgroundService
                 // Telegram's getUpdates semantics: server-side acknowledgement
                 // is implicit when the next poll passes offset > update.Id;
                 // by NOT advancing past a failed update we get an automatic
-                // at-least-once retry.
+                // at-least-once retry. The poison-update guard (below)
+                // bounds how long that retry loop can starve later updates.
                 var batchAdvanced = true;
                 foreach (var update in updates)
                 {
@@ -189,6 +248,12 @@ internal sealed class TelegramPollingService : BackgroundService
                         // return. Subsequent getUpdates calls won't redeliver
                         // anything with id <= update.Id.
                         offset = update.Id + 1;
+
+                        // Clear any in-flight failure counter so a transient
+                        // blip that recovered does not erode the budget of
+                        // a future, unrelated failure on this id (and so the
+                        // dictionary stays bounded).
+                        failedAttempts.Remove(update.Id);
                     }
                     catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                     {
@@ -197,11 +262,53 @@ internal sealed class TelegramPollingService : BackgroundService
                     }
                     catch (Exception ex)
                     {
+                        var attempts = failedAttempts.TryGetValue(update.Id, out var prior)
+                            ? prior + 1
+                            : 1;
+
+                        if (attempts >= poisonThreshold)
+                        {
+                            // Poison-update DLQ skip. Extract whatever
+                            // forensic context the update carries — we
+                            // intentionally walk it with null-conditional
+                            // operators because the throwing party might
+                            // have been the mapper itself reacting to a
+                            // malformed payload, and we must not raise a
+                            // second exception while logging.
+                            var chatId = update.Message?.Chat?.Id
+                                ?? update.CallbackQuery?.Message?.Chat?.Id;
+                            var fromUserId = update.Message?.From?.Id
+                                ?? update.CallbackQuery?.From?.Id;
+
+                            _logger.LogCritical(
+                                ex,
+                                "Telegram polling: POISON update {UpdateId} skipped after {Attempts} consecutive failures (FR-005 DLQ guard). Advancing offset to {NextOffset} to unblock head-of-line. ChatId={ChatId} FromUserId={FromUserId}. Operators: investigate the upstream root cause and ensure the update is not lost (durable polling-mode DLQ wiring is tracked separately).",
+                                update.Id,
+                                attempts,
+                                update.Id + 1,
+                                chatId,
+                                fromUserId);
+
+                            offset = update.Id + 1;
+                            failedAttempts.Remove(update.Id);
+
+                            // Forward progress resumes immediately: keep
+                            // draining the rest of the batch in-process and
+                            // do NOT set batchAdvanced=false (which would
+                            // apply the post-failure backoff and waste the
+                            // remaining updates we already fetched).
+                            continue;
+                        }
+
+                        failedAttempts[update.Id] = attempts;
                         _logger.LogError(
                             ex,
-                            "Telegram polling: failed to process update {UpdateId}; batch broken and will retry on next poll. CurrentOffset={Offset}",
+                            "Telegram polling: failed to process update {UpdateId} (attempt {Attempts}/{MaxAttempts}); batch broken and will retry on next poll. CurrentOffset={Offset}",
                             update.Id,
+                            attempts,
+                            poisonThreshold,
                             offset);
+
                         // Leave offset unchanged so the failed update is
                         // re-fetched. Break out of the foreach so we do not
                         // skip past it by advancing on a sibling success.
