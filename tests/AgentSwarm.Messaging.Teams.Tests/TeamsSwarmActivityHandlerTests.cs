@@ -61,6 +61,48 @@ public sealed class TeamsSwarmActivityHandlerTests
     }
 
     [Fact]
+    public async Task OnMessageActivityAsync_PersistsReferenceJson_RoundTripsViaNewtonsoftAndPreservesCanonicalWireNames()
+    {
+        // Regression guard for the iter-3 -> iter-4 SerializeConversationReference fix:
+        //
+        // `Microsoft.Bot.Schema.ConversationReference` is annotated with Newtonsoft.Json
+        // `[JsonProperty(PropertyName = "serviceUrl")]`-style attributes for the canonical
+        // camelCase wire names. The persisted `ReferenceJson` is consumed by the Stage 4.x
+        // proactive-messaging worker via `JsonConvert.DeserializeObject<ConversationReference>`.
+        //
+        // This test asserts BOTH: (a) the serialized JSON carries the camelCase wire names
+        // that Bot Framework's Newtonsoft contract emits (so PascalCase regressions from a
+        // future System.Text.Json swap fail loudly), and (b) deserializing back via
+        // `JsonConvert.DeserializeObject<ConversationReference>` round-trips the key fields
+        // (ServiceUrl, Conversation.Id, Bot.Id) without loss.
+        var harness = Build();
+        MapDave(harness.IdentityResolver);
+        var activity = NewPersonalMessage("agent status");
+
+        await ProcessAsync(harness, activity);
+
+        var saved = Assert.Single(harness.Store.Saved);
+        Assert.False(string.IsNullOrEmpty(saved.ReferenceJson));
+        Assert.NotEqual("{}", saved.ReferenceJson);
+
+        // Newtonsoft wire names — camelCase, NOT PascalCase.
+        Assert.Contains("\"serviceUrl\"", saved.ReferenceJson, StringComparison.Ordinal);
+        Assert.Contains("\"conversation\"", saved.ReferenceJson, StringComparison.Ordinal);
+        Assert.Contains("\"bot\"", saved.ReferenceJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"ServiceUrl\"", saved.ReferenceJson, StringComparison.Ordinal);
+
+        // Round-trip via the same Newtonsoft contract the Stage 4.x proactive worker uses.
+        var rehydrated = Newtonsoft.Json.JsonConvert
+            .DeserializeObject<Microsoft.Bot.Schema.ConversationReference>(saved.ReferenceJson);
+        Assert.NotNull(rehydrated);
+        Assert.False(string.IsNullOrEmpty(rehydrated!.ServiceUrl));
+        Assert.NotNull(rehydrated.Conversation);
+        Assert.Equal("conv-dave-001", rehydrated.Conversation!.Id);
+        Assert.NotNull(rehydrated.Bot);
+        Assert.Equal(BotId, rehydrated.Bot!.Id);
+    }
+
+    [Fact]
     public async Task OnMessageActivityAsync_AuthorizedCommand_EmitsCommandReceivedAuditBeforeDispatch()
     {
         // Item #4 from iter-1 evaluator feedback: successful authorized commands must

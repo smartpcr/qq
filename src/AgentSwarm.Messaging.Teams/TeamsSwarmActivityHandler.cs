@@ -58,17 +58,6 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
     /// </summary>
     private const string CorrelationIdPropertyName = "correlationId";
 
-    /// <summary>
-    /// Audit <c>EventType</c> tag stamped on install-lifecycle audit rows (bot added /
-    /// removed, app installed / uninstalled). Kept distinct from
-    /// <c>AuditEventTypes.CommandReceived</c> so compliance queries can cleanly filter
-    /// inbound human commands from install/uninstall lifecycle events without resorting to
-    /// secondary filters on the <c>Action</c> column. Declared locally because the shared
-    /// <c>AuditEventTypes</c> constants live in <c>AgentSwarm.Messaging.Abstractions</c>;
-    /// promote this to a shared constant when that assembly is next updated.
-    /// </summary>
-    private const string InstallationUpdateEventType = "InstallationUpdate";
-
     private static readonly IReadOnlyList<string> KnownCommandVerbs = new[]
     {
         "agent ask",
@@ -705,17 +694,25 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             return "{}";
         }
 
-        try
-        {
-            return JsonSerializer.Serialize(reference, PayloadJsonOptions);
-        }
-        catch (NotSupportedException)
-        {
-            // Fall back to an empty document if the SDK type carries types that
-            // System.Text.Json refuses (extremely unlikely with current Bot Framework
-            // models, but the catch keeps the handler robust to SDK churn).
-            return "{}";
-        }
+        // `Microsoft.Bot.Schema.ConversationReference` — like the rest of the Bot Framework
+        // schema — is authored against Newtonsoft.Json: members carry
+        // `[JsonProperty(PropertyName = "serviceUrl")]`-style attributes for the canonical
+        // camelCase wire names, the inheritance hierarchy uses `[JsonExtensionData]` for
+        // property bags, and several members are typed `JObject`. `System.Text.Json`
+        // ignores ALL of those attributes — it would emit PascalCase property names
+        // (`ServiceUrl`, `Conversation`), drop extension data, and either throw
+        // `NotSupportedException` on `JObject` members (previously caught here, silently
+        // turning the stored value into `"{}"` and breaking proactive messaging) or emit
+        // structurally incorrect JSON.
+        //
+        // Persisted `ReferenceJson` must round-trip through
+        // `JsonConvert.DeserializeObject<ConversationReference>(...)` on the background
+        // proactive-messaging worker, so we serialize with the same Newtonsoft.Json
+        // contract here. Any unexpected serializer failure is allowed to propagate so the
+        // caller (and ops dashboards) see the issue rather than silently storing an empty
+        // document. `Microsoft.Bot.Builder` already takes a hard dependency on
+        // Newtonsoft.Json transitively, so no extra package reference is required.
+        return Newtonsoft.Json.JsonConvert.SerializeObject(reference);
     }
 
     private async Task LogSecurityRejectionAsync(
@@ -764,8 +761,16 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         }
 
         var payload = JsonSerializer.Serialize(payloadObject, PayloadJsonOptions);
+        // Install-lifecycle events log under the canonical AuditEventTypes.CommandReceived
+        // because tech-spec.md §4.3 fixes the audit EventType vocabulary at exactly seven
+        // values; "InstallationUpdate" is not in that set and the AuditEntry init setter
+        // rejects non-canonical values. Operators distinguish install/uninstall rows from
+        // human-issued commands via the Action column ("AppInstalled",
+        // "AppUninstalledFromTeam", "BotAddedToTeam", "BotRemovedFromTeam", etc.) — that
+        // disambiguation is the contract sibling docs (architecture.md, e2e-scenarios.md)
+        // assume when describing per-class audit completeness.
         var entry = BuildAuditEntry(
-            eventType: InstallationUpdateEventType,
+            eventType: AuditEventTypes.CommandReceived,
             correlationId: correlationId,
             tenantId: tenantId,
             actorId: actorId,
