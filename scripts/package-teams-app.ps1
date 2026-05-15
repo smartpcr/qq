@@ -1,68 +1,61 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Build a Microsoft Teams app sideload package (teams-app.zip) for AgentSwarm.
+    Build a Microsoft Teams sideload package (teams-app.zip) for AgentSwarm.
 
 .DESCRIPTION
-    Reads the canonical manifest template at
+    Renders the canonical manifest template at
     `src/AgentSwarm.Messaging.Teams/Manifest/manifest.json`, substitutes the
-    Teams-app id, the bot framework MicrosoftAppId, and the app version into the
-    manifest, bundles the result with the color/outline icons, and produces a
-    sideloadable zip at the requested output path.
+    single MicrosoftAppId, the bot endpoint domain, and the app version, and
+    bundles the result with the color/outline icons into a sideloadable zip.
 
-    Substitution map:
+    AgentSwarm uses a single Entra/bot-framework registration. The same
+    `MicrosoftAppId` is written into every id field in the manifest:
+
         AppId       -> top-level `id`
-                       `webApplicationInfo.id`
-                       GUID component of `webApplicationInfo.resource`
-        BotId       -> `bots[0].botId`
-                       `composeExtensions[0].botId`
-        Version     -> top-level `version`
-        BotDomain   -> (optional) `validDomains[*]`
-                       developer.websiteUrl / privacyUrl / termsOfUseUrl
-                       host portion of `webApplicationInfo.resource`
+                    -> `bots[0].botId`
+                    -> `composeExtensions[*].botId`
+                    -> `webApplicationInfo.id`
+                    -> GUID component of `webApplicationInfo.resource`
 
-    The script fails (non-zero exit code) on invalid input GUIDs or empty
-    version strings, so CI can rely on exit status to gate the package.
+        BotDomain   -> `validDomains[*]`
+                    -> developer.websiteUrl / privacyUrl / termsOfUseUrl
+                    -> host portion of `webApplicationInfo.resource`
+
+        Version     -> top-level `version`
+
+    Both `-AppId` and `-BotDomain` are MANDATORY: the script will not emit a
+    package that still contains placeholder values, so a successful exit
+    code always denotes a tenant-deployable artifact. Invalid GUIDs, empty
+    versions, or placeholder values cause a non-zero exit so CI can gate the
+    package on exit status.
 
 .PARAMETER AppId
-    The Teams app's Microsoft Entra (AAD) application id. Used for the
-    top-level `id` and the SSO `webApplicationInfo.id`. Must be a GUID and
-    must not be the all-zero placeholder GUID.
-
-.PARAMETER BotId
-    The bot framework registration id (MicrosoftAppId). Used for
-    `bots[0].botId` and `composeExtensions[0].botId`. Must be a GUID and
-    must not be the all-zero placeholder GUID.
+    The Microsoft Entra (AAD) application id registered for the bot. This is
+    the SAME `MicrosoftAppId` configured in the AgentSwarm Bot Framework
+    adapter. Must be a GUID and must not be the all-zero placeholder GUID.
 
 .PARAMETER Version
     The app version emitted into the manifest's top-level `version` field.
-    Required; should be a SemVer `MAJOR.MINOR.PATCH` string.
+    Required; must be a SemVer `MAJOR.MINOR.PATCH` string.
 
 .PARAMETER OutputPath
-    Path of the output zip file (typically `teams-app.zip`). Parent directories
-    are created if missing. An existing file at this path is overwritten.
+    Path of the output zip file (typically `teams-app.zip`). Parent
+    directories are created if missing. An existing file at this path is
+    overwritten.
 
 .PARAMETER BotDomain
-    Optional fully-qualified domain of the bot endpoint. When supplied, the
-    placeholder host `bot.example.com` is rewritten across `validDomains`,
-    `developer.*Url`, and `webApplicationInfo.resource`. When omitted, the
-    placeholder remains and the script writes a warning to stderr — useful
-    for local smoke tests, but never appropriate for tenant deployment.
+    Fully-qualified domain of the bot endpoint (e.g. `bots.contoso.com`).
+    Required: the placeholder host `bot.example.com` is rewritten across
+    `validDomains`, `developer.*Url`, and `webApplicationInfo.resource`.
+    Must not be empty and must not be the placeholder host.
 
 .EXAMPLE
     pwsh ./scripts/package-teams-app.ps1 `
         -AppId 11111111-2222-3333-4444-555555555555 `
-        -BotId 66666666-7777-8888-9999-aaaaaaaaaaaa `
         -Version 1.0.0 `
+        -BotDomain bots.contoso.com `
         -OutputPath ./artifacts/teams-app.zip
-
-.EXAMPLE
-    pwsh ./scripts/package-teams-app.ps1 `
-        -AppId 11111111-2222-3333-4444-555555555555 `
-        -BotId 66666666-7777-8888-9999-aaaaaaaaaaaa `
-        -Version 1.0.0 `
-        -OutputPath ./artifacts/teams-app.zip `
-        -BotDomain bots.contoso.com
 #>
 [CmdletBinding()]
 param(
@@ -70,16 +63,13 @@ param(
     [string]$AppId,
 
     [Parameter(Mandatory = $true)]
-    [string]$BotId,
-
-    [Parameter(Mandatory = $true)]
     [string]$Version,
 
     [Parameter(Mandatory = $true)]
-    [string]$OutputPath,
+    [string]$BotDomain,
 
-    [Parameter(Mandatory = $false)]
-    [string]$BotDomain
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -89,6 +79,8 @@ $placeholderDomain = 'bot.example.com'
 $guidRegex = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 $semverRegex = '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?(?:\+[0-9A-Za-z.\-]+)?$'
 $anyGuidRegex = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+# RFC-1123-ish: dot-separated labels, alnum + hyphen, no leading/trailing hyphen.
+$fqdnRegex = '^(?=.{1,253}$)(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)+(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-))$'
 
 # --- Input validation ----------------------------------------------------
 if ($AppId -notmatch $guidRegex) {
@@ -97,26 +89,26 @@ if ($AppId -notmatch $guidRegex) {
 if ($AppId -eq $placeholderGuid) {
     throw "-AppId must not be the placeholder GUID '$placeholderGuid'."
 }
-if ($BotId -notmatch $guidRegex) {
-    throw "-BotId '$BotId' is not a valid GUID."
-}
-if ($BotId -eq $placeholderGuid) {
-    throw "-BotId must not be the placeholder GUID '$placeholderGuid'."
-}
 if ([string]::IsNullOrWhiteSpace($Version)) {
     throw "-Version must be a non-empty version string."
 }
 if ($Version -notmatch $semverRegex) {
     throw "-Version '$Version' is not a valid SemVer (MAJOR.MINOR.PATCH)."
 }
-if ($PSBoundParameters.ContainsKey('BotDomain') -and (
-        [string]::IsNullOrWhiteSpace($BotDomain) -or $BotDomain -eq $placeholderDomain)) {
-    throw "-BotDomain must be a non-placeholder FQDN (got '$BotDomain')."
+if ([string]::IsNullOrWhiteSpace($BotDomain)) {
+    throw "-BotDomain must be a non-empty fully-qualified domain name."
+}
+if ($BotDomain -eq $placeholderDomain) {
+    throw "-BotDomain must not be the placeholder host '$placeholderDomain'."
+}
+if ($BotDomain -notmatch $fqdnRegex) {
+    throw "-BotDomain '$BotDomain' is not a valid fully-qualified domain name."
 }
 
-# Normalise GUIDs to lowercase to match Microsoft Teams conventions
+# Normalise to lowercase to match Microsoft Teams conventions and to keep
+# substitution idempotent when contributors paste mixed-case values.
 $AppId = $AppId.ToLowerInvariant()
-$BotId = $BotId.ToLowerInvariant()
+$BotDomain = $BotDomain.ToLowerInvariant()
 
 # --- Locate inputs --------------------------------------------------------
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -141,12 +133,12 @@ $manifest.version = $Version
 if (-not $manifest.bots -or $manifest.bots.Count -lt 1) {
     throw "Manifest template at '$manifestPath' is missing the 'bots' entry."
 }
-$manifest.bots[0].botId = $BotId
+$manifest.bots[0].botId = $AppId
 
 if ($manifest.PSObject.Properties.Name -contains 'composeExtensions') {
     foreach ($ext in $manifest.composeExtensions) {
         if ($ext.PSObject.Properties.Name -contains 'botId') {
-            $ext.botId = $BotId
+            $ext.botId = $AppId
         }
     }
 }
@@ -156,34 +148,38 @@ if ($manifest.PSObject.Properties.Name -contains 'webApplicationInfo') {
     if ($manifest.webApplicationInfo.PSObject.Properties.Name -contains 'resource') {
         $resource = [string]$manifest.webApplicationInfo.resource
         $resource = [regex]::Replace($resource, $anyGuidRegex, $AppId)
-        if ($PSBoundParameters.ContainsKey('BotDomain')) {
-            $resource = $resource -replace [regex]::Escape($placeholderDomain), $BotDomain
-        }
+        $resource = $resource -replace [regex]::Escape($placeholderDomain), $BotDomain
         $manifest.webApplicationInfo.resource = $resource
     }
 }
 
-if ($PSBoundParameters.ContainsKey('BotDomain')) {
-    if ($manifest.PSObject.Properties.Name -contains 'validDomains') {
-        for ($i = 0; $i -lt $manifest.validDomains.Count; $i++) {
-            $manifest.validDomains[$i] = $manifest.validDomains[$i] -replace [regex]::Escape($placeholderDomain), $BotDomain
-        }
-    }
-    if ($manifest.PSObject.Properties.Name -contains 'developer') {
-        foreach ($prop in @('websiteUrl', 'privacyUrl', 'termsOfUseUrl')) {
-            if ($manifest.developer.PSObject.Properties.Name -contains $prop) {
-                $manifest.developer.$prop = $manifest.developer.$prop -replace [regex]::Escape($placeholderDomain), $BotDomain
-            }
-        }
+if ($manifest.PSObject.Properties.Name -contains 'validDomains') {
+    for ($i = 0; $i -lt $manifest.validDomains.Count; $i++) {
+        $manifest.validDomains[$i] = $manifest.validDomains[$i] -replace [regex]::Escape($placeholderDomain), $BotDomain
     }
 }
-else {
-    Write-Warning "BotDomain not supplied: placeholder '$placeholderDomain' will remain in validDomains/developer URLs/webApplicationInfo.resource. Do not deploy this package to a production tenant."
+if ($manifest.PSObject.Properties.Name -contains 'developer') {
+    foreach ($prop in @('websiteUrl', 'privacyUrl', 'termsOfUseUrl')) {
+        if ($manifest.developer.PSObject.Properties.Name -contains $prop) {
+            $manifest.developer.$prop = $manifest.developer.$prop -replace [regex]::Escape($placeholderDomain), $BotDomain
+        }
+    }
 }
 
 # Serialize with generous depth — the Teams manifest only nests a few levels
 # but ConvertTo-Json's default depth of 2 would truncate composeExtensions.
 $substituted = $manifest | ConvertTo-Json -Depth 32
+
+# --- Post-substitution safety checks --------------------------------------
+# A successful exit must never produce a non-deployable package. Fail loudly
+# if any placeholder slipped through (e.g. because the template grew a new
+# field that this script does not yet know how to rewrite).
+if ($substituted -match [regex]::Escape($placeholderGuid)) {
+    throw "Generated manifest still contains the placeholder GUID '$placeholderGuid'. Update package-teams-app.ps1 to substitute the new field."
+}
+if ($substituted -match [regex]::Escape($placeholderDomain)) {
+    throw "Generated manifest still contains the placeholder host '$placeholderDomain'. Update package-teams-app.ps1 to substitute the new field."
+}
 
 # Validate the substituted JSON parses cleanly before we ship it.
 try {

@@ -75,9 +75,10 @@ public sealed class ComposeExtensionTests
     {
         // Teams will not route composeExtension/submitAction invocations unless
         // composeExtensions[0].botId equals the bot's MicrosoftAppId. The
-        // build-manifest.ps1 script substitutes a single placeholder GUID
-        // across all four sites; this test guards against drift if a maintainer
-        // edits the manifest by hand.
+        // package-teams-app.ps1 script substitutes a single placeholder GUID
+        // across all four sites (id, bots[0].botId, composeExtensions[0].botId,
+        // webApplicationInfo.id); this test guards against drift if a
+        // maintainer edits the manifest by hand.
         var manifest = ManifestFixture.LoadManifest().AsObject();
         var topId = manifest["id"]!.GetValue<string>();
         var extensionBotId = manifest["composeExtensions"]![0]!["botId"]!.GetValue<string>();
