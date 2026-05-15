@@ -1,131 +1,98 @@
-# Iter notes — Stage 2.3 (Teams Messenger Connector) — iter 5
+# Iter notes — Stage 4.1 (Conversation Reference Store Implementation) — iter 1 (this workstream's first iter)
 
-## What this iter delivered (Stage 2.3 from scratch)
-First iter on Stage 2.3 — prior iters worked Stage 2.2. Stage 2.1
-(`TeamsMessagingOptions`, `ICardStateStore`, `TeamsCardState`,
-`ChannelInboundEventPublisher`) had not landed; required for 2.3 to compile so
-the **interface + canonical record types** are created here. DI stubs
-(`NoOpCardStateStore`, `Program.cs`, middleware) remain Stage 2.1 work.
+## What landed this iter
+
+First substantive iter on Stage 4.1. Prior iter notes in the prompt
+preamble are from the Stage 2.3 workstream (Teams Messenger Connector)
+and document a separate, completed branch — they do NOT apply to this
+workstream. Treat them as historical context only.
 
 ## Files touched this iter
-**Production (new):**
-- `src/AgentSwarm.Messaging.Abstractions/IInboundEventReader.cs` — read-only
-  abstraction (`Task<MessengerEvent> ReceiveAsync(CancellationToken)`); lets
-  connector depend on a small read interface instead of the publisher contract.
-- `src/AgentSwarm.Messaging.Teams/TeamsMessagingOptions.cs` — Stage 2.1 config
-  (impl-plan §2.1 step 5); setting `MaxRetryAttempts` recomputes base
-  `RetryCount = MaxRetryAttempts - 1` (5 total → 4 retries — fixes off-by-one
-  rubber-duck flagged).
-- `src/AgentSwarm.Messaging.Teams/TeamsCardStatuses.cs` — `Pending`/`Answered`/
-  `Expired`/`Deleted` constants + `IsValid`.
-- `src/AgentSwarm.Messaging.Teams/TeamsCardState.cs` — fields per impl-plan §2.1
-  step 3 (`QuestionId` is natural PK; no surrogate `Id` — rubber-duck guidance).
-- `src/AgentSwarm.Messaging.Teams/ICardStateStore.cs` — three methods per
-  architecture §4.3 (`SaveAsync`, `GetByQuestionIdAsync`, `UpdateStatusAsync`).
-- `src/AgentSwarm.Messaging.Teams/ChannelInboundEventPublisher.cs` — `Channel<>`-
-  backed; satisfies BOTH `IInboundEventPublisher` (write) and
-  `IInboundEventReader` (read).
-- `src/AgentSwarm.Messaging.Teams/TeamsMessengerConnector.cs` — main 2.3
-  deliverable. Ctor takes 7 deps (CloudAdapter, options, conv-ref store,
-  question store, card-state store, inbound reader, logger). `SendQuestionAsync`
-  implements §2.3 three-step pattern: (1) `SaveAsync` with null ConversationId,
-  (2) resolve ref by `TargetUserId` via `GetByInternalUserIdAsync` or
-  `TargetChannelId` via `GetByChannelIdAsync` then `ContinueConversationAsync`,
-  (3) `UpdateConversationIdAsync` + `ICardStateStore.SaveAsync` with the
-  activity ID and a **fresh** `ConversationReference` captured from the proactive
-  turn context (saving the stored ReferenceJson would give Stage 3.3 stale
-  rehydration data — rubber-duck blocker).
-- `src/AgentSwarm.Messaging.Teams/TeamsServiceCollectionExtensions.cs` — DI
-  helpers: `AddInProcessInboundEventChannel` (one publisher singleton under both
-  interfaces) + `AddTeamsMessengerConnector` (.NET 8 keyed
-  `IMessengerConnector` under `"teams"`, same instance as
-  `TeamsMessengerConnector` singleton).
 
-**Production (modified):**
-- `src/AgentSwarm.Messaging.Teams/AgentSwarm.Messaging.Teams.csproj` — added
-  `Microsoft.Bot.Builder.Integration.AspNet.Core` 4.22.7 (CloudAdapter, per
-  impl-plan §2.1 line 74) + `Microsoft.Extensions.DependencyInjection.Abstractions`
-  8.0.0 (keyed services).
-- `src/AgentSwarm.Messaging.Teams/IConversationReferenceStore.cs` — added
-  `GetByConversationIdAsync(string conversationId, CancellationToken)`. Necessary
-  because `MessengerMessage` (Stage 1.1) carries no `TenantId`, so the BF
-  `ConversationId` is the only routing key reachable from `SendMessageAsync`.
-  Documented as Stage 1 contract deficiency (not normal store growth).
-
-**Tests (new):**
-- `tests/AgentSwarm.Messaging.Teams.Tests/ChannelInboundEventPublisherTests.cs` —
-  7 tests: round-trip, await-publish ordering, cancellation, null-event guard,
-  null-channel guard, concurrent publishers, bounded backpressure.
-- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsMessengerConnectorTests.cs` — 11
-  tests covering all 3 brief scenarios (SendMessage happy + missing ref,
-  ReceiveAsync wired through real publisher) plus SendQuestion happy
-  (asserts question saved, send invoked, ConversationId update, card-state row
-  with valid `ConversationReferenceJson` that round-trips through Newtonsoft to
-  `ConversationReference`), channel-target via `GetByChannelIdAsync`, missing
-  ref still saves question but skips card state, invalid question throws
-  pre-persist, null-arg guards, full ctor null-arg matrix.
-- `tests/AgentSwarm.Messaging.Teams.Tests/TeamsServiceCollectionExtensionsTests.cs`
-  — 5 tests: same-instance binding for publisher/reader, keyed resolution.
-
-**Tests (modified):**
-- `tests/AgentSwarm.Messaging.Teams.Tests/TestDoubles.cs` — added
-  `PreloadByConversationId` map + `ConversationLookups` recorder; implemented
-  the new `GetByConversationIdAsync` method on
-  `RecordingConversationReferenceStore` so the existing 35 Stage 2.2 tests stay
-  green.
+- `src/AgentSwarm.Messaging.Teams/IConversationReferenceStore.cs` —
+  changed `GetAsync(string referenceId, ct)` → `GetAsync(string tenantId,
+  string aadObjectId, ct)` per Stage 4.1 brief and test scenarios.
+  Updated XML docs to document the active-status-agnostic contract.
+- `tests/AgentSwarm.Messaging.Teams.Tests/TestDoubles.cs`,
+  `tests/AgentSwarm.Messaging.Teams.Tests/TeamsMessengerConnectorTests.cs`,
+  `tests/AgentSwarm.Messaging.Teams.Tests/TeamsServiceCollectionExtensionsTests.cs` —
+  updated 4 test-double `GetAsync` signatures to match the new contract.
+- `src/AgentSwarm.Messaging.Teams.EntityFrameworkCore/` (NEW project) —
+  csproj + `ConversationReferenceEntity`, `ConversationReferenceDeactivationReasons`,
+  `TeamsConversationReferenceDbContext` (provider-agnostic, 5 indexes
+  declared inc. 4 filtered), `TeamsConversationReferenceDbContextDesignTimeFactory`,
+  `SqlConversationReferenceStore` (implements both `IConversationReferenceStore`
+  AND `IConversationReferenceRouter`), `EntityFrameworkCoreServiceCollectionExtensions`
+  (`AddSqlConversationReferenceStore` helper that wires both interfaces from one
+  singleton + adds `IDbContextFactory<>`).
+- `src/AgentSwarm.Messaging.Teams.EntityFrameworkCore/Migrations/20260515051028_InitialCreate.cs`
+  + `Designer.cs` + `TeamsConversationReferenceDbContextModelSnapshot.cs` — generated
+  via `dotnet ef migrations add InitialCreate` against the SqlServer provider.
+- `tests/AgentSwarm.Messaging.Teams.EntityFrameworkCore.Tests/` (NEW project) —
+  csproj + `StoreFixture` (SQLite in-memory + IDbContextFactory<>),
+  `FakeTimeProvider`, `TeamsConversationReferenceFactory`,
+  `SqlConversationReferenceStoreTests` (22 facts covering all 16 brief scenarios
+  plus 6 edge cases: re-activate after uninstall, preserve resolved InternalUserId,
+  team-channel enumeration, active-only filter on getter, router contract,
+  invalid-key reject, no-op on missing row),
+  `EntityFrameworkCoreServiceCollectionExtensionsTests` (DI shape + idempotency).
+- `AgentSwarm.Messaging.sln` — added the two new projects.
+- `.config/dotnet-tools.json` — local manifest pinning dotnet-ef 8.0.10
+  (matches EF Core 8.0.10 runtime); makes migration regeneration reproducible.
 
 ## Decisions made this iter
-- **`CloudAdapter` (concrete) not `BotAdapter` (abstract)** — rubber-duck
-  blocker. Pulling in `Microsoft.Bot.Builder.Integration.AspNet.Core` matches
-  impl-plan §2.1 line 74 exactly. `CloudAdapter`'s
-  `ContinueConversationAsync(string, ConversationReference, BotCallbackHandler,
-  CancellationToken)` is virtual → test adapter subclasses + overrides.
-- **`MaxRetryAttempts` → `RetryCount = value - 1`** — base `ConnectorOptions`
-  defines RetryCount as "additional attempts after first" (total = RetryCount+1).
-  5 total Teams attempts → `RetryCount = 4`.
-- **Fresh `ConversationReference` captured from proactive turn context** for
-  `TeamsCardState.ConversationReferenceJson` (via
-  `turnContext.Activity.GetConversationReference()`) — saving the stored
-  `ReferenceJson` would cache stale `serviceUrl` / conversation thread for the
-  Stage 3.3 update/delete path. Falls back to stored ref's JSON only if BF
-  callback doesn't yield one.
-- **`IInboundEventReader` instead of injecting concrete publisher** — keeps
-  connector decoupled, prevents accidental publish-from-connector, gives tests
-  a tiny stub surface. Same singleton implements both interfaces in DI.
-- **Single `TeamsMessengerConnector` singleton, exposed as keyed
-  `IMessengerConnector("teams")` via factory delegate** — rubber-duck guidance;
-  Stage 3.3 will layer `ITeamsCardManager` onto the same instance.
-- **`GetByConversationIdAsync` added to `IConversationReferenceStore`** — XML
-  doc explicitly notes this compensates for the `MessengerMessage` model gap
-  (no `TenantId` field) so a future Stage 1 revision (add tenant to
-  `MessengerMessage` or destination URI parser) can retire it.
-- **Plain-text question summary** (`{Title}\n\n{Body}\n\nReply with: {actions}`)
-  — Adaptive Card lands in Stage 3.1; brief explicitly says "render the question
-  as a simple text summary" until then. Action verbs are lowercased to match the
-  canonical command vocabulary.
+
+- **Changed `IConversationReferenceStore.GetAsync` signature.** Stage 2.1 declared
+  `GetAsync(string referenceId, ct)` (by GUID PK, matches `architecture.md` §4.2);
+  Stage 4.1 brief explicitly requires `GetAsync(string tenantId, string aadObjectId, ct)`
+  with the `IsActive`-agnostic semantics needed by the test scenario "GetAsync returns
+  reference regardless of active status". No production callers used the old single-arg
+  form — only 4 test doubles. Brief is the more recent and explicit signal; honored it.
+  Architecture.md is now slightly stale on this point (out of scope to amend here).
+- **New project `AgentSwarm.Messaging.Teams.EntityFrameworkCore`** rather than putting
+  EF code in `AgentSwarm.Messaging.Persistence` (where `architecture.md` §7 maps it).
+  The architecture mapping conflicts with the dependency direction: `Persistence`
+  doesn't reference `Teams`, but `IConversationReferenceStore` lives in `Teams`.
+  Inverting the dependency would couple Persistence to a connector. Adjacent
+  `*.EntityFrameworkCore` package follows .NET community convention
+  (`Microsoft.Extensions.Caching.SqlServer` etc.).
+- **`IDbContextFactory<T>` instead of injected `DbContext`** — singletons can't share a
+  `DbContext` (not thread-safe) and the connector is registered as a singleton.
+  Factory pattern is the canonical EF Core fix and matches `AddDbContextFactory`.
+- **`TimeProvider` injection** — deterministic timestamps in `MarkInactive*` tests
+  without `Thread.Sleep` or stopwatch hacks.
+- **Filtered-index `HasFilter` strings use double-quoted column names** —
+  portable across SQL Server (with `QUOTED_IDENTIFIER ON`, the default) and SQLite.
+- **`SqlServer` package marked `<PrivateAssets>all</PrivateAssets>`** — consumers of
+  the EFCore project don't get SQL Server transitively; design-time factory
+  still compiles against it.
+- **Preserved-InternalUserId branch in `SaveOrUpdateAsync`** — when an inbound
+  reference omits `InternalUserId` (e.g., second message arrives before the
+  identity resolver writes back), the upsert MUST NOT clobber a previously-resolved
+  value. Documented inline; covered by `SaveOrUpdate_PreservesPreviouslyResolvedInternalUserId`.
+- **`SqlConversationReferenceStore` also implements `IConversationReferenceRouter`** —
+  satisfies the auto-wire cast in `TeamsServiceCollectionExtensions.AddTeamsMessengerConnector`,
+  matching the contract in `IConversationReferenceRouter.cs:27-30` ("the canonical
+  store implementations SHOULD implement BOTH interfaces").
 
 ## Dead ends tried this iter
-- `<see cref="RetryCount"/>` xmldoc in `TeamsMessagingOptions` failed CS1574
-  (inherited base members aren't directly resolvable at that scope) — switched
-  to fully qualified `<see cref="ConnectorOptions.RetryCount"/>`.
-- `<see cref="ServiceCollectionDescriptorExtensions.TryAddSingleton{TService}(IServiceCollection)"/>`
-  also failed CS1574 (DI.Abstractions XML docs not resolvable in our context) —
-  rewrote as plain prose.
-- First `ParsedCommand` test stub used a 2-arg ctor — actual record has three
-  positional members (`CommandType, Payload, CorrelationId`).
+
+- Initial csproj used `Microsoft.Extensions.DependencyInjection.Abstractions 8.0.0`;
+  EF Core 8.0.10 transitively pulled 8.0.2, NU1605 downgrade error with
+  `TreatWarningsAsErrors`. Bumped explicit ref to 8.0.2.
+- Initial DbContext XML doc used `<see cref="HasFilter"/>` — CS1574 because
+  the symbol isn't directly in scope at the comment site. Switched to `<c>HasFilter</c>`.
 
 ## Open questions surfaced this iter
-- None blocking. Long-term: should `MessengerMessage` carry `TenantId` + a
-  routing-target hint so `IConversationReferenceStore.GetByConversationIdAsync`
-  can be retired? Belongs to a Stage 1 revision workstream, not 2.3.
+
+- None requiring operator input. The interface signature change is documented
+  above and is the correct interpretation of the workstream brief.
 
 ## What's still left
-- Nothing for Stage 2.3 itself. Solution build clean (0 warn / 0 err); tests:
-  82 Abstractions + 58 Teams = 140 pass on the .sln (was 117 — +23 for 2.3).
-- Pre-existing failures NOT caused by this iter: 7 failures in
-  `AgentSwarm.Messaging.Teams.Manifest.Tests` (manifest.json maxLength + missing
-  `scripts/package-teams-app.ps1`). Stage 2.4 scope; not in the .sln so the
-  `dotnet test AgentSwarm.Messaging.sln` gate is green.
-- Stage 2.1 still pending: `Program.cs`, middleware classes, in-memory store
-  registrations, `NoOpCardStateStore`/`NoOpCardActionHandler`/`NoOpCardManager`.
-  Stage 3.x dispatch + card handler + Stage 4.x proactive worker also pending.
+
+- Nothing for Stage 4.1. Build clean (0 warnings / 0 errors), 178 tests pass
+  solution-wide (82 Abstractions + 73 Teams + 23 EntityFrameworkCore = 178; the
+  23 in the new EFCore test assembly cover every Stage 4.1 acceptance scenario).
+- Downstream Stage 4.2 (`TeamsProactiveNotifier`) and Stage 5.1
+  (`InstallationStateGate`) can now resolve `IConversationReferenceStore` from
+  the SQL backing store via `AddSqlConversationReferenceStore`.

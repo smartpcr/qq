@@ -36,7 +36,7 @@ internal static class TestDoubles
             return Task.CompletedTask;
         }
 
-        public Task<TeamsConversationReference?> GetAsync(string referenceId, CancellationToken ct)
+        public Task<TeamsConversationReference?> GetAsync(string tenantId, string aadObjectId, CancellationToken ct)
             => Task.FromResult<TeamsConversationReference?>(null);
 
         public Task<TeamsConversationReference?> GetByAadObjectIdAsync(string tenantId, string aadObjectId, CancellationToken ct)
