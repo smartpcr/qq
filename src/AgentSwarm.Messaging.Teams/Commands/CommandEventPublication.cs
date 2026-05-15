@@ -12,6 +12,18 @@ namespace AgentSwarm.Messaging.Teams.Commands;
 /// own its own publication (per <c>implementation-plan.md</c> §3.2 step 2 — the dispatcher
 /// must be self-sufficient outside the activity-handler path) without duplicating the
 /// envelope-construction boilerplate.
+///
+/// <para>Per FR-004 (Correlation &amp; Traceability) callers MUST supply the
+/// <paramref name="correlationId"/> they intend to render on the Adaptive Card reply, so
+/// the <see cref="CommandEvent.CorrelationId"/> on the published event is guaranteed to
+/// match the Tracking ID shown to the user. The helper deliberately does NOT synthesise
+/// its own GUID fallback: an internal <c>Guid.NewGuid()</c> would diverge from any
+/// correlation ID the handler already minted for the reply card, breaking end-to-end
+/// traceability in the self-sufficient mode where <see cref="CommandContext.CorrelationId"/>
+/// is null (handler invoked outside the Teams activity-handler pipeline). The handler is
+/// expected to compute the correlation ID exactly once (e.g.
+/// <c>context.CorrelationId ?? Guid.NewGuid().ToString()</c>) and thread the same value
+/// into both <see cref="CommandReplyCards"/> and this method.</para>
 /// </summary>
 internal static class CommandEventPublication
 {
@@ -21,11 +33,15 @@ internal static class CommandEventPublication
         string commandVerb,
         string eventType,
         string body,
+        string correlationId,
         CancellationToken ct)
     {
-        var correlationId = string.IsNullOrEmpty(context.CorrelationId)
-            ? Guid.NewGuid().ToString()
-            : context.CorrelationId!;
+        if (string.IsNullOrEmpty(correlationId))
+        {
+            throw new ArgumentException(
+                "CorrelationId must be supplied by the caller so the published event's CorrelationId matches the Tracking ID rendered on the Adaptive Card reply (FR-004 Correlation & Traceability).",
+                nameof(correlationId));
+        }
 
         var commandEvent = new CommandEvent(eventType)
         {
