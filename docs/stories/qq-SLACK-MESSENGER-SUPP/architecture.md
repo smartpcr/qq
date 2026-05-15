@@ -12,18 +12,25 @@ applications.
 **Scope.** This story covers the Slack-specific connector layer:
 
 - Receiving inbound Slack events (Events API, Socket Mode, slash commands,
-  interactive payloads).
+  app mentions, interactive payloads).
 - Dispatching outbound messages via the Slack Web API.
 - Mapping Slack interactions to the shared `HumanDecisionEvent` model.
 - Threading every agent task into a dedicated Slack conversation thread.
 - Idempotency, authorization, audit, and observability for the Slack channel.
 
 **Out of scope.** Platform-agnostic abstractions (`IMessengerConnector`,
-`AgentQuestion`, `HumanDecisionEvent`) are defined in
-`AgentSwarm.Messaging.Abstractions` and are not re-specified here except by
-reference. Persistence infrastructure (outbox engine, DLQ store) lives in
-`AgentSwarm.Messaging.Persistence`. The orchestrator and agent runtime are
-upstream consumers.
+`AgentQuestion`, `HumanDecisionEvent`) are proposed in the target project
+`AgentSwarm.Messaging.Abstractions` (not yet created in the repo) and are not
+re-specified here except by reference. Persistence infrastructure (outbox
+engine, DLQ store) is proposed in `AgentSwarm.Messaging.Persistence`. The
+orchestrator and agent runtime are upstream consumers.
+
+> **Repo status.** As of this writing the repository contains no `src/`
+> directory, no `.csproj` files, and no implementation code. All project and
+> namespace references in this document (e.g., `AgentSwarm.Messaging.Slack`,
+> `AgentSwarm.Messaging.Core`) describe the **target solution structure** to be
+> created during implementation. See the companion `implementation-plan.md` for
+> the build-out sequence.
 
 **Library choice.** SlackNet is the preferred C# client library (see story
 description). Fallback: Slack.NetStandard or direct `HttpClient` calls against
@@ -34,14 +41,15 @@ the Slack Web API.
 ## 2. Component Inventory
 
 Each component below maps to a class (or small set of classes) inside the
-`AgentSwarm.Messaging.Slack` project. Components in `Abstractions`, `Core`, or
-`Persistence` are referenced but not owned by this story.
+proposed `AgentSwarm.Messaging.Slack` project (to be created). Components in
+the proposed `Abstractions`, `Core`, or `Persistence` projects are referenced
+but not owned by this story.
 
 ### 2.1 SlackConnector
 
 | Attribute | Value |
 |---|---|
-| Project | `AgentSwarm.Messaging.Slack` |
+| Project | `AgentSwarm.Messaging.Slack` (proposed -- not yet in repo) |
 | Implements | `IMessengerConnector` |
 | Responsibility | Top-level facade that wires inbound transport, command dispatch, interaction handling, outbound dispatch, thread management, and audit into a single connector lifecycle. Registered in DI as the Slack implementation of `IMessengerConnector`. |
 
@@ -71,11 +79,11 @@ Each transport converts Slack-native payloads into a normalized
 | Attribute | Value |
 |---|---|
 | Transport | HTTP POST endpoints (ASP.NET Core) |
-| Responsibility | Handles Events API callbacks and the `url_verification` challenge. Validates request signature via `SlackSignatureValidator`. Immediately returns HTTP 200 to satisfy the 3-second ACK requirement, then enqueues the event envelope for async processing. |
+| Responsibility | Handles Events API callbacks (including `app_mention` events), the `url_verification` challenge, slash commands, and interactive payloads. Validates request signature via `SlackSignatureValidator`. Immediately returns HTTP 200 to satisfy the 3-second ACK requirement, then enqueues the event envelope for async processing. For slash commands that require a modal (`review`, `escalate`), the receiver invokes `views.open` synchronously before responding, because the `trigger_id` expires within 3 seconds (see section 5.3). |
 
 Endpoint routes:
 
-- `POST /api/slack/events` -- Events API subscription
+- `POST /api/slack/events` -- Events API subscription (receives `app_mention`, `message`, and other event types)
 - `POST /api/slack/commands` -- Slash command payloads
 - `POST /api/slack/interactions` -- Interactive component payloads (buttons, modals)
 
@@ -136,7 +144,19 @@ Supported commands:
 | `/agent` | `review <task-id>` | Open review modal |
 | `/agent` | `escalate <task-id>` | Open escalation modal |
 
-### 2.8 SlackInteractionHandler
+### 2.8 SlackAppMentionHandler
+
+| Attribute | Value |
+|---|---|
+| Responsibility | Processes `app_mention` events from the Events API. When a user mentions the bot (e.g., `@AgentBot status TASK-42`), this handler parses the mention text, strips the bot user ID prefix, and routes the extracted command to the same dispatch logic used by `SlackCommandHandler`. Replies are posted as threaded messages in the same conversation. |
+
+App mentions provide an alternative to slash commands: users can interact with
+the agent bot in any channel where the app is installed by @-mentioning it.
+The handler normalizes the mention text into the same sub-command format used
+by slash commands (`ask`, `status`, `approve`, `reject`, `review`, `escalate`)
+so that downstream processing is unified.
+
+### 2.9 SlackInteractionHandler
 
 | Attribute | Value |
 |---|---|
@@ -150,10 +170,10 @@ Mapping rules:
 | Modal `view_submission` | `ActionValue` = parsed form values; `Comment` = free-text input |
 | `user.id` | `ExternalUserId` |
 | `message.ts` or `view.id` | `ExternalMessageId` |
-| Payload `token` timestamp | `ReceivedAt` |
+| Server receive time | `ReceivedAt` = `DateTimeOffset.UtcNow` captured at ingest |
 | Thread-mapped `correlation_id` | `CorrelationId` |
 
-### 2.9 SlackMessageRenderer
+### 2.10 SlackMessageRenderer
 
 | Attribute | Value |
 |---|---|
@@ -170,7 +190,7 @@ Rendering rules:
 - `AgentQuestion.Severity` -> emoji prefix and color attachment bar.
 - `AgentQuestion.ExpiresAt` -> context block showing deadline.
 
-### 2.10 SlackThreadManager
+### 2.11 SlackThreadManager
 
 | Attribute | Value |
 |---|---|
@@ -188,7 +208,7 @@ Lifecycle:
    a warning to audit and attempts to create a new thread in the fallback
    channel (configurable).
 
-### 2.11 SlackOutboundDispatcher
+### 2.12 SlackOutboundDispatcher
 
 | Attribute | Value |
 |---|---|
@@ -202,13 +222,13 @@ Rate-limit strategy:
 - Burst capacity is managed via a token-bucket rate limiter per API method
   tier.
 
-### 2.12 SlackInboundIngestor
+### 2.13 SlackInboundIngestor
 
 | Attribute | Value |
 |---|---|
-| Responsibility | Receives normalized `SlackInboundEnvelope` from the transport layer, runs it through `SlackSignatureValidator` (if not already validated by middleware), `SlackAuthorizationFilter`, and `SlackIdempotencyGuard`, then dispatches to `SlackCommandHandler` or `SlackInteractionHandler`. Failed processing is retried per the retry policy; poison messages go to the DLQ. |
+| Responsibility | Receives normalized `SlackInboundEnvelope` from the transport layer, runs it through `SlackSignatureValidator` (if not already validated by middleware), `SlackAuthorizationFilter`, and `SlackIdempotencyGuard`, then dispatches to `SlackCommandHandler`, `SlackAppMentionHandler`, or `SlackInteractionHandler`. Failed processing is retried per the retry policy; poison messages go to the DLQ. |
 
-### 2.13 SlackAuditLogger
+### 2.14 SlackAuditLogger
 
 | Attribute | Value |
 |---|---|
@@ -218,7 +238,8 @@ Rate-limit strategy:
 
 ## 3. Data Model
 
-All entities below are persisted via `AgentSwarm.Messaging.Persistence`.
+All entities below will be persisted via the proposed
+`AgentSwarm.Messaging.Persistence` project.
 Primary keys are shown in **bold**.
 
 ### 3.1 SlackWorkspaceConfig
@@ -305,7 +326,7 @@ Immutable audit log for every Slack exchange (inbound and outbound).
 | task_id | `string?` | Task involved (null if not yet assigned) |
 | conversation_id | `string?` | Logical conversation ID (maps to thread) |
 | direction | `string` | `inbound` or `outbound` |
-| request_type | `string` | `slash_command`, `event`, `interaction`, `message_send`, `modal_open`, `message_update` |
+| request_type | `string` | `slash_command`, `event`, `app_mention`, `interaction`, `message_send`, `modal_open`, `message_update` |
 | team_id | `string` | Slack workspace ID |
 | channel_id | `string?` | Slack channel ID |
 | thread_ts | `string?` | Slack thread timestamp |
@@ -322,8 +343,8 @@ Indexed on: `correlation_id`, `task_id`, `agent_id`, `team_id + channel_id`,
 
 ### 3.6 Shared Model References
 
-These types are defined in `AgentSwarm.Messaging.Abstractions` and used
-throughout the Slack connector:
+These types are proposed in `AgentSwarm.Messaging.Abstractions` (to be created)
+and used throughout the Slack connector:
 
 #### 3.6.1 AgentQuestion
 
@@ -479,6 +500,7 @@ SlackConnector
   |     |     \-- SlackMembershipResolver
   |     |-- ISlackIdempotencyGuard
   |     |-- SlackCommandHandler
+  |     |-- SlackAppMentionHandler
   |     \-- SlackInteractionHandler
   |-- SlackOutboundDispatcher
   |     |-- ISlackThreadManager
@@ -487,12 +509,12 @@ SlackConnector
   \-- ISlackAuditLogger
 ```
 
-External dependencies (from other projects):
+External dependencies (proposed projects -- none exist in the repo yet):
 
 - `AgentSwarm.Messaging.Abstractions` -- shared types and `IMessengerConnector`
 - `AgentSwarm.Messaging.Core` -- retry engine, outbox/inbox queues, DLQ
 - `AgentSwarm.Messaging.Persistence` -- EF Core DbContext, migrations
-- `SlackNet` -- Slack API client (NuGet)
+- `SlackNet` (NuGet package) -- Slack API client
 
 ---
 
@@ -504,7 +526,7 @@ External dependencies (from other projects):
 Human                  Slack Platform         SlackEventsApiReceiver    SlackInboundIngestor    SlackCommandHandler     Orchestrator            SlackOutboundDispatcher   Slack Platform
   |                         |                         |                         |                         |                         |                         |                         |
   |-- /agent ask "plan" --->|                         |                         |                         |                         |                         |                         |
-  |                         |-- POST /api/slack/cmd ->|                         |                         |                         |                         |                         |
+  |                         |-- POST /api/slack/commands ->|                         |                         |                         |                         |                         |
   |                         |                         |-- validate signature --->|                         |                         |                         |                         |
   |                         |                         |<-- HTTP 200 (ack) ------>|                         |                         |                         |                         |
   |                         |                         |   (within 3 seconds)     |                         |                         |                         |                         |
@@ -564,7 +586,7 @@ Orchestrator          SlackOutboundDispatcher   SlackThreadManager   SlackMessag
 ```
 Slack Platform         SlackEventsApiReceiver    SlackInboundIngestor     SlackInteractionHandler   Orchestrator
   |                         |                         |                         |                         |
-  |-- POST /interactions -->|                         |                         |                         |
+  |-- POST /api/slack/interactions -->|                         |                         |                         |
   |                         |-- HTTP 200 (ack) ------>|                         |                         |
   |                         |-- enqueue ------------->|                         |                         |
   |                         |                         |-- idempotency check --->|                         |
@@ -600,22 +622,37 @@ Steps:
 
 ### 5.3 Modal Flow: `/agent review <task-id>`
 
+> **Trigger-ID constraint.** Slack's `trigger_id` (included in every slash
+> command and interactive payload) expires approximately 3 seconds after
+> issuance. Because `views.open` requires a valid `trigger_id`, modal-opening
+> commands (`review`, `escalate`) follow a **synchronous fast-path**: the
+> `SlackEventsApiReceiver` validates the signature, calls `views.open` with the
+> `trigger_id` immediately (before returning the HTTP response), and only then
+> enqueues the remaining work for async processing. This differs from the
+> standard flow where the receiver ACKs first and processes later.
+
 Steps:
 
 1. Human types `/agent review TASK-42`.
-2. After ACK, `SlackCommandHandler` parses sub-command `review`.
-3. Handler calls `views.open` via `SlackOutboundDispatcher` with a modal
-   rendered by `SlackMessageRenderer.RenderReviewModal`. The modal contains:
-   - Read-only section showing task summary (fetched from orchestrator).
+2. `SlackEventsApiReceiver` validates the request signature.
+3. The receiver detects that sub-command `review` requires a modal. It
+   synchronously calls `SlackCommandHandler` which invokes `views.open` with
+   the `trigger_id` from the slash-command payload, passing a modal rendered by
+   `SlackMessageRenderer.RenderReviewModal`. This must complete within the
+   3-second `trigger_id` window. The modal contains:
+   - Read-only section showing task summary (fetched from orchestrator cache).
    - Multi-line text input for review comments.
    - Select menu for verdict (approve / request-changes / reject).
    - Submit and cancel buttons.
-4. Human fills in the modal and clicks Submit.
-5. Slack sends a `view_submission` payload to `/api/slack/interactions`.
-6. `SlackInteractionHandler` extracts form values, builds a
+4. The receiver returns HTTP 200 to Slack (ACK).
+5. Human fills in the modal and clicks Submit.
+6. Slack sends a `view_submission` payload to `/api/slack/interactions`.
+7. `SlackInteractionHandler` extracts form values, builds a
    `HumanDecisionEvent` with `ActionValue` = selected verdict and `Comment` =
    review text.
-7. Event is published; the originating thread receives a confirmation reply.
+8. Event is published; the originating thread receives a confirmation reply.
+
+The same fast-path applies to `/agent escalate`, which also opens a modal.
 
 ### 5.4 Duplicate Event Handling (Idempotency)
 
@@ -661,14 +698,31 @@ Steps:
 3. Responds with `{ "challenge": "<token>" }` and HTTP 200.
 4. No further processing occurs. This is a one-time handshake.
 
----
+### 5.7 App Mention: `@AgentBot ask <prompt>`
 
-## 6. Reliability and Performance
+Steps:
+
+1. A user in an authorized channel posts: `@AgentBot ask design persistence
+   layer`.
+2. Slack delivers an `app_mention` event to `POST /api/slack/events`.
+3. `SlackEventsApiReceiver` validates the signature and ACKs with HTTP 200.
+   The event envelope is enqueued for async processing.
+4. `SlackInboundIngestor` runs authorization and idempotency checks.
+5. `SlackAppMentionHandler` strips the bot user-ID prefix from the mention
+   text, yielding `ask design persistence layer`. It parses this as
+   sub-command `ask` with prompt text and delegates to the same orchestrator
+   path used by slash commands.
+6. The orchestrator creates a task. `SlackOutboundDispatcher` posts a threaded
+   reply in the same channel/thread where the mention occurred.
+7. All exchanges are recorded by `SlackAuditLogger` with `request_type =
+   app_mention`.
+
+---
 
 ### 6.1 Durable Message Pipeline
 
-The Slack connector uses the shared `AgentSwarm.Messaging.Core` pipeline
-infrastructure:
+The Slack connector uses the shared pipeline infrastructure proposed in
+`AgentSwarm.Messaging.Core` (to be created):
 
 | Component | Role |
 |---|---|
