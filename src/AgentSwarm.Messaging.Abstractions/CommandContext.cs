@@ -63,4 +63,21 @@ public sealed record CommandContext
     /// logging and deduplication downstream of the dispatcher.
     /// </summary>
     public string? ActivityId { get; init; }
+
+    /// <summary>
+    /// Arguments portion of the command — the text remaining after the canonical command
+    /// keyword has been stripped from <see cref="NormalizedText"/>. Populated by
+    /// <see cref="ICommandDispatcher"/> immediately before invoking the matching
+    /// <see cref="ICommandHandler"/> so handlers can read the body directly without
+    /// re-parsing. <c>null</c> when the dispatcher has not yet run (e.g., during early
+    /// pipeline validation) or when the inbound text matched no known command.
+    /// </summary>
+    /// <remarks>
+    /// For example, when <see cref="NormalizedText"/> is
+    /// <c>"agent ask create e2e tests"</c> and the matched handler's
+    /// <see cref="ICommandHandler.CommandName"/> is <c>"agent ask"</c>, the dispatcher sets
+    /// <see cref="CommandArguments"/> to <c>"create e2e tests"</c>. For parameterless
+    /// commands (e.g. bare <c>"approve"</c>), the value is the empty string.
+    /// </remarks>
+    public string? CommandArguments { get; init; }
 }

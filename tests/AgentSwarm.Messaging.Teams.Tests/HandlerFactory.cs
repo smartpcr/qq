@@ -30,6 +30,24 @@ internal static class HandlerFactory
         IInboundEventPublisher EventPublisher,
         InertBotAdapter Adapter);
 
+    /// <summary>
+    /// E2E harness wiring the real <see cref="AgentSwarm.Messaging.Teams.Commands.CommandDispatcher"/>
+    /// and every concrete <see cref="AgentSwarm.Messaging.Abstractions.ICommandHandler"/>
+    /// shipped in <c>AgentSwarm.Messaging.Teams.Commands</c>. Used by tests that need the
+    /// full activity-handler → dispatcher → handler → publisher pipeline (so the per-verb
+    /// CommandEvent / DecisionEvent / TextEvent emissions can be asserted end-to-end).
+    /// </summary>
+    public sealed record E2EHarness(
+        TeamsSwarmActivityHandler Handler,
+        RecordingConversationReferenceStore Store,
+        FakeIdentityResolver IdentityResolver,
+        AlwaysAuthorizationService Authorization,
+        RecordingAuditLogger AuditLogger,
+        RecordingCardActionHandler CardHandler,
+        IInboundEventPublisher EventPublisher,
+        InMemoryAgentQuestionStore QuestionStore,
+        InertBotAdapter Adapter);
+
     public static Harness Build()
         => Build(eventPublisher: new RecordingInboundEventPublisher());
 
@@ -57,6 +75,59 @@ internal static class HandlerFactory
             eventPublisher,
             NullLogger<TeamsSwarmActivityHandler>.Instance);
         return new Harness(handler, store, dispatcher, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, new InertBotAdapter());
+    }
+
+    /// <summary>
+    /// Build an E2E harness wiring the real <see cref="AgentSwarm.Messaging.Teams.Commands.CommandDispatcher"/>
+    /// with every concrete handler. The dispatcher and handlers share the supplied
+    /// <paramref name="eventPublisher"/> so each canonical verb publishes its own
+    /// <c>CommandEvent</c> / <c>DecisionEvent</c> / <c>TextEvent</c> exactly once.
+    /// </summary>
+    public static E2EHarness BuildE2E(IInboundEventPublisher eventPublisher)
+    {
+        var store = new RecordingConversationReferenceStore();
+        var identityResolver = new FakeIdentityResolver();
+        var authorization = new AlwaysAuthorizationService();
+        var auditLogger = new RecordingAuditLogger();
+        var cardHandler = new RecordingCardActionHandler();
+        var questionStore = new InMemoryAgentQuestionStore();
+        var renderer = new AgentSwarm.Messaging.Teams.Cards.AdaptiveCardBuilder();
+        var statusProvider = new AgentSwarm.Messaging.Teams.Commands.NullAgentSwarmStatusProvider();
+
+        var handlers = new AgentSwarm.Messaging.Abstractions.ICommandHandler[]
+        {
+            new AgentSwarm.Messaging.Teams.Commands.AskCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.AskCommandHandler>.Instance),
+            new AgentSwarm.Messaging.Teams.Commands.StatusCommandHandler(statusProvider, renderer, eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.StatusCommandHandler>.Instance),
+            new AgentSwarm.Messaging.Teams.Commands.ApproveCommandHandler(questionStore, eventPublisher, renderer, NullLogger<AgentSwarm.Messaging.Teams.Commands.ApproveCommandHandler>.Instance),
+            new AgentSwarm.Messaging.Teams.Commands.RejectCommandHandler(questionStore, eventPublisher, renderer, NullLogger<AgentSwarm.Messaging.Teams.Commands.RejectCommandHandler>.Instance),
+            new AgentSwarm.Messaging.Teams.Commands.EscalateCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.EscalateCommandHandler>.Instance),
+            new AgentSwarm.Messaging.Teams.Commands.PauseCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.PauseCommandHandler>.Instance),
+            new AgentSwarm.Messaging.Teams.Commands.ResumeCommandHandler(eventPublisher, NullLogger<AgentSwarm.Messaging.Teams.Commands.ResumeCommandHandler>.Instance),
+        };
+
+        var dispatcher = new AgentSwarm.Messaging.Teams.Commands.CommandDispatcher(
+            handlers,
+            eventPublisher,
+            NullLogger<AgentSwarm.Messaging.Teams.Commands.CommandDispatcher>.Instance);
+
+        var handler = new TeamsSwarmActivityHandler(
+            store,
+            dispatcher,
+            identityResolver,
+            authorization,
+            questionStore,
+            auditLogger,
+            cardHandler,
+            eventPublisher,
+            NullLogger<TeamsSwarmActivityHandler>.Instance);
+
+        return new E2EHarness(handler, store, identityResolver, authorization, auditLogger, cardHandler, eventPublisher, questionStore, new InertBotAdapter());
+    }
+
+    public static async Task ProcessE2EAsync(E2EHarness harness, Activity activity, CancellationToken ct = default)
+    {
+        var turnContext = new TurnContext(harness.Adapter, activity);
+        await ((IBot)harness.Handler).OnTurnAsync(turnContext, ct).ConfigureAwait(false);
     }
 
     public static UserIdentity MapDave(FakeIdentityResolver resolver, string aadObjectId = "aad-obj-dave-001")
