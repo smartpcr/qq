@@ -89,6 +89,47 @@ public sealed class TelegramOptions
     public List<TelegramOperatorBindingOptions> OperatorBindings { get; set; } = new();
 
     /// <summary>
+    /// Dev/test seed used by
+    /// <see cref="Swarm.StubOperatorRegistry"/> (Stage 2.7) to project a
+    /// fixed set of <see cref="Core.OperatorBinding"/> rows without a
+    /// database. Each entry is materialised into an
+    /// <see cref="Core.OperatorBinding"/> with a deterministic
+    /// <see cref="Core.OperatorBinding.Id"/> derived from
+    /// (TenantId, WorkspaceId, TelegramUserId, TelegramChatId) so
+    /// repeated reads yield a stable id usable as a
+    /// <c>TaskOversight.OperatorBindingId</c> foreign key in
+    /// fixture-driven acceptance tests.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Distinct from <see cref="OperatorBindings"/>.</b>
+    /// <see cref="OperatorBindings"/> drives inbound authorization
+    /// (<see cref="Auth.ConfiguredOperatorAuthorizationService"/>) —
+    /// pinning which (user, chat) pairs may issue commands. The
+    /// <see cref="DevOperators"/> list, by contrast, is the
+    /// "directory" the Stage 2.7 swarm-event subscription service
+    /// reads when resolving outbound routing in dev / unit-test /
+    /// integration-test hosts. The two lists may overlap (and
+    /// typically do in fixtures), but they may also legitimately
+    /// diverge — e.g. a dev host wired to receive events for tenants
+    /// that no human is permitted to message back into.
+    /// </para>
+    /// <para>
+    /// Replaced in production by the Stage 3.4
+    /// <c>PersistentOperatorRegistry</c> which reads from the
+    /// <c>operator_bindings</c> table; the production registration
+    /// supersedes <see cref="Swarm.StubOperatorRegistry"/> via the
+    /// <c>TryAddSingleton</c> / <c>AddSingleton</c> last-wins
+    /// pattern. Validator coverage: entries reuse
+    /// <see cref="TelegramOperatorBindingOptions"/> so the existing
+    /// <see cref="TelegramOptionsValidator"/> TenantId/WorkspaceId
+    /// non-blank guard applies (added in Stage 2.7 — see
+    /// <c>TelegramOptionsValidator.Validate</c>).
+    /// </para>
+    /// </remarks>
+    public List<TelegramOperatorBindingOptions> DevOperators { get; set; } = new();
+
+    /// <summary>
     /// Shared secret echoed by Telegram in the
     /// <c>X-Telegram-Bot-Api-Secret-Token</c> header. Validated by
     /// <c>TelegramWebhookSecretFilter</c> in Stage 2.4. Also a secret —
