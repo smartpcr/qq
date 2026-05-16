@@ -21,6 +21,6 @@ public interface IKeyVaultSecretClient
     /// </summary>
     /// <param name="secretName">The name of the secret to retrieve.</param>
     /// <param name="cancellationToken">A token to observe while waiting for the operation to complete.</param>
-    /// <returns>The plaintext secret value.</returns>
-    Task<string> GetSecretAsync(string secretName, CancellationToken cancellationToken = default);
+    /// <returns>The plaintext secret value, or <see langword="null"/> when the secret is not present.</returns>
+    Task<string?> GetSecretAsync(string secretName, CancellationToken cancellationToken = default);
 }

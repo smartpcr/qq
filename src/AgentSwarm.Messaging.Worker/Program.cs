@@ -2,6 +2,7 @@ using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Security;
+using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
@@ -121,7 +122,53 @@ public class Program
             .AddControllers(options =>
             {
                 options.Filters.AddService<SlackAuthorizationFilter>();
-            });
+            })
+            // Stage 4.1: discover the Slack inbound controllers
+            // (SlackEventsController, SlackCommandsController,
+            // SlackInteractionsController) which live in the
+            // AgentSwarm.Messaging.Slack class library. Without this
+            // call MVC's application-part scanner only sees the
+            // Worker entry assembly and would not map the
+            // /api/slack/* routes.
+            .AddSlackInboundControllers();
+
+        // Stage 4.1: register the inbound HTTP transport services
+        // (envelope factory, in-process ISlackInboundQueue, default
+        // modal fast-path handler). The TryAdd-style bindings let a
+        // future composition root swap in durable queue implementations
+        // (Service Bus, SQL outbox/inbox) supplied by
+        // AgentSwarm.Messaging.Core without changing this call site.
+        builder.Services.AddSlackInboundTransport();
+
+        // Stage 4.1 (evaluator iter-3 item 2): swap the default
+        // in-process-only ISlackFastPathIdempotencyStore for the
+        // durable two-level composite (in-process L1 + EF L2 backed by
+        // the slack_inbound_request_record table). Without this call
+        // the modal fast-path falls back to in-memory dedup that does
+        // not survive a process restart, allowing a Slack retry that
+        // crosses a deployment to open a second modal for the same
+        // trigger_id.
+        builder.Services
+            .AddSlackFastPathDurableIdempotency<SlackPersistenceDbContext>();
+
+        // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the
+        // durable file-system dead-letter sink for post-ACK enqueue
+        // failures. The default registration inside
+        // AddSlackInboundTransport is InMemorySlackInboundEnqueueDeadLetterSink,
+        // which loses captured envelopes on process restart -- the
+        // operator-uploaded story attachment's FR-005 / FR-007
+        // "no message loss" requirements (and the iter-4 evaluator)
+        // require durable persistence so a worker restart cannot
+        // erase the recovery log. Hosts configure the destination via
+        // Slack:Inbound:DeadLetterDirectory; the default value points
+        // at a relative "data/slack-inbound-dead-letter" path so a
+        // missing config does NOT silently fall back to in-memory.
+        string deadLetterDir = builder.Configuration["Slack:Inbound:DeadLetterDirectory"]
+            ?? "data/slack-inbound-dead-letter";
+        if (!string.IsNullOrWhiteSpace(deadLetterDir))
+        {
+            builder.Services.AddFileSystemSlackInboundEnqueueDeadLetterSink(deadLetterDir);
+        }
 
         WebApplication app = builder.Build();
 
