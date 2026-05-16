@@ -6,19 +6,36 @@ using Microsoft.Extensions.Logging;
 
 /// <summary>
 /// Shared body for <c>/pause</c> and <c>/resume</c>. Both commands take
-/// a single positional <see cref="SwarmCommand.TaskId"/> argument and
+/// a single positional argument — either an <c>AGENT-ID</c> (single-agent
+/// scope) or the literal <c>all</c> (workspace-wide fan-out scoped to
+/// the operator's <see cref="AuthorizedOperator.WorkspaceId"/>) — and
 /// emit a <see cref="SwarmCommand"/> on <see cref="ISwarmCommandBus"/>
-/// with the appropriate <see cref="SwarmCommand.CommandType"/>. Sharing
-/// the orchestration here makes the contract a single edit away when
-/// the team adds e.g. a comment-payload override or per-agent scope.
+/// with the appropriate <see cref="SwarmCommand.CommandType"/>,
+/// <see cref="SwarmCommand.AgentId"/>, <see cref="SwarmCommand.WorkspaceId"/>
+/// and <see cref="SwarmCommand.Scope"/>. The architecture.md §5 command
+/// table specifies <c>/pause AGENT-ID</c> | <c>/pause all</c> and
+/// <c>/resume AGENT-ID</c> | <c>/resume all</c>; the orchestrator
+/// receives the structured fields rather than re-parsing the raw text.
+/// Sharing the orchestration here makes the contract a single edit away
+/// when the team adds e.g. a comment-payload override or a per-task scope.
 /// </summary>
 public abstract class LifecycleCommandHandlerBase : ICommandHandler
 {
-    public const string MissingTaskIdMessage =
-        "Usage: `/{0} <taskId>` — supply the id of the task to {0}.";
+    /// <summary>
+    /// Literal token the operator types to fan out the command to every
+    /// agent in their workspace. Case-insensitive match per architecture
+    /// (<c>/pause all</c>, <c>/PAUSE All</c>, <c>/pause ALL</c> all match).
+    /// </summary>
+    public const string AllScopeToken = "all";
 
-    public const string ConfirmationTemplate =
-        "✅ {0} signal sent for task {1}. Correlation: {2}";
+    public const string MissingTargetMessage =
+        "Usage: `/{0} <agentId>` or `/{0} all` — name the agent to {0} or use `all` for every agent in your workspace.";
+
+    public const string SingleConfirmationTemplate =
+        "✅ {0} signal sent to agent {1}. Correlation: {2}";
+
+    public const string AllConfirmationTemplate =
+        "✅ {0} signal sent to all agents in workspace {1}. Correlation: {2}";
 
     private readonly ISwarmCommandBus _bus;
     private readonly ILogger _logger;
@@ -64,47 +81,62 @@ public abstract class LifecycleCommandHandlerBase : ICommandHandler
                 Success = false,
                 ResponseText = string.Format(
                     CultureInfo.InvariantCulture,
-                    MissingTaskIdMessage,
+                    MissingTargetMessage,
                     CommandName),
-                ErrorCode = $"{CommandName}_missing_task_id",
+                ErrorCode = $"{CommandName}_missing_target",
                 CorrelationId = Guid.NewGuid().ToString("N"),
             };
         }
 
-        var taskId = command.Arguments[0];
+        var target = command.Arguments[0].Trim();
+        var isAllScope = string.Equals(target, AllScopeToken, StringComparison.OrdinalIgnoreCase);
         var correlationId = Guid.NewGuid().ToString("N");
+
         var swarmCommand = new SwarmCommand
         {
             CommandType = SwarmCommandTypeValue,
-            TaskId = taskId,
+            AgentId = isAllScope ? null : target,
+            WorkspaceId = @operator.WorkspaceId,
+            Scope = isAllScope ? SwarmCommandScope.All : SwarmCommandScope.Single,
             OperatorId = @operator.OperatorId,
             CorrelationId = correlationId,
         };
 
         _logger.LogInformation(
-            "{Command}CommandHandler publishing lifecycle signal. TaskId={TaskId} OperatorId={OperatorId} CorrelationId={CorrelationId}",
+            "{Command}CommandHandler publishing lifecycle signal. AgentId={AgentId} WorkspaceId={WorkspaceId} Scope={Scope} OperatorId={OperatorId} CorrelationId={CorrelationId}",
             CommandName,
-            taskId,
+            swarmCommand.AgentId ?? "(all)",
+            swarmCommand.WorkspaceId,
+            swarmCommand.Scope,
             @operator.OperatorId,
             correlationId);
 
         await _bus.PublishCommandAsync(swarmCommand, ct).ConfigureAwait(false);
 
+        var responseText = isAllScope
+            ? string.Format(
+                CultureInfo.InvariantCulture,
+                AllConfirmationTemplate,
+                DisplayVerb,
+                @operator.WorkspaceId,
+                correlationId)
+            : string.Format(
+                CultureInfo.InvariantCulture,
+                SingleConfirmationTemplate,
+                DisplayVerb,
+                target,
+                correlationId);
+
         return new CommandResult
         {
             Success = true,
-            ResponseText = string.Format(
-                CultureInfo.InvariantCulture,
-                ConfirmationTemplate,
-                DisplayVerb,
-                taskId,
-                correlationId),
+            ResponseText = responseText,
             CorrelationId = correlationId,
         };
     }
 }
 
-/// <summary>Handles <c>/pause &lt;taskId&gt;</c>.</summary>
+/// <summary>Handles <c>/pause &lt;agentId&gt;</c> and <c>/pause all</c>.</summary>
 public sealed class PauseCommandHandler : LifecycleCommandHandlerBase
 {
     public PauseCommandHandler(
@@ -119,7 +151,7 @@ public sealed class PauseCommandHandler : LifecycleCommandHandlerBase
     protected override string DisplayVerb => "Pause";
 }
 
-/// <summary>Handles <c>/resume &lt;taskId&gt;</c>.</summary>
+/// <summary>Handles <c>/resume &lt;agentId&gt;</c> and <c>/resume all</c>.</summary>
 public sealed class ResumeCommandHandler : LifecycleCommandHandlerBase
 {
     public ResumeCommandHandler(

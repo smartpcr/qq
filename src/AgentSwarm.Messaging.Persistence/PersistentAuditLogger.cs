@@ -40,6 +40,25 @@ using Microsoft.Extensions.Logging;
 /// <see cref="PersistentOutboundDeadLetterStore"/>,
 /// <see cref="PersistentTaskOversightRepository"/>.
 /// </para>
+/// <para>
+/// <b>Failure semantics.</b> Audit writes are best-effort. Both the
+/// <see cref="IAuditLogger.LogAsync"/> and
+/// <see cref="IAuditLogger.LogHumanResponseAsync"/> paths are called
+/// by command handlers (e.g. <c>DecisionCommandHandlerBase</c>,
+/// <c>HandoffCommandHandler</c>) <em>after</em> the user-visible
+/// business side effect — publishing the
+/// <c>HumanDecisionEvent</c>, upserting the task-oversight row,
+/// enqueueing the operator notification — has already committed.
+/// Propagating an audit persistence error at that point would surface
+/// a failure to the operator even though the business event landed
+/// successfully, and would prevent the handler from returning the
+/// success <c>CommandResult</c>. Both writer paths therefore <em>log
+/// and swallow</em> any exception raised by
+/// <see cref="Microsoft.EntityFrameworkCore.DbContext.SaveChangesAsync(CancellationToken)"/>,
+/// matching the silent-success behaviour of
+/// <c>NullAuditLogger</c>. The error log keeps the failure
+/// observable for operations / Stage 5.3 to investigate.
+/// </para>
 /// </remarks>
 public sealed class PersistentAuditLogger : IAuditLogger
 {
@@ -113,17 +132,24 @@ public sealed class PersistentAuditLogger : IAuditLogger
         }
         catch (Exception ex)
         {
-            // Audit writes are never the hot path; failing loud here
-            // could mask the original business event with an unrelated
-            // persistence error. Log and continue — the upstream caller
-            // already responded to the operator.
+            // Audit writes are best-effort. Command handlers
+            // (DecisionCommandHandlerBase, HandoffCommandHandler)
+            // invoke the audit path *after* publishing the
+            // HumanDecisionEvent / upserting the oversight row /
+            // enqueueing the operator notification, so the business
+            // side effect is already committed by the time we get
+            // here. Re-throwing would propagate a persistence failure
+            // back through the handler and prevent the operator's
+            // success CommandResult from being returned — they would
+            // see an error even though the decision / handoff landed.
+            // Log loudly so ops can investigate, then swallow to keep
+            // the handler contract intact (mirrors NullAuditLogger).
             _logger.LogError(
                 ex,
-                "PersistentAuditLogger failed to persist audit row. EntryId={EntryId} EntryKind={EntryKind} CorrelationId={CorrelationId}",
+                "PersistentAuditLogger failed to persist audit row; swallowing to preserve handler success path. EntryId={EntryId} EntryKind={EntryKind} CorrelationId={CorrelationId}",
                 row.EntryId,
                 row.EntryKind,
                 row.CorrelationId);
-            throw;
         }
     }
 }
