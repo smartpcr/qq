@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>AgentSwarm.Messaging.Worker</RootNamespace>
+    <AssemblyName>AgentSwarm.Messaging.Worker</AssemblyName>
+    <UserSecretsId>agentswarm-messaging-worker-2cf8aa67</UserSecretsId>
+    <Description>ASP.NET Core host that exposes the Slack inbound HTTP endpoints, runs the background message-processing pipeline, and bootstraps connector DI.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AgentSwarm.Messaging.Slack\AgentSwarm.Messaging.Slack.csproj" />
+    <ProjectReference Include="..\AgentSwarm.Messaging.Persistence\AgentSwarm.Messaging.Persistence.csproj" />
+  </ItemGroup>
+
+</Project>

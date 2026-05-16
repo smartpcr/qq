@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>AgentSwarm.Messaging.Slack</RootNamespace>
+    <AssemblyName>AgentSwarm.Messaging.Slack</AssemblyName>
+    <Description>Slack connector: Events API + Web API integration, slash commands, Block Kit, modals, threading, signature verification, and authorization.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj" />
+    <ProjectReference Include="..\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj" />
+    <ProjectReference Include="..\AgentSwarm.Messaging.Persistence\AgentSwarm.Messaging.Persistence.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SlackNet" Version="0.17.10" />
+    <PackageReference Include="SlackNet.AspNetCore" Version="0.17.10" />
+  </ItemGroup>
+
+</Project>
