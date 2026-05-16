@@ -20,6 +20,7 @@ public class MessengerMessageTests
             Body: "Deploy succeeded.",
             Severity: MessageSeverity.Normal,
             CorrelationId: "trace-1",
+            Timestamp: new DateTimeOffset(2026, 5, 15, 10, 0, 0, TimeSpan.Zero),
             Metadata: new Dictionary<string, string>
             {
                 ["ThreadId"] = "9988776655",
@@ -35,6 +36,7 @@ public class MessengerMessageTests
         roundTripped.Body.Should().Be("Deploy succeeded.");
         roundTripped.Severity.Should().Be(MessageSeverity.Normal);
         roundTripped.CorrelationId.Should().Be("trace-1");
+        roundTripped.Timestamp.Should().Be(message.Timestamp);
         roundTripped.Metadata.Should().NotBeNull();
         roundTripped.Metadata!["ThreadId"].Should().Be("9988776655");
         roundTripped.Metadata["AgentId"].Should().Be("deploy-agent");
@@ -48,7 +50,8 @@ public class MessengerMessageTests
             ChannelId: "1",
             Body: "hello",
             Severity: MessageSeverity.Low,
-            CorrelationId: "trace");
+            CorrelationId: "trace",
+            Timestamp: DateTimeOffset.UnixEpoch);
 
         var json = JsonSerializer.Serialize(message, JsonOptions);
         var roundTripped = JsonSerializer.Deserialize<MessengerMessage>(json, JsonOptions);
@@ -65,7 +68,8 @@ public class MessengerMessageTests
             ChannelId: "1",
             Body: "critical alert",
             Severity: MessageSeverity.Critical,
-            CorrelationId: "trace");
+            CorrelationId: "trace",
+            Timestamp: DateTimeOffset.UnixEpoch);
 
         var json = JsonSerializer.Serialize(message, JsonOptions);
 
