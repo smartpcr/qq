@@ -11,7 +11,7 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 /// payloads using the <c>AdaptiveCards</c> NuGet package and wraps each card in a
 /// Bot Framework <see cref="Attachment"/> with
 /// <c>ContentType = "application/vnd.microsoft.card.adaptive"</c>. Implements steps 1–5 of
-/// <c>implementation-plan.md</c> §3.1.
+/// <c>implementation-plan.md</c> §3.1 and the lifecycle-notice cards added in §3.3.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -29,11 +29,44 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 /// same submit. <see cref="CardActionMapper"/> reads the merged payload on the inbound
 /// round-trip.
 /// </para>
+/// <para>
+/// <b>Clock.</b> Lifecycle-notice cards (<see cref="RenderExpiredNoticeCard"/> and
+/// <see cref="RenderCancelledNoticeCard"/>) stamp a "Recorded at" timestamp through the
+/// injected <see cref="TimeProvider"/>, matching the deterministic-clock pattern used by
+/// <c>SqlAgentQuestionStore</c>, <c>SqlCardStateStore</c>, <c>CardActionHandler</c>, and
+/// <c>QuestionExpiryProcessor</c>. The parameterless constructor binds to
+/// <see cref="TimeProvider.System"/> so existing call sites keep working unchanged.
+/// </para>
 /// </remarks>
 public sealed class AdaptiveCardBuilder : IAdaptiveCardRenderer
 {
     /// <summary>The Adaptive Card schema version emitted by every <c>Render*</c> method.</summary>
     public static readonly AdaptiveSchemaVersion SchemaVersion = new(1, 5);
+
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>
+    /// Construct the builder bound to the system clock. Used by production DI registrations
+    /// and by call sites that do not need to fake the clock.
+    /// </summary>
+    public AdaptiveCardBuilder()
+        : this(TimeProvider.System)
+    {
+    }
+
+    /// <summary>
+    /// Test-friendly constructor that accepts a deterministic <see cref="TimeProvider"/>
+    /// so unit tests can verify the "Recorded at" stamp on the expired/cancelled notice
+    /// cards without wall-clock flakiness. Mirrors the TimeProvider-injection pattern
+    /// adopted by <c>SqlAgentQuestionStore</c>, <c>SqlCardStateStore</c>,
+    /// <c>CardActionHandler</c>, and <c>QuestionExpiryProcessor</c>.
+    /// </summary>
+    /// <param name="timeProvider">Time source used for lifecycle-notice timestamps.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="timeProvider"/> is <c>null</c>.</exception>
+    public AdaptiveCardBuilder(TimeProvider timeProvider)
+    {
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+    }
 
     /// <inheritdoc />
     public Attachment RenderQuestionCard(AgentQuestion question)
@@ -329,11 +362,16 @@ public sealed class AdaptiveCardBuilder : IAdaptiveCardRenderer
 
         var card = new AdaptiveCard(SchemaVersion);
         AddPlainHeader(card, "Question expired");
+        // "Recorded at" is sourced from the injected TimeProvider (not DateTimeOffset.UtcNow)
+        // so the lifecycle-notice card is deterministic under FakeTimeProvider in unit
+        // tests and consistent with the store-owned timestamp pattern used by
+        // SqlAgentQuestionStore / SqlCardStateStore / CardActionHandler /
+        // QuestionExpiryProcessor.
         card.Body.Add(BuildMetadataFactSet(new (string, string)[]
         {
             ("Question", questionId),
             ("Status", "Expired"),
-            ("Recorded at", FormatTimestamp(DateTimeOffset.UtcNow)),
+            ("Recorded at", FormatTimestamp(_timeProvider.GetUtcNow())),
         }));
         card.Body.Add(new AdaptiveTextBlock
         {
@@ -355,11 +393,16 @@ public sealed class AdaptiveCardBuilder : IAdaptiveCardRenderer
 
         var card = new AdaptiveCard(SchemaVersion);
         AddPlainHeader(card, "Question cancelled");
+        // "Recorded at" is sourced from the injected TimeProvider (not DateTimeOffset.UtcNow)
+        // so the lifecycle-notice card is deterministic under FakeTimeProvider in unit
+        // tests and consistent with the store-owned timestamp pattern used by
+        // SqlAgentQuestionStore / SqlCardStateStore / CardActionHandler /
+        // QuestionExpiryProcessor.
         card.Body.Add(BuildMetadataFactSet(new (string, string)[]
         {
             ("Question", questionId),
             ("Status", "Cancelled"),
-            ("Recorded at", FormatTimestamp(DateTimeOffset.UtcNow)),
+            ("Recorded at", FormatTimestamp(_timeProvider.GetUtcNow())),
         }));
         card.Body.Add(new AdaptiveTextBlock
         {
