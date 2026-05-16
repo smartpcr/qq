@@ -8,8 +8,6 @@ namespace AgentSwarm.Messaging.Slack.Tests.Persistence;
 
 using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Data.Common;
 using System.Linq;
 using AgentSwarm.Messaging.Slack.Entities;
 using AgentSwarm.Messaging.Slack.Persistence;
@@ -97,7 +95,7 @@ public sealed class SlackAddSlackEntitiesContractTests
                 .UseSqlite(connection)
                 .Options;
 
-        IReadOnlyList<string> before = ListSqliteUserTables(connection);
+        IReadOnlyList<string> before = SqliteTestHelpers.ListSqliteUserTables(connection);
         before.Should().BeEmpty(
             because: "the in-memory database starts empty before EnsureCreated");
 
@@ -106,7 +104,7 @@ public sealed class SlackAddSlackEntitiesContractTests
             db.Database.EnsureCreated().Should().BeTrue();
         }
 
-        IReadOnlyList<string> after = ListSqliteUserTables(connection);
+        IReadOnlyList<string> after = SqliteTestHelpers.ListSqliteUserTables(connection);
         after.Should().Contain(new[]
         {
             ExpectedWorkspaceTable,
@@ -144,29 +142,6 @@ public sealed class SlackAddSlackEntitiesContractTests
             because: "AddSlackEntities must make SlackWorkspaceConfig retrievable via Set<T>() on the upstream-style context");
         loaded!.TeamId.Should().Be(UpstreamTeamId);
         loaded.WorkspaceName.Should().Be(SlackDbSeeder.SampleWorkspaceName);
-    }
-
-    private static IReadOnlyList<string> ListSqliteUserTables(SqliteConnection connection)
-    {
-        ArgumentNullException.ThrowIfNull(connection);
-
-        if (connection.State != ConnectionState.Open)
-        {
-            connection.Open();
-        }
-
-        using DbCommand cmd = connection.CreateCommand();
-        cmd.CommandText =
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
-
-        List<string> names = new();
-        using DbDataReader reader = cmd.ExecuteReader();
-        while (reader.Read())
-        {
-            names.Add(reader.GetString(0));
-        }
-
-        return names;
     }
 
     /// <summary>
