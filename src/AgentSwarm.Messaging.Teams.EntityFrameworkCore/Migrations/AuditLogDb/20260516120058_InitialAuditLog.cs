@@ -69,6 +69,19 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore.Migrations.AuditLogDb
             // tech-spec.md §4.3) demands tamper-resistance be on by default; an
             // opt-in flag would defeat the audit invariant during the time the
             // flag is off.
+            //
+            // The trigger / role / permission statements below intentionally do
+            // NOT pass `suppressTransaction: true` (review iter-r0 — atomic
+            // rollback). CREATE TRIGGER, CREATE ROLE, GRANT, REVOKE and DENY
+            // are all transactional DDL in SQL Server and may run inside the
+            // migration's ambient transaction; participating in that transaction
+            // means a failure in any later step (e.g. the second trigger, a
+            // GRANT, or the __EFMigrationsHistory insert) rolls back the partial
+            // changes instead of leaving the database in a half-applied state
+            // with triggers but no role, or permissions but no triggers. The
+            // "first statement in batch" rule for CREATE TRIGGER is still
+            // satisfied because each `migrationBuilder.Sql(...)` call is emitted
+            // as its own batch by the SQL Server migrations generator.
             migrationBuilder.Sql(
                 "CREATE TRIGGER [dbo].[TR_AuditLog_NoUpdate] " +
                 "ON [dbo].[AuditLog] " +
@@ -77,8 +90,7 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore.Migrations.AuditLogDb
                 "BEGIN " +
                 "    SET NOCOUNT ON; " +
                 "    THROW 50001, 'AuditLog rows are immutable: UPDATE is not permitted on this table.', 1; " +
-                "END;",
-                suppressTransaction: true);
+                "END;");
 
             migrationBuilder.Sql(
                 "CREATE TRIGGER [dbo].[TR_AuditLog_NoDelete] " +
@@ -88,8 +100,7 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore.Migrations.AuditLogDb
                 "BEGIN " +
                 "    SET NOCOUNT ON; " +
                 "    THROW 50002, 'AuditLog rows are immutable: DELETE is not permitted on this table.', 1; " +
-                "END;",
-                suppressTransaction: true);
+                "END;");
 
             // ── Stage 5.2 Step 2 (defense-in-depth GRANT / DENY) ────────────────────────
             // Per tech-spec.md §4.3 and the implementation-plan step 2:
@@ -128,38 +139,34 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore.Migrations.AuditLogDb
             // that is verifiable end-to-end against a SQL Server instance.
             migrationBuilder.Sql(
                 "IF DATABASE_PRINCIPAL_ID('AuditLogWriter') IS NULL " +
-                "    EXEC('CREATE ROLE [AuditLogWriter];');",
-                suppressTransaction: true);
+                "    EXEC('CREATE ROLE [AuditLogWriter];');");
 
             migrationBuilder.Sql(
-                "GRANT INSERT, SELECT ON OBJECT::[dbo].[AuditLog] TO [AuditLogWriter];",
-                suppressTransaction: true);
+                "GRANT INSERT, SELECT ON OBJECT::[dbo].[AuditLog] TO [AuditLogWriter];");
 
             migrationBuilder.Sql(
-                "REVOKE UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [AuditLogWriter];",
-                suppressTransaction: true);
+                "REVOKE UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [AuditLogWriter];");
 
             migrationBuilder.Sql(
-                "REVOKE UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [public];",
-                suppressTransaction: true);
+                "REVOKE UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [public];");
 
             migrationBuilder.Sql(
-                "DENY UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] TO [public];",
-                suppressTransaction: true);
+                "DENY UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] TO [public];");
         }
 
         /// <inheritdoc />
         protected override void Down(MigrationBuilder migrationBuilder)
         {
             // Reverse the GRANT / DENY before dropping the table so the permission
-            // entries do not become orphaned in sys.database_permissions.
+            // entries do not become orphaned in sys.database_permissions. These run
+            // inside the migration's ambient transaction (no suppressTransaction)
+            // so a failure in the role-drop or DropTable step rolls back the
+            // permission changes atomically — see Up() for the rationale.
             migrationBuilder.Sql(
-                "REVOKE INSERT, SELECT, UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [AuditLogWriter];",
-                suppressTransaction: true);
+                "REVOKE INSERT, SELECT, UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [AuditLogWriter];");
 
             migrationBuilder.Sql(
-                "REVOKE UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [public];",
-                suppressTransaction: true);
+                "REVOKE UPDATE, DELETE ON OBJECT::[dbo].[AuditLog] FROM [public];");
 
             // Drop the role only when it has no remaining members (deployment scripts
             // that ALTER ROLE [AuditLogWriter] ADD MEMBER expect the role to outlive
@@ -169,16 +176,13 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore.Migrations.AuditLogDb
                 "IF DATABASE_PRINCIPAL_ID('AuditLogWriter') IS NOT NULL " +
                 "    AND NOT EXISTS (SELECT 1 FROM sys.database_role_members " +
                 "                    WHERE role_principal_id = DATABASE_PRINCIPAL_ID('AuditLogWriter')) " +
-                "    EXEC('DROP ROLE [AuditLogWriter];');",
-                suppressTransaction: true);
+                "    EXEC('DROP ROLE [AuditLogWriter];');");
 
             migrationBuilder.Sql(
-                "IF OBJECT_ID('dbo.TR_AuditLog_NoDelete', 'TR') IS NOT NULL DROP TRIGGER [dbo].[TR_AuditLog_NoDelete];",
-                suppressTransaction: true);
+                "IF OBJECT_ID('dbo.TR_AuditLog_NoDelete', 'TR') IS NOT NULL DROP TRIGGER [dbo].[TR_AuditLog_NoDelete];");
 
             migrationBuilder.Sql(
-                "IF OBJECT_ID('dbo.TR_AuditLog_NoUpdate', 'TR') IS NOT NULL DROP TRIGGER [dbo].[TR_AuditLog_NoUpdate];",
-                suppressTransaction: true);
+                "IF OBJECT_ID('dbo.TR_AuditLog_NoUpdate', 'TR') IS NOT NULL DROP TRIGGER [dbo].[TR_AuditLog_NoUpdate];");
 
             migrationBuilder.DropTable(
                 name: "AuditLog");
