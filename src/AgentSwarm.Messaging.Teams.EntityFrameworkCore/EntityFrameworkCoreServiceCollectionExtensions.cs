@@ -179,8 +179,9 @@ public static class EntityFrameworkCoreServiceCollectionExtensions
         services.AddDbContextFactory<TeamsOutboxDbContext>(optionsAction);
         services.TryAddSingleton<TimeProvider>(TimeProvider.System);
 
-        // Safe default — overridden when the host also calls AddTeamsOutbox(), but
-        // ensures SqlMessageOutbox resolves even when wired in isolation. SqlMessageOutbox
+        // Safe default — overridden when the host also calls AddTeamsOutboxEngine() (the
+        // Stage 6.1 helper in AgentSwarm.Messaging.Teams.Outbox), but ensures
+        // SqlMessageOutbox resolves even when wired in isolation. SqlMessageOutbox
         // requires non-null OutboxOptions via its constructor null-guard.
         services.TryAddSingleton<OutboxOptions>();
         services.TryAddSingleton<SqlMessageOutbox>();
