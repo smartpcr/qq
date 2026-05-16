@@ -43,6 +43,7 @@ public static class SlackConnectorServiceCollectionExtensions
 
         var connectorSection = configuration.GetSection(SlackConnectorOptions.SectionName);
         var retrySection = configuration.GetSection(SlackRetryOptions.SectionName);
+        var idempotencySection = configuration.GetSection(SlackIdempotencyOptions.SectionName);
 
         services
             .AddOptions<SlackConnectorOptions>()
@@ -51,6 +52,15 @@ public static class SlackConnectorServiceCollectionExtensions
             .Validate(
                 opts => opts.MaxWorkspaces > 0,
                 $"{nameof(SlackConnectorOptions)}.{nameof(SlackConnectorOptions.MaxWorkspaces)} must be greater than zero.")
+            .Validate(
+                opts => opts.Idempotency is not null && opts.Idempotency.StaleProcessingThresholdSeconds > 0,
+                $"{nameof(SlackConnectorOptions)}.{nameof(SlackConnectorOptions.Idempotency)}.{nameof(SlackIdempotencyOptions.StaleProcessingThresholdSeconds)} must be greater than zero.")
+            .Validate(
+                opts => opts.Idempotency is not null && opts.Idempotency.CompletionMaxAttempts > 0,
+                $"{nameof(SlackConnectorOptions)}.{nameof(SlackConnectorOptions.Idempotency)}.{nameof(SlackIdempotencyOptions.CompletionMaxAttempts)} must be greater than zero.")
+            .Validate(
+                opts => opts.Idempotency is not null && opts.Idempotency.CompletionInitialDelayMilliseconds >= 0,
+                $"{nameof(SlackConnectorOptions)}.{nameof(SlackConnectorOptions.Idempotency)}.{nameof(SlackIdempotencyOptions.CompletionInitialDelayMilliseconds)} must be non-negative.")
             .ValidateOnStart();
 
         services
@@ -63,6 +73,26 @@ public static class SlackConnectorServiceCollectionExtensions
             .Validate(
                 opts => opts.InitialDelayMilliseconds >= 0,
                 $"{nameof(SlackRetryOptions)}.{nameof(SlackRetryOptions.InitialDelayMilliseconds)} must be non-negative.")
+            .ValidateOnStart();
+
+        // Bind Slack:Idempotency directly too so consumers that resolve
+        // IOptions<SlackIdempotencyOptions> get the same values as
+        // SlackConnectorOptions.Idempotency. The connector-level section
+        // remains the single source of truth; this companion binding
+        // is purely a convenience for places that only need the lease
+        // knobs without depending on the whole connector options bag.
+        services
+            .AddOptions<SlackIdempotencyOptions>()
+            .Bind(idempotencySection)
+            .Validate(
+                opts => opts.StaleProcessingThresholdSeconds > 0,
+                $"{nameof(SlackIdempotencyOptions)}.{nameof(SlackIdempotencyOptions.StaleProcessingThresholdSeconds)} must be greater than zero.")
+            .Validate(
+                opts => opts.CompletionMaxAttempts > 0,
+                $"{nameof(SlackIdempotencyOptions)}.{nameof(SlackIdempotencyOptions.CompletionMaxAttempts)} must be greater than zero.")
+            .Validate(
+                opts => opts.CompletionInitialDelayMilliseconds >= 0,
+                $"{nameof(SlackIdempotencyOptions)}.{nameof(SlackIdempotencyOptions.CompletionInitialDelayMilliseconds)} must be non-negative.")
             .ValidateOnStart();
 
         return services;
