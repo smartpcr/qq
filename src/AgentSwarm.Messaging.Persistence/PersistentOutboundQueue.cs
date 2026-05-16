@@ -201,12 +201,27 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
         }
 
         // Normal Pending insert. Use the row as-supplied except for
-        // MaxAttempts — when the caller did not override the record
-        // default (5), bind it to the configured option so a host
-        // tuning the global cap via OutboundQueue:MaxRetries does
-        // not have to touch every enqueue site.
+        // MaxAttempts — `OutboundMessage.MaxAttempts` is a `required
+        // int` with no initializer, so its uninitialized value is the
+        // CLR default `0`. We treat exactly `0` as the "caller did
+        // not specify a per-message cap" sentinel and bind it to the
+        // host-tunable `OutboundQueue:MaxRetries` so adjusting the
+        // global cap does not require touching every enqueue site.
+        // Any non-zero value (including `1` for "attempt once, no
+        // retries") is honored verbatim; a negative value is
+        // explicitly rejected as nonsense rather than silently
+        // replaced — silently overriding `-1` (or `0` for callers who
+        // happened to mean it literally) would mask programmer error
+        // and was the surprise the iter-2 reviewer flagged.
         var pending = message;
-        if (pending.MaxAttempts <= 0)
+        if (pending.MaxAttempts < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(message),
+                pending.MaxAttempts,
+                "OutboundMessage.MaxAttempts must be >= 0. Use 0 to accept the configured OutboundQueue:MaxRetries default, or a positive integer to set a per-message cap.");
+        }
+        if (pending.MaxAttempts == 0)
         {
             pending = pending with { MaxAttempts = _options.MaxRetries };
         }
