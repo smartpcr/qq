@@ -387,10 +387,14 @@ public sealed class MessageExtensionHandlerTests
         Assert.Empty(dispatcher.Dispatched);
         Assert.Empty(publisher.Published);
 
-        // Authorization was actually consulted with the canonical verb "agent ask".
+        // Authorization was actually consulted with the canonical verb "agent ask"
+        // AND with the AAD object ID — RBAC is keyed by Entra `oid` claim, not by the
+        // platform-internal user ID. Previously this assertion expected
+        // "internal-viewer"; the iter-2 evaluator caught that the handler was passing
+        // the wrong identifier, so the call site (and this assertion) now use AAD.
         var call = Assert.Single(authorization.Calls);
         Assert.Equal(TenantId, call.TenantId);
-        Assert.Equal("internal-viewer", call.UserId);
+        Assert.Equal(ActorAadObjectId, call.UserId);
         Assert.Equal("agent ask", call.Command);
 
         var entry = Assert.Single(auditLogger.Entries);

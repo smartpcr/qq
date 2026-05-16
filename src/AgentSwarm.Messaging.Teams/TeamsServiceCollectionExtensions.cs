@@ -113,8 +113,48 @@ public static class TeamsServiceCollectionExtensions
 
         services.AddInProcessInboundEventChannel();
         services.AddTeamsCommandDispatcher();
+
+        // Stage 5.1 — every host that wires the Teams connector inherits the security
+        // graph by default. Without this, hosts that compose AddTeamsMessengerConnector
+        // alone (omitting an explicit AddTeamsSecurity() call) silently run with the
+        // Stage 2.1 default-deny stubs for IIdentityResolver / IUserAuthorizationService,
+        // and the TenantValidationMiddleware / InstallationStateGate /
+        // TeamsAppPolicyHealthCheck are never registered. Idempotent — AddTeamsSecurity
+        // uses RemoveAll + TryAdd so the second invocation is a no-op for callers that
+        // already wired the security graph explicitly.
+        services.AddTeamsSecurity();
+
+        // Stage 5.1 iter-4 evaluator feedback item 2 — TimeProvider MUST be in the DI graph
+        // so the constructor-with-TimeProvider+InstallationStateGate overload of
+        // TeamsMessengerConnector / TeamsProactiveNotifier is the one DI resolves.
+        // Without this, the .NET DI activator falls back to a shorter constructor that
+        // delegates with installationStateGate: null, silently bypassing the install-state
+        // pre-check in production.
+        services.TryAddSingleton<TimeProvider>(TimeProvider.System);
+
         services.TryAddSingleton<IMessageExtensionHandler, MessageExtensionHandler>();
-        services.TryAddSingleton<TeamsMessengerConnector>();
+
+        // Stage 5.1 iter-4 evaluator feedback item 2 — pin the connector registration to a
+        // factory that explicitly resolves the canonical 10-arg constructor (which carries
+        // the InstallationStateGate). Relying on .NET DI's "longest satisfiable constructor"
+        // heuristic is too fragile: if a host registers TimeProvider but not
+        // InstallationStateGate the activator silently picks the 9-arg overload and the
+        // install-state pre-check never runs. The factory below resolves the gate via
+        // GetRequiredService<InstallationStateGate>(), so any mis-wiring fails LOUDLY at
+        // first connector resolution rather than silently dropping security enforcement.
+        services.TryAddSingleton<TeamsMessengerConnector>(sp => new TeamsMessengerConnector(
+            adapter: sp.GetRequiredService<Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter>(),
+            options: sp.GetRequiredService<TeamsMessagingOptions>(),
+            conversationReferenceStore: sp.GetRequiredService<IConversationReferenceStore>(),
+            conversationReferenceRouter: sp.GetRequiredService<IConversationReferenceRouter>(),
+            agentQuestionStore: sp.GetRequiredService<IAgentQuestionStore>(),
+            cardStateStore: sp.GetRequiredService<ICardStateStore>(),
+            cardRenderer: sp.GetRequiredService<IAdaptiveCardRenderer>(),
+            inboundEventReader: sp.GetRequiredService<IInboundEventReader>(),
+            logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsMessengerConnector>>(),
+            timeProvider: sp.GetRequiredService<TimeProvider>(),
+            installationStateGate: sp.GetRequiredService<InstallationStateGate>()));
+
         services.TryAddKeyedSingleton<IMessengerConnector>(
             MessengerKey,
             (sp, _) => sp.GetRequiredService<TeamsMessengerConnector>());
@@ -333,7 +373,22 @@ public static class TeamsServiceCollectionExtensions
         // full list and the rationale.
         services.AddTeamsMessengerConnector();
 
-        services.TryAddSingleton<TeamsProactiveNotifier>();
+        // Stage 5.1 iter-4 evaluator feedback item 2 — pin the notifier registration to a
+        // factory that explicitly resolves the canonical 9-arg constructor (which carries
+        // the InstallationStateGate). Mirrors the connector wiring above. Without this,
+        // the .NET DI activator picks a shorter overload that delegates with
+        // installationStateGate: null and the install-state pre-check never runs for
+        // outbox-driven sends.
+        services.TryAddSingleton<TeamsProactiveNotifier>(sp => new TeamsProactiveNotifier(
+            adapter: sp.GetRequiredService<Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter>(),
+            options: sp.GetRequiredService<TeamsMessagingOptions>(),
+            conversationReferenceStore: sp.GetRequiredService<IConversationReferenceStore>(),
+            cardRenderer: sp.GetRequiredService<IAdaptiveCardRenderer>(),
+            cardStateStore: sp.GetRequiredService<ICardStateStore>(),
+            agentQuestionStore: sp.GetRequiredService<IAgentQuestionStore>(),
+            logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsProactiveNotifier>>(),
+            timeProvider: sp.GetRequiredService<TimeProvider>(),
+            installationStateGate: sp.GetRequiredService<InstallationStateGate>()));
         services.TryAddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<TeamsProactiveNotifier>());
 
         return services;

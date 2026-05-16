@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Security;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
@@ -93,6 +94,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
     private readonly IInboundEventReader _inboundEventReader;
     private readonly ILogger<TeamsMessengerConnector> _logger;
     private readonly TimeProvider _timeProvider;
+    private readonly InstallationStateGate? _installationStateGate;
 
     /// <summary>
     /// Construct the connector with the dependencies required by
@@ -153,6 +155,43 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         IInboundEventReader inboundEventReader,
         ILogger<TeamsMessengerConnector> logger,
         TimeProvider timeProvider)
+        : this(
+            adapter,
+            options,
+            conversationReferenceStore,
+            conversationReferenceRouter,
+            agentQuestionStore,
+            cardStateStore,
+            cardRenderer,
+            inboundEventReader,
+            logger,
+            timeProvider,
+            installationStateGate: null)
+    {
+    }
+
+    /// <summary>
+    /// Canonical production constructor wired by <c>AddTeamsMessengerConnector</c> +
+    /// <c>AddTeamsSecurity</c>. Accepts an <see cref="InstallationStateGate"/> so
+    /// <see cref="SendQuestionAsync"/> guards every proactive Adaptive Card delivery with
+    /// the Stage 5.1 install-state pre-check. When the gate is supplied as <c>null</c>
+    /// (legacy test compositions and the constructors above), the install-state probe is
+    /// bypassed — this is intended ONLY for pre-Stage-5.1 unit tests; production hosts
+    /// MUST resolve this constructor via DI so the gate is never null in deployed
+    /// environments.
+    /// </summary>
+    public TeamsMessengerConnector(
+        CloudAdapter adapter,
+        TeamsMessagingOptions options,
+        IConversationReferenceStore conversationReferenceStore,
+        IConversationReferenceRouter conversationReferenceRouter,
+        IAgentQuestionStore agentQuestionStore,
+        ICardStateStore cardStateStore,
+        IAdaptiveCardRenderer cardRenderer,
+        IInboundEventReader inboundEventReader,
+        ILogger<TeamsMessengerConnector> logger,
+        TimeProvider timeProvider,
+        InstallationStateGate? installationStateGate)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _options = options ?? throw new ArgumentNullException(nameof(options));
@@ -164,6 +203,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         _inboundEventReader = inboundEventReader ?? throw new ArgumentNullException(nameof(inboundEventReader));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _installationStateGate = installationStateGate;
     }
 
     /// <inheritdoc />
@@ -185,6 +225,36 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             .ConfigureAwait(false);
         if (stored is null)
         {
+            // Stage 5.1 iter-7 evaluator feedback item 2 — emit InstallationGateRejected
+            // audit + dead-letter the outbox entry BEFORE throwing. Unlike the user/channel
+            // paths, the connector cannot probe install-state before the lookup because
+            // MessengerMessage carries only a Bot Framework ConversationId (no tenant /
+            // user / channel identity). The canonical store's GetByConversationIdAsync
+            // filters by IsActive, so a null result definitively means "no active
+            // reference for this conversation" — which IS the install-state rejection
+            // condition. RejectMessageRoutingAsync produces the same audit row shape and
+            // dead-letter wiring that CheckAsync / CheckTargetAsync produce, so an outbox-
+            // wrapped SendMessageAsync now drops a dead-letter entry instead of allowing
+            // unbounded retry storms, and compliance review sees the same evidence
+            // regardless of which routing path was attempted.
+            if (_installationStateGate is not null)
+            {
+                var reason = await _installationStateGate.RejectMessageRoutingAsync(
+                    message,
+                    message.ConversationId,
+                    outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
+                    cancellationToken: ct).ConfigureAwait(false);
+
+                _logger.LogWarning(
+                    "InstallationStateGate rejected outbound MessengerMessage {MessageId} (correlation {CorrelationId}) for conversation {ConversationId}. Reason: {Reason}",
+                    message.MessageId,
+                    message.CorrelationId,
+                    message.ConversationId,
+                    reason);
+                throw new InvalidOperationException(
+                    $"InstallationStateGate rejected outbound delivery for message '{message.MessageId}': {reason}");
+            }
+
             throw new InvalidOperationException(
                 $"No conversation reference found for conversation '{message.ConversationId}' (message '{message.MessageId}'). " +
                 $"The Teams app must be installed and a prior interaction must have captured a reference before proactive delivery can succeed.");
@@ -237,6 +307,36 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         // Step 2 — resolve the conversation reference from the orchestrator-supplied target
         // user/channel. Only one of TargetUserId / TargetChannelId is set (enforced by
         // AgentQuestion.Validate()); we already verified Validate() returned no errors.
+        //
+        // Stage 5.1 iter-5 evaluator feedback item 1 — STRUCTURAL fix. The
+        // InstallationStateGate MUST run BEFORE the active-only reference lookup. The
+        // real SqlConversationReferenceStore filters Get*Async results by `e.IsActive`,
+        // so an inactive (uninstalled) target returns null and the older "lookup-then-
+        // gate" ordering threw InvalidOperationException BEFORE the gate emitted the
+        // InstallationGateRejected audit row or dead-lettered the outbox entry.
+        // CheckAsync uses IsActiveBy*Async probes (booleans handling missing/inactive
+        // alike) so the gate does not depend on the lookup having succeeded.
+        if (_installationStateGate is not null)
+        {
+            var gateResult = await _installationStateGate.CheckAsync(
+                question,
+                outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
+                correlationId: question.CorrelationId ?? string.Empty,
+                ct).ConfigureAwait(false);
+
+            if (!gateResult.IsActive)
+            {
+                _logger.LogWarning(
+                    "InstallationStateGate rejected synchronous AgentQuestion {QuestionId} (correlation {CorrelationId}) in tenant {TenantId}. Skipping reference lookup and Bot Framework call. Reason: {Reason}",
+                    question.QuestionId,
+                    question.CorrelationId,
+                    question.TenantId,
+                    gateResult.Reason);
+                throw new InvalidOperationException(
+                    $"InstallationStateGate rejected proactive delivery for question '{question.QuestionId}': {gateResult.Reason}");
+            }
+        }
+
         TeamsConversationReference? stored;
         if (!string.IsNullOrWhiteSpace(question.TargetUserId))
         {

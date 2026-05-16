@@ -22,6 +22,17 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
   </ItemGroup>
 
+  <!--
+    Stage 5.1 adds an ASP.NET Core HTTP middleware (TenantValidationMiddleware) and an
+    IHealthCheck (TeamsAppPolicyHealthCheck). Both live in the shared
+    Microsoft.AspNetCore.App framework, so we reference it directly rather than pulling
+    the individual abstraction packages — this matches the integration model the bot
+    framework Integration.AspNet.Core package already uses internally.
+  -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj" />
     <ProjectReference Include="..\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj" />
