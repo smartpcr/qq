@@ -278,6 +278,50 @@ public class Program
         builder.Services.AddSlackThreadLifecycleManagement<SlackPersistenceDbContext>();
         builder.Services.AddSlackChatPostMessageOptions(builder.Configuration);
 
+        // Stage 6.3 evaluator iter-1 item #2 (FR-005 durable outbound
+        // queue + FR-007 zero message loss): replace the in-process
+        // ChannelBasedSlackOutboundQueue + InMemorySlackDeadLetterQueue
+        // defaults BEFORE AddSlackOutboundDispatcher so the
+        // dispatcher's TryAddSingleton fallbacks become no-ops and
+        // both queue surfaces persist across connector restart.
+        // FileSystemSlackOutboundQueue implements
+        // IAcknowledgeableSlackOutboundQueue, which the dispatcher
+        // detects via DI to delete the journal entry only after the
+        // envelope reaches a terminal disposition (delivered or
+        // safely dead-lettered). Hosts override the directory paths
+        // via Slack:Outbound:JournalDirectory / Slack:Outbound:DeadLetterDirectory.
+        string outboundJournalDir = builder.Configuration["Slack:Outbound:JournalDirectory"]
+            ?? "data/slack-outbound-journal";
+        if (!string.IsNullOrWhiteSpace(outboundJournalDir))
+        {
+            builder.Services.AddFileSystemSlackOutboundQueue(outboundJournalDir);
+        }
+
+        string outboundDeadLetterDir = builder.Configuration["Slack:Outbound:DeadLetterDirectory"]
+            ?? "data/slack-outbound-dead-letter";
+        if (!string.IsNullOrWhiteSpace(outboundDeadLetterDir))
+        {
+            builder.Services.AddFileSystemSlackDeadLetterQueue(outboundDeadLetterDir);
+        }
+
+        // Stage 6.3 (workstream:
+        // ws-qq-slack-messenger-supp-phase-outbound-messaging-stage-outbound-dispatch-and-rate-limiting):
+        // register the SlackOutboundDispatcher BackgroundService and
+        // its collaborators (in-process ISlackOutboundQueue, shared
+        // ISlackRateLimiter, HTTP-backed ISlackOutboundDispatchClient,
+        // SlackConnector implementing IMessengerConnector). The
+        // dispatcher drains envelopes pushed by SlackConnector,
+        // applies Slack's per-tier token-bucket limits
+        // (chat.postMessage Tier 2 per-channel; views.update Tier 4
+        // per-workspace), honours HTTP 429 Retry-After by pausing the
+        // bucket, retries transient failures per the shared
+        // ISlackRetryPolicy, and dead-letters envelopes that exhaust
+        // the retry budget. Wired after AddSlackThreadLifecycleManagement
+        // because the dispatcher resolves SlackThreadMapping rows
+        // produced by the thread manager to recover the destination
+        // channel + team for every outbound API call.
+        builder.Services.AddSlackOutboundDispatcher(builder.Configuration);
+
         // Stage 4.3 iter 6 evaluator item #2 (STRUCTURAL fix):
         // AddSlackInboundIngestor INTENTIONALLY no longer registers
         // no-op handler defaults. A production host that resolved

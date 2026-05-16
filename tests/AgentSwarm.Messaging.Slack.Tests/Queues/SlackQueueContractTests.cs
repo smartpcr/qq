@@ -162,6 +162,16 @@ public sealed class SlackQueueContractTests
         // Pinning the field surface here means Stage 4.1 (Slack Outbound
         // Dispatcher) can adopt the record without re-litigating the field
         // list spelled out in implementation-plan.md line 355.
+        //
+        // Stage 6.3 iter 2 added three OPTIONAL init-only members
+        // (MessageTs / ViewId / EnvelopeId) so the dispatcher can
+        // address chat.update / views.update targets end-to-end and
+        // the durable FileSystemSlackOutboundQueue can identify
+        // individual journal entries to delete after a terminal
+        // disposition. The primary constructor parameter list is
+        // unchanged so all existing SendMessage / SendQuestion
+        // call-sites continue to compile; the test below asserts the
+        // FULL public-surface, which now includes those extensions.
         Type t = typeof(SlackOutboundEnvelope);
         string[] props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Select(p => p.Name)
@@ -169,6 +179,29 @@ public sealed class SlackQueueContractTests
             .OrderBy(n => n)
             .ToArray();
         props.Should().BeEquivalentTo(new[]
+        {
+            nameof(SlackOutboundEnvelope.TaskId),
+            nameof(SlackOutboundEnvelope.CorrelationId),
+            nameof(SlackOutboundEnvelope.MessageType),
+            nameof(SlackOutboundEnvelope.BlockKitPayload),
+            nameof(SlackOutboundEnvelope.ThreadTs),
+            nameof(SlackOutboundEnvelope.MessageTs),
+            nameof(SlackOutboundEnvelope.ViewId),
+            nameof(SlackOutboundEnvelope.EnvelopeId),
+        });
+
+        // Independently assert that the PRIMARY-CONSTRUCTOR positional
+        // parameter list remains EXACTLY the brief-mandated 5 fields
+        // so existing producers (SendMessageAsync / SendQuestionAsync)
+        // do not have to update their `new SlackOutboundEnvelope(...)`
+        // call-sites.
+        var ctorParams = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
+            .OrderByDescending(c => c.GetParameters().Length)
+            .First()
+            .GetParameters()
+            .Select(p => p.Name)
+            .ToArray();
+        ctorParams.Should().BeEquivalentTo(new[]
         {
             nameof(SlackOutboundEnvelope.TaskId),
             nameof(SlackOutboundEnvelope.CorrelationId),

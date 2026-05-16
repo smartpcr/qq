@@ -38,6 +38,18 @@ public sealed class SlackConnectorOptionsTests
         options.RateLimits.Tier4.Should().NotBeNull();
         options.RateLimits.Tier2.Scope.Should().Be(SlackRateLimitScope.Channel,
             because: "architecture.md §2.12: chat.postMessage (Tier 2) is per-channel");
+
+        // Stage 6.3 evaluator iter-1 item #3 regression: the shipped
+        // Tier 2 default MUST honour Slack's "~1 message per second per
+        // channel" ceiling for chat.postMessage (= 60 rpm). Earlier
+        // iterations defaulted to 20 rpm, which throttled outbound
+        // posts to ~1 message every 3 seconds and silently capped
+        // agents below the Slack-documented limit. Operators can still
+        // override via Slack:RateLimits:Tier2:RequestsPerMinute when
+        // they want to be more conservative, but the SHIPPED default
+        // must meet the published ceiling.
+        options.RateLimits.Tier2.RequestsPerMinute.Should().BeGreaterOrEqualTo(60,
+            because: "Stage 6.3 evaluator item #3: Slack chat.postMessage ~1 msg/sec/channel = 60 rpm");
     }
 
     [Fact]
