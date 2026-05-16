@@ -4,6 +4,8 @@
 // </copyright>
 // -----------------------------------------------------------------------
 
+namespace AgentSwarm.Messaging.Telegram;
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -17,8 +19,6 @@ using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Requests;
 using Telegram.Bot.Types.Enums;
-
-namespace AgentSwarm.Messaging.Telegram;
 
 /// <summary>
 /// Stage 3.5 — <see cref="BackgroundService"/> that periodically
