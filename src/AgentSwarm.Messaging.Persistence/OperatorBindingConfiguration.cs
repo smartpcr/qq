@@ -51,7 +51,46 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 ///   <c>/handoff @alias</c>) cannot resolve an operator in a
 ///   different tenant. Per architecture.md lines 116–119 and the
 ///   §4.3 cross-doc note, two tenants may independently use the same
-///   alias without collision.</description></item>
+///   alias without collision.
+///   <para>
+///   <b>Lifecycle invariant — deactivation requires alias cleanup
+///   (review-r0 follow-up).</b> This index is intentionally NOT
+///   filtered on <see cref="OperatorBinding.IsActive"/>; it is a
+///   plain SQL <c>UNIQUE</c> covering both active and inactive
+///   rows. That choice keeps the schema portable across the
+///   three providers we target (SQLite uses
+///   <c>WHERE "IsActive" = 1</c>, PostgreSQL prefers
+///   <c>WHERE "IsActive" = TRUE</c>, SQL Server uses
+///   <c>WHERE [IsActive] = 1</c>) without baking a
+///   provider-specific filter fragment into the model config or
+///   the generated migration. The trade-off is that any code path
+///   that flips <see cref="OperatorBinding.IsActive"/> to
+///   <see langword="false"/> MUST also clear or scramble the row's
+///   <see cref="OperatorBinding.OperatorAlias"/> (e.g. rewrite it
+///   to <c>__deactivated__&lt;Guid&gt;</c> or similar) in the same
+///   <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
+///   call. Otherwise a NEW operator (different
+///   <see cref="OperatorBinding.TelegramUserId"/>) attempting to
+///   claim the same <c>(OperatorAlias, TenantId)</c> pair will be
+///   rejected by this index even though the holder is logically
+///   dead, and
+///   <see cref="PersistentOperatorRegistry"/>'s upsert paths
+///   (<c>StageUpsertAsync</c> /
+///   <c>StageUpsertForBatch</c>) will NOT find the stale row to
+///   refresh because they look up by
+///   <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> — a
+///   different user's deactivated alias-holder lives under a
+///   different lookup key and is invisible to the upsert. Nothing
+///   in the current code base sets <c>IsActive = false</c> (the
+///   read-side <c>x.IsActive</c> filters in
+///   <see cref="PersistentOperatorRegistry"/> exist for the
+///   anticipated <c>/deregister</c> / admin-revocation paths), so
+///   today this invariant binds future deactivation code only,
+///   not any existing flow. When the deactivation code lands it
+///   MUST add a regression test covering the
+///   "operator A deactivates → operator B reclaims alias" sequence
+///   to pin the cleanup behaviour against this index.
+///   </para></description></item>
 ///   <item><description><b><c>ux_operator_bindings_user_chat_workspace</c>
 ///   on <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c></b> —
 ///   unique, the canonical "no duplicate binding for the same
@@ -170,6 +209,10 @@ public sealed class OperatorBindingConfiguration : IEntityTypeConfiguration<Oper
         builder.HasIndex(x => new { x.TelegramUserId, x.TelegramChatId })
             .HasDatabaseName("ix_operator_bindings_user_chat");
 
+        // Unfiltered unique index — deactivation MUST clear / scramble
+        // OperatorAlias to free this slot. See the "Lifecycle
+        // invariant" paragraph in the class XML doc above for the
+        // full rationale and the required regression-test shape.
         builder.HasIndex(x => new { x.OperatorAlias, x.TenantId })
             .IsUnique()
             .HasDatabaseName("ux_operator_bindings_alias_tenant");
