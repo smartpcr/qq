@@ -126,12 +126,45 @@ public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
     public async Task<BotFrameworkTokenProbeResult> AcquireTokenAsync(CancellationToken cancellationToken)
     {
         var messaging = _messagingOptions.CurrentValue;
-        if (string.IsNullOrEmpty(messaging.MicrosoftAppId) ||
-            string.IsNullOrEmpty(messaging.MicrosoftAppPassword))
+
+        // Iter-4 evaluator feedback item 1 — the prior implementation returned
+        // BotFrameworkTokenProbeStatus.Skipped whenever AppId or AppPassword was
+        // empty, which let a misconfigured shared-secret bot (the canonical and
+        // default Bot Framework deployment topology per TeamsMessagingOptions docs)
+        // report Healthy despite being unable to acquire a token in production. We
+        // now consult TeamsMessagingOptions.AuthenticationMode to decide whether an
+        // empty AppPassword is a configuration defect (SharedSecret → Failed,
+        // flipping the health check to Degraded) or a legitimate by-design skip
+        // (Certificate / ManagedIdentity / WorkloadFederated, which legitimately
+        // have no AppPassword and require a host-supplied IBotFrameworkTokenProbe
+        // for their credential path).
+        if (messaging.AuthenticationMode != TeamsAuthenticationMode.SharedSecret)
         {
             return new BotFrameworkTokenProbeResult(
                 BotFrameworkTokenProbeStatus.Skipped,
-                FailureMessage: "MicrosoftAppId or MicrosoftAppPassword is not configured; password-based token probe skipped.");
+                FailureMessage:
+                    $"AuthenticationMode is '{messaging.AuthenticationMode}'; the password-based token probe " +
+                    "does not apply. Register a custom IBotFrameworkTokenProbe to exercise the configured credential flow.");
+        }
+
+        // SharedSecret mode REQUIRES both AppId and AppPassword. Either being empty
+        // is a misconfiguration that must surface on /health, not a silent skip.
+        if (string.IsNullOrEmpty(messaging.MicrosoftAppId))
+        {
+            return new BotFrameworkTokenProbeResult(
+                BotFrameworkTokenProbeStatus.Failed,
+                FailureMessage:
+                    "TeamsMessagingOptions.MicrosoftAppId is required for SharedSecret authentication mode " +
+                    "but is not configured; the shared-secret token probe cannot acquire a Bot Framework token.");
+        }
+
+        if (string.IsNullOrEmpty(messaging.MicrosoftAppPassword))
+        {
+            return new BotFrameworkTokenProbeResult(
+                BotFrameworkTokenProbeStatus.Failed,
+                FailureMessage:
+                    "TeamsMessagingOptions.MicrosoftAppPassword is required for SharedSecret authentication mode " +
+                    "but is not configured; the shared-secret token probe cannot acquire a Bot Framework token.");
         }
 
         cancellationToken.ThrowIfCancellationRequested();

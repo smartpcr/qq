@@ -380,14 +380,23 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             : question.TargetChannelId;
 
         // Stage 6.3 — open the canonical CorrelationId / TenantId / UserId log scope.
-        // AgentQuestion carries all three (TargetUserId is null for channel-scoped
-        // questions; the scope omits empty fields so the channel path does not emit a
-        // blank UserId enrichment).
+        // AgentQuestion carries all three; TargetUserId is null for channel-scoped
+        // questions so the channel path does not emit a UserId enrichment.
+        //
+        // Iter-5 evaluator feedback item 1 — STRUCTURAL fix. Previously this site
+        // passed `userId: destinationId`, which on the channel path resolves to
+        // `question.TargetChannelId` and therefore mislabelled channel IDs as
+        // UserId in the Serilog enrichment contract (the canonical (CorrelationId,
+        // TenantId, UserId) shape). We now pass `question.TargetUserId` directly,
+        // which is exactly the right field — empty/null for channel-targeted
+        // questions, populated for personal-targeted questions — matching the
+        // already-corrected pattern in `TeamsProactiveNotifier` /
+        // `OutboxBackedProactiveNotifier` / `TeamsOutboxDispatcher`.
         using var logScope = TeamsLogScope.BeginScope(
             _logger,
             correlationId: question.CorrelationId,
             tenantId: question.TenantId,
-            userId: destinationId);
+            userId: question.TargetUserId);
 
         using var activity = Telemetry?.StartSendActivity(
             TeamsConnectorTelemetry.SendQuestionActivityName,

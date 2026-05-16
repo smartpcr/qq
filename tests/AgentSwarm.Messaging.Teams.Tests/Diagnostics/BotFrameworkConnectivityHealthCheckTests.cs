@@ -282,15 +282,66 @@ public sealed class BotFrameworkConnectivityHealthCheckTests
     }
 
     [Fact]
-    public async Task MicrosoftAppCredentialsTokenProbe_NoPasswordConfigured_ReturnsSkipped()
+    public async Task MicrosoftAppCredentialsTokenProbe_SharedSecret_NoPasswordConfigured_ReturnsFailed()
     {
-        // The default probe's "no credentials" guard — exercises the
-        // MicrosoftAppCredentialsTokenProbe path that runs in production when the host
-        // uses managed-identity / cert auth and never sets MicrosoftAppPassword.
+        // Iter-4 evaluator feedback item 1 — a SharedSecret bot (the default
+        // AuthenticationMode) with a missing MicrosoftAppPassword is misconfigured
+        // and MUST surface as Failed (Degraded on /health) rather than silently
+        // skipping. Prior to iter-4 this path returned Skipped and kept health
+        // green, hiding a production-fatal config bug.
         var options = new TeamsMessagingOptions
         {
             MicrosoftAppId = MicrosoftAppId,
             MicrosoftAppPassword = string.Empty,
+            AuthenticationMode = TeamsAuthenticationMode.SharedSecret,
+        };
+        var probe = new MicrosoftAppCredentialsTokenProbe(
+            messagingOptions: new StaticOptionsMonitor<TeamsMessagingOptions>(options));
+
+        var result = await probe.AcquireTokenAsync(CancellationToken.None);
+
+        Assert.Equal(BotFrameworkTokenProbeStatus.Failed, result.Status);
+        Assert.NotNull(result.FailureMessage);
+        Assert.Contains("MicrosoftAppPassword", result.FailureMessage);
+        Assert.Contains("SharedSecret", result.FailureMessage);
+    }
+
+    [Fact]
+    public async Task MicrosoftAppCredentialsTokenProbe_SharedSecret_NoAppIdConfigured_ReturnsFailed()
+    {
+        var options = new TeamsMessagingOptions
+        {
+            MicrosoftAppId = string.Empty,
+            MicrosoftAppPassword = "non-empty",
+            AuthenticationMode = TeamsAuthenticationMode.SharedSecret,
+        };
+        var probe = new MicrosoftAppCredentialsTokenProbe(
+            messagingOptions: new StaticOptionsMonitor<TeamsMessagingOptions>(options));
+
+        var result = await probe.AcquireTokenAsync(CancellationToken.None);
+
+        Assert.Equal(BotFrameworkTokenProbeStatus.Failed, result.Status);
+        Assert.NotNull(result.FailureMessage);
+        Assert.Contains("MicrosoftAppId", result.FailureMessage);
+        Assert.Contains("SharedSecret", result.FailureMessage);
+    }
+
+    [Theory]
+    [InlineData(TeamsAuthenticationMode.Certificate)]
+    [InlineData(TeamsAuthenticationMode.ManagedIdentity)]
+    [InlineData(TeamsAuthenticationMode.WorkloadFederated)]
+    public async Task MicrosoftAppCredentialsTokenProbe_NonSharedSecretMode_NoPasswordConfigured_ReturnsSkipped(
+        TeamsAuthenticationMode mode)
+    {
+        // Iter-4 — cert / managed-identity / federated hosts legitimately have no
+        // AppPassword. The default probe MUST report Skipped (not Failed) for
+        // these modes so health stays green and the host's custom probe (which
+        // exercises the real cert/MSI path) owns the credential health signal.
+        var options = new TeamsMessagingOptions
+        {
+            MicrosoftAppId = MicrosoftAppId,
+            MicrosoftAppPassword = string.Empty,
+            AuthenticationMode = mode,
         };
         var probe = new MicrosoftAppCredentialsTokenProbe(
             messagingOptions: new StaticOptionsMonitor<TeamsMessagingOptions>(options));
@@ -299,23 +350,30 @@ public sealed class BotFrameworkConnectivityHealthCheckTests
 
         Assert.Equal(BotFrameworkTokenProbeStatus.Skipped, result.Status);
         Assert.NotNull(result.FailureMessage);
-        Assert.Contains("MicrosoftAppPassword", result.FailureMessage);
+        Assert.Contains(mode.ToString(), result.FailureMessage);
     }
 
     [Fact]
-    public async Task MicrosoftAppCredentialsTokenProbe_NoAppIdConfigured_ReturnsSkipped()
+    public async Task BotFrameworkConnectivityHealthCheck_SharedSecret_MissingPassword_ReportsDegraded()
     {
+        // Iter-4 — end-to-end regression: the default DI registration (SharedSecret
+        // + no password) MUST flip /health to Degraded, not Healthy. This is the
+        // exact path the evaluator flagged in iter-3 feedback item 1.
         var options = new TeamsMessagingOptions
         {
-            MicrosoftAppId = string.Empty,
-            MicrosoftAppPassword = "non-empty",
+            MicrosoftAppId = MicrosoftAppId,
+            MicrosoftAppPassword = string.Empty,
+            AuthenticationMode = TeamsAuthenticationMode.SharedSecret,
         };
         var probe = new MicrosoftAppCredentialsTokenProbe(
             messagingOptions: new StaticOptionsMonitor<TeamsMessagingOptions>(options));
+        var check = BuildCheck(tokenProbe: probe);
 
-        var result = await probe.AcquireTokenAsync(CancellationToken.None);
+        var result = await check.CheckHealthAsync(new HealthCheckContext(), CancellationToken.None);
 
-        Assert.Equal(BotFrameworkTokenProbeStatus.Skipped, result.Status);
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.Contains("App-credential token acquisition failed", result.Description);
+        Assert.False((bool)result.Data["tokenAcquisitionSucceeded"]);
     }
 
     [Fact]

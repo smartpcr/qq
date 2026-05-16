@@ -114,16 +114,31 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
         ArgumentNullException.ThrowIfNull(entry);
 
         // Stage 6.3 iter-2 — every log entry the dispatcher writes for this delivery
-        // attempt carries the canonical CorrelationId/UserId enrichment. The destination
-        // string is "teams://{tenant}/{user-or-channel}/{id}" — split it back into
-        // (tenantId, destinationId) so the Serilog enricher can surface both keys on
-        // dashboards.
+        // attempt carries the canonical CorrelationId/TenantId enrichment. The
+        // destination string is "teams://{tenant}/{user-or-channel}/{id}" — split it
+        // back into (tenantId, destinationId) so the Serilog enricher can surface
+        // both keys on dashboards.
+        //
+        // Iter-4 evaluator feedback item 2 — only Personal (1:1) deliveries carry a
+        // user identity; Channel deliveries' destinationId is a channel ID and
+        // MUST NOT be stamped into the UserId enrichment slot (doing so corrupts
+        // user-oriented dashboards / RBAC queries with channel IDs that look like
+        // users). For channel-scoped entries we therefore omit the UserId
+        // enrichment entirely — the canonical TeamsLogScope contract is (Correlation,
+        // Tenant, User) so a channel-id enrichment key would be a contract change
+        // beyond the scope of the §6.3 observability surface.
         var (tenantId, destinationId) = SplitDestination(entry.Destination, entry.DestinationId);
+        var scopeUserId = string.Equals(
+            entry.DestinationType,
+            OutboxDestinationTypes.Channel,
+            StringComparison.OrdinalIgnoreCase)
+            ? null
+            : destinationId;
         using var logScope = TeamsLogScope.BeginScope(
             _logger,
             correlationId: entry.CorrelationId,
             tenantId: tenantId,
-            userId: destinationId);
+            userId: scopeUserId);
 
         if (string.IsNullOrWhiteSpace(entry.ConversationReferenceJson))
         {
