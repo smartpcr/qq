@@ -596,6 +596,292 @@ public sealed class OutboundQueueProcessorTests
             combined.Last());
     }
 
+    [Fact]
+    public async Task SuccessfulSend_WhenHostShutdownRacesBeforeMarkSent_StillCompletesMarkSent()
+    {
+        // Stage 4.1 iter-7 evaluator items 1 + 4 — the Sending→Sent
+        // bookkeeping after a successful HTTP 200 send MUST land
+        // even when the host's stoppingToken cancels between the
+        // send returning and the MarkSentAsync call. Without
+        // shutdown-safe bookkeeping the row would stay in Sending,
+        // the next process restart's recovery sweep would re-claim
+        // it, and Telegram would receive a duplicate delivery —
+        // violating the durable outbox's exactly-once-side-effect
+        // boundary that backs the story's reliability requirement.
+        //
+        // Test strategy: drive the processor with an
+        // IOutboundQueue stub whose MarkSentAsync captures the
+        // CancellationToken it was given. After the call, cancel
+        // a parallel "host" CancellationTokenSource and assert the
+        // captured bookkeeping token is NOT also cancelled — proof
+        // that the processor passed a detached token rather than
+        // the host's stoppingToken. The stub's MarkSentAsync also
+        // calls `await Task.Delay(50ms, ct)` so a regression that
+        // passes the host token directly would manifest as an OCE
+        // and the MarkSentCalls counter would stay at 0.
+        var time = new FakeTimeProvider(BaseTime);
+        using var hostCts = new CancellationTokenSource();
+        var capture = new BookkeepingTokenCapturingQueue(NewTextMessage(1));
+
+        var sendCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sender = new ScriptedSender((_, _, _) =>
+        {
+            sendCompleted.TrySetResult(true);
+            return Task.FromResult(new SendResult(TelegramMessageId: 4242L));
+        });
+
+        using var processor = NewProcessor(capture, sender, time, concurrency: 1);
+        await processor.StartAsync(hostCts.Token);
+
+        await sendCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        // Cancel the host token IMMEDIATELY after the send returns.
+        // A processor that forwards `ct` into MarkSentAsync would
+        // see this cancellation propagate into the queue write and
+        // either throw OCE (no MarkSent recorded) or abort the
+        // Task.Delay inside the stub's MarkSentAsync.
+        hostCts.Cancel();
+
+        await WaitUntilAsync(() => capture.MarkSentCalls >= 1, TimeSpan.FromSeconds(5));
+        await processor.StopAsync(CancellationToken.None);
+
+        capture.MarkSentCalls.Should().Be(
+            1,
+            "MarkSentAsync MUST run to completion after a successful Telegram send even when the host stoppingToken races before bookkeeping — otherwise the row stays in Sending and the recovery sweep re-sends, violating the durable queue's exactly-once-side-effect boundary");
+        capture.LastMarkSentToken.IsCancellationRequested.Should().BeFalse(
+            "the MarkSentAsync call site MUST pass a detached bookkeeping token (a fresh, time-bounded CancellationTokenSource), NOT the host stoppingToken — otherwise the shutdown signal that arrived between HTTP 200 and this write would have aborted the row's Sending→Sent transition and produced a duplicate send on restart");
+        capture.LastMarkSentTelegramMessageId.Should().Be(
+            4242L,
+            "the bookkeeping write must carry the TelegramMessageId returned from the successful send so the audit trail preserves the live message id");
+    }
+
+    [Fact]
+    public async Task PermanentSendFailure_WhenHostShutdownRacesBeforeDeadLetter_StillCompletesDeadLetter()
+    {
+        // Stage 4.1 iter-7 evaluator items 2 + 4 — a Permanent
+        // TelegramSendFailedException must result in a DeadLettered
+        // row even if the host's stoppingToken cancels between the
+        // exception being observed and DeadLetterAsync being
+        // called. If the DeadLetter write is aborted by shutdown,
+        // the row stays Sending, the recovery sweep re-claims it,
+        // and the same permanently-broken send is re-tried on
+        // every restart — burning sender capacity and never
+        // surfacing in the dead-letter audit trail.
+        var time = new FakeTimeProvider(BaseTime);
+        using var hostCts = new CancellationTokenSource();
+        var capture = new BookkeepingTokenCapturingQueue(NewTextMessage(1) with { MaxAttempts = 99 });
+
+        var sendObserved = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sender = new ScriptedSender((chatId, _, _) =>
+        {
+            sendObserved.TrySetResult(true);
+            throw new TelegramSendFailedException(
+                chatId: chatId,
+                correlationId: "trace-perm",
+                attemptCount: 1,
+                failureCategory: OutboundFailureCategory.Permanent,
+                deadLetterPersisted: false,
+                message: "chat blocked",
+                inner: new InvalidOperationException("permanent"));
+        });
+
+        using var processor = NewProcessor(capture, sender, time, concurrency: 1);
+        await processor.StartAsync(hostCts.Token);
+
+        await sendObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        hostCts.Cancel();
+
+        await WaitUntilAsync(() => capture.DeadLetterCalls >= 1, TimeSpan.FromSeconds(5));
+        await processor.StopAsync(CancellationToken.None);
+
+        capture.DeadLetterCalls.Should().Be(
+            1,
+            "DeadLetterAsync MUST run to completion when a Permanent TelegramSendFailedException is observed, even when the host stoppingToken races before bookkeeping — otherwise the permanently-broken row is re-claimed and re-dispatched on every restart");
+        capture.LastDeadLetterToken.IsCancellationRequested.Should().BeFalse(
+            "the DeadLetterAsync call site MUST pass a detached bookkeeping token so a racing shutdown cannot abort the DeadLettered transition; if `ct` were forwarded directly, the row stays stuck in Sending and the failure never lands in the dead-letter audit trail");
+        capture.LastDeadLetterReason.Should().StartWith(
+            "Permanent:",
+            "the dead-letter reason must preserve the canonical OutboundFailureCategory prefix so operators can triage by failure class");
+    }
+
+    [Fact]
+    public async Task TransientSendFailure_WhenHostShutdownRacesBeforeMarkFailed_StillCompletesMarkFailed()
+    {
+        // Stage 4.1 iter-7 evaluator items 2 + 4 — a transient
+        // TelegramSendFailedException must result in a MarkFailed
+        // bookkeeping write (which increments AttemptCount and
+        // schedules NextRetryAt) even if the host's stoppingToken
+        // races before the write. If MarkFailed is aborted by
+        // shutdown, the row stays Sending with its OLD
+        // AttemptCount, the recovery sweep re-claims it, and the
+        // retry budget never decrements — a permanently broken
+        // Telegram path could loop forever instead of eventually
+        // dead-lettering.
+        var time = new FakeTimeProvider(BaseTime);
+        using var hostCts = new CancellationTokenSource();
+        var capture = new BookkeepingTokenCapturingQueue(NewTextMessage(1));
+
+        var sendObserved = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sender = new ScriptedSender((chatId, _, _) =>
+        {
+            sendObserved.TrySetResult(true);
+            throw new TelegramSendFailedException(
+                chatId: chatId,
+                correlationId: "trace-transient",
+                attemptCount: 1,
+                failureCategory: OutboundFailureCategory.TransientTransport,
+                deadLetterPersisted: false,
+                message: "simulated transient",
+                inner: new InvalidOperationException("oops"));
+        });
+
+        using var processor = NewProcessor(capture, sender, time, concurrency: 1);
+        await processor.StartAsync(hostCts.Token);
+
+        await sendObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        hostCts.Cancel();
+
+        await WaitUntilAsync(() => capture.MarkFailedCalls >= 1, TimeSpan.FromSeconds(5));
+        await processor.StopAsync(CancellationToken.None);
+
+        capture.MarkFailedCalls.Should().Be(
+            1,
+            "MarkFailedAsync MUST run to completion when a transient TelegramSendFailedException is observed, even when the host stoppingToken races — otherwise AttemptCount never decrements and a permanently broken Telegram path could loop forever instead of eventually dead-lettering");
+        capture.LastMarkFailedToken.IsCancellationRequested.Should().BeFalse(
+            "the MarkFailedAsync call site MUST pass a detached bookkeeping token so the AttemptCount + NextRetryAt update lands regardless of host shutdown timing");
+        capture.LastMarkFailedError.Should().Contain(
+            "TransientTransport",
+            "the error string must preserve the failure category so the retry policy and operator triage retain visibility into the failure class");
+    }
+
+    [Fact]
+    public async Task UnexpectedSendFailure_WhenHostShutdownRacesBeforeMarkFailed_StillCompletesMarkFailed()
+    {
+        // Stage 4.1 iter-7 evaluator items 2 + 4 (regression for
+        // the generic catch-all path) — non-TelegramSendFailedException
+        // exceptions thrown from the sender (e.g. a serialization
+        // bug or a transient infra exception) must STILL land a
+        // MarkFailed transition even when the host stoppingToken
+        // races. The iter-6 fix introduced ExecuteShutdownSafeBookkeepingAsync
+        // for this path; this test pins the contract so a future
+        // refactor cannot silently revert to passing `ct` directly.
+        var time = new FakeTimeProvider(BaseTime);
+        using var hostCts = new CancellationTokenSource();
+        var capture = new BookkeepingTokenCapturingQueue(NewTextMessage(1));
+
+        var sendObserved = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sender = new ScriptedSender((_, _, _) =>
+        {
+            sendObserved.TrySetResult(true);
+            throw new InvalidOperationException("unexpected serialization bug");
+        });
+
+        using var processor = NewProcessor(capture, sender, time, concurrency: 1);
+        await processor.StartAsync(hostCts.Token);
+
+        await sendObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        hostCts.Cancel();
+
+        await WaitUntilAsync(() => capture.MarkFailedCalls >= 1, TimeSpan.FromSeconds(5));
+        await processor.StopAsync(CancellationToken.None);
+
+        capture.MarkFailedCalls.Should().Be(
+            1,
+            "the catch-all unexpected-exception path MUST run MarkFailedAsync on a detached bookkeeping token even when the host stoppingToken raced after the exception was observed");
+        capture.LastMarkFailedToken.IsCancellationRequested.Should().BeFalse(
+            "the catch-all path's MarkFailedAsync call MUST receive a detached bookkeeping token so the row leaves Sending even mid-shutdown");
+    }
+
+    /// <summary>
+    /// Test-only <see cref="IOutboundQueue"/> stub that returns a
+    /// single pre-fabricated message on the first DequeueAsync and
+    /// records every Mark* / DeadLetter invocation with the
+    /// CancellationToken the processor passed. The captured tokens
+    /// let assertions verify that bookkeeping writes use a
+    /// shutdown-safe (detached) token rather than the host's
+    /// stoppingToken — covering Stage 4.1 iter-7 evaluator items
+    /// 1 + 2 + 4.
+    /// </summary>
+    private sealed class BookkeepingTokenCapturingQueue : IOutboundQueue
+    {
+        private readonly OutboundMessage _message;
+        private int _dequeueCalls;
+        private int _markSentCalls;
+        private int _markFailedCalls;
+        private int _deadLetterCalls;
+
+        public BookkeepingTokenCapturingQueue(OutboundMessage message)
+        {
+            _message = message;
+        }
+
+        public int MarkSentCalls => Volatile.Read(ref _markSentCalls);
+
+        public int MarkFailedCalls => Volatile.Read(ref _markFailedCalls);
+
+        public int DeadLetterCalls => Volatile.Read(ref _deadLetterCalls);
+
+        public CancellationToken LastMarkSentToken { get; private set; }
+
+        public long LastMarkSentTelegramMessageId { get; private set; }
+
+        public CancellationToken LastMarkFailedToken { get; private set; }
+
+        public string? LastMarkFailedError { get; private set; }
+
+        public CancellationToken LastDeadLetterToken { get; private set; }
+
+        public string? LastDeadLetterReason { get; private set; }
+
+        public Task EnqueueAsync(OutboundMessage message, CancellationToken ct)
+            => Task.CompletedTask;
+
+        public Task<OutboundMessage?> DequeueAsync(CancellationToken ct)
+        {
+            var n = Interlocked.Increment(ref _dequeueCalls);
+            if (n > 1)
+            {
+                return Task.FromResult<OutboundMessage?>(null);
+            }
+            var pinned = _message with
+            {
+                Status = OutboundMessageStatus.Sending,
+                DequeuedAt = _message.CreatedAt,
+            };
+            return Task.FromResult<OutboundMessage?>(pinned);
+        }
+
+        public async Task MarkSentAsync(Guid messageId, long telegramMessageId, CancellationToken ct)
+        {
+            LastMarkSentToken = ct;
+            LastMarkSentTelegramMessageId = telegramMessageId;
+            // Force the call to suspend on the supplied token. If
+            // the processor passed the host stoppingToken (which
+            // the test cancels before this point), the delay would
+            // throw OCE and MarkSentCalls would stay at 0 — surfacing
+            // the regression. A detached bookkeeping token does
+            // NOT cancel on host shutdown, so the delay completes
+            // and we increment the counter.
+            await Task.Delay(TimeSpan.FromMilliseconds(50), ct).ConfigureAwait(false);
+            Interlocked.Increment(ref _markSentCalls);
+        }
+
+        public async Task MarkFailedAsync(Guid messageId, string error, CancellationToken ct)
+        {
+            LastMarkFailedToken = ct;
+            LastMarkFailedError = error;
+            await Task.Delay(TimeSpan.FromMilliseconds(50), ct).ConfigureAwait(false);
+            Interlocked.Increment(ref _markFailedCalls);
+        }
+
+        public async Task DeadLetterAsync(Guid messageId, string reason, CancellationToken ct)
+        {
+            LastDeadLetterToken = ct;
+            LastDeadLetterReason = reason;
+            await Task.Delay(TimeSpan.FromMilliseconds(50), ct).ConfigureAwait(false);
+            Interlocked.Increment(ref _deadLetterCalls);
+        }
+    }
+
     // ----- helpers below -----
 
     private static OutboundMessage NewTextMessage(

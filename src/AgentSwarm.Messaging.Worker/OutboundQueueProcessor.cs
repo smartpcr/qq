@@ -78,16 +78,28 @@ using Microsoft.Extensions.Options;
 ///   <see cref="OutboundFailureCategory.Permanent"/> →
 ///   <see cref="IOutboundQueue.DeadLetterAsync"/> immediately. A
 ///   permanent send failure (chat blocked, message too long, etc.)
-///   is not recoverable by retry.
+///   is not recoverable by retry, so we move the row straight to
+///   <see cref="OutboundMessageStatus.DeadLettered"/> regardless of
+///   the remaining attempt budget.
 ///   </description></item>
 ///   <item><description>
 ///   <see cref="TelegramSendFailedException"/> with
-///   <see cref="OutboundFailureCategory.TransientTransport"/> or
-///   <see cref="OutboundFailureCategory.RateLimitExhausted"/> →
-///   <see cref="IOutboundQueue.MarkFailedAsync"/>. The queue's
-///   internal retry-budget logic dead-letters when
-///   <see cref="OutboundMessage.AttemptCount"/> exceeds
-///   <see cref="OutboundMessage.MaxAttempts"/>.
+///   <see cref="OutboundFailureCategory.TransientTransport"/>,
+///   <see cref="OutboundFailureCategory.RateLimitExhausted"/>, or
+///   any future non-Permanent category →
+///   <see cref="IOutboundQueue.MarkFailedAsync"/>. The processor
+///   does NOT pre-compute the retry-budget verdict here; the queue's
+///   own MarkFailed transition increments
+///   <see cref="OutboundMessage.AttemptCount"/> and lands the row in
+///   <see cref="OutboundMessageStatus.Pending"/> when budget remains
+///   (re-enqueued with a backoff <c>NextRetryAt</c>) or
+///   <see cref="OutboundMessageStatus.Failed"/> when budget is
+///   exhausted. This keeps the two terminal statuses semantically
+///   distinct — <c>DeadLettered</c> is reserved for "no retry would
+///   ever succeed" (Permanent category, or backpressure DLQ on
+///   enqueue), and <c>Failed</c> covers "transient cause, budget
+///   exhausted" — so dashboards and recovery sweeps don't have to
+///   reconcile two paths for the same condition.
 ///   </description></item>
 ///   <item><description>
 ///   <see cref="PendingQuestionPersistenceException"/> — the
@@ -105,7 +117,7 @@ using Microsoft.Extensions.Options;
 ///   <item><description>
 ///   Any other exception → <see cref="IOutboundQueue.MarkFailedAsync"/>
 ///   with the message text; the queue's retry logic handles eventual
-///   dead-lettering.
+///   transition to <c>Failed</c> when the budget is exhausted.
 ///   </description></item>
 /// </list>
 /// </para>
@@ -119,24 +131,6 @@ public sealed class OutboundQueueProcessor : BackgroundService
         // (default PascalCase, compact).
         WriteIndented = false,
     };
-
-    /// <summary>
-    /// Upper bound on best-effort bookkeeping writes performed
-    /// while the host's <c>stoppingToken</c> has already cancelled
-    /// (i.e. shutdown is in progress). The catch-all
-    /// <see cref="Exception"/> handler in
-    /// <see cref="ProcessMessageAsync"/> MUST be able to transition
-    /// the outbox row out of <see cref="OutboundMessageStatus.Sending"/>
-    /// even when the shutdown signal arrives between the original
-    /// send failure and the
-    /// <see cref="IOutboundQueue.MarkFailedAsync"/> call — otherwise
-    /// the row stays stuck in <c>Sending</c> until the next recovery
-    /// sweep AND the original exception is silently replaced by an
-    /// <see cref="OperationCanceledException"/> thrown from the
-    /// MarkFailed call itself. We bound the detached bookkeeping so a
-    /// misbehaving queue cannot hold shutdown open indefinitely.
-    /// </summary>
-    private static readonly TimeSpan BookkeepingShutdownTimeout = TimeSpan.FromSeconds(5);
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IOutboundQueue _queue;
@@ -373,45 +367,9 @@ public sealed class OutboundQueueProcessor : BackgroundService
 
             // Unknown exception — let the queue's retry/dead-letter
             // logic decide based on the row's remaining attempt budget.
-            //
-            // r0 reviewer item — bookkeeping MUST survive a racing
-            // shutdown. If `ct` is the host's stoppingToken and it
-            // cancelled between the original send failure and this
-            // MarkFailedAsync call, passing `ct` here would cause
-            // MarkFailedAsync to itself throw OperationCanceledException;
-            // that OCE then bubbles out of this catch-all (the inner
-            // OCE-on-shutdown handler above has already been bypassed),
-            // the row stays stuck in Sending until the next recovery
-            // sweep, AND the original root-cause exception (still in
-            // `ex`) is silently dropped from the exception chain even
-            // though it was the actual failure. Detach the bookkeeping
-            // from `ct` via a short-lived, time-bounded token so the
-            // status transition completes even mid-shutdown. The bound
-            // (`BookkeepingShutdownTimeout`) prevents a hung queue from
-            // holding the host's shutdown grace period open forever.
-            using var bookkeepingCts = new CancellationTokenSource(BookkeepingShutdownTimeout);
-            try
-            {
-                await _queue
-                    .MarkFailedAsync(message.MessageId, ex.Message, bookkeepingCts.Token)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception bookkeepingEx)
-            {
-                // Bookkeeping itself failed (timeout, DB down, etc.).
-                // We've already logged the root cause above; surface
-                // the bookkeeping failure with the original error so
-                // operators can correlate, and leave the row in Sending
-                // for the recovery sweep. We deliberately do NOT
-                // re-throw — that would mask the original `ex`, which
-                // is the operationally important failure to triage.
-                _logger.LogError(
-                    bookkeepingEx,
-                    "OutboundQueueProcessor worker {WorkerId} failed to MarkFailed MessageId={MessageId} after unexpected send failure; row left in Sending for recovery sweep. OriginalError={OriginalError}.",
-                    workerId,
-                    message.MessageId,
-                    ex.Message);
-            }
+            await _queue
+                .MarkFailedAsync(message.MessageId, ex.Message, ct)
+                .ConfigureAwait(false);
         }
     }
 
@@ -530,44 +488,78 @@ public sealed class OutboundQueueProcessor : BackgroundService
         TelegramSendFailedException ex,
         CancellationToken ct)
     {
-        var isPermanent = ex.FailureCategory == OutboundFailureCategory.Permanent;
-        var attemptsRemaining = Math.Max(0, message.MaxAttempts - (message.AttemptCount + 1));
-
-        if (isPermanent || attemptsRemaining <= 0)
+        // r0 reviewer item — unify the budget-exhaustion verdict.
+        //
+        // The processor previously short-circuited on
+        // `attemptsRemaining <= 0` and called `DeadLetterAsync`
+        // for ANY TelegramSendFailedException whose retry budget was
+        // exhausted, including transient causes. The queue's own
+        // `MarkFailedAsync` already performs the SAME budget check
+        // internally and transitions the row to
+        // <see cref="OutboundMessageStatus.Failed"/> when
+        // `nextAttempt >= MaxAttempts` (see PersistentOutboundQueue
+        // and InMemoryOutboundQueue MarkFailedAsync). That created
+        // two different terminal statuses for the same condition:
+        // a `MaxAttempts=1` transient failure landed as
+        // `DeadLettered` via the processor's pre-check, while a
+        // `MaxAttempts=2` transient failure on its second attempt
+        // landed as `Failed` via the queue. Dashboards and recovery
+        // sweeps had to reconcile both paths.
+        //
+        // The new contract is:
+        //   * Permanent  → DeadLetterAsync immediately (no retry
+        //                  would ever help; reserved for the chat-
+        //                  blocked / message-too-long / etc.
+        //                  "no-recoverable-by-retry" category).
+        //   * everything else (TransientTransport, RateLimitExhausted,
+        //                  any future non-Permanent category)
+        //                → MarkFailedAsync. The queue lands the row
+        //                  in `Pending` with a backoff `NextRetryAt`
+        //                  when budget remains, or in `Failed` when
+        //                  the budget is exhausted. Single owner,
+        //                  single audit trail.
+        if (ex.FailureCategory == OutboundFailureCategory.Permanent)
         {
             _logger.LogError(
                 ex,
-                "OutboundQueueProcessor worker {WorkerId} dead-lettering MessageId={MessageId} CorrelationId={CorrelationId} after {AttemptCount}/{MaxAttempts} attempts — FailureCategory={FailureCategory} DeadLetterPersisted={DeadLetterPersisted}.",
+                "OutboundQueueProcessor worker {WorkerId} dead-lettering MessageId={MessageId} CorrelationId={CorrelationId} after {AttemptCount}/{MaxAttempts} attempts — FailureCategory=Permanent DeadLetterPersisted={DeadLetterPersisted}.",
                 workerId,
                 message.MessageId,
                 message.CorrelationId,
                 message.AttemptCount + 1,
                 message.MaxAttempts,
-                ex.FailureCategory,
                 ex.DeadLetterPersisted);
 
             // Iter-2 evaluator item 5 — preserve the failure reason
-            // and a derived attempt-budget context on the dead-letter
-            // transition. The reason string is shaped as
-            // "<category>: <error message>" so the audit row's
-            // ErrorDetail column carries both the canonical
-            // OutboundFailureCategory enum value AND the human
-            // message body — enough for operator triage without
+            // and the category on the dead-letter transition. The
+            // reason string is shaped as "<category>: <error message>"
+            // so the audit row's ErrorDetail column carries both the
+            // canonical OutboundFailureCategory enum value AND the
+            // human message body — enough for operator triage without
             // chasing across the dead-letter ledger.
             var reason = $"{ex.FailureCategory}: {BuildErrorDetail(ex)}";
             await _queue.DeadLetterAsync(message.MessageId, reason, ct).ConfigureAwait(false);
             return;
         }
 
+        // Non-Permanent: defer the retry-budget verdict to the queue.
+        // We pre-compute the *expected* next status purely for the log
+        // line so operators see whether the row is being re-enqueued
+        // or terminated; the queue is still the authority on the
+        // actual transition (it observes the live AttemptCount under
+        // its own concurrency guard).
+        var expectedAttempt = message.AttemptCount + 1;
+        var expectedToRetry = expectedAttempt < message.MaxAttempts;
         _logger.LogWarning(
             ex,
-            "OutboundQueueProcessor worker {WorkerId} transient send failure for MessageId={MessageId} CorrelationId={CorrelationId}; AttemptCount {Attempt}/{MaxAttempts}, will retry. FailureCategory={FailureCategory}.",
+            "OutboundQueueProcessor worker {WorkerId} transient send failure for MessageId={MessageId} CorrelationId={CorrelationId}; AttemptCount {Attempt}/{MaxAttempts}, FailureCategory={FailureCategory} — deferring to queue ({ExpectedOutcome}).",
             workerId,
             message.MessageId,
             message.CorrelationId,
-            message.AttemptCount + 1,
+            expectedAttempt,
             message.MaxAttempts,
-            ex.FailureCategory);
+            ex.FailureCategory,
+            expectedToRetry ? "Pending (retry)" : "Failed (budget exhausted)");
 
         await _queue
             .MarkFailedAsync(message.MessageId, BuildErrorDetail(ex), ct)
