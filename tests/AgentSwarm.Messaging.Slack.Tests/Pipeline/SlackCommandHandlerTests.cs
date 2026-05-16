@@ -12,6 +12,8 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Slack.Entities;
+using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Rendering;
 using AgentSwarm.Messaging.Slack.Transport;
@@ -356,6 +358,97 @@ public sealed class SlackCommandHandlerTests
             .Which.Message.Should().Contain("expired_trigger_id");
     }
 
+    // -----------------------------------------------------------------
+    // Stage 6.4 evaluator iter-3 item #1: HandleModalAsync MUST
+    // write a modal_open audit row for EVERY views.open call (success
+    // AND failure paths). The async slash-command modal path used to
+    // be silent on audit; the brief's "Log every views.open call to
+    // SlackAuditLogger with request_type = modal_open" requirement
+    // forbids that silence. These two tests pin the audit-on-every-
+    // call contract -- a regression that re-removes the recorder
+    // call would fail here even if every other handler behaviour
+    // still passes.
+    // -----------------------------------------------------------------
+    [Fact]
+    public async Task Review_command_writes_modal_open_success_audit_row_on_views_open_success()
+    {
+        TestHarness harness = new();
+        harness.ViewsOpenClient.NextResult = SlackViewsOpenResult.Success();
+
+        SlackInboundEnvelope envelope = BuildCommandEnvelope(
+            idempotencyKey: "cmd:T1:U1:/agent:trig-review-audit-ok",
+            text: "review TASK-77",
+            triggerId: "trig-review-audit-ok");
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        harness.AuditWriter.Entries.Should().ContainSingle(
+            "the async slash-command modal path must write exactly one modal_open audit row per views.open call (success path)");
+
+        SlackAuditEntry row = harness.AuditWriter.Entries[0];
+        row.RequestType.Should().Be(SlackModalAuditRecorder.RequestTypeModalOpen);
+        row.Direction.Should().Be(SlackModalAuditRecorder.DirectionInbound);
+        row.Outcome.Should().Be(SlackModalAuditRecorder.OutcomeSuccess);
+        row.TeamId.Should().Be(envelope.TeamId);
+        row.UserId.Should().Be(envelope.UserId);
+        row.ChannelId.Should().Be(envelope.ChannelId);
+        row.CorrelationId.Should().Be(envelope.IdempotencyKey);
+        row.CommandText.Should().Be("/agent review",
+            "the audit row's CommandText must encode the sub-command so the audit query path can distinguish review vs escalate vs the comment-modal interaction follow-up");
+        row.ErrorDetail.Should().BeNull(
+            "success-outcome rows do not carry an error detail");
+    }
+
+    [Fact]
+    public async Task Escalate_command_writes_modal_open_error_audit_row_with_views_open_error_detail_on_failure()
+    {
+        TestHarness harness = new();
+        harness.ViewsOpenClient.NextResult = SlackViewsOpenResult.Failure("expired_trigger_id");
+
+        SlackInboundEnvelope envelope = BuildCommandEnvelope(
+            idempotencyKey: "cmd:T1:U1:/agent:trig-escalate-audit-fail",
+            text: "escalate TASK-9",
+            triggerId: "trig-escalate-audit-fail");
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        harness.AuditWriter.Entries.Should().ContainSingle(
+            "the async slash-command modal path must ALSO write an audit row when views.open returns a failure result -- the brief requires every views.open to be logged regardless of outcome");
+
+        SlackAuditEntry row = harness.AuditWriter.Entries[0];
+        row.RequestType.Should().Be(SlackModalAuditRecorder.RequestTypeModalOpen);
+        row.Outcome.Should().Be(SlackModalAuditRecorder.OutcomeError);
+        row.ErrorDetail.Should().NotBeNull()
+            .And.Contain("expired_trigger_id",
+                "the error-outcome row must surface the Slack-reported error code so the audit query can correlate user-visible ephemeral failures with the underlying Slack response");
+        row.ErrorDetail.Should().Contain("views_open_SlackError",
+            "the error-detail must encode the SlackViewsOpenResultKind so a query can distinguish Slack-side errors from network failures and missing configuration");
+        row.CommandText.Should().Be("/agent escalate");
+        row.CorrelationId.Should().Be(envelope.IdempotencyKey);
+    }
+
+    [Fact]
+    public async Task Review_command_with_missing_trigger_id_does_NOT_write_audit_row_because_no_views_open_call_was_attempted()
+    {
+        // Defensive guard: HandleModalAsync bails out before the
+        // OpenAsync call when the envelope is missing a trigger_id,
+        // so there is no views.open call to log. The audit recorder
+        // must NOT be invoked in this branch -- otherwise the audit
+        // table would carry phantom "modal_open" rows for requests
+        // that never actually attempted views.open.
+        TestHarness harness = new();
+        SlackInboundEnvelope envelope = BuildCommandEnvelope(
+            idempotencyKey: "cmd:T1:U1:/agent:trig-review-no-trigger",
+            text: "review TASK-1",
+            triggerId: null);
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        harness.ViewsOpenClient.Requests.Should().BeEmpty();
+        harness.AuditWriter.Entries.Should().BeEmpty(
+            "without a trigger_id the handler never reaches views.open, so it must NOT write a phantom modal_open audit row");
+    }
+
     [Fact]
     public async Task Orchestrator_exception_propagates_so_pipeline_can_retry()
     {
@@ -390,11 +483,17 @@ public sealed class SlackCommandHandlerTests
             this.Responder = new RecordingEphemeralResponder();
             this.ViewsOpenClient = new RecordingViewsOpenClient();
             this.MessageRenderer = new RecordingMessageRenderer();
+            this.AuditWriter = new InMemorySlackAuditEntryWriter();
+            this.ModalAuditRecorder = new SlackModalAuditRecorder(
+                this.AuditWriter,
+                NullLogger<SlackModalAuditRecorder>.Instance,
+                TimeProvider.System);
             this.Handler = new SlackCommandHandler(
                 this.TaskService,
                 this.Responder,
                 this.ViewsOpenClient,
                 this.MessageRenderer,
+                this.ModalAuditRecorder,
                 NullLogger<SlackCommandHandler>.Instance,
                 TimeProvider.System);
         }
@@ -406,6 +505,10 @@ public sealed class SlackCommandHandlerTests
         public RecordingViewsOpenClient ViewsOpenClient { get; }
 
         public RecordingMessageRenderer MessageRenderer { get; }
+
+        public InMemorySlackAuditEntryWriter AuditWriter { get; }
+
+        public SlackModalAuditRecorder ModalAuditRecorder { get; }
 
         public SlackCommandHandler Handler { get; }
     }

@@ -8,7 +8,9 @@ namespace AgentSwarm.Messaging.Slack.Pipeline;
 
 using System;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Rendering;
+using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -82,6 +84,22 @@ public static class SlackCommandDispatchServiceCollectionExtensions
         // that has already registered a production poster (e.g. the
         // Stage 6.x outbound dispatcher) wins.
         services.TryAddSingleton<ISlackThreadedReplyPoster, NoOpSlackThreadedReplyPoster>();
+
+        // Stage 6.4 evaluator iter-3 item #1: the async slash-command
+        // modal path (SlackCommandHandler.HandleModalAsync) now writes
+        // a modal_open audit row around its OpenAsync call so every
+        // views.open caller satisfies the brief's "log every views.open"
+        // requirement. TryAdd the recorder + its in-memory audit-writer
+        // fallback here so a host wiring AddSlackCommandDispatcher
+        // without AddSlackInboundTransport (lighter test harnesses)
+        // still resolves the SlackModalAuditRecorder dependency.
+        // Production hosts that also call AddSlackInboundTransport will
+        // have the EF-backed writer win because its registration
+        // RemoveAll-s the in-memory default before adding itself.
+        services.TryAddSingleton<InMemorySlackAuditEntryWriter>();
+        services.TryAddSingleton<ISlackAuditEntryWriter>(sp =>
+            sp.GetRequiredService<InMemorySlackAuditEntryWriter>());
+        services.TryAddSingleton<SlackModalAuditRecorder>();
 
         // Real command handler -- REPLACES any earlier ISlackCommandHandler
         // registration (notably the Stage 4.3 NoOpSlackCommandHandler

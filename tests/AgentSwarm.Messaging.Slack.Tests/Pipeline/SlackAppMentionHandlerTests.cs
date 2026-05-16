@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Rendering;
 using AgentSwarm.Messaging.Slack.Transport;
@@ -426,6 +427,10 @@ public sealed class SlackAppMentionHandlerTests
                 this.Responder,
                 this.ViewsOpenClient,
                 this.MessageRenderer,
+                new SlackModalAuditRecorder(
+                    new InMemorySlackAuditEntryWriter(),
+                    NullLogger<SlackModalAuditRecorder>.Instance,
+                    TimeProvider.System),
                 NullLogger<SlackCommandHandler>.Instance,
                 TimeProvider.System);
 

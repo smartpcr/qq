@@ -144,6 +144,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     private readonly ISlackEphemeralResponder ephemeralResponder;
     private readonly ISlackViewsOpenClient viewsOpenClient;
     private readonly ISlackMessageRenderer messageRenderer;
+    private readonly SlackModalAuditRecorder modalAuditRecorder;
 
     // Retained for forward-compatibility with later stages (e.g., scheduling /
     // expiry timestamps that are not carried on the envelope). Stage 5.1 iter-3
@@ -161,6 +162,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
         ISlackEphemeralResponder ephemeralResponder,
         ISlackViewsOpenClient viewsOpenClient,
         ISlackMessageRenderer messageRenderer,
+        SlackModalAuditRecorder modalAuditRecorder,
         ILogger<SlackCommandHandler> logger,
         TimeProvider? timeProvider = null)
     {
@@ -168,6 +170,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
         this.ephemeralResponder = ephemeralResponder ?? throw new ArgumentNullException(nameof(ephemeralResponder));
         this.viewsOpenClient = viewsOpenClient ?? throw new ArgumentNullException(nameof(viewsOpenClient));
         this.messageRenderer = messageRenderer ?? throw new ArgumentNullException(nameof(messageRenderer));
+        this.modalAuditRecorder = modalAuditRecorder ?? throw new ArgumentNullException(nameof(modalAuditRecorder));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -617,8 +620,35 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             .OpenAsync(new SlackViewsOpenRequest(envelope.TeamId, envelope.TriggerId!, viewPayload), ct)
             .ConfigureAwait(false);
 
+        // Stage 6.4 evaluator iter-3 item #1: every views.open caller
+        // MUST write a modal_open audit row -- not just the synchronous
+        // fast-path handlers. The async modal path (this method) was
+        // previously silent on audit, which violated the brief's "Log
+        // every views.open call to SlackAuditLogger with
+        // request_type = modal_open" requirement. SlackDirectApiClient's
+        // OpenAsync stays audit-free so the fast-path
+        // (DefaultSlackModalFastPathHandler -> OpenAsync ->
+        // SlackModalAuditRecorder) is not double-written; THIS caller
+        // adds the row the transport intentionally omits.
         if (result.IsSuccess)
         {
+            try
+            {
+                await this.modalAuditRecorder
+                    .RecordSuccessAsync(envelope, subCommand, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception auditEx)
+            {
+                // Best-effort: the user already has their modal. Log
+                // the audit-pipeline blip but do not surface it.
+                this.logger.LogError(
+                    auditEx,
+                    "SlackCommandHandler {SubCommand} failed to record modal_open success audit row for envelope idempotency_key={IdempotencyKey}; the user-visible modal is unaffected.",
+                    subCommand,
+                    envelope.IdempotencyKey);
+            }
+
             this.logger.LogInformation(
                 "SlackCommandHandler {SubCommand} opened modal for task_id={TaskId} team={TeamId} user={UserId} trigger_id={TriggerId}.",
                 subCommand,
@@ -627,6 +657,31 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 envelope.UserId,
                 envelope.TriggerId);
             return;
+        }
+
+        // Record the failure side of the views.open call. CancellationToken.None
+        // because cancellation between views.open returning and the audit row
+        // landing must NOT lose the durable record of what Slack reported -- the
+        // ephemeral response below is still meaningful even when the request
+        // token tripped.
+        try
+        {
+            await this.modalAuditRecorder
+                .RecordErrorAsync(
+                    envelope,
+                    subCommand,
+                    $"views_open_{result.Kind}: {result.Error ?? "unknown"}",
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception auditEx)
+        {
+            this.logger.LogError(
+                auditEx,
+                "SlackCommandHandler {SubCommand} failed to record modal_open error audit row for envelope idempotency_key={IdempotencyKey} kind={Kind}.",
+                subCommand,
+                envelope.IdempotencyKey,
+                result.Kind);
         }
 
         string userMessage = result.Kind switch
