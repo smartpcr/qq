@@ -31,7 +31,11 @@ public class TelegramPipelineRegistrationTests
     // CommandRouter — the dispatch dictionary is built from the nine
     // ICommandHandler registrations injected via IEnumerable<>.
     [InlineData(typeof(ICommandRouter), typeof(CommandRouter))]
-    [InlineData(typeof(ICallbackHandler), typeof(StubCallbackHandler))]
+    // Stage 3.3 swapped StubCallbackHandler for the production
+    // CallbackQueryHandler — inline-button presses now decode
+    // QuestionId:ActionId payloads, emit HumanDecisionEvent, audit,
+    // and answer the Telegram callback.
+    [InlineData(typeof(ICallbackHandler), typeof(CallbackQueryHandler))]
     [InlineData(typeof(ITelegramUpdatePipeline), typeof(TelegramUpdatePipeline))]
     public void AddTelegram_RegistersStage22Service(Type serviceType, Type implementationType)
     {

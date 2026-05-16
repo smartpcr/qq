@@ -134,6 +134,14 @@ public static class TelegramUpdateMapper
                 Timestamp = receivedAt,
                 CorrelationId = correlationId,
                 Payload = cb.Data,
+                // Stage 3.3 — preserve the Telegram callback-query id so
+                // CallbackQueryHandler can echo it back via
+                // AnswerCallbackQueryAsync to stop the spinner on the
+                // operator's device, AND use it as the per-callback
+                // idempotency key required by implementation-plan.md
+                // Stage 3.3 ("if the same CallbackQuery.Id has already
+                // been processed, skip processing and re-answer").
+                CallbackId = cb.Id,
             };
         }
 

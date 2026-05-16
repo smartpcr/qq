@@ -30,4 +30,28 @@ public sealed record MessengerEvent
     }
 
     public string? Payload { get; init; }
+
+    /// <summary>
+    /// Messenger-platform-specific reply token a callback handler must echo
+    /// back to acknowledge the inline-button tap. Populated by the Telegram
+    /// connector from <c>Update.CallbackQuery.Id</c>; <c>null</c> for
+    /// <see cref="EventType.Command"/> / <see cref="EventType.TextReply"/>
+    /// where no reply-token concept exists. Other connectors (Discord
+    /// interaction id, Slack trigger id) plug into the same field so the
+    /// <see cref="ICallbackHandler"/> contract remains transport-agnostic.
+    /// </summary>
+    /// <remarks>
+    /// Used by <c>CallbackQueryHandler</c> (Stage 3.3) as both the
+    /// <c>callback_query_id</c> argument to
+    /// <c>AnswerCallbackQueryAsync</c> AND as the dedup key for the
+    /// implementation-plan.md Stage 3.3 idempotency requirement
+    /// ("if the same callback has already been processed (same
+    /// <c>CallbackQuery.Id</c>), skip processing and re-answer with the
+    /// previous result"). The Stage 2.2 pipeline-level dedup gate keys on
+    /// <see cref="EventId"/> (which for Telegram is derived from
+    /// <c>update_id</c>) so this field is the second-line defence the
+    /// handler uses when a duplicate slips past the pipeline (e.g. the
+    /// reservation TTL evicted before the redelivery arrived).
+    /// </remarks>
+    public string? CallbackId { get; init; }
 }
