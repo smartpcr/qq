@@ -13,6 +13,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Rendering;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.Logging;
@@ -634,8 +635,13 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
         {
             try
             {
+                // Stage 7.1 evaluator iter-1 item 3: persist the
+                // serialised modal view JSON in the audit row's
+                // ResponsePayload so successful async-path modal
+                // opens carry the story-required response payload.
+                string? serialisedView = SlackAuditPayloadSerializer.Serialize(viewPayload);
                 await this.modalAuditRecorder
-                    .RecordSuccessAsync(envelope, subCommand, CancellationToken.None)
+                    .RecordSuccessAsync(envelope, subCommand, CancellationToken.None, serialisedView)
                     .ConfigureAwait(false);
             }
             catch (Exception auditEx)
