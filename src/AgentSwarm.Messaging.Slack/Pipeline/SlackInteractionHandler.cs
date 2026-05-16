@@ -364,9 +364,19 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
         // is the user's severity choice. When the user submits without
         // touching the select Slack still echoes the initial_option
         // (Warning), so production submissions always carry severity.
+        //
+        // Idempotence guard: skip composition when the pinned base is
+        // ALREADY a namespaced "escalate:<...>" value (a hand-rolled
+        // modal that pinned the severity directly), otherwise the
+        // suffix would be appended a second time (producing
+        // "escalate:warning:warning"). The guard asserts the SPECIFIC
+        // "escalate:" prefix rather than the bare separator -- a
+        // generic Contains(':') would silently suppress composition
+        // for any future pinned value that happens to carry a colon
+        // for an unrelated reason.
         if (string.Equals(detail.View.CallbackId, DefaultSlackMessageRenderer.EscalateCallbackId, StringComparison.Ordinal)
             && !string.IsNullOrEmpty(detail.View.FirstStaticSelectValue)
-            && !actionValue!.Contains(EscalateSeveritySeparator, StringComparison.Ordinal))
+            && !actionValue!.StartsWith(DefaultSlackMessageRenderer.EscalateActionValue + EscalateSeveritySeparator, StringComparison.Ordinal))
         {
             actionValue = string.Concat(actionValue, EscalateSeveritySeparator, detail.View.FirstStaticSelectValue);
         }
