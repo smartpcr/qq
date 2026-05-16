@@ -119,6 +119,34 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         Assert.Same(originalConnector, provider.GetRequiredService<IInnerTeamsMessengerConnector>().Inner);
     }
 
+    /// <summary>
+    /// Iter-7 evaluator critique #1 regression — the <see cref="OutboxRetryEngine"/>
+    /// hosted-service descriptor must appear exactly once after two compositions, so a
+    /// host that calls <see cref="TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/>
+    /// twice (e.g. once in a shared <c>ConfigureTeamsServices</c> helper and once in a
+    /// late composition root) never starts duplicate retry workers competing for the
+    /// same <see cref="IMessageOutbox"/>. Two competing engines would double-claim
+    /// pending outbox entries, double-emit telemetry, and burn the per-second rate
+    /// budget twice.
+    /// </summary>
+    [Fact]
+    public void AddTeamsOutboxEngine_OutboxRetryEngineDescriptorIsRegisteredOnce()
+    {
+        var services = SeedBaseServices();
+
+        services.AddTeamsOutboxEngine();
+        services.AddTeamsOutboxEngine();
+        services.AddTeamsOutboxEngine();
+
+        var hostedRetryEngineDescriptors = services
+            .Where(d => d.ServiceType == typeof(IHostedService)
+                && (d.ImplementationType == typeof(OutboxRetryEngine)
+                    || d.ImplementationInstance is OutboxRetryEngine))
+            .ToList();
+
+        Assert.Single(hostedRetryEngineDescriptors);
+    }
+
     [Fact]
     public void AddTeamsOutboxEngine_ThrowsWhenInnerProactiveNotifierMissing()
     {
