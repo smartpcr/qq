@@ -1,3 +1,4 @@
+using AgentSwarm.Messaging.Abstractions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -50,5 +51,109 @@ public static class EntityFrameworkCoreServiceCollectionExtensions
             sp => sp.GetRequiredService<SqlConversationReferenceStore>());
 
         return services;
+    }
+
+    /// <summary>
+    /// Register the EF Core context factory for <see cref="TeamsLifecycleDbContext"/>
+    /// (shared by both Stage 3.3 stores) and the <see cref="SqlAgentQuestionStore"/>
+    /// singleton, exposed under <see cref="IAgentQuestionStore"/>. <b>Replaces</b> any
+    /// pre-existing <see cref="IAgentQuestionStore"/> registration (e.g. the Stage 2.1
+    /// in-memory or no-op stub) by clearing all prior descriptors before adding the
+    /// concrete SQL implementation. This matches the Stage 3.3 implementation-plan
+    /// requirement that the production store unconditionally wins.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The underlying <c>AddDbContextFactory</c> call is safe to invoke twice with
+    /// identical options. The context factory is shared with
+    /// <see cref="AddSqlCardStateStore"/> so a host that calls both helpers gets a single
+    /// pooled-context factory rather than two competing ones.
+    /// </para>
+    /// <para>
+    /// <b>Iter-8 fix:</b> previous iterations used <c>TryAddSingleton</c> which silently
+    /// preserved any Stage 2.1 stub registration. The Stage 3.3 acceptance contract is
+    /// that wiring <c>AddSqlAgentQuestionStore</c> after the no-op default leaves the
+    /// production SQL store wired — so this helper uses
+    /// <see cref="ServiceCollectionDescriptorExtensions.RemoveAll{T}(IServiceCollection)"/>
+    /// before the final <see cref="ServiceCollectionServiceExtensions.AddSingleton{TService}(IServiceCollection, Func{IServiceProvider, TService})"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="services">DI container.</param>
+    /// <param name="optionsAction">EF context options (provider, connection string).</param>
+    /// <returns>The same <paramref name="services"/> for chaining.</returns>
+    public static IServiceCollection AddSqlAgentQuestionStore(
+        this IServiceCollection services,
+        Action<DbContextOptionsBuilder> optionsAction)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(optionsAction);
+
+        services.AddDbContextFactory<TeamsLifecycleDbContext>(optionsAction);
+        services.TryAddSingleton<SqlAgentQuestionStore>();
+
+        // Unconditionally replace any prior IAgentQuestionStore registration so the
+        // SQL store wins regardless of whether the Stage 2.1 stub was wired first.
+        services.RemoveAll<IAgentQuestionStore>();
+        services.AddSingleton<IAgentQuestionStore>(
+            sp => sp.GetRequiredService<SqlAgentQuestionStore>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Register the EF Core context factory for <see cref="TeamsLifecycleDbContext"/>
+    /// (shared by both Stage 3.3 stores) and the <see cref="SqlCardStateStore"/>
+    /// singleton, exposed under <see cref="ICardStateStore"/>. <b>Replaces</b> the
+    /// Stage 2.1 <c>NoOpCardStateStore</c> stub (or any other pre-existing registration)
+    /// when the host wires this helper.
+    /// </summary>
+    /// <remarks>
+    /// <b>Iter-8 fix:</b> uses
+    /// <see cref="ServiceCollectionDescriptorExtensions.RemoveAll{T}(IServiceCollection)"/>
+    /// followed by an unconditional <see cref="ServiceCollectionServiceExtensions.AddSingleton{TService}(IServiceCollection, Func{IServiceProvider, TService})"/>
+    /// instead of <c>TryAddSingleton</c>, matching the implementation-plan requirement
+    /// that the production SQL store replaces the no-op stub.
+    /// </remarks>
+    public static IServiceCollection AddSqlCardStateStore(
+        this IServiceCollection services,
+        Action<DbContextOptionsBuilder> optionsAction)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(optionsAction);
+
+        services.AddDbContextFactory<TeamsLifecycleDbContext>(optionsAction);
+        services.TryAddSingleton<SqlCardStateStore>();
+
+        services.RemoveAll<ICardStateStore>();
+        services.AddSingleton<ICardStateStore>(
+            sp => sp.GetRequiredService<SqlCardStateStore>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Apply any pending migrations against the <see cref="TeamsLifecycleDbContext"/>
+    /// for the resolved service provider. Production hosts call this in a startup hook
+    /// (e.g. <c>app.Services.MigrateTeamsLifecycle()</c>) after building the service
+    /// provider. Tests continue to use <c>EnsureCreated()</c> against the fixture
+    /// DbContext factory directly.
+    /// </summary>
+    /// <remarks>
+    /// The helper resolves the registered <see cref="IDbContextFactory{TContext}"/>,
+    /// opens a scoped context, and invokes
+    /// <see cref="Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions.Migrate(Microsoft.EntityFrameworkCore.Infrastructure.DatabaseFacade)"/>
+    /// — the canonical EF Core production schema deployment path. This is opt-in (not
+    /// auto-wired into <see cref="AddSqlAgentQuestionStore"/> or
+    /// <see cref="AddSqlCardStateStore"/>) so the host retains explicit control over
+    /// when schema changes apply.
+    /// </remarks>
+    /// <param name="serviceProvider">A built <see cref="IServiceProvider"/>.</param>
+    public static void MigrateTeamsLifecycle(this IServiceProvider serviceProvider)
+    {
+        ArgumentNullException.ThrowIfNull(serviceProvider);
+
+        var factory = serviceProvider.GetRequiredService<IDbContextFactory<TeamsLifecycleDbContext>>();
+        using var context = factory.CreateDbContext();
+        context.Database.Migrate();
     }
 }

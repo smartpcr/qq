@@ -49,7 +49,7 @@ namespace AgentSwarm.Messaging.Teams.Commands;
 /// so the orchestrator sees the decision exactly as it would for an Adaptive Card
 /// invoke.</description></item>
 /// <item><description>Reply with a decision-confirmation Adaptive Card built by
-/// <see cref="Cards.IAdaptiveCardRenderer.RenderDecisionConfirmationCard"/>.</description></item>
+/// <see cref="Cards.IAdaptiveCardRenderer.RenderDecisionConfirmationCard(HumanDecisionEvent)"/>.</description></item>
 /// </list>
 /// </para>
 /// </remarks>

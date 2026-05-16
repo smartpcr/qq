@@ -66,8 +66,22 @@ namespace AgentSwarm.Messaging.Teams;
 /// in-memory and Stage 4.1 SQL) are expected to implement both interfaces and register
 /// the same singleton under both service types.
 /// </para>
+/// <para>
+/// <b>Clock injection:</b> all timestamps stamped onto persisted rows
+/// (<see cref="TeamsCardState.CreatedAt"/>, <see cref="TeamsCardState.UpdatedAt"/>) and
+/// onto in-memory <see cref="HumanDecisionEvent"/> placeholders flow through an injected
+/// <see cref="TimeProvider"/>. The DI-friendly public constructor defaults to
+/// <see cref="TimeProvider.System"/>; a second public overload accepts a deterministic
+/// provider so unit tests can advance the clock without wall-clock flakiness. This
+/// mirrors the pattern already used by <see cref="Cards.AdaptiveCardBuilder"/>,
+/// <see cref="Cards.CardActionHandler"/>, and
+/// <see cref="Lifecycle.QuestionExpiryProcessor"/> and keeps the connector's
+/// store-bound timestamps consistent with the rest of the lifecycle code so
+/// cross-component ordering (card state row vs. dedupe cache vs. expiry sweep) stays
+/// deterministic under a fake clock.
+/// </para>
 /// </remarks>
-public sealed class TeamsMessengerConnector : IMessengerConnector
+public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardManager
 {
     private readonly CloudAdapter _adapter;
     private readonly TeamsMessagingOptions _options;
@@ -78,6 +92,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
     private readonly IAdaptiveCardRenderer _cardRenderer;
     private readonly IInboundEventReader _inboundEventReader;
     private readonly ILogger<TeamsMessengerConnector> _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Construct the connector with the dependencies required by
@@ -88,7 +103,8 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
     /// rendering, and an <see cref="ILogger{T}"/> for operational logging. Every
     /// parameter is null-guarded so DI mis-registration fails loudly at startup rather
     /// than producing a <see cref="NullReferenceException"/> deep inside an outbound
-    /// delivery.
+    /// delivery. The clock defaults to <see cref="TimeProvider.System"/>; unit tests
+    /// resolve the second public overload to inject a deterministic provider.
     /// </summary>
     public TeamsMessengerConnector(
         CloudAdapter adapter,
@@ -100,6 +116,43 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         IAdaptiveCardRenderer cardRenderer,
         IInboundEventReader inboundEventReader,
         ILogger<TeamsMessengerConnector> logger)
+        : this(
+            adapter,
+            options,
+            conversationReferenceStore,
+            conversationReferenceRouter,
+            agentQuestionStore,
+            cardStateStore,
+            cardRenderer,
+            inboundEventReader,
+            logger,
+            TimeProvider.System)
+    {
+    }
+
+    /// <summary>
+    /// Test-friendly constructor that accepts a deterministic <see cref="TimeProvider"/>
+    /// so unit tests can verify the exact values stamped onto
+    /// <see cref="TeamsCardState.CreatedAt"/> / <see cref="TeamsCardState.UpdatedAt"/>
+    /// (including the stale-activity fallback in
+    /// <see cref="UpdateCardAsync(string, CardUpdateAction, CancellationToken)"/>) and
+    /// onto <see cref="HumanDecisionEvent.ReceivedAt"/> placeholders without wall-clock
+    /// flakiness. Production DI resolves the 9-arg constructor, which delegates here
+    /// with <see cref="TimeProvider.System"/>; this overload is public (matching the
+    /// pattern used by <see cref="Lifecycle.QuestionExpiryProcessor"/>) so tests in
+    /// other assemblies do not need <c>InternalsVisibleTo</c>.
+    /// </summary>
+    public TeamsMessengerConnector(
+        CloudAdapter adapter,
+        TeamsMessagingOptions options,
+        IConversationReferenceStore conversationReferenceStore,
+        IConversationReferenceRouter conversationReferenceRouter,
+        IAgentQuestionStore agentQuestionStore,
+        ICardStateStore cardStateStore,
+        IAdaptiveCardRenderer cardRenderer,
+        IInboundEventReader inboundEventReader,
+        ILogger<TeamsMessengerConnector> logger,
+        TimeProvider timeProvider)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _options = options ?? throw new ArgumentNullException(nameof(options));
@@ -110,6 +163,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
         _cardRenderer = cardRenderer ?? throw new ArgumentNullException(nameof(cardRenderer));
         _inboundEventReader = inboundEventReader ?? throw new ArgumentNullException(nameof(inboundEventReader));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
 
     /// <inheritdoc />
@@ -272,7 +326,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
             .UpdateConversationIdAsync(question.QuestionId, deliveredConversationId!, ct)
             .ConfigureAwait(false);
 
-        var now = DateTimeOffset.UtcNow;
+        var now = _timeProvider.GetUtcNow();
         var cardState = new TeamsCardState
         {
             QuestionId = question.QuestionId,
@@ -290,6 +344,348 @@ public sealed class TeamsMessengerConnector : IMessengerConnector
     /// <inheritdoc />
     public Task<MessengerEvent> ReceiveAsync(CancellationToken ct)
         => _inboundEventReader.ReceiveAsync(ct);
+
+    /// <inheritdoc />
+    public Task UpdateCardAsync(string questionId, CardUpdateAction action, CancellationToken ct)
+        => UpdateCardCoreAsync(questionId, action, decision: null, actorDisplayName: null, ct);
+
+    /// <inheritdoc />
+    public Task UpdateCardAsync(
+        string questionId,
+        CardUpdateAction action,
+        HumanDecisionEvent decision,
+        string? actorDisplayName,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(decision);
+        return UpdateCardCoreAsync(questionId, action, decision: (HumanDecisionEvent?)decision, actorDisplayName, ct);
+    }
+
+    private async Task UpdateCardCoreAsync(
+        string questionId,
+        CardUpdateAction action,
+        HumanDecisionEvent? decision,
+        string? actorDisplayName,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(questionId))
+        {
+            throw new ArgumentException("QuestionId must be a non-empty string.", nameof(questionId));
+        }
+
+        var state = await _cardStateStore.GetByQuestionIdAsync(questionId, ct).ConfigureAwait(false);
+        if (state is null)
+        {
+            throw new InvalidOperationException(
+                $"No TeamsCardState found for question '{questionId}'; card update cannot proceed " +
+                "because the originating ActivityId/ConversationReference are unknown.");
+        }
+
+        var conversationReference = DeserializeReferenceFromJson(state.ConversationReferenceJson, questionId);
+        var attachment = RenderUpdateCard(questionId, action, decision, actorDisplayName);
+        var nextStatus = action switch
+        {
+            CardUpdateAction.MarkAnswered => TeamsCardStatuses.Answered,
+            CardUpdateAction.MarkExpired => TeamsCardStatuses.Expired,
+            CardUpdateAction.MarkCancelled => TeamsCardStatuses.Expired,
+            _ => TeamsCardStatuses.Answered,
+        };
+
+        // Inline retry loop — same exponential-backoff policy as the outbox engine
+        // (base 2s, multiplier 2×, max 60s, 4 retries) executed synchronously.
+        await ExecuteWithInlineRetryAsync(
+            operationName: "UpdateActivityAsync",
+            questionId,
+            async (innerCt) =>
+            {
+                var staleActivityFallbackTriggered = false;
+                string? newActivityId = null;
+
+                await _adapter.ContinueConversationAsync(
+                    _options.MicrosoftAppId,
+                    conversationReference,
+                    async (turnContext, cbCt) =>
+                    {
+                        var replacement = MessageFactory.Attachment(attachment);
+                        replacement.Id = state.ActivityId;
+
+                        try
+                        {
+                            await turnContext.UpdateActivityAsync(replacement, cbCt).ConfigureAwait(false);
+                        }
+                        catch (Microsoft.Bot.Schema.ErrorResponseException ex) when (IsActivityNotFound(ex))
+                        {
+                            // Stale-activity fallback per architecture.md §6.5 / e2e-scenarios.md
+                            // §Update/Delete: send a fresh replacement card and persist the new
+                            // activity ID. Status remains the action-target (Answered / Expired)
+                            // because the user-visible state of the conversation is unchanged.
+                            staleActivityFallbackTriggered = true;
+                            var fresh = MessageFactory.Attachment(attachment);
+                            var resp = await turnContext.SendActivityAsync(fresh, cbCt).ConfigureAwait(false);
+                            newActivityId = resp?.Id;
+                        }
+                    },
+                    innerCt).ConfigureAwait(false);
+
+                if (staleActivityFallbackTriggered && !string.IsNullOrWhiteSpace(newActivityId))
+                {
+                    // Use the injected TimeProvider (not DateTimeOffset.UtcNow) so the
+                    // refreshed row's UpdatedAt stays in sync with the rest of the
+                    // lifecycle code (AdaptiveCardBuilder, CardActionHandler,
+                    // QuestionExpiryProcessor) and remains deterministic under a fake
+                    // clock in unit tests.
+                    var refreshed = state with
+                    {
+                        ActivityId = newActivityId!,
+                        Status = nextStatus,
+                        UpdatedAt = _timeProvider.GetUtcNow(),
+                    };
+                    await _cardStateStore.SaveAsync(refreshed, innerCt).ConfigureAwait(false);
+                    return;
+                }
+
+                await _cardStateStore.UpdateStatusAsync(questionId, nextStatus, innerCt).ConfigureAwait(false);
+            },
+            ct).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task DeleteCardAsync(string questionId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(questionId))
+        {
+            throw new ArgumentException("QuestionId must be a non-empty string.", nameof(questionId));
+        }
+
+        var state = await _cardStateStore.GetByQuestionIdAsync(questionId, ct).ConfigureAwait(false);
+        if (state is null)
+        {
+            throw new InvalidOperationException(
+                $"No TeamsCardState found for question '{questionId}'; card delete cannot proceed " +
+                "because the originating ActivityId/ConversationReference are unknown.");
+        }
+
+        var conversationReference = DeserializeReferenceFromJson(state.ConversationReferenceJson, questionId);
+
+        await ExecuteWithInlineRetryAsync(
+            operationName: "DeleteActivityAsync",
+            questionId,
+            async (innerCt) =>
+            {
+                await _adapter.ContinueConversationAsync(
+                    _options.MicrosoftAppId,
+                    conversationReference,
+                    async (turnContext, cbCt) =>
+                    {
+                        try
+                        {
+                            await turnContext.DeleteActivityAsync(state.ActivityId, cbCt).ConfigureAwait(false);
+                        }
+                        catch (Microsoft.Bot.Schema.ErrorResponseException ex) when (IsActivityNotFound(ex))
+                        {
+                            // Already gone — treat as success per the e2e-scenarios.md
+                            // §Update/Delete contract ("avoid infinite retry on stale activity").
+                            _logger.LogInformation(
+                                "DeleteActivityAsync for question {QuestionId} returned 404; treating as already-deleted.",
+                                questionId);
+                        }
+                    },
+                    innerCt).ConfigureAwait(false);
+
+                // Per implementation-plan.md §3.3 step 5 ("update card state to Expired") and
+                // §3.3 acceptance scenario (line 222): a deleted card lands at the canonical
+                // Expired status. There is no separate `Deleted` status — the canonical
+                // vocabulary is Pending/Answered/Expired and `Expired` covers both
+                // expiry and post-delete terminal state.
+                await _cardStateStore.UpdateStatusAsync(questionId, TeamsCardStatuses.Expired, innerCt).ConfigureAwait(false);
+            },
+            ct).ConfigureAwait(false);
+    }
+
+    private Microsoft.Bot.Schema.Attachment RenderUpdateCard(
+        string questionId,
+        CardUpdateAction action,
+        HumanDecisionEvent? decision,
+        string? actorDisplayName)
+    {
+        return action switch
+        {
+            CardUpdateAction.MarkAnswered when decision is not null
+                => _cardRenderer.RenderDecisionConfirmationCard(decision, actorDisplayName),
+            CardUpdateAction.MarkAnswered
+                => _cardRenderer.RenderDecisionConfirmationCard(BuildPlaceholderDecision(questionId, "answered"), null),
+            CardUpdateAction.MarkExpired
+                => _cardRenderer.RenderExpiredNoticeCard(questionId),
+            CardUpdateAction.MarkCancelled
+                => _cardRenderer.RenderCancelledNoticeCard(questionId),
+            _ => _cardRenderer.RenderExpiredNoticeCard(questionId),
+        };
+    }
+
+    private HumanDecisionEvent BuildPlaceholderDecision(string questionId, string actionValue)
+        => new(
+            QuestionId: questionId,
+            ActionValue: actionValue,
+            Comment: null,
+            Messenger: "Teams",
+            ExternalUserId: "system",
+            ExternalMessageId: string.Empty,
+            ReceivedAt: _timeProvider.GetUtcNow(),
+            CorrelationId: questionId);
+
+    private static ConversationReference DeserializeReferenceFromJson(string referenceJson, string questionId)
+    {
+        if (string.IsNullOrWhiteSpace(referenceJson))
+        {
+            throw new InvalidOperationException(
+                $"TeamsCardState.ConversationReferenceJson is empty for question '{questionId}'; cannot rehydrate.");
+        }
+
+        var reference = JsonConvert.DeserializeObject<ConversationReference>(referenceJson)
+            ?? throw new InvalidOperationException(
+                $"TeamsCardState.ConversationReferenceJson for question '{questionId}' deserialized to null.");
+        return reference;
+    }
+
+    /// <summary>
+    /// Inline retry helper used by <see cref="UpdateCardCoreAsync"/> and
+    /// <see cref="DeleteCardAsync"/>. The contract is intentionally narrow so callers
+    /// (and tests like
+    /// <c>UpdateCardAsync_TransientFailureExhaustsRetries_Throws</c>) see deterministic
+    /// behavior:
+    /// <list type="bullet">
+    /// <item><description><b>Success</b> on any attempt → method returns normally.</description></item>
+    /// <item><description><b>Cancellation</b> via <paramref name="ct"/> → original
+    /// <see cref="OperationCanceledException"/> propagates verbatim.</description></item>
+    /// <item><description><b>Transient Bot Connector failure</b> on attempts
+    /// <c>1..(N-1)</c> → log and retry after exponential backoff (or the server-supplied
+    /// <c>Retry-After</c>).</description></item>
+    /// <item><description><b>Anything else</b> — including a transient failure on the
+    /// FINAL attempt and any non-transient exception on any attempt — propagates the
+    /// ORIGINAL exception verbatim. Callers that need to surface the underlying HTTP
+    /// status (<see cref="Microsoft.Bot.Schema.ErrorResponseException.Response"/>) get
+    /// the unwrapped exception, not a generic
+    /// <see cref="InvalidOperationException"/> wrapper.</description></item>
+    /// </list>
+    /// Because the loop body either returns on success or has its exception bubble
+    /// out of the <c>try</c> (the catch filter <c>attempt &lt; totalAttempts</c>
+    /// deliberately stops matching on the final iteration), the loop never exits via
+    /// fall-through. There is therefore no post-loop throw — adding one would be dead
+    /// code AND would mask the underlying exception type the test contract requires.
+    /// </summary>
+    private async Task ExecuteWithInlineRetryAsync(
+        string operationName,
+        string questionId,
+        Func<CancellationToken, Task> operation,
+        CancellationToken ct)
+    {
+        var totalAttempts = Math.Max(1, _options.MaxRetryAttempts);
+        var baseDelay = TimeSpan.FromSeconds(Math.Max(1, _options.RetryBaseDelaySeconds));
+        var maxDelay = TimeSpan.FromSeconds(60);
+
+        for (var attempt = 1; attempt <= totalAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                await operation(ct).ConfigureAwait(false);
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsTransientBotConnectorFailure(ex) && attempt < totalAttempts)
+            {
+                var retryAfter = ExtractRetryAfter(ex);
+                var backoff = retryAfter ?? ComputeExponentialBackoff(attempt, baseDelay, maxDelay);
+                _logger.LogWarning(
+                    ex,
+                    "Transient failure on {Operation} for question {QuestionId} (attempt {Attempt}/{Total}); retrying after {Delay}.",
+                    operationName,
+                    questionId,
+                    attempt,
+                    totalAttempts,
+                    backoff);
+                await Task.Delay(backoff, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static TimeSpan ComputeExponentialBackoff(int attempt, TimeSpan baseDelay, TimeSpan maxDelay)
+    {
+        // exponential: base * 2^(attempt-1), capped at maxDelay.
+        var multiplier = Math.Pow(2, attempt - 1);
+        var raw = TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * multiplier);
+        return raw > maxDelay ? maxDelay : raw;
+    }
+
+    private static bool IsTransientBotConnectorFailure(Exception ex)
+    {
+        // Bot Framework wraps transport failures in ErrorResponseException; the underlying
+        // HTTP status indicates retryability. Anything 5xx or 429 is transient. Bare
+        // HttpRequestException and TaskCanceledException (timeout) are also retryable.
+        if (ex is Microsoft.Bot.Schema.ErrorResponseException bre)
+        {
+            var status = (int?)bre.Response?.StatusCode;
+            if (status is null)
+            {
+                return true;
+            }
+
+            return status == 408 || status == 425 || status == 429 || (status >= 500 && status < 600);
+        }
+
+        if (ex is System.Net.Http.HttpRequestException http)
+        {
+            var status = (int?)http.StatusCode;
+            if (status is null)
+            {
+                return true;
+            }
+
+            return status == 408 || status == 425 || status == 429 || (status >= 500 && status < 600);
+        }
+
+        if (ex is TaskCanceledException)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static TimeSpan? ExtractRetryAfter(Exception ex)
+    {
+        if (ex is Microsoft.Bot.Schema.ErrorResponseException bre)
+        {
+            var headers = bre.Response?.Headers;
+            if (headers is null)
+            {
+                return null;
+            }
+
+            if (headers.TryGetValue("Retry-After", out var values))
+            {
+                foreach (var raw in values)
+                {
+                    if (int.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+                    {
+                        return TimeSpan.FromSeconds(seconds);
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsActivityNotFound(Microsoft.Bot.Schema.ErrorResponseException ex)
+    {
+        var status = (int?)ex.Response?.StatusCode;
+        return status == 404 || status == 410;
+    }
 
     private static ConversationReference DeserializeReference(TeamsConversationReference stored)
     {

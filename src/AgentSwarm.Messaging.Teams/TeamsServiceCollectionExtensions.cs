@@ -2,8 +2,10 @@ using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Extensions;
+using AgentSwarm.Messaging.Teams.Lifecycle;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 
 namespace AgentSwarm.Messaging.Teams;
 
@@ -205,6 +207,68 @@ public static class TeamsServiceCollectionExtensions
         services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, ResumeCommandHandler>());
 
         services.TryAddSingleton<ICommandDispatcher, CommandDispatcher>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Composes the Stage 3.3 card-lifecycle dependency graph in a single call: registers
+    /// <see cref="TeamsMessengerConnector"/> under <see cref="ITeamsCardManager"/>
+    /// (delegating to the existing singleton wired by
+    /// <see cref="AddTeamsMessengerConnector"/>), the concrete
+    /// <see cref="Cards.CardActionHandler"/> under
+    /// <see cref="ICardActionHandler"/> (<b>replacing</b> the Stage 2.1 <c>NoOpCardActionHandler</c>),
+    /// and the <see cref="QuestionExpiryProcessor"/> hosted service so the lifecycle worker
+    /// boots with the host.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Persistence-store registration is intentionally NOT included</b>: the SQL-backed
+    /// <c>IAgentQuestionStore</c> and <c>ICardStateStore</c> implementations live in the
+    /// <c>AgentSwarm.Messaging.Teams.EntityFrameworkCore</c> package and are wired by
+    /// <c>AddSqlAgentQuestionStore()</c> / <c>AddSqlCardStateStore()</c> on the EF
+    /// service-collection extensions. Hosts compose those helpers BEFORE calling this
+    /// method so the lifecycle worker sees the production stores rather than the
+    /// Stage 2.1 in-memory stubs.
+    /// </para>
+    /// <para>
+    /// <b>Iter-8 fix:</b> the <see cref="ICardActionHandler"/> and
+    /// <see cref="ITeamsCardManager"/> registrations now use
+    /// <see cref="ServiceCollectionDescriptorExtensions.RemoveAll{T}(IServiceCollection)"/>
+    /// + <see cref="ServiceCollectionServiceExtensions.AddSingleton{TService}(IServiceCollection, Func{IServiceProvider, TService})"/>
+    /// rather than <c>TryAddSingleton</c>. This unconditionally replaces any Stage 2.1
+    /// no-op stub previously registered for either contract — the implementation-plan
+    /// requirement that the concrete Stage 3.3 handler/connector wins regardless of
+    /// composition order.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddTeamsCardLifecycle(this IServiceCollection services)
+    {
+        if (services is null)
+        {
+            throw new ArgumentNullException(nameof(services));
+        }
+
+        // Compose the base connector first so TryAddSingleton<TeamsMessengerConnector>()
+        // there resolves the same instance we register under ITeamsCardManager below.
+        services.AddTeamsMessengerConnector();
+
+        // Connector is the canonical ITeamsCardManager implementation per
+        // architecture.md §4.1.1 ("TeamsMessengerConnector implements both
+        // IMessengerConnector and ITeamsCardManager"). Replace any prior stub
+        // registration so hosts that wired a no-op in Stage 2.1 get the concrete here.
+        services.RemoveAll<ITeamsCardManager>();
+        services.AddSingleton<ITeamsCardManager>(
+            sp => sp.GetRequiredService<TeamsMessengerConnector>());
+
+        // Replace the Stage 2.1 NoOpCardActionHandler (or any other prior stub) with the
+        // concrete CardActionHandler implementation.
+        services.RemoveAll<ICardActionHandler>();
+        services.AddSingleton<ICardActionHandler, CardActionHandler>();
+
+        // Lifecycle worker — singleton per BackgroundService convention. Registered via
+        // AddHostedService<T>() so the runtime picks it up automatically.
+        services.AddHostedService<QuestionExpiryProcessor>();
 
         return services;
     }
