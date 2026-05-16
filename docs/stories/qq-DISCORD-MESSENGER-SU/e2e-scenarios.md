@@ -214,16 +214,6 @@ Feature: Button interaction -- approve
 
 ### Scenario 2.3: Question with more than 5 actions uses select menu
 
-> **Platform adaptation:** Buttons encode `ActionId` in `custom_id` as
-> `q:{QuestionId}:{ActionId}` (per architecture.md Section 8.3). Discord
-> select menus have one `custom_id` per component (not per option), so the
-> select menu carries `q:{QuestionId}:select` as its component `custom_id`
-> and each option encodes `ActionId` in the option `value` field. The
-> `ComponentInteractionHandler` handles both encodings: for buttons it
-> parses `ActionId` from `custom_id`; for select menus it parses
-> `QuestionId` from `custom_id` and reads `ActionId` from the selected
-> option value.
-
 ```gherkin
 Feature: Select menu for questions with many actions
 
@@ -231,12 +221,12 @@ Feature: Select menu for questions with many actions
     Given an AgentQuestionEnvelope wraps an AgentQuestion with 6 AllowedActions
     When DiscordMessageSender renders the question embed
     Then the message uses a select menu component instead of buttons
-    And the select menu component has custom_id "q:Q-42:select" (QuestionId in custom_id)
     And each AllowedAction appears as a select menu option with:
-      | Option field | Value                                      |
-      | label        | HumanAction.Label (display text)           |
-      | value        | HumanAction.ActionId (parsed on selection) |
+      | Option field | Value                                              |
+      | label        | HumanAction.Label (display text)                   |
+      | value        | "q:{QuestionId}:{ActionId}" (same format as button custom_id) |
     And the select menu placeholder reads "Choose an action..."
+    And ComponentInteractionHandler parses QuestionId and ActionId from the selected option value using the same "q:{QuestionId}:{ActionId}" format used for button custom_id (architecture.md Section 8.3)
 ```
 
 ### Scenario 2.4: Action with RequiresComment triggers a modal dialog
@@ -1074,9 +1064,11 @@ Feature: Duplicate skips ACK
 
 ## Feature 12: Select Menu Interaction
 
-Validates select menu behavior for questions with many actions. Uses the
-platform-adapted encoding described in Scenario 2.3 above: component
-`custom_id` = `q:{QuestionId}:select`, option `value` = `ActionId`.
+Validates select menu behavior for questions with many actions. Select menu
+option values use the same `q:{QuestionId}:{ActionId}` format as button
+`custom_id` values (per architecture.md Section 8.3), so
+`ComponentInteractionHandler` uses a single parsing contract for both
+component types.
 
 ### Scenario 12.1: Operator selects an action from a select menu
 
@@ -1085,11 +1077,10 @@ Feature: Select menu interaction
 
   Scenario: Operator selects an action from a dropdown menu
     Given a pending question "Q-70" has 6 AllowedActions rendered as a select menu
-    And the select menu component has custom_id "q:Q-70:select"
-    When the operator selects the option with value "need-info" from the dropdown
+    And each option value uses the format "q:Q-70:{ActionId}"
+    When the operator selects the option with value "q:Q-70:need-info" from the dropdown
     Then DiscordGatewayService persists a DiscordInteractionRecord with InteractionType "SelectMenu"
-    And ComponentInteractionHandler parses QuestionId "Q-70" from the component custom_id
-    And ActionId "need-info" is read from the selected option's value field
+    And ComponentInteractionHandler parses QuestionId "Q-70" and ActionId "need-info" from the selected option value "q:Q-70:need-info"
     And IPendingQuestionStore.GetAsync("Q-70") returns the pending question
     And HumanAction.Value is resolved for ActionId "need-info"
     And ISwarmCommandBus.PublishHumanDecisionAsync is called with:
