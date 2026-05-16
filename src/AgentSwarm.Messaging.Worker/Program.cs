@@ -196,23 +196,60 @@ public class Program
         builder.Services
             .AddSlackInboundIngestor<SlackPersistenceDbContext>();
 
+        // Stage 5.1 (workstream:
+        // ws-qq-slack-messenger-supp-phase-command-and-interaction-processing-stage-slash-command-dispatch):
+        // register the real SlackCommandHandler (replaces the Stage
+        // 4.3 NoOpSlackCommandHandler dev-stub for the ingestor's
+        // ISlackCommandHandler binding). The dispatcher parses
+        // `/agent <sub-command>` text, calls IAgentTaskService for
+        // ask / status / approve / reject and best-effort views.open
+        // for review / escalate, and writes ephemeral error messages
+        // for unrecognised sub-commands. Must follow
+        // AddSlackInboundIngestor so the
+        // AddSlackInboundDevelopmentHandlerStubs call below only
+        // re-registers no-ops for the still-unimplemented
+        // ISlackAppMentionHandler / ISlackInteractionHandler
+        // contracts.
+        builder.Services.AddSlackCommandDispatcher();
+
+        // Stage 5.1 iter-2 evaluator item 3 (STRUCTURAL fix):
+        // AddSlackCommandDispatcher INTENTIONALLY no longer auto-
+        // registers a default IAgentTaskService. The previous build
+        // silently wired NoOpAgentTaskService, so a misconfigured
+        // production deployment would happily ACK every `/agent ask`
+        // as "success" without ever dispatching it to the orchestrator
+        // (a real no-message-loss bug indistinguishable from green).
+        // The Worker explicitly opts in to the development stub here
+        // so local boots succeed while the real orchestrator project
+        // (qq:ORCHESTRATOR) is still being built; any operator
+        // reading this file SEES the explicit opt-in and knows to
+        // remove it before going to production.
+        //
+        // TODO(qq:SLACK-MESSENGER-SUPP -- post-orchestrator): replace
+        // this call with the orchestrator-supplied IAgentTaskService
+        // registration. The production Worker must NOT ship the
+        // NoOpAgentTaskService.
+        builder.Services.AddSlackCommandDispatcherDevelopmentDefaults();
+
         // Stage 4.3 iter 6 evaluator item #2 (STRUCTURAL fix):
         // AddSlackInboundIngestor INTENTIONALLY no longer registers
         // no-op handler defaults. A production host that resolved
         // ISlackCommandHandler / ISlackAppMentionHandler /
         // ISlackInteractionHandler against the silent-completion
         // stubs would ack-and-drop every Slack request -- a real
-        // no-message-loss bug. Until Stage 5.1/5.2/5.3 ship the real
-        // handlers, the Worker explicitly opts into the development
-        // stand-ins so the ingestor remains resolvable AND any
-        // operator reading this file SEES the explicit opt-in (and
-        // knows to remove it before going to production).
+        // no-message-loss bug. Stage 5.1 swaps in the real
+        // SlackCommandHandler above; Stages 5.2 / 5.3 are still in
+        // flight, so the Worker explicitly opts into the development
+        // stand-ins for the @mention and interaction handlers so the
+        // ingestor remains resolvable AND any operator reading this
+        // file SEES the explicit opt-in (and knows to remove it
+        // before going to production).
         //
         // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this call
-        // with the real handler registrations (Stage 5.1 command
-        // dispatcher, Stage 5.2 @mention dispatcher, Stage 5.3
-        // interaction -> HumanDecisionEvent dispatcher). The
-        // production Worker must NOT ship the no-op stubs.
+        // with the real handler registrations (Stage 5.2 @mention
+        // dispatcher, Stage 5.3 interaction -> HumanDecisionEvent
+        // dispatcher). The production Worker must NOT ship the
+        // remaining no-op stubs.
         builder.Services.AddSlackInboundDevelopmentHandlerStubs();
 
         // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the

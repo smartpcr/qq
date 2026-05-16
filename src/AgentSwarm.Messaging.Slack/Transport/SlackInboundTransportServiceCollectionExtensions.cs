@@ -86,6 +86,7 @@ public static class SlackInboundTransportServiceCollectionExtensions
         services.TryAddSingleton<SlackInProcessIdempotencyStore>();
         services.TryAddSingleton<ISlackFastPathIdempotencyStore>(sp =>
             sp.GetRequiredService<SlackInProcessIdempotencyStore>());
+        services.TryAddSingleton<Rendering.ISlackMessageRenderer, Rendering.DefaultSlackMessageRenderer>();
         services.TryAddSingleton<ISlackModalPayloadBuilder, DefaultSlackModalPayloadBuilder>();
 
         // Audit recorder for modal_open entries (architecture.md §5.3

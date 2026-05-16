@@ -116,6 +116,42 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
                     "Could not open the modal: missing sub-command (expected `/agent review …` or `/agent escalate …`)."));
         }
 
+        // Stage 5.1 iter-3 evaluator item 1 (STRUCTURAL fix): both
+        // /agent review and /agent escalate REQUIRE a task-id argument
+        // -- the modal exists to act on a specific task, and the Stage
+        // 5.3 view-submission handler needs the task-id to route the
+        // resulting HumanDecisionEvent back to the right orchestrator
+        // task. Previously the fast-path silently opened a modal whose
+        // private_metadata fell back to the envelope's idempotency key
+        // (via DefaultSlackModalPayloadBuilder), producing a "task-id"
+        // that did not actually identify any agent task. The fix
+        // pre-validates the argument BEFORE acquiring the idempotency
+        // reservation so missing-argument requests (a) do not burn a
+        // durable dedup row, (b) do not call views.open, and (c)
+        // surface a usable ephemeral error to the invoking user. Tests
+        // pin both review and escalate paths in
+        // DefaultSlackModalFastPathHandlerTests.cs.
+        if (RequiresTaskIdArgument(payload.SubCommand!) && string.IsNullOrWhiteSpace(payload.ArgumentText))
+        {
+            this.logger.LogWarning(
+                "Slack modal fast-path rejected envelope idempotency_key={IdempotencyKey} team_id={TeamId} user_id={UserId}: sub-command '{SubCommand}' requires a task-id argument but none was supplied (text='{Text}').",
+                envelope.IdempotencyKey,
+                envelope.TeamId,
+                envelope.UserId,
+                payload.SubCommand,
+                payload.Text);
+            await this.auditRecorder
+                .RecordErrorAsync(
+                    envelope,
+                    payload.SubCommand!,
+                    "missing required task-id argument.",
+                    ct)
+                .ConfigureAwait(false);
+            return SlackModalFastPathResult.Handled(
+                BuildEphemeralError(
+                    $"`/agent {payload.SubCommand}` requires a task-id (e.g., `/agent {payload.SubCommand} TASK-42`)."));
+        }
+
         SlackFastPathIdempotencyResult acquireResult = await this.idempotencyStore
             .TryAcquireAsync(envelope.IdempotencyKey, envelope, lifetime: null, ct: ct)
             .ConfigureAwait(false);
@@ -298,6 +334,24 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
             .ConfigureAwait(false);
 
         return SlackModalFastPathResult.Handled(BuildEphemeralError(userMessage));
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> for sub-commands whose modal
+    /// rendering REQUIRES a task-id argument (currently
+    /// <c>/agent review</c> and <c>/agent escalate</c>).
+    /// </summary>
+    /// <remarks>
+    /// Stage 5.1 iter-3 evaluator item 1: this predicate is the single
+    /// source of truth for the fast-path's missing-argument validation
+    /// gate. Adding a new modal-style sub-command later requires
+    /// extending this method AND adding the matching renderer method on
+    /// <see cref="Rendering.ISlackMessageRenderer"/>.
+    /// </remarks>
+    private static bool RequiresTaskIdArgument(string subCommand)
+    {
+        return string.Equals(subCommand, "review", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(subCommand, "escalate", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
