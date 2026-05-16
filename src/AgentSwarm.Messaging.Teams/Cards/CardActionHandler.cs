@@ -1,122 +1,153 @@
 using System.Collections.Concurrent;
-using System.Net;
 using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Schema;
 using Microsoft.Extensions.Logging;
+using Newtonsoft.Json.Linq;
 
 namespace AgentSwarm.Messaging.Teams.Cards;
 
 /// <summary>
-/// Concrete <see cref="ICardActionHandler"/> implementation introduced in Stage 3.3.
-/// Parses an inbound Adaptive Card <c>adaptiveCard/action</c> invoke, validates the
-/// chosen action against the originating <see cref="AgentQuestion.AllowedActions"/>,
-/// transitions the question's <see cref="AgentQuestion.Status"/> via the
-/// compare-and-set <see cref="IAgentQuestionStore.TryUpdateStatusAsync"/> (first-writer
-/// wins), publishes a <see cref="DecisionEvent"/> wrapping the
-/// <see cref="HumanDecisionEvent"/>, and replaces the original card via
-/// <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, HumanDecisionEvent, string?, CancellationToken)"/>.
-/// Every terminal path writes a single sanitised <see cref="AuditEntry"/>.
+/// Concrete implementation of <see cref="ICardActionHandler"/> for Stage 3.3 of
+/// <c>implementation-plan.md</c> (steps 3 and 4) and <c>architecture.md</c> ┬º2.6 / ┬º6.3.
+/// Replaces the <c>NoOpCardActionHandler</c> stub registered in Stage 2.1 once the SQL
+/// stores ship.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Dedupe (architecture §2.6 layer 2).</b> A per-actor / per-question / per-action
-/// in-process dedupe set short-circuits duplicate submissions within
-/// <see cref="DedupeTtl"/> so a Teams double-tap cannot produce two terminal outcomes or
-/// two decision events. The dedupe key is <c>(QuestionId, AadObjectId, ActionValue)</c>
-/// — a different actor (or different action) is NOT deduped. When the handler throws
-/// (infrastructure outage), the dedupe entry is evicted in the <c>finally</c> so the
-/// actor can retry.
+/// The handler is deliberately the single point of entry from
+/// <see cref="TeamsSwarmActivityHandler"/>'s <c>OnAdaptiveCardInvokeAsync</c> override ΓÇö
+/// every responsibility called out in the implementation plan is fulfilled here:
 /// </para>
-/// <para>
-/// <b>Sanitised audit payload.</b> The user-supplied <see cref="HumanDecisionEvent.Comment"/>
-/// is replaced with the literal sentinel <c>&lt;redacted&gt;</c> before serialisation so
-/// free-text comments cannot leak PII or secrets into the audit log. The audit payload
-/// captures only stable, non-sensitive context — the question / action IDs, the
-/// correlation ID, the actor's AAD object ID, the (optional) Teams activity ID resolved
-/// from <see cref="ICardStateStore"/>, and whether a comment was present (without the
-/// content).
-/// </para>
-/// <para>
-/// <b>Update-card failure handling.</b> When
+/// <list type="number">
+/// <item><description>Parse the inbound <see cref="Activity.Value"/> via
+/// <see cref="CardActionMapper.ReadPayload"/> to extract the <c>QuestionId</c>,
+/// <c>ActionId</c>, <c>ActionValue</c>, <c>CorrelationId</c>, and the optional
+/// <c>Comment</c> ΓÇö the same code path used by Stage 3.1's
+/// <see cref="CardActionMapper"/> so a typo on either side fails fast.</description></item>
+/// <item><description>Apply the <c>architecture.md</c> ┬º2.6 fast-path dedupe ΓÇö the
+/// <see cref="_processedActions"/> in-memory set keyed on <c>QuestionId + ActorAad</c>
+/// short-circuits within-session duplicate submissions (double-taps) <i>before</i>
+/// touching any store. Entries are kept for
+/// <see cref="DedupeRetentionPeriod"/> on every terminal outcome (success or known
+/// rejection) so a user cannot get a different reply by spamming the same action;
+/// entries are explicitly evicted on unhandled exceptions so transient infrastructure
+/// failures remain retryable.</description></item>
+/// <item><description>Resolve the originating <see cref="AgentQuestion"/> via
+/// <see cref="IAgentQuestionStore.GetByIdAsync"/>. A missing question reports a
+/// <c>Rejected</c> audit entry and surfaces a "question not found" card without
+/// publishing a decision event.</description></item>
+/// <item><description>Validate that <see cref="AgentQuestion.AllowedActions"/> contains
+/// the submitted <c>ActionValue</c>. An invalid action reports a <c>Rejected</c>
+/// audit entry and a "not permitted" card.</description></item>
+/// <item><description>Reject if the question's <see cref="AgentQuestion.Status"/> is
+/// already terminal (<see cref="AgentQuestionStatuses.Resolved"/> or
+/// <see cref="AgentQuestionStatuses.Expired"/>). The audit entry uses
+/// <see cref="AuditOutcomes.Rejected"/>.</description></item>
+/// <item><description>Atomically transition <see cref="AgentQuestion.Status"/> from
+/// <see cref="AgentQuestionStatuses.Open"/> to
+/// <see cref="AgentQuestionStatuses.Resolved"/> via
+/// <see cref="IAgentQuestionStore.TryUpdateStatusAsync"/>. If the CAS returns
+/// <c>false</c> (another pod won the race per <c>architecture.md</c> ┬º6.3), surface
+/// a "decision already recorded" card and emit a <c>Rejected</c> audit entry ΓÇö the
+/// concurrent winner is responsible for the decision event and the card update.</description></item>
+/// <item><description>On a successful CAS publish a <see cref="DecisionEvent"/>
+/// wrapping the <see cref="HumanDecisionEvent"/> via
+/// <see cref="IInboundEventPublisher.PublishAsync"/>, replace the original card via
 /// <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, HumanDecisionEvent, string?, CancellationToken)"/>
-/// throws AFTER the durable Open→Resolved CAS succeeded, the durable resolution stands
-/// (the user's choice is recorded and the decision event is published) but the audit
-/// outcome flips to <see cref="AuditOutcomes.Failed"/> with a <c>cardUpdateError</c>
-/// marker — operators need a signal that the user-visible card was not replaced.
+/// (the actor-attributed overload ΓÇö the canonical 3-arg
+/// <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, CancellationToken)"/>
+/// remains intact for callers that have no decision payload), and write a
+/// <see cref="AuditEventTypes.CardActionReceived"/> audit entry. <b>Iter-8 fix #3:</b>
+/// if the card update throws after the durable resolution succeeds, the audit row is
+/// written with <see cref="AuditOutcomes.Failed"/> and a <c>cardUpdateError</c>
+/// marker in the sanitised payload JSON ΓÇö the decision itself is durably recorded so
+/// the caller still receives an <c>Accept</c> response, but operators see the
+/// lifecycle gap in the audit trail.</description></item>
+/// </list>
+/// <para>
+/// <b>Audit payload sanitisation.</b> The <see cref="AuditEntry.PayloadJson"/> field is
+/// built by <see cref="BuildSanitizedPayloadJsonAsync"/> which extracts only the
+/// canonical card-action fields plus a redacted comment indicator and the persisted
+/// card-state activity ID ΓÇö never the raw <c>Activity.Value</c> blob, never any free-form
+/// user comment text. This is the sanitization mandated by <c>tech-spec.md</c> ┬º4.3
+/// (PayloadJson must contain "no secrets or PII beyond identity"). The card-state lookup
+/// is best-effort: a missing or failing <see cref="ICardStateStore.GetByQuestionIdAsync"/>
+/// is logged at warning level and the resulting payload simply omits the
+/// <c>cardActivityId</c> hint.
 /// </para>
 /// </remarks>
 public sealed class CardActionHandler : ICardActionHandler
 {
-    private const string AdaptiveCardInvokeName = "adaptiveCard/action";
-    private const string MessageResponseType = "application/vnd.microsoft.activity.message";
-    private const string ErrorResponseType = "application/vnd.microsoft.error";
-    private const string TeamsMessengerLabel = "Teams";
-    private const string RedactionSentinel = "<redacted>";
-
-    /// <summary>Window inside which a repeated (actor, question, action) tap is treated as a double-tap.</summary>
-    private static readonly TimeSpan DedupeTtl = TimeSpan.FromMinutes(5);
-
-    private static readonly JsonSerializerOptions InvokePayloadJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-    };
-
-    private static readonly JsonSerializerOptions SanitisedPayloadJsonOptions = new()
-    {
-        WriteIndented = false,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-    };
+    /// <summary>
+    /// Retention window for the in-memory processed-action dedupe set
+    /// (<c>architecture.md</c> ┬º2.6 layer 2). Entries older than this are pruned on
+    /// every <see cref="HandleAsync"/> entry so the set does not grow unbounded.
+    /// Five minutes is intentionally wider than the typical card-double-tap window but
+    /// narrow enough that a user who genuinely retries after a transient failure can
+    /// recover. Tests opt in to a shorter window via the
+    /// <c>internal</c> 8-argument constructor.
+    /// </summary>
+    internal static readonly TimeSpan DedupeRetentionPeriod = TimeSpan.FromMinutes(5);
 
     private readonly IAgentQuestionStore _questionStore;
     private readonly ICardStateStore _cardStateStore;
     private readonly ITeamsCardManager _cardManager;
-    private readonly IInboundEventPublisher _publisher;
-    private readonly IAuditLogger _audit;
+    private readonly IInboundEventPublisher _inboundEventPublisher;
+    private readonly IAuditLogger _auditLogger;
     private readonly ILogger<CardActionHandler> _logger;
+    private readonly CardActionMapper _mapper;
     private readonly TimeProvider _timeProvider;
-    private readonly ConcurrentDictionary<DedupeKey, DateTimeOffset> _dedupe = new();
+    private readonly TimeSpan _dedupeRetention;
+
+    // architecture.md ┬º2.6 layer 2 ΓÇö fast-path dedupe keyed on "{questionId}|{actorAad}".
+    // Tracks the timestamp the key was first claimed so stale entries (older than
+    // _dedupeRetention) can be evicted lazily on every HandleAsync entry.
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _processedActions = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Production constructor — defaults the clock to <see cref="TimeProvider.System"/>.
-    /// Every dependency is null-guarded so DI mis-registration fails loudly at the
-    /// composition root rather than producing a <see cref="NullReferenceException"/>
-    /// inside an inbound invoke.
+    /// Construct the handler with the six dependencies required by
+    /// <c>implementation-plan.md</c> ┬º3.3 step 3. Every parameter is null-guarded so DI
+    /// mis-registration fails loudly.
     /// </summary>
     public CardActionHandler(
         IAgentQuestionStore questionStore,
         ICardStateStore cardStateStore,
         ITeamsCardManager cardManager,
-        IInboundEventPublisher publisher,
-        IAuditLogger audit,
+        IInboundEventPublisher inboundEventPublisher,
+        IAuditLogger auditLogger,
         ILogger<CardActionHandler> logger)
-        : this(questionStore, cardStateStore, cardManager, publisher, audit, logger, TimeProvider.System)
+        : this(questionStore, cardStateStore, cardManager, inboundEventPublisher, auditLogger, logger, TimeProvider.System, DedupeRetentionPeriod)
     {
     }
 
     /// <summary>
-    /// Test-friendly constructor that accepts a deterministic <see cref="TimeProvider"/>
-    /// so unit tests can pin audit timestamps and exercise dedupe TTL without
-    /// wall-clock flakiness.
+    /// Test-friendly constructor that accepts a deterministic
+    /// <see cref="TimeProvider"/> and a configurable dedupe retention window. Hosts
+    /// resolve the public 6-arg constructor via DI; unit tests opt in to this overload
+    /// to advance the dedupe clock without sleeping.
     /// </summary>
-    public CardActionHandler(
+    internal CardActionHandler(
         IAgentQuestionStore questionStore,
         ICardStateStore cardStateStore,
         ITeamsCardManager cardManager,
-        IInboundEventPublisher publisher,
-        IAuditLogger audit,
+        IInboundEventPublisher inboundEventPublisher,
+        IAuditLogger auditLogger,
         ILogger<CardActionHandler> logger,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        TimeSpan dedupeRetention)
     {
         _questionStore = questionStore ?? throw new ArgumentNullException(nameof(questionStore));
         _cardStateStore = cardStateStore ?? throw new ArgumentNullException(nameof(cardStateStore));
         _cardManager = cardManager ?? throw new ArgumentNullException(nameof(cardManager));
-        _publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
-        _audit = audit ?? throw new ArgumentNullException(nameof(audit));
+        _inboundEventPublisher = inboundEventPublisher ?? throw new ArgumentNullException(nameof(inboundEventPublisher));
+        _auditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _dedupeRetention = dedupeRetention > TimeSpan.Zero ? dedupeRetention : DedupeRetentionPeriod;
+        _mapper = new CardActionMapper();
     }
 
     /// <inheritdoc />
@@ -124,446 +155,553 @@ public sealed class CardActionHandler : ICardActionHandler
     {
         ArgumentNullException.ThrowIfNull(turnContext);
 
-        var activity = turnContext.Activity
-            ?? throw new InvalidOperationException("ITurnContext.Activity must not be null for an Adaptive Card invoke.");
-
-        var actorAad = activity.From?.AadObjectId ?? activity.From?.Id ?? "unknown";
-        var actorDisplayName = activity.From?.Name;
+        var activity = turnContext.Activity;
+        var actorAad = activity?.From?.AadObjectId ?? activity?.From?.Id ?? "unknown";
+        var actorDisplayName = activity?.From?.Name;
         var tenantId = ResolveTenantId(activity);
+        var receivedAt = activity?.Timestamp ?? _timeProvider.GetUtcNow();
 
-        // Parse the payload up front. A null / malformed Activity.Value is a rejection
-        // — we still write a Rejected audit row so the security/forensic timeline shows
-        // the invalid invoke arrived. CardActionPayload validation is delegated to
-        // CardActionMapper.ReadPayload which throws on missing required keys.
-        CardActionPayload? payload = null;
-        Exception? parseError = null;
-        try
+        // Guard: an Adaptive Card invoke without an Action.Submit payload is malformed ΓÇö
+        // surface as Rejected so operators can investigate via the audit trail without a
+        // stack trace blowing up the bot framework pipeline. The dedupe layer cannot key
+        // off a missing question ID so we skip it for this malformed branch.
+        if (activity?.Value is null)
         {
-            if (activity.Value is null)
-            {
-                parseError = new InvalidOperationException("Activity.Value is null.");
-            }
-            else
-            {
-                payload = new CardActionMapper().ReadPayload(activity.Value);
-            }
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or System.Text.Json.JsonException)
-        {
-            parseError = ex;
-        }
-
-        if (payload is null)
-        {
-            await WriteAuditAsync(
-                tenantId: tenantId,
-                correlationId: activity.GetCorrelationId() ?? Guid.NewGuid().ToString(),
-                actorAad: actorAad,
+            _logger.LogWarning("Adaptive card invoke arrived with a null Activity.Value; rejecting.");
+            await WriteRejectionAuditAsync(
+                actorAad,
+                tenantId,
                 agentId: null,
-                taskId: null,
-                conversationId: activity.Conversation?.Id,
-                action: "invalid",
-                payloadJson: BuildErrorPayload("invalidPayload", parseError?.Message ?? "Payload missing or unparseable."),
-                outcome: AuditOutcomes.Rejected,
+                action: "(missing)",
+                payloadJson: BuildEmptyPayloadJson(reason: "missing-activity-value"),
+                correlationId: ResolveCorrelationId(activity, fallback: Guid.NewGuid().ToString("N")),
+                receivedAt,
                 ct).ConfigureAwait(false);
-
-            return Reject("InvalidPayload", "Adaptive card payload was missing or malformed.");
+            return Reject("Adaptive card payload was missing.");
         }
 
-        // Architecture §2.6 layer 2: short-circuit duplicate submissions BEFORE touching
-        // any store. The dedupe key is (QuestionId, AadObjectId, ActionValue) so a
-        // different actor (or a different action) is NOT deduped.
-        var dedupeKey = new DedupeKey(payload.QuestionId, actorAad, payload.ActionValue);
-        if (TryShortCircuitDuplicate(dedupeKey))
-        {
-            _logger.LogDebug(
-                "Short-circuiting duplicate card action for question {QuestionId}, actor {Actor}, action {Action}.",
-                payload.QuestionId, actorAad, payload.ActionValue);
-            return Accept();
-        }
-
-        var dedupeRegistered = true;
+        CardActionPayload payload;
         try
         {
-            // GetByIdAsync is intentionally NOT inside a try/catch — an infrastructure
-            // outage (store down) should propagate so the caller can retry. The finally
-            // block below evicts the dedupe entry so the actor's retry is not silently
-            // short-circuited.
-            var question = await _questionStore.GetByIdAsync(payload.QuestionId, ct).ConfigureAwait(false);
-
-            if (question is null)
-            {
-                await WriteAuditAsync(
-                    tenantId: tenantId,
-                    correlationId: payload.CorrelationId,
-                    actorAad: actorAad,
-                    agentId: null,
-                    taskId: null,
-                    conversationId: activity.Conversation?.Id,
-                    action: payload.ActionValue,
-                    payloadJson: BuildSanitisedPayload(payload, actorAad, activityId: activity.ReplyToId, commentPresent: payload.Comment is not null, cardUpdateError: null),
-                    outcome: AuditOutcomes.Rejected,
-                    ct).ConfigureAwait(false);
-
-                return Reject("QuestionNotFound", "This question is no longer available.");
-            }
-
-            if (!IsActionAllowed(question, payload.ActionValue))
-            {
-                await WriteAuditAsync(
-                    tenantId: tenantId,
-                    correlationId: payload.CorrelationId,
-                    actorAad: actorAad,
-                    agentId: question.AgentId,
-                    taskId: question.TaskId,
-                    conversationId: activity.Conversation?.Id ?? question.ConversationId,
-                    action: payload.ActionValue,
-                    payloadJson: BuildSanitisedPayload(payload, actorAad, activityId: activity.ReplyToId, commentPresent: payload.Comment is not null, cardUpdateError: null),
-                    outcome: AuditOutcomes.Rejected,
-                    ct).ConfigureAwait(false);
-
-                return Reject("InvalidAction", $"'{payload.ActionValue}' is not an allowed action for this question.");
-            }
-
-            if (!string.Equals(question.Status, AgentQuestionStatuses.Open, StringComparison.Ordinal))
-            {
-                await WriteAuditAsync(
-                    tenantId: tenantId,
-                    correlationId: payload.CorrelationId,
-                    actorAad: actorAad,
-                    agentId: question.AgentId,
-                    taskId: question.TaskId,
-                    conversationId: activity.Conversation?.Id ?? question.ConversationId,
-                    action: payload.ActionValue,
-                    payloadJson: BuildSanitisedPayload(payload, actorAad, activityId: activity.ReplyToId, commentPresent: payload.Comment is not null, cardUpdateError: null),
-                    outcome: AuditOutcomes.Rejected,
-                    ct).ConfigureAwait(false);
-
-                return Reject(
-                    "AlreadyResolved",
-                    $"This question has already been {question.Status.ToLowerInvariant()}.");
-            }
-
-            // First-writer-wins CAS. A concurrent winner causes the CAS to return false;
-            // we record a Rejected audit row and tell the user.
-            var won = await _questionStore
-                .TryUpdateStatusAsync(question.QuestionId, AgentQuestionStatuses.Open, AgentQuestionStatuses.Resolved, ct)
-                .ConfigureAwait(false);
-            if (!won)
-            {
-                await WriteAuditAsync(
-                    tenantId: tenantId,
-                    correlationId: payload.CorrelationId,
-                    actorAad: actorAad,
-                    agentId: question.AgentId,
-                    taskId: question.TaskId,
-                    conversationId: activity.Conversation?.Id ?? question.ConversationId,
-                    action: payload.ActionValue,
-                    payloadJson: BuildSanitisedPayload(payload, actorAad, activityId: activity.ReplyToId, commentPresent: payload.Comment is not null, cardUpdateError: null),
-                    outcome: AuditOutcomes.Rejected,
-                    ct).ConfigureAwait(false);
-
-                return Reject("RaceLost", "This question was just resolved by someone else.");
-            }
-
-            // Build & publish the decision payload. Comment passes through here intact
-            // (it goes onto the in-process channel, NOT into the audit log).
-            var decision = new HumanDecisionEvent(
-                QuestionId: question.QuestionId,
-                ActionValue: payload.ActionValue,
-                Comment: payload.Comment,
-                Messenger: TeamsMessengerLabel,
-                ExternalUserId: actorAad,
-                ExternalMessageId: activity.Id ?? Guid.NewGuid().ToString("N"),
-                ReceivedAt: _timeProvider.GetUtcNow(),
-                CorrelationId: payload.CorrelationId);
-
-            var decisionEvent = new DecisionEvent
-            {
-                EventId = Guid.NewGuid().ToString(),
-                CorrelationId = payload.CorrelationId,
-                Messenger = TeamsMessengerLabel,
-                ExternalUserId = actorAad,
-                ActivityId = activity.Id,
-                Source = activity.Conversation?.ConversationType == "channel"
-                    ? MessengerEventSources.TeamChannel
-                    : MessengerEventSources.PersonalChat,
-                Timestamp = _timeProvider.GetUtcNow(),
-                Payload = decision,
-            };
-
-            await _publisher.PublishAsync(decisionEvent, ct).ConfigureAwait(false);
-
-            // Best-effort: try to resolve the original activity ID from card state so it
-            // can be surfaced in the sanitised audit payload. A throw from the store is
-            // swallowed — the audit log MUST be written regardless of whether we know
-            // the original activity ID.
-            string? resolvedActivityId = activity.ReplyToId;
-            try
-            {
-                var cardState = await _cardStateStore.GetByQuestionIdAsync(question.QuestionId, ct).ConfigureAwait(false);
-                if (cardState is not null && !string.IsNullOrWhiteSpace(cardState.ActivityId))
-                {
-                    resolvedActivityId = cardState.ActivityId;
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Best-effort card-state lookup failed for question {QuestionId}; continuing.", question.QuestionId);
-            }
-
-            // Replace the original card via the decision-attributed overload. A throw
-            // here is non-fatal for the durable resolution (CAS already won, decision
-            // already published, response will still Accept) but flips the audit outcome
-            // to Failed with a cardUpdateError marker so operators can see the visible
-            // card was not replaced.
-            string? cardUpdateError = null;
-            try
-            {
-                await _cardManager
-                    .UpdateCardAsync(question.QuestionId, CardUpdateAction.MarkAnswered, decision, actorDisplayName, ct)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                cardUpdateError = ex.Message;
-                _logger.LogError(ex, "Card update failed for question {QuestionId}; audit will reflect Failed.", question.QuestionId);
-            }
-
-            await WriteAuditAsync(
-                tenantId: tenantId,
-                correlationId: payload.CorrelationId,
-                actorAad: actorAad,
-                agentId: question.AgentId,
-                taskId: question.TaskId,
-                conversationId: activity.Conversation?.Id ?? question.ConversationId,
-                action: payload.ActionValue,
-                payloadJson: BuildSanitisedPayload(
-                    payload,
-                    actorAad,
-                    activityId: resolvedActivityId,
-                    commentPresent: payload.Comment is not null,
-                    cardUpdateError: cardUpdateError),
-                outcome: cardUpdateError is null ? AuditOutcomes.Success : AuditOutcomes.Failed,
+            payload = _mapper.ReadPayload(activity.Value);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentNullException)
+        {
+            _logger.LogWarning(ex, "Adaptive card invoke payload was malformed; rejecting.");
+            await WriteRejectionAuditAsync(
+                actorAad,
+                tenantId,
+                agentId: null,
+                action: "(invalid)",
+                payloadJson: BuildEmptyPayloadJson(reason: "malformed-payload"),
+                correlationId: ResolveCorrelationId(activity, fallback: Guid.NewGuid().ToString("N")),
+                receivedAt,
                 ct).ConfigureAwait(false);
+            return Reject($"Adaptive card payload was invalid: {ex.Message}");
+        }
 
-            return Accept();
+        var correlationId = !string.IsNullOrWhiteSpace(payload.CorrelationId)
+            ? payload.CorrelationId
+            : ResolveCorrelationId(activity, fallback: Guid.NewGuid().ToString("N"));
+
+        // architecture.md ┬º2.6 layer 2 ΓÇö in-memory processed-action dedupe set, keyed on
+        // (QuestionId + UserId). Fast-path short-circuits within-session duplicate
+        // submissions (e.g. user double-tapped the Approve button or the Bot Framework
+        // delivered the same invoke twice) before any I/O. Entries are kept for
+        // _dedupeRetention on every terminal outcome (success or planned rejection); only
+        // unhandled exceptions evict the entry so transient infrastructure failures stay
+        // retryable.
+        var dedupeKey = BuildDedupeKey(payload.QuestionId, actorAad);
+        var nowForDedupe = _timeProvider.GetUtcNow();
+        PruneStaleDedupeEntries(nowForDedupe);
+        if (!_processedActions.TryAdd(dedupeKey, nowForDedupe))
+        {
+            _logger.LogInformation(
+                "Card action {ActionValue} for question {QuestionId} by actor {Actor} short-circuited by in-memory dedupe.",
+                payload.ActionValue,
+                payload.QuestionId,
+                actorAad);
+            return Reject($"Decision for question '{payload.QuestionId}' has already been submitted.");
+        }
+
+        var keepDedupeEntry = false;
+        try
+        {
+            var response = await ProcessHandledAsync(
+                turnContext,
+                activity,
+                payload,
+                actorAad,
+                actorDisplayName,
+                tenantId,
+                receivedAt,
+                correlationId,
+                ct).ConfigureAwait(false);
+            keepDedupeEntry = true;
+            return response;
         }
         catch
         {
-            // Architecture §2.6: a failure mid-pipeline must evict the dedupe entry so
-            // the actor can retry. Without this, a transient outage would permanently
-            // reject the actor's next attempt within the dedupe TTL.
-            _dedupe.TryRemove(dedupeKey, out _);
-            dedupeRegistered = false;
+            // Unhandled exception means we never reached a terminal outcome ΓÇö let the
+            // user retry the action by evicting the dedupe entry. Planned rejections and
+            // the Failed-audit branch flow through the normal return path above and keep
+            // the entry.
             throw;
         }
         finally
         {
-            if (dedupeRegistered)
+            if (!keepDedupeEntry)
             {
-                // Leave the registered entry in place on success — it is the source of
-                // truth for "this actor already submitted this action". Eviction on the
-                // success path happens lazily via the TTL check in TryShortCircuit.
+                _processedActions.TryRemove(dedupeKey, out _);
             }
         }
     }
 
-    private bool TryShortCircuitDuplicate(DedupeKey key)
-    {
-        var now = _timeProvider.GetUtcNow();
-
-        // If a recent entry exists AND is still within the TTL, the second submission is
-        // a duplicate. Otherwise install (or refresh) the entry and run the pipeline.
-        if (_dedupe.TryGetValue(key, out var existing) && now - existing < DedupeTtl)
-        {
-            return true;
-        }
-
-        _dedupe[key] = now;
-        return false;
-    }
-
-    private static bool IsActionAllowed(AgentQuestion question, string actionValue)
-    {
-        foreach (var action in question.AllowedActions)
-        {
-            if (string.Equals(action.Value, actionValue, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static string ResolveTenantId(Activity activity)
-    {
-        // Preferred: Conversation.TenantId (set by the Teams channel adapter).
-        var convTenant = activity.Conversation?.TenantId;
-        if (!string.IsNullOrWhiteSpace(convTenant))
-        {
-            return convTenant!;
-        }
-
-        // Fallback: ChannelData.tenant.id when the activity carries Teams channel data.
-        if (activity.ChannelData is Newtonsoft.Json.Linq.JObject channelData)
-        {
-            var tenantToken = channelData["tenant"]?["id"];
-            if (tenantToken is not null)
-            {
-                var raw = tenantToken.Type == Newtonsoft.Json.Linq.JTokenType.String
-                    ? (string?)tenantToken
-                    : tenantToken.ToString();
-                if (!string.IsNullOrWhiteSpace(raw))
-                {
-                    return raw!;
-                }
-            }
-        }
-
-        return "unknown";
-    }
-
-    private static AdaptiveCardInvokeResponse Accept()
-    {
-        return new AdaptiveCardInvokeResponse
-        {
-            StatusCode = (int)HttpStatusCode.OK,
-            Type = MessageResponseType,
-            Value = new { message = "Recorded." },
-        };
-    }
-
-    private static AdaptiveCardInvokeResponse Reject(string code, string message)
-    {
-        // Bot Framework Universal Action contract: errors use a 4xx status + the
-        // application/vnd.microsoft.error type. Value carries a code/message pair the
-        // Teams client surfaces to the user.
-        return new AdaptiveCardInvokeResponse
-        {
-            StatusCode = (int)HttpStatusCode.BadRequest,
-            Type = ErrorResponseType,
-            Value = new { code, message },
-        };
-    }
-
-    private static string BuildSanitisedPayload(
+    private async Task<AdaptiveCardInvokeResponse> ProcessHandledAsync(
+        ITurnContext turnContext,
+        Activity activity,
         CardActionPayload payload,
         string actorAad,
-        string? activityId,
-        bool commentPresent,
-        string? cardUpdateError)
+        string? actorDisplayName,
+        string tenantId,
+        DateTimeOffset receivedAt,
+        string correlationId,
+        CancellationToken ct)
     {
-        var sanitised = new SanitisedAuditPayload(
+        _ = turnContext;
+
+        var question = await _questionStore.GetByIdAsync(payload.QuestionId, ct).ConfigureAwait(false);
+        if (question is null)
+        {
+            _logger.LogWarning(
+                "Card action {ActionValue} for question {QuestionId} rejected ΓÇö no stored question.",
+                payload.ActionValue,
+                payload.QuestionId);
+            var sanitized = await BuildSanitizedPayloadJsonAsync(payload, agentId: null, ct).ConfigureAwait(false);
+            await WriteAuditAsync(
+                outcome: AuditOutcomes.Rejected,
+                actorAad,
+                tenantId,
+                agentId: null,
+                action: payload.ActionValue,
+                payloadJson: sanitized,
+                correlationId,
+                receivedAt,
+                ct).ConfigureAwait(false);
+            return Reject($"Question '{payload.QuestionId}' was not found.");
+        }
+
+        var allowed = question.AllowedActions
+            .Any(a => string.Equals(a.Value, payload.ActionValue, StringComparison.Ordinal));
+        if (!allowed)
+        {
+            _logger.LogWarning(
+                "Card action {ActionValue} for question {QuestionId} rejected ΓÇö not in AllowedActions.",
+                payload.ActionValue,
+                payload.QuestionId);
+            var sanitized = await BuildSanitizedPayloadJsonAsync(payload, question.AgentId, ct).ConfigureAwait(false);
+            await WriteAuditAsync(
+                outcome: AuditOutcomes.Rejected,
+                actorAad,
+                tenantId,
+                agentId: question.AgentId,
+                action: payload.ActionValue,
+                payloadJson: sanitized,
+                correlationId,
+                receivedAt,
+                ct).ConfigureAwait(false);
+            return Reject($"Action '{payload.ActionValue}' is not permitted on this question.");
+        }
+
+        if (!string.Equals(question.Status, AgentQuestionStatuses.Open, StringComparison.Ordinal))
+        {
+            _logger.LogInformation(
+                "Card action {ActionValue} for question {QuestionId} rejected ΓÇö status is {Status}.",
+                payload.ActionValue,
+                payload.QuestionId,
+                question.Status);
+            var sanitized = await BuildSanitizedPayloadJsonAsync(payload, question.AgentId, ct).ConfigureAwait(false);
+            await WriteAuditAsync(
+                outcome: AuditOutcomes.Rejected,
+                actorAad,
+                tenantId,
+                agentId: question.AgentId,
+                action: payload.ActionValue,
+                payloadJson: sanitized,
+                correlationId,
+                receivedAt,
+                ct).ConfigureAwait(false);
+            return Reject($"Decision for question '{payload.QuestionId}' has already been recorded.");
+        }
+
+        var transitioned = await _questionStore
+            .TryUpdateStatusAsync(
+                payload.QuestionId,
+                AgentQuestionStatuses.Open,
+                AgentQuestionStatuses.Resolved,
+                ct)
+            .ConfigureAwait(false);
+
+        if (!transitioned)
+        {
+            _logger.LogInformation(
+                "Card action {ActionValue} for question {QuestionId} rejected ΓÇö concurrent resolver won the race.",
+                payload.ActionValue,
+                payload.QuestionId);
+            var sanitized = await BuildSanitizedPayloadJsonAsync(payload, question.AgentId, ct).ConfigureAwait(false);
+            await WriteAuditAsync(
+                outcome: AuditOutcomes.Rejected,
+                actorAad,
+                tenantId,
+                agentId: question.AgentId,
+                action: payload.ActionValue,
+                payloadJson: sanitized,
+                correlationId,
+                receivedAt,
+                ct).ConfigureAwait(false);
+            return Reject($"Decision for question '{payload.QuestionId}' has already been recorded.");
+        }
+
+        // CAS won ΓÇö emit decision, update the card, and write the success audit row.
+        var decision = new HumanDecisionEvent(
             QuestionId: payload.QuestionId,
-            ActionId: payload.ActionId,
             ActionValue: payload.ActionValue,
-            CorrelationId: payload.CorrelationId,
-            ActorAad: actorAad,
-            ActivityId: activityId,
-            Comment: commentPresent ? RedactionSentinel : null,
-            CardUpdateError: cardUpdateError);
-        return JsonSerializer.Serialize(sanitised, SanitisedPayloadJsonOptions);
+            Comment: payload.Comment,
+            Messenger: "Teams",
+            ExternalUserId: actorAad,
+            ExternalMessageId: activity.Id ?? string.Empty,
+            ReceivedAt: receivedAt,
+            CorrelationId: correlationId);
+
+        var decisionEvent = new DecisionEvent
+        {
+            EventId = Guid.NewGuid().ToString("N"),
+            CorrelationId = correlationId,
+            Messenger = "Teams",
+            ExternalUserId = actorAad,
+            ActivityId = activity.Id,
+            Source = MessengerEventSourceFromActivity(activity),
+            Timestamp = receivedAt,
+            Payload = decision,
+        };
+
+        try
+        {
+            await _inboundEventPublisher.PublishAsync(decisionEvent, ct).ConfigureAwait(false);
+        }
+        catch (Exception publishEx)
+        {
+            // Iter-9 fix (FR-005 "Message loss: 0 tolerated"): the durable status was
+            // just flipped Open->Resolved, but the decision event never reached the
+            // inbound publisher (channel full, writer closed, host shutdown, ...). If
+            // we leave the question pinned Resolved, the actor's retry will short-
+            // circuit on the status guard above and return "already recorded" — the
+            // human's decision is silently lost and the agent never observes it.
+            // Compensate by attempting a Resolved->Open CAS so the retry path (the
+            // outer HandleAsync catch evicts the dedupe entry on rethrow) can re-run
+            // end-to-end.
+            //
+            // Rollback uses a fresh CancellationTokenSource bounded by a short
+            // timeout: the inbound ct is most often cancelled when PublishAsync
+            // fails (channel shutdown, host stop), but the rollback must still make
+            // a best-effort attempt to land. The bounded timeout protects against a
+            // pathological store hang.
+            using var rollbackCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            bool rolledBack;
+            try
+            {
+                rolledBack = await _questionStore
+                    .TryUpdateStatusAsync(
+                        payload.QuestionId,
+                        AgentQuestionStatuses.Resolved,
+                        AgentQuestionStatuses.Open,
+                        rollbackCts.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception rollbackEx)
+            {
+                _logger.LogError(
+                    new AggregateException(publishEx, rollbackEx),
+                    "Decision publish failed for question {QuestionId} and the compensating Resolved->Open rollback also threw; the question is stuck Resolved with no decision event delivered. Operator intervention is required to restore status=Open or to replay the decision out-of-band.",
+                    payload.QuestionId);
+                throw;
+            }
+
+            if (rolledBack)
+            {
+                _logger.LogWarning(
+                    publishEx,
+                    "Decision publish failed for question {QuestionId}; compensating CAS Resolved->Open succeeded so the actor can retry.",
+                    payload.QuestionId);
+            }
+            else
+            {
+                // The status was already moved off Resolved by some other actor (very
+                // unlikely — only the expiry processor would touch a Resolved row,
+                // and it ignores Resolved). We cannot deliver the original decision,
+                // so log loud and let the original exception propagate.
+                _logger.LogError(
+                    publishEx,
+                    "Decision publish failed for question {QuestionId} and the compensating Resolved->Open CAS did not apply (status diverged); the decision is lost and operator intervention is required.",
+                    payload.QuestionId);
+            }
+
+            throw;
+        }
+
+        // Iter-8 fix #3: capture the card-update exception (if any) so the audit row
+        // truthfully reflects the lifecycle outcome. The decision is durably resolved at
+        // this point and we still return Accept to the caller ΓÇö but the audit must NOT
+        // report Success when the original card was not replaced.
+        Exception? cardUpdateException = null;
+        try
+        {
+            await _cardManager
+                .UpdateCardAsync(
+                    payload.QuestionId,
+                    CardUpdateAction.MarkAnswered,
+                    decision,
+                    actorDisplayName,
+                    ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            cardUpdateException = ex;
+            _logger.LogError(
+                ex,
+                "Card update for question {QuestionId} failed after successful resolution; decision is durably recorded but the original card remains active and is now stale.",
+                payload.QuestionId);
+        }
+
+        var auditOutcome = cardUpdateException is null
+            ? AuditOutcomes.Success
+            : AuditOutcomes.Failed;
+        var payloadJson = await BuildSanitizedPayloadJsonAsync(
+            payload,
+            question.AgentId,
+            ct,
+            cardUpdateError: cardUpdateException?.Message).ConfigureAwait(false);
+        await WriteAuditAsync(
+            outcome: auditOutcome,
+            actorAad,
+            tenantId,
+            agentId: question.AgentId,
+            action: payload.ActionValue,
+            payloadJson: payloadJson,
+            correlationId,
+            receivedAt,
+            ct).ConfigureAwait(false);
+
+        return Accept($"Recorded {payload.ActionValue} for {payload.QuestionId}.");
     }
 
-    private static string BuildErrorPayload(string code, string message)
+    private static string BuildDedupeKey(string questionId, string actorAad)
+        => $"{questionId}|{actorAad}";
+
+    private void PruneStaleDedupeEntries(DateTimeOffset now)
     {
-        return JsonSerializer.Serialize(new { code, message }, SanitisedPayloadJsonOptions);
+        // Lazy O(N) eviction on each entry ΓÇö the dedupe set is bounded by the rate of
+        // distinct (question, user) pairs within _dedupeRetention. For a realistic
+        // approval workload this stays in the low hundreds of entries even at peak. We
+        // deliberately avoid a background sweep timer because keeping the handler free
+        // of timers makes lifetime reasoning and tests simpler.
+        if (_processedActions.IsEmpty)
+        {
+            return;
+        }
+
+        foreach (var kvp in _processedActions)
+        {
+            if (now - kvp.Value > _dedupeRetention)
+            {
+                _processedActions.TryRemove(kvp.Key, out _);
+            }
+        }
+    }
+
+    private static AdaptiveCardInvokeResponse Reject(string message)
+        => new()
+        {
+            StatusCode = 200,
+            Type = "application/vnd.microsoft.activity.message",
+            Value = message,
+        };
+
+    private static AdaptiveCardInvokeResponse Accept(string message)
+        => new()
+        {
+            StatusCode = 200,
+            Type = "application/vnd.microsoft.activity.message",
+            Value = message,
+        };
+
+    private static string ResolveTenantId(Activity? activity)
+    {
+        var tenant = activity?.ChannelData is JObject channelData
+            ? channelData.SelectToken("tenant.id")?.ToString()
+            : null;
+        if (!string.IsNullOrWhiteSpace(tenant))
+        {
+            return tenant!;
+        }
+
+        return activity?.Conversation?.TenantId ?? "unknown";
+    }
+
+    private static string ResolveCorrelationId(Activity? activity, string fallback)
+    {
+        if (activity?.Properties is JObject props)
+        {
+            var token = props.GetValue("correlationId", StringComparison.OrdinalIgnoreCase);
+            var value = token?.Type == JTokenType.String ? token.ToString() : null;
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value!;
+            }
+        }
+
+        return fallback;
+    }
+
+    private static string MessengerEventSourceFromActivity(Activity activity)
+    {
+        var conversationType = activity.Conversation?.ConversationType;
+        return conversationType switch
+        {
+            "channel" => MessengerEventSources.TeamChannel,
+            "groupChat" => MessengerEventSources.TeamChannel,
+            "personal" => MessengerEventSources.PersonalChat,
+            _ => MessengerEventSources.PersonalChat,
+        };
+    }
+
+    private async Task<string> BuildSanitizedPayloadJsonAsync(
+        CardActionPayload payload,
+        string? agentId,
+        CancellationToken ct,
+        string? cardUpdateError = null)
+    {
+        // Sanitization rules per tech-spec.md ┬º4.3 ΓÇö payload JSON must carry no secrets or
+        // PII beyond identity. We persist only the canonical card-action discriminators
+        // (question + action identity, correlation ID), a redacted comment indicator, and
+        // ΓÇö if available ΓÇö the persisted card activity ID. The free-form user-supplied
+        // comment text is replaced with a "<redacted>" sentinel so auditors can see that
+        // a comment was provided without revealing its content.
+        //
+        // Iter-8 fix #3: when the post-resolution card update threw, surface the
+        // exception's Message via the `cardUpdateError` marker so operators can find the
+        // lifecycle gap in the audit trail. We log the full exception elsewhere; the
+        // PayloadJson keeps only the short message so the audit row stays compact.
+        string? cardActivityId = null;
+        try
+        {
+            var card = await _cardStateStore.GetByQuestionIdAsync(payload.QuestionId, ct).ConfigureAwait(false);
+            cardActivityId = card?.ActivityId;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Card-state lookup for question {QuestionId} failed while building audit payload; continuing.",
+                payload.QuestionId);
+        }
+
+        var sanitized = new
+        {
+            questionId = payload.QuestionId,
+            actionId = payload.ActionId,
+            actionValue = payload.ActionValue,
+            correlationId = payload.CorrelationId,
+            comment = string.IsNullOrEmpty(payload.Comment) ? null : "<redacted>",
+            cardActivityId,
+            agentId,
+            cardUpdateError,
+        };
+
+        return JsonSerializer.Serialize(sanitized);
+    }
+
+    private static string BuildEmptyPayloadJson(string reason)
+    {
+        var sanitized = new { reason };
+        return JsonSerializer.Serialize(sanitized);
+    }
+
+    private async Task WriteRejectionAuditAsync(
+        string actorAad,
+        string tenantId,
+        string? agentId,
+        string action,
+        string payloadJson,
+        string correlationId,
+        DateTimeOffset receivedAt,
+        CancellationToken ct)
+    {
+        await WriteAuditAsync(
+            AuditOutcomes.Rejected,
+            actorAad,
+            tenantId,
+            agentId,
+            action,
+            payloadJson,
+            correlationId,
+            receivedAt,
+            ct).ConfigureAwait(false);
     }
 
     private async Task WriteAuditAsync(
-        string tenantId,
-        string correlationId,
+        string outcome,
         string actorAad,
+        string tenantId,
         string? agentId,
-        string? taskId,
-        string? conversationId,
         string action,
         string payloadJson,
-        string outcome,
+        string correlationId,
+        DateTimeOffset receivedAt,
         CancellationToken ct)
     {
-        var timestamp = _timeProvider.GetUtcNow();
-        const string eventType = AuditEventTypes.CardActionReceived;
-        const string actorType = AuditActorTypes.User;
-
         var checksum = AuditEntry.ComputeChecksum(
-            timestamp,
-            correlationId,
-            eventType,
-            actorAad,
-            actorType,
-            tenantId,
-            agentId,
-            taskId,
-            conversationId,
-            action,
-            payloadJson,
-            outcome);
+            timestamp: receivedAt,
+            correlationId: correlationId,
+            eventType: AuditEventTypes.CardActionReceived,
+            actorId: actorAad,
+            actorType: AuditActorTypes.User,
+            tenantId: tenantId,
+            agentId: agentId,
+            taskId: null,
+            conversationId: null,
+            action: action,
+            payloadJson: payloadJson,
+            outcome: outcome);
 
         var entry = new AuditEntry
         {
-            Timestamp = timestamp,
+            Timestamp = receivedAt,
             CorrelationId = correlationId,
-            EventType = eventType,
+            EventType = AuditEventTypes.CardActionReceived,
             ActorId = actorAad,
-            ActorType = actorType,
+            ActorType = AuditActorTypes.User,
             TenantId = tenantId,
             AgentId = agentId,
-            TaskId = taskId,
-            ConversationId = conversationId,
+            TaskId = null,
+            ConversationId = null,
             Action = action,
             PayloadJson = payloadJson,
             Outcome = outcome,
             Checksum = checksum,
         };
 
-        await _audit.LogAsync(entry, ct).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Composite key for the dedupe layer. Uses an ordinal comparer so the AAD object
-    /// ID's casing is significant (the upstream Teams channel preserves casing).
-    /// </summary>
-    private readonly record struct DedupeKey(string QuestionId, string ActorAad, string ActionValue);
-
-    /// <summary>Strongly-typed shape for the sanitised audit payload.</summary>
-    private sealed record SanitisedAuditPayload(
-        string QuestionId,
-        string ActionId,
-        string ActionValue,
-        string CorrelationId,
-        string ActorAad,
-        string? ActivityId,
-        string? Comment,
-        string? CardUpdateError);
-}
-
-/// <summary>
-/// Extension shim around <see cref="Activity"/> for reading the optional
-/// <c>correlationId</c> property that <see cref="TeamsSwarmActivityHandler"/> stamps on
-/// inbound activities. Kept private to this file so the helper is only available where it
-/// is actually used.
-/// </summary>
-internal static class CardActionHandlerActivityExtensions
-{
-    public static string? GetCorrelationId(this Activity activity)
-    {
-        if (activity.Properties is null)
+        try
         {
-            return null;
+            await _auditLogger.LogAsync(entry, ct).ConfigureAwait(false);
         }
-
-        var token = activity.Properties["correlationId"];
-        if (token is null || token.Type == Newtonsoft.Json.Linq.JTokenType.Null)
+        catch (Exception ex)
         {
-            return null;
+            // Audit logging failure must not abort the user-facing response ΓÇö the
+            // decision has been durably recorded and the operator can recover the audit
+            // trail from primary persistence at a later point.
+            _logger.LogError(ex, "Failed to write CardActionReceived audit entry (outcome={Outcome}).", outcome);
         }
-
-        var raw = token.Type == Newtonsoft.Json.Linq.JTokenType.String
-            ? (string?)token
-            : token.ToString();
-        return string.IsNullOrWhiteSpace(raw) ? null : raw;
     }
 }

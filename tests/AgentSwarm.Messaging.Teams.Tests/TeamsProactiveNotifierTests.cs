@@ -70,6 +70,17 @@ public sealed class TeamsProactiveNotifierTests
         Assert.Equal("Q-proactive-1", update.QuestionId);
         Assert.Equal(stored.ConversationId, update.ConversationId);
 
+        // Iter-3 evaluator feedback #1 — the question must be persisted BEFORE the
+        // network send so CardActionHandler.GetByIdAsync resolves subsequent Adaptive
+        // Card actions, AND so UpdateConversationIdAsync (which is implemented as a
+        // SQL ExecuteUpdate that silently affects zero rows when the row is missing)
+        // actually stamps the conversation ID. The saved copy MUST have
+        // ConversationId = null (sanitised) so a caller-supplied stale value cannot
+        // poison the bare approve/reject lookup path.
+        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-proactive-1", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
+
         // Card state persisted with the activityId returned by SendActivitiesAsync, the
         // proactive turn context's ConversationId, and a ConversationReferenceJson that
         // round-trips through Newtonsoft (so Stage 6 outbox retries can rehydrate).
@@ -110,6 +121,14 @@ public sealed class TeamsProactiveNotifierTests
         Assert.Empty(harness.Adapter.Sent);
         Assert.Empty(harness.CardStateStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+
+        // Iter-3 evaluator feedback #1 — the AgentQuestion row IS persisted up front
+        // (before the lookup), so the orchestrator can observe the attempt and the
+        // Phase 6 outbox engine has a durable row to replay against. The saved copy
+        // has ConversationId = null (no proactive turn context to source it from).
+        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-missing-ref", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
     }
 
     /// <summary>
@@ -247,6 +266,14 @@ public sealed class TeamsProactiveNotifierTests
         Assert.Equal("Q-channel-question", cardState.QuestionId);
         Assert.Equal(stored.ConversationId, cardState.ConversationId);
         Assert.Equal(TeamsCardStatuses.Pending, cardState.Status);
+
+        // Iter-3 evaluator feedback #1 — the channel-scoped question path also persists
+        // the AgentQuestion BEFORE the send so the post-send UpdateConversationIdAsync
+        // can find a row to stamp and CardActionHandler.GetByIdAsync can resolve
+        // subsequent Adaptive Card actions delivered into the channel.
+        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-channel-question", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
     }
 
     /// <summary>
@@ -267,10 +294,20 @@ public sealed class TeamsProactiveNotifierTests
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-1", question, CancellationToken.None));
 
-        // Send was attempted but no persistence ran.
+        // Send was attempted but no per-card persistence ran.
         Assert.Single(harness.Adapter.Sent);
         Assert.Empty(harness.CardStateStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+
+        // Iter-3 evaluator feedback #1 — the upfront SaveAsync still ran (it precedes
+        // the lookup / send), so the AgentQuestion row exists with ConversationId =
+        // null. The all-or-nothing card-state persistence guarantee is what gets
+        // skipped: CardStateStore.Saved and ConversationIdUpdates remain empty so the
+        // Stage 3.3 card-update / bare approve-reject paths are not given a partial
+        // row to follow.
+        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-noconv", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
     }
 
     /// <summary>
@@ -300,6 +337,91 @@ public sealed class TeamsProactiveNotifierTests
         Assert.Null(ex.InternalUserId);
         Assert.Null(ex.QuestionId);
         Assert.Empty(harness.Adapter.ContinueCalls);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #1 (channel-scope coverage) — mirrors
+    /// <see cref="SendProactiveQuestionAsync_NoStoredReference_ThrowsConversationReferenceNotFoundException"/>
+    /// for the channel-scope question entry point. The upfront SaveAsync must run
+    /// even when the channel reference is missing so the orchestrator and the
+    /// Phase 6 outbox engine see a durable row to attribute the failed delivery to.
+    /// </summary>
+    [Fact]
+    public async Task SendQuestionToChannelAsync_NoStoredReference_PersistsQuestionAndThrows()
+    {
+        var harness = NotifierHarness.Build();
+        var question = NewQuestion("Q-missing-chan-ref", targetChannelId: "missing-channel");
+
+        var ex = await Assert.ThrowsAsync<ConversationReferenceNotFoundException>(() =>
+            harness.Notifier.SendQuestionToChannelAsync(TenantId, "missing-channel", question, CancellationToken.None));
+
+        Assert.Equal(TenantId, ex.TenantId);
+        Assert.Equal("missing-channel", ex.ChannelId);
+        Assert.Equal("Q-missing-chan-ref", ex.QuestionId);
+
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.Adapter.Sent);
+        Assert.Empty(harness.CardStateStore.Saved);
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+
+        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-missing-chan-ref", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #1 (ordering invariant) — the upfront SaveAsync must
+    /// execute BEFORE the reference lookup AND before <c>ContinueConversationAsync</c>.
+    /// This pins the relative ordering by recording the sequence into a shared list
+    /// across the AgentQuestion store, the conversation-reference store, and the
+    /// CloudAdapter — the ordering matters because UpdateConversationIdAsync silently
+    /// affects zero rows when the row is missing, and CardActionHandler.GetByIdAsync
+    /// returns null for an unpersisted question.
+    /// </summary>
+    [Fact]
+    public async Task SendProactiveQuestionAsync_SaveAsyncRunsBeforeLookupAndContinue()
+    {
+        var ordering = new List<string>();
+        var adapter = new OrderRecordingCloudAdapter(ordering);
+        var harness = NotifierHarness.Build(adapter);
+        var stored = NewPersonalReference("ref-ordering", aadObjectId: "aad-ord", internalUserId: "user-1");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-1")] = stored;
+        harness.ConversationReferenceStore.OnInternalUserLookup = () => ordering.Add("lookup");
+        harness.AgentQuestionStore.OnSave = () => ordering.Add("save");
+        harness.AgentQuestionStore.OnUpdateConversationId = () => ordering.Add("updateConversationId");
+        harness.CardStateStore.OnSave = () => ordering.Add("cardStateSave");
+        var question = NewQuestion("Q-ordering", targetUserId: "user-1");
+
+        await harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-1", question, CancellationToken.None);
+
+        Assert.Equal(
+            new[] { "save", "lookup", "continueConversation", "updateConversationId", "cardStateSave" },
+            ordering);
+    }
+
+    /// <summary>
+    /// Reliability of the new ordering — symmetric to the user-scope ordering test for
+    /// the channel-scope question entry point.
+    /// </summary>
+    [Fact]
+    public async Task SendQuestionToChannelAsync_SaveAsyncRunsBeforeLookupAndContinue()
+    {
+        var ordering = new List<string>();
+        var adapter = new OrderRecordingCloudAdapter(ordering);
+        var harness = NotifierHarness.Build(adapter);
+        var stored = NewChannelReference("ref-ordering-chan", channelId: "channel-general");
+        harness.ConversationReferenceStore.PreloadByChannelId[(TenantId, "channel-general")] = stored;
+        harness.ConversationReferenceStore.OnChannelLookup = () => ordering.Add("lookup");
+        harness.AgentQuestionStore.OnSave = () => ordering.Add("save");
+        harness.AgentQuestionStore.OnUpdateConversationId = () => ordering.Add("updateConversationId");
+        harness.CardStateStore.OnSave = () => ordering.Add("cardStateSave");
+        var question = NewQuestion("Q-ordering-chan", targetChannelId: "channel-general");
+
+        await harness.Notifier.SendQuestionToChannelAsync(TenantId, "channel-general", question, CancellationToken.None);
+
+        Assert.Equal(
+            new[] { "save", "lookup", "continueConversation", "updateConversationId", "cardStateSave" },
+            ordering);
     }
 
     /// <summary>
@@ -397,6 +519,11 @@ public sealed class TeamsProactiveNotifierTests
         Assert.Empty(harness.Adapter.Sent);
         Assert.Empty(harness.CardStateStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        // Iter-3 evaluator feedback #1 invariant — the tenant guard fires BEFORE the
+        // upfront SaveAsync, so no AgentQuestion row leaks into the store on a tenant
+        // mismatch (would otherwise pollute the durable log with a question that was
+        // never authorised to be delivered).
+        Assert.Empty(harness.AgentQuestionStore.Saved);
     }
 
     /// <summary>
@@ -424,6 +551,8 @@ public sealed class TeamsProactiveNotifierTests
         Assert.Empty(harness.Adapter.ContinueCalls);
         Assert.Empty(harness.CardStateStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        // Iter-3 evaluator feedback #1 invariant — see tenant-mismatch test above.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
     }
 
     /// <summary>
@@ -446,6 +575,8 @@ public sealed class TeamsProactiveNotifierTests
 
         Assert.Empty(harness.ConversationReferenceStore.InternalUserLookups);
         Assert.Empty(harness.Adapter.ContinueCalls);
+        // Iter-3 evaluator feedback #1 invariant — the scope guard fires BEFORE Save.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
     }
 
     /// <summary>
@@ -470,6 +601,8 @@ public sealed class TeamsProactiveNotifierTests
         Assert.Empty(harness.Adapter.ContinueCalls);
         Assert.Empty(harness.CardStateStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        // Iter-3 evaluator feedback #1 invariant — see user-scope tenant-mismatch test.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
     }
 
     /// <summary>
@@ -492,6 +625,8 @@ public sealed class TeamsProactiveNotifierTests
 
         Assert.Empty(harness.ConversationReferenceStore.ChannelLookups);
         Assert.Empty(harness.Adapter.ContinueCalls);
+        // Iter-3 evaluator feedback #1 invariant — see user-scope tenant-mismatch test.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
     }
 
     /// <summary>
@@ -514,6 +649,8 @@ public sealed class TeamsProactiveNotifierTests
 
         Assert.Empty(harness.ConversationReferenceStore.ChannelLookups);
         Assert.Empty(harness.Adapter.ContinueCalls);
+        // Iter-3 evaluator feedback #1 invariant — see user-scope tenant-mismatch test.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
     }
 
     // ---- Test helpers ------------------------------------------------------------
@@ -653,9 +790,20 @@ public sealed class TeamsProactiveNotifierTests
             CancellationToken cancellationToken)
         {
             ContinueCalls.Add((botAppId, reference));
+            OnContinueConversation();
             var continuation = SynthesizeContinuationActivity(reference);
             var turnContext = new TurnContext(this, continuation);
             return callback(turnContext, cancellationToken);
+        }
+
+        /// <summary>
+        /// Hook invoked at the start of every <see cref="ContinueConversationAsync"/>
+        /// call so the ordering tests can record the relative position of the network
+        /// send against the upfront <see cref="IAgentQuestionStore.SaveAsync"/> and the
+        /// reference lookup. The default is a no-op.
+        /// </summary>
+        protected virtual void OnContinueConversation()
+        {
         }
 
         protected virtual Activity SynthesizeContinuationActivity(ConversationReference reference)
@@ -692,6 +840,19 @@ public sealed class TeamsProactiveNotifierTests
     }
 
     /// <summary>
+    /// Recording adapter that appends the literal <c>"continueConversation"</c> marker
+    /// to an externally-provided ordering list. Used by the iter-3 ordering tests to
+    /// pin the relative position of the upfront <see cref="IAgentQuestionStore.SaveAsync"/>,
+    /// the reference lookup, and the proactive send.
+    /// </summary>
+    public sealed class OrderRecordingCloudAdapter : RecordingCloudAdapter
+    {
+        private readonly List<string> _ordering;
+        public OrderRecordingCloudAdapter(List<string> ordering) => _ordering = ordering;
+        protected override void OnContinueConversation() => _ordering.Add("continueConversation");
+    }
+
+    /// <summary>
     /// Recording <see cref="IConversationReferenceStore"/> tailored for notifier tests.
     /// Captures the (TenantId, key) tuples used for each lookup so the routing /
     /// reference-resolution paths can be asserted directly.
@@ -703,12 +864,19 @@ public sealed class TeamsProactiveNotifierTests
         public List<(string TenantId, string InternalUserId)> InternalUserLookups { get; } = new();
         public List<(string TenantId, string ChannelId)> ChannelLookups { get; } = new();
 
+        /// <summary>Optional hook fired BEFORE every <see cref="GetByInternalUserIdAsync"/> resolves; used by ordering tests.</summary>
+        public Action? OnInternalUserLookup { get; set; }
+
+        /// <summary>Optional hook fired BEFORE every <see cref="GetByChannelIdAsync"/> resolves; used by ordering tests.</summary>
+        public Action? OnChannelLookup { get; set; }
+
         public Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct) => Task.CompletedTask;
         public Task<TeamsConversationReference?> GetAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
         public Task<TeamsConversationReference?> GetByAadObjectIdAsync(string tenantId, string aadObjectId, CancellationToken ct) => Task.FromResult<TeamsConversationReference?>(null);
 
         public Task<TeamsConversationReference?> GetByInternalUserIdAsync(string tenantId, string internalUserId, CancellationToken ct)
         {
+            OnInternalUserLookup?.Invoke();
             InternalUserLookups.Add((tenantId, internalUserId));
             PreloadByInternalUserId.TryGetValue((tenantId, internalUserId), out var hit);
             return Task.FromResult<TeamsConversationReference?>(hit);
@@ -716,6 +884,7 @@ public sealed class TeamsProactiveNotifierTests
 
         public Task<TeamsConversationReference?> GetByChannelIdAsync(string tenantId, string channelId, CancellationToken ct)
         {
+            OnChannelLookup?.Invoke();
             ChannelLookups.Add((tenantId, channelId));
             PreloadByChannelId.TryGetValue((tenantId, channelId), out var hit);
             return Task.FromResult<TeamsConversationReference?>(hit);
@@ -747,8 +916,15 @@ public sealed class TeamsProactiveNotifierTests
         public List<AgentQuestion> Saved { get; } = new();
         public List<(string QuestionId, string ConversationId)> ConversationIdUpdates { get; } = new();
 
+        /// <summary>Optional hook fired BEFORE every <see cref="SaveAsync"/> records; used by ordering tests.</summary>
+        public Action? OnSave { get; set; }
+
+        /// <summary>Optional hook fired BEFORE every <see cref="UpdateConversationIdAsync"/> records; used by ordering tests.</summary>
+        public Action? OnUpdateConversationId { get; set; }
+
         public Task SaveAsync(AgentQuestion question, CancellationToken ct)
         {
+            OnSave?.Invoke();
             Saved.Add(question);
             return Task.CompletedTask;
         }
@@ -758,6 +934,7 @@ public sealed class TeamsProactiveNotifierTests
 
         public Task UpdateConversationIdAsync(string questionId, string conversationId, CancellationToken ct)
         {
+            OnUpdateConversationId?.Invoke();
             ConversationIdUpdates.Add((questionId, conversationId));
             return Task.CompletedTask;
         }
@@ -776,8 +953,12 @@ public sealed class TeamsProactiveNotifierTests
     {
         public List<TeamsCardState> Saved { get; } = new();
 
+        /// <summary>Optional hook fired BEFORE every <see cref="SaveAsync"/> records; used by ordering tests.</summary>
+        public Action? OnSave { get; set; }
+
         public Task SaveAsync(TeamsCardState state, CancellationToken ct)
         {
+            OnSave?.Invoke();
             Saved.Add(state);
             return Task.CompletedTask;
         }

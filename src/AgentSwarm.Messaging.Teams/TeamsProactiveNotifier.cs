@@ -235,6 +235,25 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     /// identical across user-targeted and channel-targeted sends — a divergence would
     /// silently break Stage 3.3's card update/delete path for one of the two targets.
     /// </summary>
+    /// <remarks>
+    /// Persistence ordering mirrors <see cref="TeamsMessengerConnector.SendQuestionAsync"/>:
+    /// the question row is inserted into <see cref="IAgentQuestionStore"/> BEFORE the
+    /// reference lookup / network send, and the <see cref="AgentQuestion.ConversationId"/>
+    /// is stamped LATER via <see cref="IAgentQuestionStore.UpdateConversationIdAsync"/>
+    /// once the proactive turn context surfaces a real conversation ID. Saving up front is
+    /// the only ordering that satisfies BOTH downstream paths: (1)
+    /// <see cref="Cards.CardActionHandler"/> calls
+    /// <see cref="IAgentQuestionStore.GetByIdAsync"/> on every inbound Adaptive Card
+    /// action — if the question row does not exist yet, the handler rejects with
+    /// <c>QuestionNotFound</c>; (2)
+    /// <see cref="IAgentQuestionStore.UpdateConversationIdAsync"/> is implemented as a
+    /// SQL <c>ExecuteUpdate</c> that silently affects zero rows when the question is
+    /// missing (see <c>AgentSwarm.Messaging.Teams.EntityFrameworkCore.SqlAgentQuestionStore.UpdateConversationIdAsync</c>),
+    /// so post-send save would also silently lose the <c>ConversationId</c> stamp and
+    /// break bare approve/reject text resolution. Persisting up front also means a
+    /// missing-reference failure surfaces a durable record the Phase 6 outbox engine can
+    /// replay against (the question exists; only the delivery did not).
+    /// </remarks>
     private async Task SendQuestionCoreAsync(
         string tenantId,
         AgentQuestion question,
@@ -253,6 +272,20 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
             throw new InvalidOperationException(
                 $"AgentQuestion '{question.QuestionId}' is invalid: {string.Join("; ", validationErrors)}");
         }
+
+        // Step 1 (iter-3 evaluator feedback #1) — persist a SANITIZED copy with
+        // ConversationId forced to null BEFORE the lookup / send. Two reasons:
+        //   * UpdateConversationIdAsync (Step 4 below) is a no-op when the row is
+        //     missing, so without the up-front Save the post-send ConversationId stamp
+        //     would silently disappear and CardActionHandler.GetByIdAsync would reject
+        //     subsequent Adaptive Card actions with QuestionNotFound.
+        //   * Forcing ConversationId = null avoids letting a caller-supplied stale value
+        //     poison bare approve/reject text-command resolution that joins on
+        //     ConversationId.
+        // Reference equality is unchanged for callers that already passed a null
+        // ConversationId — the `with` expression returns the same effective record.
+        var sanitizedQuestion = question with { ConversationId = null };
+        await _agentQuestionStore.SaveAsync(sanitizedQuestion, ct).ConfigureAwait(false);
 
         var stored = await lookupAsync(ct).ConfigureAwait(false)
             ?? throw notFoundFactory();

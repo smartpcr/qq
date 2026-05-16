@@ -287,10 +287,27 @@ public static class TeamsServiceCollectionExtensions
     /// <see cref="IAgentQuestionStore"/>, and <see cref="Cards.IAdaptiveCardRenderer"/>
     /// dependencies with <see cref="TeamsMessengerConnector"/>; this helper therefore
     /// composes <see cref="AddTeamsMessengerConnector"/> first so the shared
-    /// <see cref="Cards.IAdaptiveCardRenderer"/> registration is in place.
-    /// Persistence-store registration is NOT included for the same reason as
-    /// <see cref="AddTeamsCardLifecycle"/>: SQL-backed stores live in the EF Core
-    /// extension package and are composed by the host BEFORE this helper.
+    /// <see cref="Cards.IAdaptiveCardRenderer"/> default registration (and the
+    /// <see cref="IConversationReferenceRouter"/> cast-adapter) are in place.
+    /// </para>
+    /// <para>
+    /// <b>Host-supplied dependencies</b>: <see cref="AddTeamsMessengerConnector"/> does
+    /// <i>not</i> register the underlying <see cref="Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter"/>,
+    /// <see cref="IConversationReferenceStore"/>, <see cref="IAgentQuestionStore"/>,
+    /// <see cref="ICardStateStore"/>, <see cref="TeamsMessagingOptions"/>, or the
+    /// <see cref="Microsoft.Extensions.Logging.ILogger{T}"/> the notifier consumes —
+    /// those are owned by the host application (typically: the EF Core extension
+    /// package's <c>AddSql*Store</c> helpers and the host's
+    /// <see cref="Microsoft.Extensions.Logging.LoggerFactory"/> wiring). The host MUST
+    /// register all of them BEFORE calling this helper, otherwise resolving
+    /// <see cref="TeamsProactiveNotifier"/> from the built provider will throw the
+    /// canonical <see cref="InvalidOperationException"/> for a missing service. The only
+    /// dependencies <i>auto-wired</i> by <see cref="AddTeamsMessengerConnector"/> (and
+    /// therefore satisfied transitively by this helper) are the default
+    /// <see cref="Cards.IAdaptiveCardRenderer"/> (
+    /// <see cref="Cards.AdaptiveCardBuilder"/>) and the
+    /// <see cref="IConversationReferenceRouter"/> cast-adapter that re-exposes the
+    /// host-supplied store under the router contract.
     /// </para>
     /// <para>
     /// <b>Idempotent</b> — every registration uses <c>TryAdd*</c> variants so calling
@@ -305,10 +322,13 @@ public static class TeamsServiceCollectionExtensions
             throw new ArgumentNullException(nameof(services));
         }
 
-        // Compose the shared dependency graph: CloudAdapter + IConversationReferenceStore
-        // + IAdaptiveCardRenderer are all populated by AddTeamsMessengerConnector. Hosts
-        // that compose AddTeamsProactiveNotifier without the connector would have to
-        // register every dependency manually; cross-wiring keeps the DI graph consistent.
+        // Compose the shared default graph: the IAdaptiveCardRenderer default and the
+        // IConversationReferenceRouter cast-adapter are populated by
+        // AddTeamsMessengerConnector. The host is responsible for registering
+        // CloudAdapter, IConversationReferenceStore, IAgentQuestionStore,
+        // ICardStateStore, TeamsMessagingOptions, and ILogger<T> before resolving the
+        // notifier from the built provider — see the remarks on this method for the
+        // full list and the rationale.
         services.AddTeamsMessengerConnector();
 
         services.TryAddSingleton<TeamsProactiveNotifier>();
