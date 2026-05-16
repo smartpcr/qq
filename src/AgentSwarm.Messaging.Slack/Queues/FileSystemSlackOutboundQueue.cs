@@ -75,16 +75,14 @@ using Microsoft.Extensions.Logging;
 /// replay re-creates the envelope instance from disk.
 /// </para>
 /// <para>
-/// <b>Injected clock</b>. The sortable-timestamp prefix of the
-/// journal file name is sourced from an injected
-/// <see cref="TimeProvider"/> -- the same testability pattern used
-/// by <see cref="Pipeline.SlackOutboundDispatcher"/>,
+/// <b>Injected clock</b>. The journal filename's leading sortable
+/// tick prefix is sourced from an injected <see cref="TimeProvider"/>
+/// (matching the pattern used by
+/// <see cref="Pipeline.SlackOutboundDispatcher"/>,
 /// <see cref="Pipeline.SlackTokenBucketRateLimiter"/>, and
-/// <see cref="Pipeline.HttpClientSlackOutboundDispatchClient"/>. The
-/// production no-arg path delegates to <see cref="TimeProvider.System"/>;
-/// the internal constructor lets unit tests pin the clock and assert
-/// deterministic journal file ordering across same-millisecond
-/// enqueues without relying on wall-clock races.
+/// <see cref="Pipeline.HttpClientSlackOutboundDispatchClient"/>) so
+/// tests can control journal-file ordering deterministically. The
+/// production DI path resolves <see cref="TimeProvider.System"/>.
 /// </para>
 /// </remarks>
 internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutboundQueue, IDisposable
@@ -106,11 +104,11 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
     private bool disposed;
 
     /// <summary>
-    /// Production constructor: uses <see cref="TimeProvider.System"/>
-    /// as the wall clock so hosts get monotonic UTC timestamps in
-    /// journal file names. Delegates to the internal
-    /// clock-injecting overload so the implementation lives in one
-    /// place.
+    /// DI-friendly constructor that defaults the clock to
+    /// <see cref="TimeProvider.System"/>. Production hosts resolve
+    /// this overload through the
+    /// <see cref="FileSystemSlackOutboundQueueServiceCollectionExtensions.AddFileSystemSlackOutboundQueue"/>
+    /// extension.
     /// </summary>
     public FileSystemSlackOutboundQueue(
         string directoryPath,
@@ -120,11 +118,11 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
     }
 
     /// <summary>
-    /// Test-friendly constructor that lets the fixture inject a fake
-    /// <see cref="TimeProvider"/> so the sortable-timestamp prefix
-    /// of journal file names is deterministic. Used by the durable
-    /// queue's unit tests to assert FIFO replay ordering across
-    /// same-millisecond enqueues without relying on wall-clock races.
+    /// Test-friendly constructor that lets the fixture inject a
+    /// fake <see cref="TimeProvider"/> so the journal filename's
+    /// leading sortable tick prefix is deterministic. Tests can use
+    /// a <c>FakeTimeProvider</c> to assert FIFO ordering of replay
+    /// without relying on wall-clock granularity.
     /// </summary>
     internal FileSystemSlackOutboundQueue(
         string directoryPath,
@@ -182,13 +180,10 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
         // suffix gives us a stable per-envelope handle for ack
         // (deletion) without having to reopen the file to read its
         // contents. The clock is sourced from the injected
-        // TimeProvider so unit tests can pin ordering deterministically
-        // -- matching the testability pattern used by the dispatcher,
-        // rate limiter, and dispatch client in this stage.
-        long utcTicks = this.timeProvider.GetUtcNow().UtcDateTime.Ticks;
+        // TimeProvider so tests can control ordering deterministically.
         string fileName = string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
-            $"{utcTicks:D19}-{envelope.EnvelopeId:N}.json");
+            $"{this.timeProvider.GetUtcNow().UtcDateTime.Ticks:D19}-{envelope.EnvelopeId:N}.json");
         string filePath = Path.Combine(this.PendingDirectoryPath, fileName);
 
         FileSystemSlackOutboundRecord record = ToRecord(envelope);
@@ -503,13 +498,10 @@ public static class FileSystemSlackOutboundQueueServiceCollectionExtensions
     /// are created eagerly if missing.
     /// </param>
     /// <remarks>
-    /// The queue resolves its <see cref="TimeProvider"/> from DI when
-    /// one is registered (matching the dispatcher / rate-limiter /
-    /// dispatch-client wiring); otherwise it falls back to
-    /// <see cref="TimeProvider.System"/>. This keeps the production
-    /// no-config path working while letting integration test hosts
-    /// substitute a fake clock to assert deterministic journal
-    /// file ordering.
+    /// The queue resolves <see cref="TimeProvider"/> from DI if one
+    /// is registered (matching the rest of the Slack pipeline's
+    /// testability pattern); otherwise it falls back to
+    /// <see cref="TimeProvider.System"/>.
     /// </remarks>
     public static IServiceCollection AddFileSystemSlackOutboundQueue(
         this IServiceCollection services,
