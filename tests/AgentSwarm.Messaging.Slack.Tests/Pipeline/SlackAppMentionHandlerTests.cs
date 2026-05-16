@@ -525,6 +525,9 @@ public sealed class SlackAppMentionHandlerTests
 
         public object RenderEscalateModal(SlackEscalateModalContext context)
             => new { type = "modal", task_id = context.TaskId };
+
+        public object RenderCommentModal(SlackCommentModalContext context)
+            => new { type = "modal", question_id = context.QuestionId };
     }
 
     private sealed class RecordingThreadedReplyPoster : ISlackThreadedReplyPoster

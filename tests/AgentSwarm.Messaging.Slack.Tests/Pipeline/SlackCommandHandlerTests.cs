@@ -492,6 +492,8 @@ public sealed class SlackCommandHandlerTests
 
         public SlackEscalateModalContext? LastEscalateContext { get; private set; }
 
+        public SlackCommentModalContext? LastCommentContext { get; private set; }
+
         public object RenderReviewModal(SlackReviewModalContext context)
         {
             this.LastReviewContext = context;
@@ -502,6 +504,12 @@ public sealed class SlackCommandHandlerTests
         {
             this.LastEscalateContext = context;
             return new { type = "modal", callback_id = "agent_escalate_modal", task_id = context.TaskId };
+        }
+
+        public object RenderCommentModal(SlackCommentModalContext context)
+        {
+            this.LastCommentContext = context;
+            return new { type = "modal", callback_id = SlackInteractionEncoding.CommentCallbackId, question_id = context.QuestionId };
         }
     }
 
