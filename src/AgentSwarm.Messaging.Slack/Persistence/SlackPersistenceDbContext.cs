@@ -42,7 +42,8 @@ using Microsoft.EntityFrameworkCore;
 public class SlackPersistenceDbContext : DbContext,
     ISlackAuditEntryDbContext,
     ISlackWorkspaceConfigDbContext,
-    ISlackInboundRequestRecordDbContext
+    ISlackInboundRequestRecordDbContext,
+    ISlackThreadMappingDbContext
 {
     /// <summary>
     /// Creates the context with the supplied options. The options must
@@ -72,6 +73,9 @@ public class SlackPersistenceDbContext : DbContext,
 
     /// <inheritdoc />
     public DbSet<SlackInboundRequestRecord> SlackInboundRequestRecords => this.Set<SlackInboundRequestRecord>();
+
+    /// <inheritdoc />
+    public DbSet<SlackThreadMapping> SlackThreadMappings => this.Set<SlackThreadMapping>();
 
     /// <inheritdoc />
     protected override void OnModelCreating(ModelBuilder modelBuilder)
