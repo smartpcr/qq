@@ -121,7 +121,7 @@ Feature: /agent status slash command
 
 Covers story acceptance criterion AC-3 (CLI path): "Human can answer via button
 or modal." Both `/agent approve <question-id>` and Block Kit button clicks are
-supported per operator decision OQ-3 (architecture.md section 9).
+supported per operator decision OQ-3 (tech-spec.md section 9).
 
 ### Scenario 3.1: Happy path -- approve via CLI argument
 
@@ -135,7 +135,7 @@ Feature: /agent approve slash command
     When user "U-ALICE" types "/agent approve Q-200" in an authorized channel
     Then SlackEventsApiReceiver returns HTTP 200 within 3 seconds
       And SlackCommandHandler parses sub-command "approve" with argument "Q-200"
-      And SlackInteractionHandler produces a HumanDecisionEvent with:
+      And SlackCommandHandler produces a HumanDecisionEvent with:
         | Field             | Value       |
         | QuestionId        | Q-200       |
         | ActionValue       | approve     |
