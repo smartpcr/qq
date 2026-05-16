@@ -28,9 +28,16 @@ public class MessagingDbContextTests
 
             var provider = services.BuildServiceProvider();
 
-            // Trigger the startup initialization registered by AddMessagingPersistence
-            var hostedService = provider.GetRequiredService<IHostedService>();
-            await hostedService.StartAsync(CancellationToken.None);
+            // Trigger the startup initialization registered by AddMessagingPersistence.
+            // AddMessagingPersistence registers more than one IHostedService
+            // (DatabaseInitializer for schema bootstrap, and Stage 4.3's
+            // DeduplicationCleanupService for periodic purge). Iterate
+            // and start all of them so the schema gets created
+            // regardless of registration order.
+            foreach (var hostedService in provider.GetServices<IHostedService>())
+            {
+                await hostedService.StartAsync(CancellationToken.None);
+            }
 
             var context = provider.GetRequiredService<MessagingDbContext>();
 

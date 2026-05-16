@@ -118,11 +118,30 @@ public static class TelegramServiceCollectionExtensions
         services.AddSingleton<ITelegramBotClient>(sp =>
             sp.GetRequiredService<TelegramBotClientFactory>().Create());
 
-        // Stage 2.2 inbound pipeline + stubs. Stubs are singletons so their
-        // in-memory state (dedup set, pending questions, pending workspace
-        // disambiguations) survives across pipeline invocations within the
-        // same process.
-        services.AddSingleton<IDeduplicationService, InMemoryDeduplicationService>();
+        // Stage 4.3 — IDeduplicationService.
+        //
+        // The dev / local backend is the in-memory sliding-window
+        // implementation (ConcurrentDictionary<string, DateTimeOffset>
+        // + periodic cleanup timer) per implementation-plan.md
+        // Stage 4.3 step 2. Registered via TryAddSingleton so a host
+        // that ALSO wires AddMessagingPersistence wins last-Replace
+        // and gets the EF-backed PersistentDeduplicationService instead
+        // — without that ordering guarantee the in-memory backend
+        // would silently shadow the persistent store in production
+        // (the AddTelegram → AddMessagingPersistence composition path
+        // documented in the Worker's Program.cs).
+        //
+        // The SlidingWindowDeduplicationService ctor takes
+        // IOptions<DeduplicationOptions>, TimeProvider, and
+        // ILogger<SlidingWindowDeduplicationService>. The options
+        // binding and TimeProvider registration below are
+        // TryAdd-guarded so AddMessagingPersistence's own binding
+        // (and a host that registered an alternate TimeProvider for
+        // testing) still wins.
+        services.AddOptions<DeduplicationOptions>()
+            .Configure(opts => configuration.GetSection(DeduplicationOptions.SectionName).Bind(opts));
+        services.TryAddSingleton(TimeProvider.System);
+        services.TryAddSingleton<IDeduplicationService, SlidingWindowDeduplicationService>();
 
         // Stage 3.5 — IPendingQuestionStore uses TryAddSingleton so a
         // host that already wired AddMessagingPersistence (which calls

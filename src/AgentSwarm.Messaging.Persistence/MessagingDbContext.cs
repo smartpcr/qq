@@ -95,6 +95,19 @@ public class MessagingDbContext : DbContext
     /// </summary>
     public DbSet<PendingQuestionRecord> PendingQuestions => Set<PendingQuestionRecord>();
 
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the sliding-window inbound
+    /// deduplication ledger (Stage 4.3). One row per processed or
+    /// in-flight event id; the row's
+    /// <see cref="ProcessedEvent.ProcessedAt"/> column distinguishes
+    /// the reservation phase (NULL) from the sticky-processed phase
+    /// (non-null). Queried by <see cref="PersistentDeduplicationService"/>
+    /// and purged on a fixed cadence by
+    /// <see cref="DeduplicationCleanupService"/>. Configured via
+    /// <see cref="ProcessedEventConfiguration"/>.
+    /// </summary>
+    public DbSet<ProcessedEvent> ProcessedEvents => Set<ProcessedEvent>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

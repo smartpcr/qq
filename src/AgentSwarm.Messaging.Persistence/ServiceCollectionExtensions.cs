@@ -6,6 +6,9 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace AgentSwarm.Messaging.Persistence;
 
@@ -60,6 +63,8 @@ public static class ServiceCollectionExtensions
     ///   evaluator item 5).</description></item>
     ///   <item><description><see cref="IOperatorRegistry"/>
     ///   → <see cref="PersistentOperatorRegistry"/> (Stage 3.4).</description></item>
+    ///   <item><description><see cref="IDeduplicationService"/>
+    ///   → <see cref="PersistentDeduplicationService"/> (Stage 4.3).</description></item>
     /// </list>
     /// Every replaced concrete is a singleton that bridges to the
     /// scoped <see cref="MessagingDbContext"/> via
@@ -256,6 +261,50 @@ public static class ServiceCollectionExtensions
         // IDistributedCache entry has expired. Neither path touches
         // IDistributedCache at timeout.
         services.Replace(ServiceDescriptor.Singleton<IPendingQuestionStore, PersistentPendingQuestionStore>());
+
+        // Stage 4.3 — durable inbound deduplication ledger. Replaces
+        // the Stage 2.2 InMemoryDeduplicationService stub registered
+        // by AddTelegram via AddSingleton with the EF-backed
+        // PersistentDeduplicationService so duplicate webhook
+        // deliveries are suppressed across worker restarts and across
+        // multi-pod deployments (the InMemoryDeduplicationService
+        // stub is process-local and would lose state on restart). The
+        // sliding-window TTL + periodic purge contract is owned by
+        // DeduplicationCleanupService below — both share the same
+        // DeduplicationOptions binding.
+        //
+        // The DeduplicationOptions binding captures the caller's
+        // IConfiguration directly in the closure rather than resolving
+        // it from DI (the pattern useMigrations uses above). The
+        // DI-resolving variant — Configure<IConfiguration>((o,c) => …)
+        // — would require the host to also register IConfiguration as
+        // a service, which the existing MessagingDbContextTests's bare
+        // ServiceCollection deliberately does not do. The cleanup
+        // hosted service below eagerly resolves
+        // IOptionsMonitor<DeduplicationOptions> in its factory, so the
+        // binding must succeed without IConfiguration in DI.
+        services.AddOptions<DeduplicationOptions>()
+            .Configure(opts => configuration.GetSection(DeduplicationOptions.SectionName).Bind(opts));
+        services.Replace(ServiceDescriptor.Singleton<IDeduplicationService, PersistentDeduplicationService>());
+
+        // Stage 4.3 — periodic purge of expired processed_events rows.
+        // Hosted service registered alongside the persistent store so
+        // the table stays bounded under burst load. Disabled when
+        // PurgeInterval == TimeSpan.Zero (tests drive the sweep
+        // manually via RunSweepAsync instead). Registered via the same
+        // factory pattern as DatabaseInitializer so the ILogger
+        // dependency falls back to NullLogger when the host has not
+        // wired logging — this preserves the existing
+        // MessagingDbContextTests.MessagingDbContext_ResolvesFromDI_AndCanConnect
+        // test which boots a bare ServiceCollection without
+        // services.AddLogging().
+        services.AddSingleton<IHostedService>(sp =>
+            new DeduplicationCleanupService(
+                sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<IOptionsMonitor<DeduplicationOptions>>(),
+                sp.GetRequiredService<TimeProvider>(),
+                sp.GetService<ILogger<DeduplicationCleanupService>>()
+                    ?? NullLogger<DeduplicationCleanupService>.Instance));
 
         return services;
     }
