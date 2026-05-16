@@ -113,6 +113,36 @@ public sealed class PackagingScriptSmokeTests : IDisposable
         Assert.Contains("BotId", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    [InlineData("v1.0.0")]
+    [InlineData("1")]
+    [InlineData("1.0")]
+    [InlineData("1.0.0.0")]
+    [InlineData("01.0.0")]
+    [InlineData("1.0.0-")]
+    [InlineData("not-a-version")]
+    public void PackagingScript_RejectsInvalidSemVerVersion(string invalidVersion)
+    {
+        var ex = Assert.Throws<PackagingScriptFailedException>(
+            () => this.RunPackaging(SampleAppId, SampleBotId, invalidVersion));
+
+        Assert.Contains("Version", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("1.0.0")]
+    [InlineData("0.1.0")]
+    [InlineData("10.20.30")]
+    [InlineData("1.0.0-rc.1")]
+    [InlineData("2.3.4+build.7")]
+    [InlineData("1.0.0-alpha.1+exp.sha.5114f85")]
+    public void PackagingScript_AcceptsValidSemVerVersion(string validVersion)
+    {
+        var result = this.RunPackaging(SampleAppId, SampleBotId, validVersion);
+
+        Assert.True(File.Exists(result.ZipPath), $"Packaging should succeed for SemVer '{validVersion}'.");
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {

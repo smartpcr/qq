@@ -848,7 +848,11 @@ public sealed class TeamsServiceCollectionExtensionsTests
             => Task.CompletedTask;
         public Task<IReadOnlyList<AgentSwarm.Messaging.Core.OutboxEntry>> DequeueAsync(int batchSize, CancellationToken ct)
             => Task.FromResult<IReadOnlyList<AgentSwarm.Messaging.Core.OutboxEntry>>(Array.Empty<AgentSwarm.Messaging.Core.OutboxEntry>());
-        public Task AcknowledgeAsync(string outboxEntryId, CancellationToken ct)
+        public Task AcknowledgeAsync(string outboxEntryId, AgentSwarm.Messaging.Core.OutboxDeliveryReceipt receipt, CancellationToken ct)
+            => Task.CompletedTask;
+        public Task RecordSendReceiptAsync(string outboxEntryId, AgentSwarm.Messaging.Core.OutboxDeliveryReceipt receipt, CancellationToken ct)
+            => Task.CompletedTask;
+        public Task RescheduleAsync(string outboxEntryId, DateTimeOffset nextRetryAt, string error, CancellationToken ct)
             => Task.CompletedTask;
         public Task DeadLetterAsync(string outboxEntryId, string error, CancellationToken ct)
             => Task.CompletedTask;
