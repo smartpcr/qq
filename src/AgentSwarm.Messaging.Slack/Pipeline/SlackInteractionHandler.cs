@@ -84,6 +84,33 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
         SlackInteractionEncoding.CommentCallbackId,
     };
 
+    /// <summary>
+    /// Slack <c>views.open</c> error codes that classify the
+    /// <c>trigger_id</c> as PERMANENTLY unusable (one-shot tokens with
+    /// a ~3 second lifetime: once expired / exchanged / invalid, no
+    /// retry will ever succeed). The async handler uses this set to
+    /// distinguish a transient network/server hiccup from a structural
+    /// "the fast-path didn't run inline" failure, so the dead-letter
+    /// entry can be tagged accordingly and operators are not paged on
+    /// every routine post-ACK arrival of a RequiresComment click.
+    /// </summary>
+    /// <remarks>
+    /// Per the Slack <c>views.open</c> error reference: <c>expired_trigger_id</c>
+    /// (token aged out of its ~3 s window), <c>trigger_exchanged</c> /
+    /// <c>exchanged_trigger_id</c> (token already used by an earlier
+    /// successful <c>views.open</c>), <c>invalid_trigger_id</c> /
+    /// <c>trigger_expired</c> (Slack-side rejection that, like
+    /// expiry, is non-retryable).
+    /// </remarks>
+    private static readonly HashSet<string> TerminalTriggerErrorCodes = new(StringComparer.Ordinal)
+    {
+        "expired_trigger_id",
+        "trigger_expired",
+        "trigger_exchanged",
+        "exchanged_trigger_id",
+        "invalid_trigger_id",
+    };
+
     private readonly IAgentTaskService taskService;
     private readonly ISlackThreadMappingLookup threadMappingLookup;
     private readonly ISlackChatUpdateClient chatUpdateClient;
@@ -399,9 +426,29 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
         // silent-return would lose the human action with no retry /
         // dead-letter signal. Throwing lets the
         // SlackInboundProcessingPipeline route the envelope through
-        // its retry / dead-letter machinery; even if the trigger_id
-        // has expired by retry time, the dead-letter sink at least
-        // captures the lost action for operator triage.
+        // its retry / dead-letter machinery. Two distinct exception
+        // shapes are used so operators can triage the DLQ entry
+        // without reading attempt-by-attempt logs:
+        //   * SlackTriggerExpiredException -- the views.open call
+        //     returned one of the Slack-side terminal trigger codes
+        //     (expired_trigger_id, trigger_exchanged, ...). These are
+        //     PERMANENT failures: trigger_ids are one-shot tokens with
+        //     a ~3 s lifetime, so every retry attempt will also fail.
+        //     This almost always means the synchronous fast-path
+        //     (DefaultSlackInteractionFastPathHandler) is not wired
+        //     (or NoOpSlackModalFastPathHandler is registered), so the
+        //     RequiresComment click is reaching the async handler
+        //     post-ACK after the trigger_id has already aged out. The
+        //     exception message is prefixed "permanently failed --
+        //     trigger_id expired" so the resulting
+        //     SlackDeadLetterEntry.Reason is greppable by alerting,
+        //     and the failure is logged at Error level so operators
+        //     are paged BEFORE the retry budget exhausts.
+        //   * InvalidOperationException -- transient transport /
+        //     renderer / missing-trigger failures. Retries may succeed
+        //     (e.g., the next Slack delivery carries a fresh
+        //     trigger_id, or a network blip recovers). Logged at
+        //     Warning.
         string? triggerId = detail.TriggerId ?? envelope.TriggerId;
         if (string.IsNullOrEmpty(triggerId))
         {
@@ -450,8 +497,32 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
             return;
         }
 
-        // Non-success result -- log and throw so the pipeline retries /
-        // dead-letters.
+        // Distinguish permanent Slack-side trigger failures from
+        // transient transport hiccups. Permanent failures get a
+        // dedicated exception type AND an Error-level log so the
+        // dead-letter entry's Reason carries the "permanently failed
+        // -- trigger_id expired" tag and operators are paged on the
+        // FIRST attempt rather than after the retry budget exhausts.
+        if (result.Kind == SlackViewsOpenResultKind.SlackError
+            && IsTerminalTriggerError(result.Error))
+        {
+            this.logger.LogError(
+                "SlackInteractionHandler comment-modal views.open returned terminal Slack error '{SlackError}' for question_id={QuestionId} team={TeamId} trigger_id={TriggerId} envelope idempotency_key={IdempotencyKey}: trigger_id is one-shot and ~3 s lived, so every retry will also fail permanently. This almost always means the synchronous fast-path (DefaultSlackInteractionFastPathHandler) is not wired (or NoOpSlackModalFastPathHandler is registered) -- RequiresComment clicks MUST be handled inline before the HTTP ACK so views.open executes within Slack's trigger_id lifetime. Dead-lettering as permanently failed.",
+                result.Error,
+                questionId,
+                envelope.TeamId,
+                triggerId,
+                envelope.IdempotencyKey);
+            throw new SlackTriggerExpiredException(
+                envelope.IdempotencyKey ?? string.Empty,
+                questionId,
+                envelope.TeamId,
+                triggerId,
+                result.Error ?? "(none)");
+        }
+
+        // Transient / non-trigger Slack error -- log Warning and throw
+        // so the pipeline retries / dead-letters under normal budget.
         this.logger.LogWarning(
             "SlackInteractionHandler comment-modal views.open failed kind={Kind} error={Error} question_id={QuestionId} team={TeamId} trigger_id={TriggerId}; propagating so the pipeline can retry / dead-letter.",
             result.Kind,
@@ -607,10 +678,116 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
     private static bool IsRecognizedViewCallback(string? callbackId)
         => !string.IsNullOrEmpty(callbackId) && KnownViewCallbackIds.Contains(callbackId);
 
+    /// <summary>
+    /// Returns <see langword="true"/> when <paramref name="slackError"/>
+    /// is one of the Slack <c>views.open</c> error codes that classify
+    /// the <c>trigger_id</c> as permanently unusable (one-shot tokens
+    /// with a ~3 second lifetime -- no retry will ever succeed). See
+    /// <see cref="TerminalTriggerErrorCodes"/> for the canonical list.
+    /// </summary>
+    private static bool IsTerminalTriggerError(string? slackError)
+        => !string.IsNullOrEmpty(slackError) && TerminalTriggerErrorCodes.Contains(slackError);
+
     private static string ResolveFallbackCorrelationId(SlackInboundEnvelope envelope)
         => string.IsNullOrEmpty(envelope.IdempotencyKey)
             ? Guid.NewGuid().ToString("N")
             : envelope.IdempotencyKey;
+}
+
+/// <summary>
+/// Thrown by <see cref="SlackInteractionHandler"/> when a
+/// <c>RequiresComment</c> button click reaches the async handler and
+/// the resulting <c>views.open</c> call returns a Slack-side terminal
+/// trigger error (<c>expired_trigger_id</c>, <c>trigger_exchanged</c>,
+/// <c>invalid_trigger_id</c>, ...). The trigger_id is a one-shot token
+/// with a ~3 second lifetime, so this failure is PERMANENT -- every
+/// retry attempt will also fail. The exception's
+/// <see cref="Exception.Message"/> is prefixed
+/// <c>"permanently failed -- trigger_id expired"</c> so the resulting
+/// <see cref="Queues.SlackDeadLetterEntry.Reason"/> is greppable for
+/// operator alerting / triage.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Derives from <see cref="InvalidOperationException"/> so existing
+/// tests / callers that assert against <see cref="InvalidOperationException"/>
+/// (the previously shipped error type for views.open failures) keep
+/// passing while still allowing precise <c>catch</c> /
+/// <c>is SlackTriggerExpiredException</c> handling at sites that want
+/// to special-case the permanent failure (e.g., a future retry policy
+/// that classifies terminal exceptions as non-retryable).
+/// </para>
+/// <para>
+/// This condition almost always indicates that the synchronous
+/// <see cref="DefaultSlackInteractionFastPathHandler"/> is not wired
+/// (or <see cref="Transport.NoOpSlackModalFastPathHandler"/> is the
+/// active registration) -- RequiresComment clicks are supposed to be
+/// handled inline BEFORE the HTTP ACK so <c>views.open</c> executes
+/// within Slack's trigger_id lifetime. The
+/// <see cref="DiagnosticHint"/> property surfaces that hint to log
+/// formatters and dashboards without requiring them to re-parse
+/// <see cref="Exception.Message"/>.
+/// </para>
+/// </remarks>
+internal sealed class SlackTriggerExpiredException : InvalidOperationException
+{
+    /// <summary>
+    /// Diagnostic prefix pinned on every instance's
+    /// <see cref="Exception.Message"/> so the resulting dead-letter
+    /// entry's <see cref="Queues.SlackDeadLetterEntry.Reason"/> can be
+    /// matched with a simple <c>startswith</c> / <c>contains</c> query
+    /// in operator dashboards and alerting rules. Stable string --
+    /// existing alerts SHOULD match on this exact prefix.
+    /// </summary>
+    public const string ReasonPrefix = "permanently failed -- trigger_id expired";
+
+    /// <summary>
+    /// Human-readable hint surfacing the most likely root cause
+    /// (synchronous fast-path not wired). Kept short so it fits in
+    /// alert summaries without truncation.
+    /// </summary>
+    public const string DiagnosticHint =
+        "trigger_id is one-shot and ~3 s lived; this almost always means the synchronous fast-path is not wired (DefaultSlackInteractionFastPathHandler missing, or NoOpSlackModalFastPathHandler registered) -- RequiresComment clicks must run inline before the HTTP ACK so views.open executes within Slack's trigger_id lifetime.";
+
+    public SlackTriggerExpiredException(
+        string idempotencyKey,
+        string questionId,
+        string teamId,
+        string triggerId,
+        string slackError)
+        : base(BuildMessage(idempotencyKey, questionId, teamId, triggerId, slackError))
+    {
+        this.IdempotencyKey = idempotencyKey ?? string.Empty;
+        this.QuestionId = questionId ?? string.Empty;
+        this.TeamId = teamId ?? string.Empty;
+        this.TriggerId = triggerId ?? string.Empty;
+        this.SlackError = slackError ?? string.Empty;
+    }
+
+    /// <summary>Inbound envelope idempotency key (for log correlation).</summary>
+    public string IdempotencyKey { get; }
+
+    /// <summary>Decoded QuestionId of the click that could not open its modal.</summary>
+    public string QuestionId { get; }
+
+    /// <summary>Slack workspace identifier of the originating click.</summary>
+    public string TeamId { get; }
+
+    /// <summary>The expired trigger_id (logged so operators can confirm the token, not for replay).</summary>
+    public string TriggerId { get; }
+
+    /// <summary>Raw Slack error string returned by <c>views.open</c>.</summary>
+    public string SlackError { get; }
+
+    private static string BuildMessage(
+        string idempotencyKey,
+        string questionId,
+        string teamId,
+        string triggerId,
+        string slackError)
+    {
+        return $"{ReasonPrefix}: slack_error='{slackError}' question_id='{questionId}' team_id='{teamId}' trigger_id='{triggerId}' idempotency_key='{idempotencyKey}'. {DiagnosticHint}";
+    }
 }
 
 /// <summary>
