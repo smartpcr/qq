@@ -62,6 +62,8 @@ public static class ServiceCollectionExtensions
     ///   evaluator item 5).</description></item>
     ///   <item><description><see cref="IOperatorRegistry"/>
     ///   → <see cref="PersistentOperatorRegistry"/> (Stage 3.4).</description></item>
+    ///   <item><description><see cref="IDeduplicationService"/>
+    ///   → <see cref="PersistentDeduplicationService"/> (Stage 4.3).</description></item>
     /// </list>
     /// Every replaced concrete is a singleton that bridges to the
     /// scoped <see cref="MessagingDbContext"/> via

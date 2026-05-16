@@ -13,6 +13,13 @@
       be shared with any future connector that registers it.
     -->
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.*" />
+    <!--
+      Stage 4.3 — SlidingWindowDeduplicationService consumes
+      IOptions<DeduplicationOptions>. Options.Abstractions is the
+      smallest surface that provides IOptions / IOptionsMonitor; it
+      does NOT pull in Configuration so Core stays connector-agnostic.
+    -->
+    <PackageReference Include="Microsoft.Extensions.Options" Version="8.*" />
   </ItemGroup>
 
   <PropertyGroup>

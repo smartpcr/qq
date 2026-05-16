@@ -3,6 +3,7 @@ using System;
 using AgentSwarm.Messaging.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,127 +11,13 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace AgentSwarm.Messaging.Persistence.Migrations
 {
     [DbContext(typeof(MessagingDbContext))]
-    partial class MessagingDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260601000007_AddProcessedEvents")]
+    partial class AddProcessedEvents
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "8.0.27");
-
-            modelBuilder.Entity("AgentSwarm.Messaging.Abstractions.DeadLetterMessage", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("AgentId")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("AlertStatus")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT");
-
-                    b.Property<long?>("AlertSentAt")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("AttemptCount")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("AttemptTimestamps")
-                        .IsRequired()
-                        .HasColumnType("TEXT")
-                        .HasDefaultValue("[]");
-
-                    b.Property<long>("ChatId")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("CorrelationId")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<long>("CreatedAt")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<long>("DeadLetteredAt")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("ErrorHistory")
-                        .IsRequired()
-                        .HasColumnType("TEXT")
-                        .HasDefaultValue("[]");
-
-                    b.Property<string>("FailureCategory")
-                        .IsRequired()
-                        .HasMaxLength(48)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("FinalError")
-                        .IsRequired()
-                        .HasMaxLength(2048)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("IdempotencyKey")
-                        .IsRequired()
-                        .HasMaxLength(256)
-                        .HasColumnType("TEXT");
-
-                    b.Property<Guid>("OriginalMessageId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Payload")
-                        .IsRequired()
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ReplayCorrelationId")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ReplayStatus")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT")
-                        .HasDefaultValue("None");
-
-                    b.Property<int>("Severity")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("SourceEnvelopeJson")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("SourceId")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("SourceType")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("CorrelationId")
-                        .HasDatabaseName("ix_dead_letter_messages_correlation_id");
-
-                    b.HasIndex("DeadLetteredAt")
-                        .HasDatabaseName("ix_dead_letter_messages_dead_lettered_at");
-
-                    b.HasIndex("OriginalMessageId")
-                        .IsUnique()
-                        .HasDatabaseName("ux_dead_letter_messages_original_message_id");
-
-                    b.HasIndex("AlertStatus", "Severity")
-                        .HasDatabaseName("ix_dead_letter_messages_alert_status_severity");
-
-                    b.HasIndex("AgentId")
-                        .HasDatabaseName("ix_dead_letter_messages_agent_id");
-
-                    b.HasIndex("ReplayStatus")
-                        .HasDatabaseName("ix_dead_letter_messages_replay_status");
-
-                    b.ToTable("dead_letter_messages", (string)null);
-                });
 
             modelBuilder.Entity("AgentSwarm.Messaging.Abstractions.InboundUpdate", b =>
                 {
@@ -234,9 +121,6 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.Property<int>("AttemptCount")
                         .HasColumnType("INTEGER");
-
-                    b.Property<string>("AttemptHistoryJson")
-                        .HasColumnType("TEXT");
 
                     b.Property<long>("ChatId")
                         .HasColumnType("INTEGER");
