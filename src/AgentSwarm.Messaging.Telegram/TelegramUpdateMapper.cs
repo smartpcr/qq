@@ -61,6 +61,27 @@ namespace AgentSwarm.Messaging.Telegram;
 /// <see cref="EventType.Unknown"/> BEFORE authz so misclassified events
 /// cannot accidentally clear authorization.
 /// </para>
+/// <para>
+/// <b>Chat-type formatting.</b> The lowercase
+/// <see cref="MessengerEvent.ChatType"/> token is produced by the private
+/// <see cref="FormatChatType"/> helper on this class. The sibling
+/// webhook-path mapper (<see cref="Webhook.TelegramUpdateMapper"/>) owns
+/// an equivalent formatter on its own class. The two formatters MUST
+/// agree on the token vocabulary ("private", "group", "supergroup",
+/// "channel", "sender", plus the <c>ToString().ToLowerInvariant()</c>
+/// fallback) because the downstream
+/// <c>Auth.TelegramChatTypeParser.ParseOrDefault</c> consumer is
+/// transport-agnostic — if the webhook starts emitting a capitalised or
+/// abbreviated token, the parser will silently fall through to the
+/// <c>Private</c> default and onboarding will mis-tag the binding's
+/// <c>ChatType</c>. The duplication is deliberate: a shared helper would
+/// either live in <c>Webhook</c> (forcing polling to depend on webhook
+/// infrastructure — the brittle coupling this file used to have) or
+/// require introducing a third class purely to wrap a five-line switch,
+/// which trades a real coupling for a thin abstraction. The lockstep
+/// invariant is enforced by review and by the polling/webhook mapper
+/// unit tests asserting against the same expected token set.
+/// </para>
 /// </remarks>
 public static class TelegramUpdateMapper
 {
@@ -108,7 +129,7 @@ public static class TelegramUpdateMapper
                     RawCommand = text,
                     UserId = userId,
                     ChatId = chatId,
-                    ChatType = TelegramChatTypeFormatter.Format(message.Chat.Type),
+                    ChatType = FormatChatType(message.Chat.Type),
                     Timestamp = timestamp,
                     CorrelationId = correlationId,
                     Payload = text,
@@ -121,7 +142,7 @@ public static class TelegramUpdateMapper
                 EventType = EventType.TextReply,
                 UserId = userId,
                 ChatId = chatId,
-                ChatType = TelegramChatTypeFormatter.Format(message.Chat.Type),
+                ChatType = FormatChatType(message.Chat.Type),
                 Timestamp = timestamp,
                 CorrelationId = correlationId,
                 Payload = text,
@@ -140,7 +161,7 @@ public static class TelegramUpdateMapper
                 EventType = EventType.CallbackResponse,
                 UserId = callback.From.Id.ToString(CultureInfo.InvariantCulture),
                 ChatId = callback.Message.Chat.Id.ToString(CultureInfo.InvariantCulture),
-                ChatType = TelegramChatTypeFormatter.Format(callback.Message.Chat.Type),
+                ChatType = FormatChatType(callback.Message.Chat.Type),
                 // CallbackQuery has no native timestamp — using UtcNow stamps
                 // the click time rather than the (potentially stale) age of
                 // the original message the button was attached to.
@@ -193,6 +214,44 @@ public static class TelegramUpdateMapper
         return CreateUuidV5(CorrelationNamespace, eventId).ToString();
     }
 
+    /// <summary>
+    /// Stage 3.4 — render the Telegram-typed
+    /// <see cref="Telegram.Bot.Types.Enums.ChatType"/> as the
+    /// transport-agnostic lowercase string the pipeline carries on
+    /// <see cref="MessengerEvent.ChatType"/>. The downstream authz
+    /// service parses this into the Core
+    /// <see cref="AgentSwarm.Messaging.Core.ChatType"/> enum so the
+    /// onboarded <see cref="AgentSwarm.Messaging.Core.OperatorBinding"/>
+    /// records the actual chat kind (private vs. group vs. supergroup
+    /// vs. channel) instead of always defaulting to Private.
+    /// </summary>
+    /// <remarks>
+    /// Kept private to this polling-path mapper so the polling subsystem
+    /// owns its own formatting and does not reach into the sibling
+    /// <c>Webhook</c> namespace for an <c>internal</c> helper. The
+    /// previous implementation delegated to
+    /// <c>Webhook.TelegramUpdateMapper.FormatChatType</c>, which created
+    /// a brittle dependency from polling infrastructure to webhook
+    /// infrastructure (the reviewer flagged this on PR #82). The token
+    /// vocabulary ("private", "group", "supergroup", "channel",
+    /// "sender", plus the <c>type.ToString().ToLowerInvariant()</c>
+    /// fallback) is intentionally identical to the webhook-path
+    /// mapper's local copy because the downstream
+    /// <c>Auth.TelegramChatTypeParser</c> is transport-agnostic; the
+    /// two copies are kept in lockstep by review and by symmetric
+    /// mapper unit tests on the polling and webhook paths.
+    /// </remarks>
+    private static string FormatChatType(global::Telegram.Bot.Types.Enums.ChatType type) =>
+        type switch
+        {
+            global::Telegram.Bot.Types.Enums.ChatType.Private => "private",
+            global::Telegram.Bot.Types.Enums.ChatType.Group => "group",
+            global::Telegram.Bot.Types.Enums.ChatType.Supergroup => "supergroup",
+            global::Telegram.Bot.Types.Enums.ChatType.Channel => "channel",
+            global::Telegram.Bot.Types.Enums.ChatType.Sender => "sender",
+            _ => type.ToString().ToLowerInvariant(),
+        };
+
     private static Guid CreateUuidV5(Guid namespaceId, string name)
     {
         // RFC 4122 §4.3: v5 = SHA-1(namespace_bytes || name_bytes) truncated
@@ -241,53 +300,4 @@ public static class TelegramUpdateMapper
         (guid[4], guid[5]) = (guid[5], guid[4]);
         (guid[6], guid[7]) = (guid[7], guid[6]);
     }
-}
-
-/// <summary>
-/// Shared formatter that renders the SDK-typed
-/// <see cref="global::Telegram.Bot.Types.Enums.ChatType"/> as the
-/// transport-agnostic lowercase string the pipeline carries on
-/// <see cref="MessengerEvent.ChatType"/>.
-/// </summary>
-/// <remarks>
-/// <para>
-/// Lives in the root <c>AgentSwarm.Messaging.Telegram</c> namespace so
-/// both the polling-path <see cref="TelegramUpdateMapper"/> and the
-/// webhook-path mapper (<c>AgentSwarm.Messaging.Telegram.Webhook.TelegramUpdateMapper</c>)
-/// can reference a single source of truth for the lowercase-token shape
-/// without one polling/webhook half having to reach into the other's
-/// namespace. The downstream
-/// <see cref="AgentSwarm.Messaging.Telegram.Auth.TelegramChatTypeParser"/>
-/// is the inverse of this formatter — keeping both pinned to the same
-/// (private/group/supergroup/channel/sender) token set is a contract
-/// across the transport boundary, so a single helper here prevents one
-/// receiver from silently drifting (e.g. emitting "Supergroup" with
-/// PascalCase) and breaking the parser's switch.
-/// </para>
-/// <para>
-/// Unknown enum members fall back to
-/// <c>type.ToString().ToLowerInvariant()</c> rather than throwing — a
-/// future SDK release that adds a new <c>ChatType</c> member must not
-/// crash an inbound update mid-pipeline; the downstream parser already
-/// treats unrecognized tokens as <c>Private</c>, which is the safer
-/// default for authorization (the most restrictive binding) than
-/// either an exception or silent re-typing.
-/// </para>
-/// </remarks>
-public static class TelegramChatTypeFormatter
-{
-    /// <summary>
-    /// Render <paramref name="type"/> as the lowercase token surfaced on
-    /// <see cref="MessengerEvent.ChatType"/>.
-    /// </summary>
-    public static string Format(global::Telegram.Bot.Types.Enums.ChatType type) =>
-        type switch
-        {
-            global::Telegram.Bot.Types.Enums.ChatType.Private => "private",
-            global::Telegram.Bot.Types.Enums.ChatType.Group => "group",
-            global::Telegram.Bot.Types.Enums.ChatType.Supergroup => "supergroup",
-            global::Telegram.Bot.Types.Enums.ChatType.Channel => "channel",
-            global::Telegram.Bot.Types.Enums.ChatType.Sender => "sender",
-            _ => type.ToString().ToLowerInvariant(),
-        };
 }
