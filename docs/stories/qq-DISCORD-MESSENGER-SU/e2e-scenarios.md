@@ -147,15 +147,22 @@ Feature: Agent question with buttons
   Scenario: Agent posts a question with Approve, Reject, Need more info, and Delegate buttons
     Given the Discord bot is connected
     And the outbound queue processor is running
-    When the orchestrator emits an AgentQuestion with QuestionId "Q-42"
-      | Field          | Value                                  |
-      | AgentId        | build-agent-3                          |
-      | TaskId         | T-42                                   |
-      | Title          | Cache strategy approval                |
-      | Body           | Should we use Redis or Memcached?      |
-      | Severity       | High                                   |
-      | AllowedActions | Approve, Reject, Need more info, Delegate |
-    Then DiscordMessengerConnector enqueues an OutboundMessage with SourceType "Question" and Severity "High"
+    When the orchestrator emits an AgentQuestionEnvelope wrapping an AgentQuestion with QuestionId "Q-42"
+      | Envelope Field           | Value                                  |
+      | Question.AgentId         | build-agent-3                          |
+      | Question.TaskId          | T-42                                   |
+      | Question.Title           | Cache strategy approval                |
+      | Question.Body            | Should we use Redis or Memcached?      |
+      | Question.Severity        | High                                   |
+      | Question.AllowedActions  | Approve, Reject, Need more info, Delegate |
+      | ProposedDefaultActionId  | approve                                |
+      | RoutingMetadata          | DiscordChannelId = "C-control"         |
+    Then DiscordMessengerConnector.SendQuestionAsync(envelope, ct) enqueues an OutboundMessage with:
+      | Field            | Value                                           |
+      | SourceType       | Question                                        |
+      | Severity         | High                                            |
+      | SourceEnvelopeJson | serialized AgentQuestionEnvelope (full envelope) |
+      | IdempotencyKey   | q:build-agent-3:Q-42                             |
     And OutboundQueueProcessor dequeues the message and calls DiscordMessageSender.SendQuestionAsync
     And the Discord embed includes:
       | Embed Section   | Content                            |
@@ -206,10 +213,14 @@ Feature: Button interaction -- approve
 Feature: Select menu for questions with many actions
 
   Scenario: Agent question with 6 allowed actions renders as a select menu
-    Given an AgentQuestion has 6 AllowedActions
+    Given an AgentQuestionEnvelope wraps an AgentQuestion with 6 AllowedActions
     When DiscordMessageSender renders the question embed
     Then the message uses a select menu component instead of buttons
-    And each AllowedAction appears as a select menu option with Label and custom_id
+    And the select menu component has custom_id "q:{QuestionId}:select"
+    And each AllowedAction appears as a select menu option with:
+      | Option field | Value                          |
+      | label        | HumanAction.Label              |
+      | value        | HumanAction.ActionId           |
     And the select menu placeholder reads "Choose an action..."
 ```
 
@@ -221,15 +232,19 @@ Feature: Modal for comment-required actions
   Scenario: Operator selects an action that requires a comment
     Given a pending question "Q-55" has AllowedAction "reject" with RequiresComment = true
     When the operator clicks the "Reject" button with custom_id "q:Q-55:reject"
-    Then ComponentInteractionHandler detects RequiresComment = true for "reject"
+    Then DiscordGatewayService persists the DiscordInteractionRecord
+    And ComponentInteractionHandler detects RequiresComment = true for "reject"
+    And RespondWithModalAsync is called (this IS the interaction ACK -- DeferAsync is NOT called)
     And a Discord modal dialog is opened with:
       | Field       | Value                          |
       | Title       | Provide rejection reason       |
       | Input label | Comment                        |
       | Style       | Paragraph (multi-line)         |
+      | custom_id   | modal:Q-55:reject              |
     And IPendingQuestionStore status transitions to "AwaitingComment" for "Q-55"
     When the operator submits the modal with text "Approach violates the caching policy"
     Then a DiscordInteractionRecord is persisted with InteractionType "ModalSubmit"
+    And DeferAsync is called for the modal submit interaction
     And ISwarmCommandBus.PublishHumanDecisionAsync is called with Comment "Approach violates the caching policy"
     And IPendingQuestionStore.MarkAnsweredAsync is called for "Q-55"
     And the question embed is updated to show rejection and the comment
@@ -699,15 +714,24 @@ Feature: Control channel routing
 
   Scenario: Slash commands are accepted in the control channel
     Given a GuildBinding with ChannelPurpose "Control" for channel "C-control"
+    And the operator has an authorized role
     When the operator sends "/agent ask architect design cache" in "C-control"
-    Then the command is processed normally
+    Then AuthorizeAsync resolves the GuildBinding for "C-control" with ChannelPurpose "Control"
+    And the command is processed normally through the interaction pipeline
 
-  Scenario: Slash commands in a workstream channel are also accepted if bound
+  Scenario: Slash commands in a workstream channel are rejected
     Given a GuildBinding with ChannelPurpose "Workstream" for channel "C-ws-1"
-    And AllowedRoleIds includes the operator's role
-    When the operator sends "/agent status" in "C-ws-1"
-    Then the command is processed normally (all bound channels accept commands from authorized users)
+    And the operator has an authorized role
+    When the operator sends "/agent ask coder-1 build widget" in "C-ws-1"
+    Then the interaction pipeline rejects the command because ChannelPurpose is not "Control"
+    And an ephemeral follow-up states "Commands are only accepted in the control channel"
+    And the command is NOT dispatched to ISwarmCommandBus
 ```
+
+> **Note:** Per tech-spec Section 2.5, the Control channel receives operator
+> commands and agent questions. Workstream channels receive task-specific
+> status updates and threaded conversations only. The Alert channel receives
+> priority alerts.
 
 ### Scenario 7.2: Alerts are routed to the alert channel
 
@@ -786,12 +810,17 @@ Feature: Decision audit logging
   Scenario: Button click decision is recorded with all Discord IDs
     When the operator clicks "Approve" on question "Q-42"
     Then IAuditLogger.LogHumanResponseAsync is called with a HumanResponseAuditEntry containing:
-      | Field           | Value                              |
-      | Platform        | Discord                            |
-      | ExternalUserId  | <operator Discord user ID>         |
-      | MessageId       | <interaction snowflake ID>         |
-      | CorrelationId   | <question correlation ID>          |
-    And AuditEntry.Details JSON includes GuildId, ChannelId, InteractionId, and ThreadId (if applicable)
+      | Field           | Value                                             |
+      | Platform        | Discord                                           |
+      | ExternalUserId  | <operator Discord user ID as string>              |
+      | MessageId       | <Discord message snowflake ID of bot follow-up>   |
+      | CorrelationId   | <question correlation ID>                         |
+    And AuditEntry.Details JSON includes:
+      | Key            | Value                                              |
+      | GuildId        | <guild snowflake ID>                               |
+      | ChannelId      | <channel snowflake ID>                             |
+      | InteractionId  | <interaction snowflake ID of the button click>     |
+      | ThreadId       | <thread snowflake ID, if applicable>               |
 ```
 
 ### Scenario 8.3: CorrelationId propagated end-to-end
@@ -892,11 +921,15 @@ Feature: Gap B crash recovery
     When the service restarts and QuestionRecoverySweep runs
     Then the sweep finds "M-1" with SourceType=Question, Status=Sent, and no matching PendingQuestionRecord
     And the sweep backfills a PendingQuestionRecord using:
-      | Field              | Source                                    |
-      | QuestionId         | M-1.SourceId                              |
-      | DiscordMessageId   | M-1.PlatformMessageId                     |
-      | DiscordChannelId   | M-1.ChatId (cast to ulong)                |
-      | AgentQuestion JSON | deserialized from M-1.SourceEnvelopeJson  |
+      | Field              | Source                                                   |
+      | QuestionId         | M-1.SourceId                                             |
+      | DiscordMessageId   | M-1.PlatformMessageId                                    |
+      | DiscordChannelId   | M-1.ChatId (cast to ulong)                               |
+      | AgentQuestion      | envelope.Question (from deserialized AgentQuestionEnvelope) |
+      | DefaultActionId    | envelope.ProposedDefaultActionId                         |
+      | DefaultActionValue | resolved from envelope.Question.AllowedActions            |
+      | ExpiresAt          | envelope.Question.ExpiresAt                              |
+    And SourceEnvelopeJson is deserialized as AgentQuestionEnvelope (not bare AgentQuestion)
     And the question is now correctly tracked for operator button clicks
 ```
 
@@ -913,10 +946,11 @@ by the story.
 Feature: Agent identity in embeds
 
   Scenario: Agent question embed displays name, role, task, confidence, and blocking status
-    Given the orchestrator emits an AgentQuestion from agent "build-agent-3"
-      | Field           | Value                      |
-      | AgentId         | build-agent-3              |
-      | TaskId          | T-42                       |
+    Given the orchestrator emits an AgentQuestionEnvelope from agent "build-agent-3"
+      | Envelope Field          | Value                      |
+      | Question.AgentId        | build-agent-3              |
+      | Question.TaskId         | T-42                       |
+      | ProposedDefaultActionId | approve                    |
     And AgentInfo for "build-agent-3" reports:
       | Field           | Value                      |
       | Role            | Coder                      |
@@ -965,11 +999,19 @@ Feature: 3-second ACK deadline
 
   Scenario: DeferAsync is called within the 3-second Discord deadline
     Given the database supports < 500ms p99 INSERT latency
-    When the operator sends any slash command or clicks any button
+    When the operator sends any slash command or clicks a button where RequiresComment = false
     Then DiscordGatewayService persists the DiscordInteractionRecord
     And DeferAsync is called immediately after the durable persist
     And the total time from interaction receipt to DeferAsync completion is under 3 seconds
     And the user sees a "thinking..." indicator in Discord while processing continues
+
+  Scenario: Button with RequiresComment uses modal as ACK instead of DeferAsync
+    Given the database supports < 500ms p99 INSERT latency
+    When the operator clicks a button where the resolved HumanAction has RequiresComment = true
+    Then DiscordGatewayService persists the DiscordInteractionRecord
+    And RespondWithModalAsync is called instead of DeferAsync (modal response IS the ACK)
+    And the total time from interaction receipt to RespondWithModalAsync is under 3 seconds
+    And the operator sees a modal dialog (not a "thinking..." indicator)
 ```
 
 ### Scenario 11.2: Persist happens before DeferAsync
@@ -1015,9 +1057,11 @@ Feature: Select menu interaction
 
   Scenario: Operator selects an action from a dropdown menu
     Given a pending question "Q-70" has 6 AllowedActions rendered as a select menu
-    When the operator selects "Need more info" from the dropdown
+    And the select menu component has custom_id "q:Q-70:select"
+    When the operator selects the option with value "need-info" (ActionId) from the dropdown
     Then DiscordGatewayService persists a DiscordInteractionRecord with InteractionType "SelectMenu"
-    And ComponentInteractionHandler parses QuestionId "Q-70" and ActionId from the selected value
+    And ComponentInteractionHandler parses QuestionId "Q-70" from the component custom_id "q:Q-70:select"
+    And ActionId "need-info" is read from the selected option's value field
     And the same HumanDecisionEvent flow as button clicks is followed
     And the question embed is updated to show the selection
 ```
