@@ -197,19 +197,26 @@ public class Program
             .AddSlackInboundIngestor<SlackPersistenceDbContext>();
 
         // Stage 5.1 (workstream:
-        // ws-qq-slack-messenger-supp-phase-command-and-interaction-processing-stage-slash-command-dispatch):
+        // ws-qq-slack-messenger-supp-phase-command-and-interaction-processing-stage-slash-command-dispatch)
+        // + Stage 5.2 (workstream:
+        // ws-qq-slack-messenger-supp-phase-command-and-interaction-processing-stage-app-mention-processing):
         // register the real SlackCommandHandler (replaces the Stage
         // 4.3 NoOpSlackCommandHandler dev-stub for the ingestor's
-        // ISlackCommandHandler binding). The dispatcher parses
+        // ISlackCommandHandler binding) AND the real
+        // SlackAppMentionHandler (replaces the
+        // NoOpSlackAppMentionHandler dev-stub for the
+        // ISlackAppMentionHandler binding). The dispatcher parses
         // `/agent <sub-command>` text, calls IAgentTaskService for
         // ask / status / approve / reject and best-effort views.open
         // for review / escalate, and writes ephemeral error messages
-        // for unrecognised sub-commands. Must follow
-        // AddSlackInboundIngestor so the
+        // for unrecognised sub-commands; the app-mention handler
+        // strips the `<@BOT_USER_ID>` prefix and delegates through the
+        // same dispatch switch (posting replies as threaded
+        // chat.postMessage instead of ephemeral response_url replies).
+        // Must follow AddSlackInboundIngestor so the
         // AddSlackInboundDevelopmentHandlerStubs call below only
         // re-registers no-ops for the still-unimplemented
-        // ISlackAppMentionHandler / ISlackInteractionHandler
-        // contracts.
+        // ISlackInteractionHandler contract.
         builder.Services.AddSlackCommandDispatcher();
 
         // Stage 5.1 iter-2 evaluator item 3 (STRUCTURAL fix):
@@ -238,18 +245,19 @@ public class Program
         // ISlackInteractionHandler against the silent-completion
         // stubs would ack-and-drop every Slack request -- a real
         // no-message-loss bug. Stage 5.1 swaps in the real
-        // SlackCommandHandler above; Stages 5.2 / 5.3 are still in
-        // flight, so the Worker explicitly opts into the development
-        // stand-ins for the @mention and interaction handlers so the
+        // SlackCommandHandler above; Stage 5.2 swaps in the real
+        // SlackAppMentionHandler via the same extension call; Stage
+        // 5.3 is still in flight, so the Worker explicitly opts into
+        // the development stand-in for the interaction handler so the
         // ingestor remains resolvable AND any operator reading this
         // file SEES the explicit opt-in (and knows to remove it
-        // before going to production).
+        // before going to production). The dev-stubs extension uses
+        // TryAddSingleton so the real handlers wired above win for
+        // the command + app-mention bindings.
         //
-        // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this call
-        // with the real handler registrations (Stage 5.2 @mention
-        // dispatcher, Stage 5.3 interaction -> HumanDecisionEvent
-        // dispatcher). The production Worker must NOT ship the
-        // remaining no-op stubs.
+        // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.3): replace this call
+        // with the real interaction-handler registration. The
+        // production Worker must NOT ship the remaining no-op stub.
         builder.Services.AddSlackInboundDevelopmentHandlerStubs();
 
         // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the
