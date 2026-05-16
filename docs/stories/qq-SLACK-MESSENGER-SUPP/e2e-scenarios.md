@@ -186,6 +186,27 @@ Feature: /agent reject slash command
       And SlackAuditLogger records the exchange with outcome "success"
 ```
 
+### Scenario 4.2: Question not found
+
+```gherkin
+  Scenario: User tries to reject a non-existent question
+    Given a valid, authorized Slack request
+    When user types "/agent reject Q-NONEXISTENT"
+    Then an ephemeral error "Question Q-NONEXISTENT not found." is returned
+      And no HumanDecisionEvent is published
+      And SlackAuditLogger records the exchange with outcome "error"
+```
+
+### Scenario 4.3: Missing question-id argument
+
+```gherkin
+  Scenario: User omits question-id from /agent reject
+    Given a valid, authorized Slack request
+    When user types "/agent reject" with no argument
+    Then an ephemeral error "Usage: /agent reject <question-id>" is returned
+      And no HumanDecisionEvent is published
+```
+
 ---
 
 ## Feature 5: Slash Command -- /agent review (Modal Flow)
@@ -278,6 +299,29 @@ Feature: /agent escalate modal flow
       And a confirmation reply is posted in the task thread
 ```
 
+### Scenario 6.2: views.open failure due to rate limit during escalate
+
+```gherkin
+  Scenario: Escalation modal opening fails due to Slack rate limit
+    Given a valid, authorized Slack request with a trigger_id
+      And the Slack Web API returns HTTP 429 for views.open
+    When user types "/agent escalate TASK-55"
+    Then SlackDirectApiClient receives the 429 response
+      And an ephemeral error message is returned: "Unable to open escalation modal. Please try again shortly."
+      And the call is NOT retried via the durable outbound queue (trigger_id is expired)
+      And SlackAuditLogger records the exchange with outcome "error" and error_detail containing "rate_limited"
+```
+
+### Scenario 6.3: Missing task-id argument for escalate
+
+```gherkin
+  Scenario: User omits task-id from /agent escalate
+    Given a valid, authorized Slack request
+    When user types "/agent escalate" with no argument
+    Then an ephemeral error "Usage: /agent escalate <task-id>" is returned
+      And no modal is opened
+```
+
 ---
 
 ## Feature 7: App Mention Invocation
@@ -315,7 +359,47 @@ Feature: App mention invocation
       And the task status is returned as a threaded reply
 ```
 
-### Scenario 7.3: App mention with unrecognized sub-command
+### Scenario 7.3: App mention delegates approve and reject
+
+```gherkin
+  Scenario: User approves a question via app mention
+    Given a valid, authorized app_mention event
+      And the orchestrator has a pending AgentQuestion with QuestionId "Q-600"
+    When user posts "@AgentBot approve Q-600"
+    Then SlackAppMentionHandler strips the bot user-ID prefix and parses sub-command "approve"
+      And the command is routed to the same SlackCommandHandler logic used by slash commands
+      And a HumanDecisionEvent is produced with ActionValue "approve"
+      And the event is published to the orchestrator
+```
+
+### Scenario 7.4: App mention delegates review (modal fast-path)
+
+```gherkin
+  Scenario: User opens a review modal via app mention
+    Given a valid, authorized app_mention event with a trigger_id
+      And task "TASK-42" exists
+    When user posts "@AgentBot review TASK-42"
+    Then SlackAppMentionHandler parses sub-command "review" with argument "TASK-42"
+      And the modal fast-path is invoked: SlackDirectApiClient calls views.open
+      And SlackAuditLogger records request_type "modal_open"
+```
+
+### Scenario 7.5: App mention delegates reject and escalate
+
+```gherkin
+  Scenario: Reject and escalate sub-commands work via app mention
+    Given a valid, authorized app_mention event
+    When user posts "@AgentBot reject Q-700"
+    Then SlackAppMentionHandler parses sub-command "reject" with argument "Q-700"
+      And the command follows the same path as "/agent reject Q-700"
+
+    Given a valid, authorized app_mention event with a trigger_id
+    When user posts "@AgentBot escalate TASK-80"
+    Then SlackAppMentionHandler parses sub-command "escalate" with argument "TASK-80"
+      And the modal fast-path is invoked for the escalation modal
+```
+
+### Scenario 7.6: App mention with unrecognized sub-command
 
 ```gherkin
   Scenario: User sends unrecognized sub-command via app mention
@@ -1028,14 +1112,16 @@ Feature: Multi-workspace support
 ```gherkin
 Feature: Error handling edge cases
 
-  Scenario: Orchestrator is temporarily unavailable
-    Given a valid "/agent ask plan something" command is processed
+  Scenario: Orchestrator is temporarily unavailable during async task creation
+    Given a valid "/agent ask plan something" command has been received
+      And SlackEventsApiReceiver has already returned HTTP 200 (ACK)
+      And async processing is now running in the inbound pipeline
       And the orchestrator service is temporarily unreachable
-    When SlackCommandHandler calls the orchestrator
-    Then the command is retried per the retry policy (exponential backoff, max 5 attempts)
-      And if all retries fail, an ephemeral error is returned to the user
-      And the message is moved to the DLQ
-      And SlackAuditLogger records outcome "error" with error_detail
+    When SlackCommandHandler calls the orchestrator to create a task
+    Then the call is retried per the retry policy (exponential backoff, max 5 attempts)
+      And if all retries fail, a follow-up error message is posted to the originating channel as a new message (not ephemeral, since the HTTP response was already sent)
+      And the failed command envelope is moved to the DLQ for operator inspection
+      And SlackAuditLogger records outcome "error" with error_detail describing the orchestrator failure
 ```
 
 ### Scenario 23.2: Malformed slash command text
@@ -1054,11 +1140,17 @@ Feature: Error handling edge cases
 ```gherkin
   Scenario: Two users click different buttons on the same question simultaneously
     Given AgentQuestion Q-500 is displayed with Approve and Reject buttons
-    When user "U-ALICE" clicks "Approve" at roughly the same time user "U-BOB" clicks "Reject"
-    Then the first interaction to pass SlackIdempotencyGuard is processed
-      And the second interaction is treated as a duplicate (same question, different action)
-        Or the orchestrator receives both decisions and applies its own conflict resolution
-      And both interactions are recorded in the audit trail
+      And the idempotency key includes action_id and trigger_id per architecture.md section 3.4
+    When user "U-ALICE" clicks "Approve" (trigger_id "trig-A", action_id "approve-Q-500")
+      And user "U-BOB" clicks "Reject" (trigger_id "trig-B", action_id "reject-Q-500")
+    Then both interactions have distinct idempotency keys and both pass SlackIdempotencyGuard
+      And two separate HumanDecisionEvent values are published to the orchestrator:
+        | ExternalUserId | ActionValue |
+        | U-ALICE        | approve     |
+        | U-BOB          | reject      |
+      And the orchestrator applies first-write-wins: the first event to arrive is accepted, the second is discarded by the orchestrator's own conflict resolution
+      And both interactions are recorded in the Slack audit trail with outcome "success"
+      And the question message is updated to reflect the winning decision
 ```
 
 ---
@@ -1098,7 +1190,7 @@ Feature: Secret management
 |---|---|
 | AC-1: User can invoke `/agent ask generate implementation plan for persistence failover` | 1.1, 1.2, 1.3 |
 | AC-2: Agent creates a Slack thread with task status and follow-up questions | 1.2, 1.3, 8.1, 13.1 |
-| AC-3: Human can answer via button or modal | 3.1, 5.1, 8.1, 8.2 |
+| AC-3: Human can answer via button or modal | 3.1, 4.1, 5.1, 8.1, 8.2 |
 | AC-4: Slack event retries do not duplicate agent tasks | 9.1, 9.2, 9.3, 9.4 |
 | AC-5: Unauthorized channels are rejected | 11.4, 11.2, 11.3, 11.5 |
 | AC-6: Every agent/human exchange is queryable by correlation ID | 12.1, 12.2, 12.3, 12.4, 12.5 |
@@ -1111,8 +1203,8 @@ Feature: Secret management
 |---|---|
 | Protocol (Events API / Socket Mode / Web API) | 1.1, 7.1, 14.1, 17.1, 17.3 |
 | C# library (SlackNet preferred) | (implementation detail; validated via build) |
-| App features (slash commands, app mentions, modals, Block Kit, threads) | 1.1, 5.1, 6.1, 7.1, 8.1, 13.1 |
-| Commands (/agent ask, status, approve, reject, review, escalate) | 1.1, 2.1, 3.1, 4.1, 5.1, 6.1 |
+| App features (slash commands, app mentions, modals, Block Kit, threads) | 1.1, 5.1, 6.1, 7.1, 7.3, 7.4, 7.5, 8.1, 13.1 |
+| Commands (/agent ask, status, approve, reject, review, escalate) | 1.1, 2.1, 3.1, 4.1, 4.2, 4.3, 5.1, 6.1, 6.2, 6.3 |
 | Threading (every task has a Slack thread) | 1.2, 13.1, 13.2, 13.3 |
 | Human response (buttons and modals map to HumanDecisionEvent) | 3.1, 5.1, 8.1, 8.2 |
 | Reliability (idempotency key from Slack event ID) | 9.1, 9.2, 9.3, 9.4 |
