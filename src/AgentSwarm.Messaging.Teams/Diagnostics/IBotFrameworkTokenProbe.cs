@@ -96,6 +96,24 @@ public enum BotFrameworkTokenProbeStatus
 /// the overall status — operators who use managed-identity / certificate auth can
 /// supply their own probe implementation.
 /// </para>
+/// <para>
+/// <b>HttpClient ownership.</b> When an <see cref="IHttpClientFactory"/> is supplied,
+/// the probe obtains its <see cref="HttpClient"/> via
+/// <see cref="IHttpClientFactory.CreateClient(string)"/> and intentionally does NOT
+/// dispose it. Per the official .NET guidance on
+/// <see cref="IHttpClientFactory"/>
+/// (<see href="https://learn.microsoft.com/dotnet/core/extensions/httpclient-factory"/>),
+/// callers must not dispose factory-issued <see cref="HttpClient"/> instances —
+/// the factory pools and rotates the underlying <see cref="HttpMessageHandler"/>
+/// (<see cref="System.Net.Http.SocketsHttpHandler"/> wrapped in a
+/// <c>LifetimeTrackingHttpMessageHandler</c>), and disposing the wrapper does
+/// not free sockets. <see cref="MicrosoftAppCredentials"/> is not
+/// <see cref="IDisposable"/> and holds the <see cref="HttpClient"/> by reference
+/// (exposed as <c>AppCredentials.CustomHttpClient</c>) without taking ownership of
+/// its disposal. Because both objects are method-local in
+/// <see cref="AcquireTokenAsync"/>, they become GC-eligible together when the
+/// method returns — no socket churn, no leak.
+/// </para>
 /// </remarks>
 public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
 {
@@ -109,7 +127,9 @@ public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
     /// custom <see cref="HttpClient"/> for the credentials object; honors the named
     /// client <see cref="BotFrameworkConnectivityHealthCheck.HttpClientName"/> when
     /// the factory is provided, otherwise the credentials use their own default
-    /// HTTP client.</param>
+    /// HTTP client. The factory owns the disposal of any <see cref="HttpClient"/>
+    /// instances it issues; see the type-level <b>HttpClient ownership</b> remark
+    /// for the full contract.</param>
     /// <param name="logger">Optional logger; failures are logged at Warning level.</param>
     /// <exception cref="ArgumentNullException">If <paramref name="messagingOptions"/> is null.</exception>
     public MicrosoftAppCredentialsTokenProbe(
@@ -174,9 +194,38 @@ public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
             // Use the named HttpClient when available so the probe honors test-host
             // substitutes (e.g. a mock handler in unit tests). The probe never mutates
             // the client, so reusing the factory-provided instance is safe.
-            HttpClient? client = _httpClientFactory?.CreateClient(BotFrameworkConnectivityHealthCheck.HttpClientName);
-            var credentials = client is not null
-                ? new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword, client)
+            //
+            // Iter-5 reviewer feedback (PR comment on this line) — HttpClient
+            // ownership contract is INTENTIONALLY one of non-disposal here, and the
+            // contract is documented exhaustively below so future maintainers do not
+            // "fix" this by adding a `using`:
+            //
+            //   (a) IHttpClientFactory owns the lifecycle. Per Microsoft's official
+            //       guidance on IHttpClientFactory
+            //       (https://learn.microsoft.com/dotnet/core/extensions/httpclient-factory),
+            //       callers MUST NOT dispose HttpClient instances returned by
+            //       CreateClient. The factory pools and rotates the underlying
+            //       SocketsHttpHandler via a LifetimeTrackingHttpMessageHandler;
+            //       disposing the wrapper does NOT free sockets (the pooled handler
+            //       is shared and refcounted) — it only marks this wrapper unusable,
+            //       which would break the still-live MicrosoftAppCredentials reference.
+            //
+            //   (b) MicrosoftAppCredentials (Microsoft.Bot.Connector 4.x) is NOT
+            //       IDisposable and stores the HttpClient as a non-owning reference
+            //       (exposed as AppCredentials.CustomHttpClient). It re-uses the
+            //       reference across GetTokenAsync calls but never disposes it.
+            //
+            //   (c) Both `credentials` and `httpClient` are method-local and
+            //       unreachable when AcquireTokenAsync returns, so they are GC-eligible
+            //       together. The fallback path (httpClient == null) hands ownership of
+            //       the default HttpClient to MicrosoftAppCredentials' internal SDK
+            //       construction, which is likewise managed by the SDK and must not be
+            //       disposed by us.
+            //
+            // Net effect: zero socket-pool churn, zero leak, no double-dispose risk.
+            HttpClient? httpClient = _httpClientFactory?.CreateClient(BotFrameworkConnectivityHealthCheck.HttpClientName);
+            var credentials = httpClient is not null
+                ? new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword, httpClient)
                 : new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword);
 
             // Iter-5 reviewer feedback — MicrosoftAppCredentials.GetTokenAsync in the
