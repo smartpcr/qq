@@ -221,6 +221,25 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// the original exception bubbling up so it can record an audit
     /// event and surface a structured error to the operator.
     /// </para>
+    /// <para>
+    /// <b>Round-trip cost (review-r0 item).</b> Earlier iterations of
+    /// this method drove the staging loop through
+    /// <see cref="StageUpsertAsync(MessagingDbContext, OperatorRegistration, CancellationToken)"/>,
+    /// which issues a tracking <see cref="EntityFrameworkQueryableExtensions.FirstOrDefaultAsync{TSource}(IQueryable{TSource}, CancellationToken)"/>
+    /// per registration. For an operator onboarded with N workspace
+    /// bindings under <c>Telegram:UserTenantMappings</c> that
+    /// produced an N+1 query pattern (N SELECTs + 1
+    /// <c>SaveChangesAsync</c>). The current implementation collapses
+    /// the lookup phase into a single batched SELECT via
+    /// <see cref="PreloadExistingForBatchAsync"/> — EF Core's
+    /// identity-resolved tracking query attaches every pre-existing
+    /// row to the change tracker before the staging loop runs, so
+    /// the loop performs zero database round-trips and the entire
+    /// batch settles into <b>1 SELECT + 1 SaveChanges</b> regardless
+    /// of N. The transaction wrapper, all-or-nothing semantics, and
+    /// no-retry-on-<see cref="DbUpdateException"/> behaviour are
+    /// preserved exactly.
+    /// </para>
     /// </remarks>
     public async Task RegisterManyAsync(
         IReadOnlyList<OperatorRegistration> registrations,
@@ -250,9 +269,21 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
 
+        // Pre-load every (TelegramUserId, TelegramChatId, WorkspaceId)
+        // row that already exists for the batch in ONE tracking SELECT.
+        // The returned dictionary lets the staging loop below decide
+        // insert-vs-update without issuing additional round-trips —
+        // EF Core's identity resolution has already attached each
+        // pre-existing row to the change tracker, so the
+        // `db.Entry(existing).CurrentValues.SetValues(...)` update
+        // path inside StageUpsertForBatch runs against tracked
+        // entities and SaveChangesAsync below emits the appropriate
+        // UPDATE / INSERT statements in a single flush.
+        var existingByKey = await PreloadExistingForBatchAsync(db, registrations, ct).ConfigureAwait(false);
+
         for (var i = 0; i < registrations.Count; i++)
         {
-            await StageUpsertAsync(db, registrations[i], ct).ConfigureAwait(false);
+            StageUpsertForBatch(db, registrations[i], existingByKey);
         }
 
         await db.SaveChangesAsync(ct).ConfigureAwait(false);
@@ -318,13 +349,13 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// <see cref="OperatorRegistration"/> on the supplied tracking
     /// <paramref name="db"/> WITHOUT calling
     /// <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>.
-    /// Callers that need atomic batch semantics
-    /// (<see cref="RegisterManyAsync(IReadOnlyList{OperatorRegistration}, CancellationToken)"/>)
-    /// stage every row into the change tracker before flushing once
-    /// inside an
-    /// <see cref="Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction"/>
-    /// so a constraint violation on the last entry rolls back all
-    /// earlier entries.
+    /// Used exclusively by the singular
+    /// <see cref="RegisterAsync(OperatorRegistration, CancellationToken)"/>
+    /// path (1 SELECT + 1 SaveChanges per call). The batch path in
+    /// <see cref="RegisterManyAsync(IReadOnlyList{OperatorRegistration}, CancellationToken)"/>
+    /// drives off a pre-loaded dictionary via
+    /// <see cref="StageUpsertForBatch"/> instead so it can collapse
+    /// the N tracking SELECTs into a single batched SELECT.
     /// </summary>
     private static async Task StageUpsertAsync(
         MessagingDbContext db,
@@ -339,6 +370,49 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
                 ct)
             .ConfigureAwait(false);
 
+        ApplyUpsert(db, registration, existing);
+    }
+
+    /// <summary>
+    /// Batch-path variant of <see cref="StageUpsertAsync"/>. Resolves
+    /// the existing row (if any) from the pre-loaded
+    /// <paramref name="existingByKey"/> dictionary instead of querying
+    /// the database, and registers any newly-staged INSERT back into
+    /// the dictionary so a duplicate
+    /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> later in
+    /// the same batch merges onto the already-staged entity rather
+    /// than enqueuing a second INSERT that would collide with the
+    /// unique index at <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
+    /// time.
+    /// </summary>
+    private static void StageUpsertForBatch(
+        MessagingDbContext db,
+        OperatorRegistration registration,
+        Dictionary<(long TelegramUserId, long TelegramChatId, string WorkspaceId), OperatorBinding> existingByKey)
+    {
+        var key = (registration.TelegramUserId, registration.TelegramChatId, registration.WorkspaceId);
+        existingByKey.TryGetValue(key, out var existing);
+
+        var staged = ApplyUpsert(db, registration, existing);
+        if (existing is null)
+        {
+            existingByKey[key] = staged;
+        }
+    }
+
+    /// <summary>
+    /// Stages an INSERT (when <paramref name="existing"/> is
+    /// <see langword="null"/>) or an UPDATE (when present) for
+    /// <paramref name="registration"/> against the tracked
+    /// <paramref name="db"/>. Returns the entity that ended up in the
+    /// change tracker so batch callers can register fresh INSERTs
+    /// back into their pre-loaded dictionary.
+    /// </summary>
+    private static OperatorBinding ApplyUpsert(
+        MessagingDbContext db,
+        OperatorRegistration registration,
+        OperatorBinding? existing)
+    {
         var alias = string.IsNullOrWhiteSpace(registration.OperatorAlias)
             ? BuildFallbackAlias(registration.TelegramUserId)
             : registration.OperatorAlias;
@@ -374,34 +448,126 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
                 IsActive = true,
             };
             db.OperatorBindings.Add(inserted);
+            return inserted;
         }
-        else
+
+        // Records are immutable — produce a refreshed copy and let
+        // EF Core's CurrentValues setter propagate the field
+        // updates onto the tracked entity. Refresh the four
+        // fields the brief calls out (IsActive, RegisteredAt,
+        // Roles, OperatorAlias) PLUS ChatType (the chat's surface
+        // may have changed from a private DM to a group between
+        // registrations — we honour the latest signal) PLUS
+        // TenantId (defensive: a re-registration with a different
+        // tenant indicates the operator's config moved tenants;
+        // overwriting keeps the row authoritative for the new
+        // tenant boundary). The unique index on
+        // (OperatorAlias, TenantId) is preserved because we only
+        // ever have one row per (user, chat, workspace) so the
+        // alias / tenant pair migrates atomically with the row.
+        var refreshed = existing with
         {
-            // Records are immutable — produce a refreshed copy and let
-            // EF Core's CurrentValues setter propagate the field
-            // updates onto the tracked entity. Refresh the four
-            // fields the brief calls out (IsActive, RegisteredAt,
-            // Roles, OperatorAlias) PLUS ChatType (the chat's surface
-            // may have changed from a private DM to a group between
-            // registrations — we honour the latest signal) PLUS
-            // TenantId (defensive: a re-registration with a different
-            // tenant indicates the operator's config moved tenants;
-            // overwriting keeps the row authoritative for the new
-            // tenant boundary). The unique index on
-            // (OperatorAlias, TenantId) is preserved because we only
-            // ever have one row per (user, chat, workspace) so the
-            // alias / tenant pair migrates atomically with the row.
-            var refreshed = existing with
+            ChatType = registration.ChatType,
+            OperatorAlias = alias,
+            TenantId = registration.TenantId,
+            Roles = roles,
+            RegisteredAt = DateTimeOffset.UtcNow,
+            IsActive = true,
+        };
+        db.Entry(existing).CurrentValues.SetValues(refreshed);
+        return existing;
+    }
+
+    /// <summary>
+    /// Issues a single tracking SELECT that returns every
+    /// <see cref="OperatorBinding"/> row whose
+    /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> tuple
+    /// appears in <paramref name="registrations"/>, keyed for O(1)
+    /// in-memory lookup. The query uses three
+    /// <see cref="Enumerable.Contains{TSource}(IEnumerable{TSource}, TSource)"/>
+    /// filters (one per axis) so EF Core can translate it to a
+    /// stable parameterised <c>WHERE … IN (…)</c> form on every
+    /// supported provider; tuple-shaped <c>IN</c> support varies
+    /// across providers and would force a raw-SQL escape hatch.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The axis-wise filter can return false positives — rows whose
+    /// individual columns each match the batch but whose tuple does
+    /// not. The dictionary build below discards these by only
+    /// inserting rows whose exact
+    /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> tuple
+    /// was requested. In practice the false-positive rate is near
+    /// zero: <see cref="RegisterManyAsync"/> is invoked from a
+    /// single operator's <c>/start</c> which pins
+    /// <c>TelegramUserId</c> and <c>TelegramChatId</c> to a single
+    /// value each and only varies <c>WorkspaceId</c>, so the broad
+    /// SQL filter and the exact in-memory match collapse to the
+    /// same row set.
+    /// </para>
+    /// <para>
+    /// The query is a tracking query (no
+    /// <see cref="EntityFrameworkQueryableExtensions.AsNoTracking{TEntity}(IQueryable{TEntity})"/>)
+    /// because the staging loop relies on EF Core's identity
+    /// resolution to attach every pre-existing row to the change
+    /// tracker — that is what makes the subsequent
+    /// <c>db.Entry(existing).CurrentValues.SetValues(...)</c>
+    /// update path produce an UPDATE statement at
+    /// <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
+    /// time instead of a duplicate INSERT.
+    /// </para>
+    /// </remarks>
+    private static async Task<Dictionary<(long TelegramUserId, long TelegramChatId, string WorkspaceId), OperatorBinding>> PreloadExistingForBatchAsync(
+        MessagingDbContext db,
+        IReadOnlyList<OperatorRegistration> registrations,
+        CancellationToken ct)
+    {
+        var userIds = new HashSet<long>();
+        var chatIds = new HashSet<long>();
+        var workspaceIds = new HashSet<string>(StringComparer.Ordinal);
+        var requestedKeys = new HashSet<(long, long, string)>();
+
+        for (var i = 0; i < registrations.Count; i++)
+        {
+            var r = registrations[i];
+            userIds.Add(r.TelegramUserId);
+            chatIds.Add(r.TelegramChatId);
+            if (!string.IsNullOrEmpty(r.WorkspaceId))
             {
-                ChatType = registration.ChatType,
-                OperatorAlias = alias,
-                TenantId = registration.TenantId,
-                Roles = roles,
-                RegisteredAt = DateTimeOffset.UtcNow,
-                IsActive = true,
-            };
-            db.Entry(existing).CurrentValues.SetValues(refreshed);
+                workspaceIds.Add(r.WorkspaceId);
+                requestedKeys.Add((r.TelegramUserId, r.TelegramChatId, r.WorkspaceId));
+            }
         }
+
+        if (requestedKeys.Count == 0)
+        {
+            return new Dictionary<(long TelegramUserId, long TelegramChatId, string WorkspaceId), OperatorBinding>();
+        }
+
+        // Materialised lists are passed to EF Core so each Contains
+        // call binds against a stable parameter list rather than
+        // re-enumerating the HashSet for every translation pass.
+        var userIdList = userIds.ToList();
+        var chatIdList = chatIds.ToList();
+        var workspaceIdList = workspaceIds.ToList();
+
+        var candidates = await db.OperatorBindings
+            .Where(x => userIdList.Contains(x.TelegramUserId)
+                && chatIdList.Contains(x.TelegramChatId)
+                && workspaceIdList.Contains(x.WorkspaceId))
+            .ToListAsync(ct)
+            .ConfigureAwait(false);
+
+        var existingByKey = new Dictionary<(long TelegramUserId, long TelegramChatId, string WorkspaceId), OperatorBinding>(candidates.Count);
+        foreach (var c in candidates)
+        {
+            var key = (c.TelegramUserId, c.TelegramChatId, c.WorkspaceId);
+            if (requestedKeys.Contains(key))
+            {
+                existingByKey[key] = c;
+            }
+        }
+        return existingByKey;
     }
 
     /// <summary>
