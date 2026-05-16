@@ -24,8 +24,12 @@
   error message that contains the literal string "BotId".
 
 .PARAMETER Version
-  Semantic version stamp written into the manifest's `version` field. Must be
-  non-empty.
+  Semantic version stamp written into the manifest's `version` field. MUST
+  conform to SemVer 2.0.0 (`MAJOR.MINOR.PATCH` with optional `-prerelease`
+  and `+build` segments, e.g. `1.0.0`, `2.3.4-rc.1`, `1.0.0+build.7`). A
+  non-SemVer value (`v1`, `1`, `1.0`, `1.0.0.0`, leading zeros, etc.)
+  causes the script to fail with a non-zero exit code and an error message
+  that contains the literal string "Version".
 
 .PARAMETER OutputPath
   Absolute path to the destination ZIP file. The parent directory MUST exist.
@@ -71,7 +75,18 @@ try {
     $normalizedBotId = Assert-GuidParam -Value $BotId -ParamName 'BotId'
 
     if ([string]::IsNullOrWhiteSpace($Version)) {
-        throw 'Version must be a non-empty string.'
+        throw 'Invalid Version: value must be a non-empty SemVer 2.0.0 string.'
+    }
+    # SemVer 2.0.0 per https://semver.org/spec/v2.0.0.html — enforces the
+    # contract the .PARAMETER block documents (MAJOR.MINOR.PATCH plus
+    # optional -prerelease and +build segments, with no leading zeros). The
+    # Teams manifest is consumed by the Teams app store / admin upload flow,
+    # which silently mis-handles non-SemVer strings (e.g. `1.0.0.0` is
+    # accepted by the schema but rejected during sideload), so we fail fast
+    # at package time rather than at install time.
+    $semverPattern = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+    if ($Version -notmatch $semverPattern) {
+        throw "Invalid Version: '$Version' is not a valid SemVer 2.0.0 string. The Version parameter must match MAJOR.MINOR.PATCH with optional -prerelease and +build segments (e.g. '1.0.0', '2.3.4-rc.1', '1.0.0+build.7')."
     }
     if ([string]::IsNullOrWhiteSpace($OutputPath)) {
         throw 'OutputPath must be a non-empty string.'

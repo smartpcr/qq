@@ -545,6 +545,56 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         Assert.Same(keyedInner, inner);
     }
 
+    [Fact]
+    public void AddTeamsOutboxEngine_LegitimateUnkeyedFactory_TakesPrecedenceOverKeyed()
+    {
+        // Iter-7 regression for iter-4 evaluator critique #2: when the host registers
+        // BOTH a keyed "teams" connector AND a SEPARATE unkeyed factory that does NOT
+        // alias to the keyed lookup (i.e. constructs a different connector), the
+        // unkeyed factory's result MUST be the captured inner — the iter-6 heuristic
+        // silently discarded the legitimate factory whenever a keyed sibling existed.
+        var keyedInner = new RecordingMessengerConnector();
+        var customUnkeyedInner = new RecordingMessengerConnector();
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IProactiveNotifier>(new RecordingProactiveNotifier());
+
+        var store = new RecordingConversationReferenceStore();
+        services.AddSingleton<IConversationReferenceStore>(store);
+        services.AddSingleton<IConversationReferenceRouter>(store);
+        services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
+
+        services.AddKeyedSingleton<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey,
+            (_, _) => keyedInner);
+
+        // Legitimate factory — does NOT call sp.GetRequiredKeyedService<IMessengerConnector>("teams").
+        // It returns an INDEPENDENT connector that should take precedence over the
+        // keyed registration once AddTeamsOutboxEngine captures the inner.
+        services.AddSingleton<IMessengerConnector>(_ => customUnkeyedInner);
+
+        services.AddTeamsOutboxEngine();
+
+        using var provider = services.BuildServiceProvider();
+
+        var unkeyed = provider.GetRequiredService<IMessengerConnector>();
+        var keyed = provider.GetRequiredKeyedService<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey);
+
+        // Both contracts return the same outbox wrapper (the keyed alias is rebound).
+        Assert.IsType<OutboxBackedMessengerConnector>(unkeyed);
+        Assert.IsType<OutboxBackedMessengerConnector>(keyed);
+        Assert.Same(unkeyed, keyed);
+
+        // The captured inner is the CUSTOM unkeyed-factory result, not the keyed
+        // registration. This is the iter-7 fix — preserving the host's explicit
+        // unkeyed-factory choice instead of overwriting it with the keyed source.
+        var inner = provider.GetRequiredService<IInnerTeamsMessengerConnector>().Inner;
+        Assert.Same(customUnkeyedInner, inner);
+        Assert.NotSame(keyedInner, inner);
+    }
+
     private static bool IsKeyedTeamsMessengerConnectorDescriptor(ServiceDescriptor d) =>
         d.ServiceType == typeof(IMessengerConnector)
         && d.IsKeyedService

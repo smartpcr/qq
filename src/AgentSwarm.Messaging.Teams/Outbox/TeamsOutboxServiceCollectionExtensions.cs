@@ -60,19 +60,42 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// evaluator critique #3.
     /// </para>
     /// <para>
-    /// <b>Cycle safety (iter-6 fix for critique #2).</b> When an unkeyed
-    /// <see cref="IMessengerConnector"/> descriptor is a factory (e.g.
-    /// <c>sp =&gt; sp.GetRequiredKeyedService&lt;IMessengerConnector&gt;(MessengerKey)</c>)
-    /// that aliases back to the keyed registration, naively capturing the inner via the
-    /// unkeyed factory after the keyed rebind would create a self-referential resolution
-    /// path: <c>Inner.factory → unkeyed.factory → keyed alias → wrapper → wrapper needs
-    /// Inner → loop</c>. To prevent this, when both an unkeyed FACTORY descriptor and a
-    /// keyed descriptor are present, the decorator captures the inner directly from the
-    /// keyed descriptor (which is snapshotted before rebind) and discards the unkeyed
-    /// alias factory. Unkeyed descriptors backed by an
+    /// <b>Cycle safety (iter-7 structural fix for critique #2).</b> Two cases require
+    /// care when the host registered both an unkeyed <see cref="IMessengerConnector"/>
+    /// FACTORY and a keyed <see cref="IMessengerConnector"/> under
+    /// <see cref="TeamsServiceCollectionExtensions.MessengerKey"/>:
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <b>Alias factory</b> — e.g.
+    ///     <c>sp =&gt; sp.GetRequiredKeyedService&lt;IMessengerConnector&gt;(MessengerKey)</c>.
+    ///     After the keyed rebind below points the keyed alias at the wrapper, a naive
+    ///     inner adapter executing this factory would resolve back through the wrapper,
+    ///     and the wrapper depends on the inner, producing a stack overflow at first
+    ///     resolution.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Legitimate factory</b> — e.g. <c>sp =&gt; new CustomConnector(...)</c>
+    ///     that does <i>not</i> touch the keyed alias. Iter 6 unconditionally discarded
+    ///     this factory whenever a keyed sibling was present, silently dropping the
+    ///     host's explicit choice; iter-4 critique #2 flagged this regression.
+    ///   </description></item>
+    /// </list>
+    /// To preserve BOTH host shapes, the decorator captures the unkeyed factory and
+    /// invokes it lazily through a
+    /// <c>KeyedTeamsConnectorInterceptor</c> wrapper around the production
+    /// <see cref="IServiceProvider"/>. The interceptor implements
+    /// <see cref="IKeyedServiceProvider"/> and intercepts ONLY the
+    /// <c>(typeof(IMessengerConnector), MessengerKey)</c> pair: that single lookup is
+    /// served from a pre-rebind snapshot of the keyed descriptor (so alias factories
+    /// return the original concrete connector). All other lookups — including
+    /// <c>GetRequiredService&lt;CustomDep&gt;()</c> calls the legitimate factory might
+    /// make — pass through unchanged. The result: alias factories no longer cycle, and
+    /// legitimate factories continue to take precedence over the keyed registration.
+    /// Unkeyed descriptors backed by an
     /// <see cref="ServiceDescriptor.ImplementationInstance"/> or
-    /// <see cref="ServiceDescriptor.ImplementationType"/> are not at risk and continue to
-    /// take precedence.
+    /// <see cref="ServiceDescriptor.ImplementationType"/> are not at risk and continue
+    /// to take precedence via the same path (the interceptor only matters when the
+    /// host's wiring is itself a factory).
     /// </para>
     /// <para>
     /// <b>Idempotent.</b> Calling this method more than once is a no-op for the inner
@@ -218,33 +241,31 @@ public static class TeamsOutboxServiceCollectionExtensions
 
         if (unkeyed is not null)
         {
-            // Cycle-safety pre-check for critique #2: if the unkeyed descriptor is a
-            // FACTORY (not a captured instance and not a concrete type) AND a keyed
-            // descriptor exists for the same service, the factory may alias back to
-            // the keyed resolution path (a common host pattern is
-            // `sp => sp.GetRequiredKeyedService<IMessengerConnector>(MessengerKey)`).
-            // After the keyed rebind below points the keyed alias at the wrapper, the
-            // inner adapter executing that factory would resolve back to the wrapper,
-            // and the wrapper depends on the inner, producing a stack overflow at
-            // first resolution. Materialise the inner from the keyed descriptor's
-            // snapshot instead and remove the unkeyed alias entirely.
-            var unkeyedIsAliasFactory = unkeyed.ImplementationInstance is null
-                                        && unkeyed.ImplementationType is null
-                                        && unkeyed.ImplementationFactory is not null;
-            if (unkeyedIsAliasFactory && keyedTeams is not null)
+            // Iter-7 structural fix for iter-4 evaluator critique #2: replace the iter-6
+            // "discard unkeyed factory when keyed sibling exists" heuristic with an
+            // IServiceProvider interceptor. The interceptor intercepts ONLY the
+            // (IMessengerConnector, MessengerKey) pair and routes it to a pre-rebind
+            // snapshot of the keyed source. Alias factories (sp => sp.GetRequiredKeyedService
+            // ("teams")) get the original concrete instance and never loop through the
+            // wrapper; legitimate factories (sp => new CustomConnector(...)) execute
+            // normally and their result becomes the captured inner, preserving the host's
+            // explicit choice over the keyed registration.
+            if (unkeyed.ImplementationFactory is not null && keyedTeams is not null)
             {
+                var capturedUnkeyedFactory = unkeyed.ImplementationFactory;
+                var capturedKeyedSource = MaterialiseKeyedTeamsConnector(keyedTeams);
                 services.Remove(unkeyed);
-                services.Remove(keyedTeams);
-                services.AddSingleton<IInnerTeamsMessengerConnector>(
-                    BuildInnerFromKeyedDescriptor(keyedTeams));
+                services.AddSingleton<IInnerTeamsMessengerConnector>(sp =>
+                {
+                    var interceptor = new KeyedTeamsConnectorInterceptor(sp, capturedKeyedSource);
+                    var inner = (IMessengerConnector)capturedUnkeyedFactory(interceptor);
+                    return new InnerMessengerConnectorAdapter(inner);
+                });
             }
             else
             {
-                // Legacy / manual wiring path — host added an explicit unkeyed
-                // registration (instance, concrete type, or a factory with no keyed
-                // sibling to cycle into). Capture the descriptor's factory/instance/
-                // type so the inner adapter can forward to it without going through
-                // the now-decorated unkeyed contract.
+                // Unkeyed is an Instance / Type / standalone-Factory (no keyed sibling to
+                // alias into). Capture the descriptor directly — no interceptor required.
                 services.Remove(unkeyed);
                 RegisterInnerMessengerAdapterFromDescriptor(services, unkeyed);
             }
@@ -357,6 +378,85 @@ public static class TeamsOutboxServiceCollectionExtensions
         throw new InvalidOperationException(
             "AddTeamsOutboxEngine could not adapt the keyed IMessengerConnector registration: " +
             "the ServiceDescriptor exposed neither a keyed instance, factory, nor implementation type.");
+    }
+
+    /// <summary>
+    /// Materialise the original keyed Teams connector source into a closure that
+    /// invokes the descriptor's instance / factory / type WITHOUT going through the
+    /// keyed-lookup chain on the production <see cref="IServiceProvider"/>. Used by
+    /// <see cref="KeyedTeamsConnectorInterceptor"/> so an unkeyed alias-factory that
+    /// resolves the keyed connector receives the pre-rebind concrete instead of the
+    /// outbox-backed wrapper (which would create a stack-overflow cycle).
+    /// </summary>
+    private static Func<IServiceProvider, IMessengerConnector> MaterialiseKeyedTeamsConnector(
+        ServiceDescriptor descriptor)
+    {
+        if (descriptor.KeyedImplementationInstance is not null)
+        {
+            var instance = (IMessengerConnector)descriptor.KeyedImplementationInstance;
+            return _ => instance;
+        }
+        if (descriptor.KeyedImplementationFactory is not null)
+        {
+            var factory = descriptor.KeyedImplementationFactory;
+            var key = descriptor.ServiceKey;
+            return sp => (IMessengerConnector)factory(sp, key);
+        }
+        if (descriptor.KeyedImplementationType is not null)
+        {
+            var implType = descriptor.KeyedImplementationType;
+            return sp => (IMessengerConnector)ActivatorUtilities.GetServiceOrCreateInstance(sp, implType);
+        }
+        throw new InvalidOperationException(
+            "AddTeamsOutboxEngine could not snapshot the keyed IMessengerConnector source: " +
+            "the ServiceDescriptor exposed neither a keyed instance, factory, nor implementation type.");
+    }
+
+    /// <summary>
+    /// <see cref="IServiceProvider"/> + <see cref="IKeyedServiceProvider"/> wrapper used
+    /// during inner-connector capture. Forwards every lookup to the production provider
+    /// EXCEPT the single <c>(IMessengerConnector, MessengerKey)</c> pair, which is
+    /// served from a pre-rebind snapshot of the host's keyed descriptor. This breaks
+    /// the alias-factory cycle without dropping legitimate host-supplied unkeyed
+    /// factories (iter-7 structural fix for iter-4 evaluator critique #2).
+    /// </summary>
+    private sealed class KeyedTeamsConnectorInterceptor : IServiceProvider, IKeyedServiceProvider
+    {
+        private readonly IServiceProvider _inner;
+        private readonly Func<IServiceProvider, IMessengerConnector> _capturedKeyedTeamsFactory;
+        private IMessengerConnector? _capturedKeyedTeamsResult;
+
+        public KeyedTeamsConnectorInterceptor(
+            IServiceProvider inner,
+            Func<IServiceProvider, IMessengerConnector> capturedKeyedTeamsFactory)
+        {
+            _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+            _capturedKeyedTeamsFactory = capturedKeyedTeamsFactory
+                ?? throw new ArgumentNullException(nameof(capturedKeyedTeamsFactory));
+        }
+
+        public object? GetService(Type serviceType) => _inner.GetService(serviceType);
+
+        public object? GetKeyedService(Type serviceType, object? serviceKey)
+        {
+            if (serviceType == typeof(IMessengerConnector)
+                && Equals(serviceKey, TeamsServiceCollectionExtensions.MessengerKey))
+            {
+                return _capturedKeyedTeamsResult ??= _capturedKeyedTeamsFactory(_inner);
+            }
+            return ((IKeyedServiceProvider)_inner).GetKeyedService(serviceType, serviceKey);
+        }
+
+        public object GetRequiredKeyedService(Type serviceType, object? serviceKey)
+        {
+            var result = GetKeyedService(serviceType, serviceKey);
+            if (result is null)
+            {
+                throw new InvalidOperationException(
+                    $"No service for type '{serviceType.FullName}' has been registered with key '{serviceKey}'.");
+            }
+            return result;
+        }
     }
 }
 
