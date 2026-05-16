@@ -36,17 +36,21 @@ The following capabilities are within the boundary of this story:
 
 ### 2.1 Inbound Event Handling
 
-- **Slash commands.** `/agent ask`, `/agent status`, `/agent approve`,
-  `/agent reject`, `/agent review`, `/agent escalate` -- six sub-commands
-  under the single `/agent` slash command.
+- **Slash commands.** `/agent ask`, `/agent status`, `/agent approve [question-id]`,
+  `/agent reject [question-id]`, `/agent review`, `/agent escalate` -- six sub-commands
+  under the single `/agent` slash command. `approve` and `reject` accept an
+  optional question-id argument; when omitted they target the most recent
+  unanswered question in the thread. Users may also approve/reject via Block
+  Kit button clicks (both paths are supported).
 - **App mentions.** `@AgentBot <sub-command> <args>` as an alternative
   invocation surface (same sub-commands).
 - **Interactive payloads.** Block Kit button clicks and modal view submissions
   arriving at `/api/slack/interactions`.
 - **Events API subscription.** `app_mention` events, URL verification
   handshake, and message events relevant to agent conversations.
-- **Socket Mode.** WebSocket-based transport as an alternative to public HTTP
-  endpoints (intended for development and environments without public ingress).
+- **Socket Mode.** WebSocket-based transport as the **default** for
+  development and environments without public ingress. Deployments requiring
+  prod-scale horizontal scaling should use Events API (see OQ-1 in section 9).
 
 ### 2.2 Outbound Messaging
 
@@ -101,6 +105,8 @@ sections 3.1--3.5).
   text, response payload, outcome.
 - Queryable by correlation ID, task ID, agent ID, team/channel/user, time
   range.
+- **Retention: 30 days.** A background cleanup job purges `SlackAuditEntry`
+  and `SlackInboundRequestRecord` rows older than 30 days.
 
 ---
 
@@ -169,7 +175,13 @@ the epic-level requirements, and the Slack platform itself.
 |---|---|
 | Implementation in C# on .NET 8+ | Epic requirement |
 | Prefer SlackNet NuGet package; fallback to Slack.NetStandard or direct `HttpClient` | Story description |
-| Target solution project: `AgentSwarm.Messaging.Slack` | Epic solution structure |
+| Target solution project: `AgentSwarm.Messaging.Slack` (proposed -- see note below) | Epic solution structure |
+
+> **Repo status.** As of this writing the repository contains no `src/`
+> directory, no `.csproj` files, and no implementation code. All project and
+> namespace references in this document (e.g., `AgentSwarm.Messaging.Slack`,
+> `AgentSwarm.Messaging.Core`) describe the **proposed target structure** to be
+> created during implementation. (See architecture.md lines 28-32.)
 
 ### 5.2 Slack Platform Constraints
 
@@ -182,6 +194,8 @@ the epic-level requirements, and the Slack platform itself.
 | Events API retry behavior | Slack retries events up to 3 times if HTTP 200 is not received. The connector must handle retries idempotently using `event_id`. |
 | Socket Mode envelope ACK | In Socket Mode, each event envelope must be acknowledged within 5 seconds via the WebSocket connection. |
 | Thread timestamp format | Slack thread parents are identified by `ts` (message timestamp). Thread replies use `thread_ts` pointing to the parent `ts`. These are strings, not numeric timestamps. |
+| Max workspaces per deployment | 15 (configurable via `MaxWorkspaces` in `SlackConnectorOptions`). Socket Mode maintains one WebSocket per workspace; connection-pool sizing must respect this limit. |
+| Enterprise Grid | Not supported in this story. Org-level apps and cross-workspace channels are out of scope. |
 
 ### 5.3 Shared Abstraction Contracts
 
@@ -317,10 +331,14 @@ of the architecture and implementation plan will need revision.
    (`SlackWorkspaceConfig`) before the connector starts. There is no runtime
    self-service workspace onboarding.
 
-3. **Orchestrator provides task context.** When rendering a review or status
-   modal, the connector can fetch task details from the orchestrator
-   synchronously within the 3-second window. If the orchestrator is slow, the
-   modal will display a minimal skeleton and update asynchronously.
+3. **Orchestrator cache provides task context.** When rendering a review or
+   status modal, the connector reads task summary data from an orchestrator
+   cache (local or shared) -- not via a synchronous RPC to the orchestrator
+   service. This cache-only path keeps modal rendering within the 3-second
+   ACK window with minimal I/O. If the cache is cold or stale, the modal
+   displays a minimal skeleton and posts an async update once the cache is
+   refreshed. (Aligned with architecture.md section 5.3 which specifies
+   "fetched from orchestrator cache.")
 
 4. **Shared infrastructure projects will exist.** The `Abstractions`, `Core`,
    and `Persistence` projects referenced throughout are prerequisites.
@@ -353,13 +371,15 @@ architectural components and flows that satisfy it.
 
 ---
 
-## 9. Open Questions
+## 9. Resolved Decisions (formerly Open Questions)
 
-| ID | Question | Options / Notes |
+All questions from iteration 1 have been answered by the operator:
+
+| ID | Decision | Detail |
 |---|---|---|
-| OQ-1 | Should Socket Mode be the default transport, or Events API? Socket Mode is simpler (no public endpoint) but has scalability limits for high-throughput deployments. | A) Events API as default, Socket Mode for dev; B) Socket Mode as default, Events API for prod scale |
-| OQ-2 | What is the retention policy for `SlackInboundRequestRecord` and `SlackAuditEntry`? Without a policy, these tables grow unbounded. | A) 30 days; B) 90 days; C) Configurable per workspace |
-| OQ-3 | Should the `/agent approve` and `/agent reject` commands accept a question-id as an argument, or should approvals/rejections only be possible via button clicks in the thread? | A) Both CLI arg and button; B) Button only; C) CLI arg required, button optional |
-| OQ-4 | What is the maximum number of workspaces the connector should support in a single deployment? This affects configuration management and connection pooling for Socket Mode. | Free-form; expected range 1-10 |
-| OQ-5 | Should the connector support Slack Enterprise Grid (organization-level apps and cross-workspace channels)? | A) Not in this story; B) Design for it but defer implementation |
-| OQ-6 | Is there a requirement for per-command authorization granularity (e.g., allowing some users to `ask` but not `approve`)? The current three-layer model grants all-or-nothing access. | A) All-or-nothing (current design); B) Per-sub-command role mapping |
+| OQ-1 | Socket Mode default; Events API for prod scale | Socket Mode is the default transport (no public endpoint required). Deployments expecting high-throughput or requiring horizontal scaling should switch to Events API. Configuration flag: `SlackTransportMode` = `SocketMode` or `EventsApi`. |
+| OQ-2 | 30-day retention | `SlackInboundRequestRecord` and `SlackAuditEntry` rows are retained for 30 days. A background cleanup job purges rows older than 30 days. |
+| OQ-3 | Both CLI arg and button | `/agent approve <question-id>` and `/agent reject <question-id>` accept an optional question-id argument for CLI-driven approvals. Users may also approve/reject via Block Kit button clicks in the thread. When the CLI arg is omitted, the command applies to the most recent unanswered question in the thread. |
+| OQ-4 | 15 workspaces, configurable | Maximum workspace count defaults to 15. The limit is configurable via `MaxWorkspaces` in `SlackConnectorOptions`. |
+| OQ-5 | Not in this story | Enterprise Grid support (org-level apps, cross-workspace channels) is explicitly out of scope. |
+| OQ-6 | All-or-nothing access | The three-layer authorization model (workspace, channel, user-group) grants or denies access to all sub-commands uniformly. Per-sub-command role mapping is not required. |
