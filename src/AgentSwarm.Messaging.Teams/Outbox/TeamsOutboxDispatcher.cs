@@ -3,6 +3,7 @@ using System.Net;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
@@ -111,6 +112,18 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
     public async Task<OutboxDispatchResult> DispatchAsync(OutboxEntry entry, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entry);
+
+        // Stage 6.3 iter-2 — every log entry the dispatcher writes for this delivery
+        // attempt carries the canonical CorrelationId/UserId enrichment. The destination
+        // string is "teams://{tenant}/{user-or-channel}/{id}" — split it back into
+        // (tenantId, destinationId) so the Serilog enricher can surface both keys on
+        // dashboards.
+        var (tenantId, destinationId) = SplitDestination(entry.Destination, entry.DestinationId);
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: entry.CorrelationId,
+            tenantId: tenantId,
+            userId: destinationId);
 
         if (string.IsNullOrWhiteSpace(entry.ConversationReferenceJson))
         {
@@ -586,5 +599,46 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Best-effort splitter for the canonical outbox <see cref="OutboxEntry.Destination"/>
+    /// string (<c>teams://{tenant}/{user-or-channel}/{id}</c>) into a (tenantId,
+    /// destinationId) pair used only for log-scope enrichment. Returns
+    /// (<paramref name="fallbackDestinationId"/>, null) when the URI does not match the
+    /// expected shape — enrichment is a best-effort observability concern, so this
+    /// helper never throws.
+    /// </summary>
+    private static (string? TenantId, string? DestinationId) SplitDestination(
+        string destination,
+        string? fallbackDestinationId)
+    {
+        if (string.IsNullOrWhiteSpace(destination))
+        {
+            return (null, fallbackDestinationId);
+        }
+
+        try
+        {
+            const string prefix = "teams://";
+            if (!destination.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return (null, fallbackDestinationId);
+            }
+
+            var rest = destination.AsSpan(prefix.Length);
+            var firstSlash = rest.IndexOf('/');
+            if (firstSlash < 0)
+            {
+                return (null, fallbackDestinationId);
+            }
+
+            var tenantId = rest[..firstSlash].ToString();
+            return (tenantId, fallbackDestinationId);
+        }
+        catch (Exception)
+        {
+            return (null, fallbackDestinationId);
+        }
     }
 }

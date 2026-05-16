@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using AgentSwarm.Messaging.Teams.Security;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
@@ -95,6 +96,21 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
     private readonly ILogger<TeamsMessengerConnector> _logger;
     private readonly TimeProvider _timeProvider;
     private readonly InstallationStateGate? _installationStateGate;
+
+    /// <summary>
+    /// Stage 6.3 OpenTelemetry surface used to emit trace spans, counters
+    /// (<c>teams.messages.sent</c> / <c>teams.messages.received</c>) and the synchronous
+    /// <c>teams.card.delivery.duration_ms</c> histogram observation on every send /
+    /// receive call. Set via the <c>WithTelemetry</c> property initializer (a host
+    /// resolves the connector through the DI factory in
+    /// <see cref="TeamsServiceCollectionExtensions"/> which assigns this property)
+    /// rather than a constructor parameter so the canonical 11-arg constructor signature
+    /// stays compatible with the legacy test compositions. When the property is
+    /// <c>null</c> (pre-Stage-6.3 unit tests), every telemetry call site short-circuits
+    /// to a no-op so the connector remains observable-free behaviour-equivalent to its
+    /// Stage 5.1 shape.
+    /// </summary>
+    public TeamsConnectorTelemetry? Telemetry { get; init; }
 
     /// <summary>
     /// Construct the connector with the dependencies required by
@@ -214,70 +230,127 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             throw new ArgumentNullException(nameof(message));
         }
 
-        if (string.IsNullOrWhiteSpace(message.ConversationId))
-        {
-            throw new InvalidOperationException(
-                $"MessengerMessage '{message.MessageId}' has no ConversationId; cannot route the outbound delivery.");
-        }
+        // Stage 6.3 — open a structured-logging scope so every ILogger entry below
+        // (including the warning path on InstallationStateGate rejection) carries the
+        // canonical CorrelationId / TenantId / UserId enrichment without each call site
+        // having to repeat the structured args. The user / tenant fields are empty on a
+        // MessengerMessage (the payload carries only a ConversationId); only
+        // CorrelationId is meaningful here.
+        using var logScope = TeamsLogScope.BeginScope(_logger, correlationId: message.CorrelationId);
 
-        var stored = await _conversationReferenceRouter
-            .GetByConversationIdAsync(message.ConversationId, ct)
-            .ConfigureAwait(false);
-        if (stored is null)
+        // Stage 6.3 — start the OpenTelemetry span and the stopwatch BEFORE any
+        // store-lookup work so the recorded duration reflects the full SendMessageAsync
+        // boundary observed by the caller (matches the §4.4 P95 budget definition for
+        // the synchronous send path). The activity is null when no listener is
+        // subscribed — the connector tolerates that without an extra branch.
+        using var activity = Telemetry?.StartSendActivity(
+            TeamsConnectorTelemetry.SendMessageActivityName,
+            message.CorrelationId,
+            TeamsConnectorTelemetry.MessageTypeMessengerMessage,
+            TeamsConnectorTelemetry.DestinationTypeConversation);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var succeeded = false;
+        try
         {
-            // Stage 5.1 iter-7 evaluator feedback item 2 — emit InstallationGateRejected
-            // audit + dead-letter the outbox entry BEFORE throwing. Unlike the user/channel
-            // paths, the connector cannot probe install-state before the lookup because
-            // MessengerMessage carries only a Bot Framework ConversationId (no tenant /
-            // user / channel identity). The canonical store's GetByConversationIdAsync
-            // filters by IsActive, so a null result definitively means "no active
-            // reference for this conversation" — which IS the install-state rejection
-            // condition. RejectMessageRoutingAsync produces the same audit row shape and
-            // dead-letter wiring that CheckAsync / CheckTargetAsync produce, so an outbox-
-            // wrapped SendMessageAsync now drops a dead-letter entry instead of allowing
-            // unbounded retry storms, and compliance review sees the same evidence
-            // regardless of which routing path was attempted.
-            if (_installationStateGate is not null)
+            if (string.IsNullOrWhiteSpace(message.ConversationId))
             {
-                var reason = await _installationStateGate.RejectMessageRoutingAsync(
-                    message,
-                    message.ConversationId,
-                    outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
-                    cancellationToken: ct).ConfigureAwait(false);
-
-                _logger.LogWarning(
-                    "InstallationStateGate rejected outbound MessengerMessage {MessageId} (correlation {CorrelationId}) for conversation {ConversationId}. Reason: {Reason}",
-                    message.MessageId,
-                    message.CorrelationId,
-                    message.ConversationId,
-                    reason);
                 throw new InvalidOperationException(
-                    $"InstallationStateGate rejected outbound delivery for message '{message.MessageId}': {reason}");
+                    $"MessengerMessage '{message.MessageId}' has no ConversationId; cannot route the outbound delivery.");
             }
 
-            throw new InvalidOperationException(
-                $"No conversation reference found for conversation '{message.ConversationId}' (message '{message.MessageId}'). " +
-                $"The Teams app must be installed and a prior interaction must have captured a reference before proactive delivery can succeed.");
-        }
-
-        var conversationReference = DeserializeReference(stored);
-
-        _logger.LogInformation(
-            "Sending outbound MessengerMessage {MessageId} (correlation {CorrelationId}) to conversation {ConversationId} via reference {ReferenceId}.",
-            message.MessageId,
-            message.CorrelationId,
-            message.ConversationId,
-            stored.Id);
-
-        await _adapter.ContinueConversationAsync(
-            _options.MicrosoftAppId,
-            conversationReference,
-            async (turnContext, innerCt) =>
+            var stored = await _conversationReferenceRouter
+                .GetByConversationIdAsync(message.ConversationId, ct)
+                .ConfigureAwait(false);
+            if (stored is null)
             {
-                var reply = MessageFactory.Text(message.Body);
-                await turnContext.SendActivityAsync(reply, innerCt).ConfigureAwait(false);
-            },
-            ct).ConfigureAwait(false);
+                // Stage 5.1 iter-7 evaluator feedback item 2 — emit InstallationGateRejected
+                // audit + dead-letter the outbox entry BEFORE throwing. Unlike the user/channel
+                // paths, the connector cannot probe install-state before the lookup because
+                // MessengerMessage carries only a Bot Framework ConversationId (no tenant /
+                // user / channel identity). The canonical store's GetByConversationIdAsync
+                // filters by IsActive, so a null result definitively means "no active
+                // reference for this conversation" — which IS the install-state rejection
+                // condition. RejectMessageRoutingAsync produces the same audit row shape and
+                // dead-letter wiring that CheckAsync / CheckTargetAsync produce, so an outbox-
+                // wrapped SendMessageAsync now drops a dead-letter entry instead of allowing
+                // unbounded retry storms, and compliance review sees the same evidence
+                // regardless of which routing path was attempted.
+                if (_installationStateGate is not null)
+                {
+                    var reason = await _installationStateGate.RejectMessageRoutingAsync(
+                        message,
+                        message.ConversationId,
+                        outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
+                        cancellationToken: ct).ConfigureAwait(false);
+
+                    _logger.LogWarning(
+                        "InstallationStateGate rejected outbound MessengerMessage {MessageId} (correlation {CorrelationId}) for conversation {ConversationId}. Reason: {Reason}",
+                        message.MessageId,
+                        message.CorrelationId,
+                        message.ConversationId,
+                        reason);
+                    throw new InvalidOperationException(
+                        $"InstallationStateGate rejected outbound delivery for message '{message.MessageId}': {reason}");
+                }
+
+                throw new InvalidOperationException(
+                    $"No conversation reference found for conversation '{message.ConversationId}' (message '{message.MessageId}'). " +
+                    $"The Teams app must be installed and a prior interaction must have captured a reference before proactive delivery can succeed.");
+            }
+
+            var conversationReference = DeserializeReference(stored);
+
+            _logger.LogInformation(
+                "Sending outbound MessengerMessage {MessageId} (correlation {CorrelationId}) to conversation {ConversationId} via reference {ReferenceId}.",
+                message.MessageId,
+                message.CorrelationId,
+                message.ConversationId,
+                stored.Id);
+
+            await _adapter.ContinueConversationAsync(
+                _options.MicrosoftAppId,
+                conversationReference,
+                async (turnContext, innerCt) =>
+                {
+                    var reply = MessageFactory.Text(message.Body);
+                    await turnContext.SendActivityAsync(reply, innerCt).ConfigureAwait(false);
+                },
+                ct).ConfigureAwait(false);
+
+            succeeded = true;
+        }
+        catch (Exception ex) when (activity is not null)
+        {
+            activity.SetStatus(System.Diagnostics.ActivityStatusCode.Error, ex.Message);
+            activity.SetTag("exception.type", ex.GetType().FullName);
+            throw;
+        }
+        finally
+        {
+            sw.Stop();
+            if (Telemetry is not null)
+            {
+                // Stage 6.3 — record the histogram observation and the messages.sent
+                // counter on every send attempt regardless of success so dashboards see
+                // failure rates. The histogram observation is gated on success so the
+                // P95 budget is computed only from successful deliveries (matching the
+                // tech-spec.md §4.4 definition: "P95 Adaptive Card delivery from
+                // outbound queue pickup to Bot Connector acknowledgement").
+                if (succeeded)
+                {
+                    Telemetry.RecordCardDeliveryDurationMs(
+                        sw.Elapsed.TotalMilliseconds,
+                        message.CorrelationId,
+                        TeamsConnectorTelemetry.MessageTypeMessengerMessage,
+                        TeamsConnectorTelemetry.DestinationTypeConversation);
+                    Telemetry.RecordMessageSent(
+                        message.CorrelationId,
+                        TeamsConnectorTelemetry.MessageTypeMessengerMessage,
+                        TeamsConnectorTelemetry.DestinationTypeConversation);
+                }
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -295,155 +368,249 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
                 $"AgentQuestion '{question.QuestionId}' is invalid: {string.Join("; ", validationErrors)}");
         }
 
-        // Step 1 — persist a SANITIZED copy with ConversationId forced to null so a caller
-        // that accidentally pre-populates the field cannot poison the bare
-        // approve/reject lookup path. Step 3 (below) will stamp the actual
-        // conversation ID returned by the proactive turn context. Reference equality is
-        // unchanged for callers that already passed a null ConversationId — the `with`
-        // expression returns the same effective record.
-        var sanitizedQuestion = question with { ConversationId = null };
-        await _agentQuestionStore.SaveAsync(sanitizedQuestion, ct).ConfigureAwait(false);
+        // Stage 6.3 — destination type derived from the XOR-validated target fields
+        // (Validate() above guarantees exactly one is set). The tag drives the
+        // teams.card.delivery.duration_ms histogram and the span attribute the §6.3
+        // dashboards slice on.
+        var destinationType = !string.IsNullOrWhiteSpace(question.TargetUserId)
+            ? TeamsConnectorTelemetry.DestinationTypeUser
+            : TeamsConnectorTelemetry.DestinationTypeChannel;
+        var destinationId = !string.IsNullOrWhiteSpace(question.TargetUserId)
+            ? question.TargetUserId
+            : question.TargetChannelId;
 
-        // Step 2 — resolve the conversation reference from the orchestrator-supplied target
-        // user/channel. Only one of TargetUserId / TargetChannelId is set (enforced by
-        // AgentQuestion.Validate()); we already verified Validate() returned no errors.
-        //
-        // Stage 5.1 iter-5 evaluator feedback item 1 — STRUCTURAL fix. The
-        // InstallationStateGate MUST run BEFORE the active-only reference lookup. The
-        // real SqlConversationReferenceStore filters Get*Async results by `e.IsActive`,
-        // so an inactive (uninstalled) target returns null and the older "lookup-then-
-        // gate" ordering threw InvalidOperationException BEFORE the gate emitted the
-        // InstallationGateRejected audit row or dead-lettered the outbox entry.
-        // CheckAsync uses IsActiveBy*Async probes (booleans handling missing/inactive
-        // alike) so the gate does not depend on the lookup having succeeded.
-        if (_installationStateGate is not null)
+        // Stage 6.3 — open the canonical CorrelationId / TenantId / UserId log scope.
+        // AgentQuestion carries all three (TargetUserId is null for channel-scoped
+        // questions; the scope omits empty fields so the channel path does not emit a
+        // blank UserId enrichment).
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: question.TenantId,
+            userId: destinationId);
+
+        using var activity = Telemetry?.StartSendActivity(
+            TeamsConnectorTelemetry.SendQuestionActivityName,
+            question.CorrelationId,
+            TeamsConnectorTelemetry.MessageTypeAgentQuestion,
+            destinationType);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var succeeded = false;
+        try
         {
-            var gateResult = await _installationStateGate.CheckAsync(
-                question,
-                outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
-                correlationId: question.CorrelationId ?? string.Empty,
+            // Step 1 — persist a SANITIZED copy with ConversationId forced to null so a caller
+            // that accidentally pre-populates the field cannot poison the bare
+            // approve/reject lookup path. Step 3 (below) will stamp the actual
+            // conversation ID returned by the proactive turn context. Reference equality is
+            // unchanged for callers that already passed a null ConversationId — the `with`
+            // expression returns the same effective record.
+            var sanitizedQuestion = question with { ConversationId = null };
+            await _agentQuestionStore.SaveAsync(sanitizedQuestion, ct).ConfigureAwait(false);
+
+            // Step 2 — resolve the conversation reference from the orchestrator-supplied target
+            // user/channel. Only one of TargetUserId / TargetChannelId is set (enforced by
+            // AgentQuestion.Validate()); we already verified Validate() returned no errors.
+            //
+            // Stage 5.1 iter-5 evaluator feedback item 1 — STRUCTURAL fix. The
+            // InstallationStateGate MUST run BEFORE the active-only reference lookup. The
+            // real SqlConversationReferenceStore filters Get*Async results by `e.IsActive`,
+            // so an inactive (uninstalled) target returns null and the older "lookup-then-
+            // gate" ordering threw InvalidOperationException BEFORE the gate emitted the
+            // InstallationGateRejected audit row or dead-lettered the outbox entry.
+            // CheckAsync uses IsActiveBy*Async probes (booleans handling missing/inactive
+            // alike) so the gate does not depend on the lookup having succeeded.
+            if (_installationStateGate is not null)
+            {
+                var gateResult = await _installationStateGate.CheckAsync(
+                    question,
+                    outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
+                    correlationId: question.CorrelationId ?? string.Empty,
+                    ct).ConfigureAwait(false);
+
+                if (!gateResult.IsActive)
+                {
+                    _logger.LogWarning(
+                        "InstallationStateGate rejected synchronous AgentQuestion {QuestionId} (correlation {CorrelationId}) in tenant {TenantId}. Skipping reference lookup and Bot Framework call. Reason: {Reason}",
+                        question.QuestionId,
+                        question.CorrelationId,
+                        question.TenantId,
+                        gateResult.Reason);
+                    throw new InvalidOperationException(
+                        $"InstallationStateGate rejected proactive delivery for question '{question.QuestionId}': {gateResult.Reason}");
+                }
+            }
+
+            TeamsConversationReference? stored;
+            if (!string.IsNullOrWhiteSpace(question.TargetUserId))
+            {
+                stored = await _conversationReferenceStore
+                    .GetByInternalUserIdAsync(question.TenantId, question.TargetUserId!, ct)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                stored = await _conversationReferenceStore
+                    .GetByChannelIdAsync(question.TenantId, question.TargetChannelId!, ct)
+                    .ConfigureAwait(false);
+            }
+
+            if (stored is null)
+            {
+                throw new InvalidOperationException(
+                    $"No conversation reference found for question '{question.QuestionId}' " +
+                    $"(tenant '{question.TenantId}', " +
+                    $"target {(question.TargetUserId is null ? $"channel '{question.TargetChannelId}'" : $"user '{question.TargetUserId}'")}). " +
+                    $"The Teams app must be installed for the target user or in the target channel before proactive delivery can succeed.");
+            }
+
+            var conversationReference = DeserializeReference(stored);
+
+            // Implementation-plan §3.1 step 7 — render the question as an Adaptive Card via
+            // IAdaptiveCardRenderer and attach it to the outbound activity. Activity.Text is
+            // populated with the question title so Teams can fall back to a plain-text
+            // notification banner on clients that cannot render the card (mobile lock screens,
+            // accessibility tooling, etc.).
+            var attachment = _cardRenderer.RenderQuestionCard(question);
+
+            // Step 2b — perform the proactive send. Closure variables capture the activityId
+            // returned by Bot Framework and a fresh ConversationReference rebuilt from the
+            // proactive turn context (preferred over the stored reference for downstream
+            // rehydration because the proactive turn context reflects the actual delivery —
+            // service URL rotation, conversation thread, etc.).
+            string? deliveredActivityId = null;
+            string? deliveredConversationId = null;
+            string? deliveredReferenceJson = null;
+
+            await _adapter.ContinueConversationAsync(
+                _options.MicrosoftAppId,
+                conversationReference,
+                async (turnContext, innerCt) =>
+                {
+                    var reply = MessageFactory.Attachment(attachment);
+                    reply.Text = question.Title;
+                    var resourceResponse = await turnContext.SendActivityAsync(reply, innerCt).ConfigureAwait(false);
+                    deliveredActivityId = resourceResponse?.Id;
+                    deliveredConversationId = turnContext.Activity?.Conversation?.Id;
+                    var freshReference = turnContext.Activity?.GetConversationReference();
+                    if (freshReference is not null)
+                    {
+                        deliveredReferenceJson = JsonConvert.SerializeObject(freshReference);
+                    }
+                },
                 ct).ConfigureAwait(false);
 
-            if (!gateResult.IsActive)
+            // Step 3 — both deliveredConversationId and deliveredActivityId are required for
+            // downstream resolution (bare approve/reject + card update/delete). If EITHER is
+            // missing, fail loudly so the orchestrator can decide whether to retry, mark the
+            // question as undeliverable, or surface to operators. Silently dropping these
+            // would leave the persisted question with a null ConversationId (breaking
+            // GetOpenByConversation) AND no card state row (breaking
+            // ITeamsCardManager.UpdateCardAsync / DeleteCardAsync). The check is performed
+            // BEFORE either persistence call so we never produce partial state.
+            if (string.IsNullOrWhiteSpace(deliveredConversationId))
             {
-                _logger.LogWarning(
-                    "InstallationStateGate rejected synchronous AgentQuestion {QuestionId} (correlation {CorrelationId}) in tenant {TenantId}. Skipping reference lookup and Bot Framework call. Reason: {Reason}",
-                    question.QuestionId,
-                    question.CorrelationId,
-                    question.TenantId,
-                    gateResult.Reason);
                 throw new InvalidOperationException(
-                    $"InstallationStateGate rejected proactive delivery for question '{question.QuestionId}': {gateResult.Reason}");
+                    $"ContinueConversationAsync for question '{question.QuestionId}' did not yield " +
+                    $"a Conversation.Id from the proactive turn context. The card was sent but cannot " +
+                    $"be resolved by bare approve/reject text commands; treating this as a delivery failure " +
+                    $"to avoid silent partial persistence.");
+            }
+
+            if (string.IsNullOrWhiteSpace(deliveredActivityId))
+            {
+                throw new InvalidOperationException(
+                    $"ContinueConversationAsync for question '{question.QuestionId}' did not yield " +
+                    $"an Activity.Id from the SendActivityAsync response. The card was sent but cannot " +
+                    $"be updated or deleted later; treating this as a delivery failure to avoid silent " +
+                    $"partial persistence.");
+            }
+
+            await _agentQuestionStore
+                .UpdateConversationIdAsync(question.QuestionId, deliveredConversationId!, ct)
+                .ConfigureAwait(false);
+
+            var now = _timeProvider.GetUtcNow();
+            var cardState = new TeamsCardState
+            {
+                QuestionId = question.QuestionId,
+                ActivityId = deliveredActivityId!,
+                ConversationId = deliveredConversationId!,
+                ConversationReferenceJson = deliveredReferenceJson ?? stored.ReferenceJson,
+                Status = TeamsCardStatuses.Pending,
+                CreatedAt = now,
+                UpdatedAt = now,
+            };
+
+            await _cardStateStore.SaveAsync(cardState, ct).ConfigureAwait(false);
+            succeeded = true;
+        }
+        catch (Exception ex) when (activity is not null)
+        {
+            activity.SetStatus(System.Diagnostics.ActivityStatusCode.Error, ex.Message);
+            activity.SetTag("exception.type", ex.GetType().FullName);
+            throw;
+        }
+        finally
+        {
+            sw.Stop();
+            if (Telemetry is not null && succeeded)
+            {
+                Telemetry.RecordCardDeliveryDurationMs(
+                    sw.Elapsed.TotalMilliseconds,
+                    question.CorrelationId,
+                    TeamsConnectorTelemetry.MessageTypeAgentQuestion,
+                    destinationType);
+                Telemetry.RecordMessageSent(
+                    question.CorrelationId,
+                    TeamsConnectorTelemetry.MessageTypeAgentQuestion,
+                    destinationType);
             }
         }
-
-        TeamsConversationReference? stored;
-        if (!string.IsNullOrWhiteSpace(question.TargetUserId))
-        {
-            stored = await _conversationReferenceStore
-                .GetByInternalUserIdAsync(question.TenantId, question.TargetUserId!, ct)
-                .ConfigureAwait(false);
-        }
-        else
-        {
-            stored = await _conversationReferenceStore
-                .GetByChannelIdAsync(question.TenantId, question.TargetChannelId!, ct)
-                .ConfigureAwait(false);
-        }
-
-        if (stored is null)
-        {
-            throw new InvalidOperationException(
-                $"No conversation reference found for question '{question.QuestionId}' " +
-                $"(tenant '{question.TenantId}', " +
-                $"target {(question.TargetUserId is null ? $"channel '{question.TargetChannelId}'" : $"user '{question.TargetUserId}'")}). " +
-                $"The Teams app must be installed for the target user or in the target channel before proactive delivery can succeed.");
-        }
-
-        var conversationReference = DeserializeReference(stored);
-
-        // Implementation-plan §3.1 step 7 — render the question as an Adaptive Card via
-        // IAdaptiveCardRenderer and attach it to the outbound activity. Activity.Text is
-        // populated with the question title so Teams can fall back to a plain-text
-        // notification banner on clients that cannot render the card (mobile lock screens,
-        // accessibility tooling, etc.).
-        var attachment = _cardRenderer.RenderQuestionCard(question);
-
-        // Step 2b — perform the proactive send. Closure variables capture the activityId
-        // returned by Bot Framework and a fresh ConversationReference rebuilt from the
-        // proactive turn context (preferred over the stored reference for downstream
-        // rehydration because the proactive turn context reflects the actual delivery —
-        // service URL rotation, conversation thread, etc.).
-        string? deliveredActivityId = null;
-        string? deliveredConversationId = null;
-        string? deliveredReferenceJson = null;
-
-        await _adapter.ContinueConversationAsync(
-            _options.MicrosoftAppId,
-            conversationReference,
-            async (turnContext, innerCt) =>
-            {
-                var reply = MessageFactory.Attachment(attachment);
-                reply.Text = question.Title;
-                var resourceResponse = await turnContext.SendActivityAsync(reply, innerCt).ConfigureAwait(false);
-                deliveredActivityId = resourceResponse?.Id;
-                deliveredConversationId = turnContext.Activity?.Conversation?.Id;
-                var freshReference = turnContext.Activity?.GetConversationReference();
-                if (freshReference is not null)
-                {
-                    deliveredReferenceJson = JsonConvert.SerializeObject(freshReference);
-                }
-            },
-            ct).ConfigureAwait(false);
-
-        // Step 3 — both deliveredConversationId and deliveredActivityId are required for
-        // downstream resolution (bare approve/reject + card update/delete). If EITHER is
-        // missing, fail loudly so the orchestrator can decide whether to retry, mark the
-        // question as undeliverable, or surface to operators. Silently dropping these
-        // would leave the persisted question with a null ConversationId (breaking
-        // GetOpenByConversation) AND no card state row (breaking
-        // ITeamsCardManager.UpdateCardAsync / DeleteCardAsync). The check is performed
-        // BEFORE either persistence call so we never produce partial state.
-        if (string.IsNullOrWhiteSpace(deliveredConversationId))
-        {
-            throw new InvalidOperationException(
-                $"ContinueConversationAsync for question '{question.QuestionId}' did not yield " +
-                $"a Conversation.Id from the proactive turn context. The card was sent but cannot " +
-                $"be resolved by bare approve/reject text commands; treating this as a delivery failure " +
-                $"to avoid silent partial persistence.");
-        }
-
-        if (string.IsNullOrWhiteSpace(deliveredActivityId))
-        {
-            throw new InvalidOperationException(
-                $"ContinueConversationAsync for question '{question.QuestionId}' did not yield " +
-                $"an Activity.Id from the SendActivityAsync response. The card was sent but cannot " +
-                $"be updated or deleted later; treating this as a delivery failure to avoid silent " +
-                $"partial persistence.");
-        }
-
-        await _agentQuestionStore
-            .UpdateConversationIdAsync(question.QuestionId, deliveredConversationId!, ct)
-            .ConfigureAwait(false);
-
-        var now = _timeProvider.GetUtcNow();
-        var cardState = new TeamsCardState
-        {
-            QuestionId = question.QuestionId,
-            ActivityId = deliveredActivityId!,
-            ConversationId = deliveredConversationId!,
-            ConversationReferenceJson = deliveredReferenceJson ?? stored.ReferenceJson,
-            Status = TeamsCardStatuses.Pending,
-            CreatedAt = now,
-            UpdatedAt = now,
-        };
-
-        await _cardStateStore.SaveAsync(cardState, ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
-    public Task<MessengerEvent> ReceiveAsync(CancellationToken ct)
-        => _inboundEventReader.ReceiveAsync(ct);
+    public async Task<MessengerEvent> ReceiveAsync(CancellationToken ct)
+    {
+        // Stage 6.3 — start the receive span BEFORE the channel read so the activity's
+        // start timestamp marks the consumer wait, then re-tag the activity with the
+        // event's correlation ID once it is observable. The counter is incremented
+        // AFTER a successful read so cancelled / failed reads do not inflate the
+        // teams.messages.received signal.
+        using var activity = Telemetry?.StartReceiveActivity();
+        try
+        {
+            var evt = await _inboundEventReader.ReceiveAsync(ct).ConfigureAwait(false);
+            var correlationId = ExtractCorrelationId(evt);
+            if (activity is not null && !string.IsNullOrEmpty(correlationId))
+            {
+                activity.SetTag(TeamsConnectorTelemetry.CorrelationIdTag, correlationId);
+            }
+
+            Telemetry?.RecordMessageReceived(
+                correlationId,
+                TeamsConnectorTelemetry.MessageTypeInboundEvent,
+                TeamsConnectorTelemetry.DestinationTypeInbound);
+
+            return evt;
+        }
+        catch (Exception ex) when (activity is not null)
+        {
+            activity.SetStatus(System.Diagnostics.ActivityStatusCode.Error, ex.Message);
+            activity.SetTag("exception.type", ex.GetType().FullName);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort extraction of the canonical correlation ID from a
+    /// <see cref="MessengerEvent"/>. The base record carries
+    /// <see cref="MessengerEvent.CorrelationId"/> as a required field on every
+    /// concrete subtype (<see cref="CommandEvent"/>, <see cref="DecisionEvent"/>,
+    /// <see cref="TextEvent"/>), so the value is always available on a non-null
+    /// event.
+    /// </summary>
+    private static string? ExtractCorrelationId(MessengerEvent? evt) => evt?.CorrelationId;
 
     /// <inheritdoc />
     public Task UpdateCardAsync(string questionId, CardUpdateAction action, CancellationToken ct)
@@ -472,6 +639,17 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         {
             throw new ArgumentException("QuestionId must be a non-empty string.", nameof(questionId));
         }
+
+        // Stage 6.3 iter-2 — extend the §6.3-step-5 structured-logging contract to the
+        // card-update path (evaluator feedback item 1). The inline retry loop in
+        // ExecuteWithInlineRetryAsync emits a Warning per transient failure; opening
+        // the scope here ensures every log entry below — including those inside the
+        // ContinueConversationAsync callback lambda and the retry loop — carries the
+        // canonical CorrelationId enrichment, projected to ILogger scopes AND to the
+        // Serilog enricher via TeamsLogContext. QuestionId is the canonical correlator
+        // for card-update flows (the originating AgentQuestion uses it as its
+        // CorrelationId; the connector preserves that mapping).
+        using var logScope = TeamsLogScope.BeginScope(_logger, correlationId: questionId);
 
         var state = await _cardStateStore.GetByQuestionIdAsync(questionId, ct).ConfigureAwait(false);
         if (state is null)
@@ -556,6 +734,16 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         {
             throw new ArgumentException("QuestionId must be a non-empty string.", nameof(questionId));
         }
+
+        // Stage 6.3 iter-2 — extend the §6.3-step-5 structured-logging contract to the
+        // card-delete path (evaluator feedback item 1). The 404 "already deleted"
+        // information log inside the ContinueConversationAsync callback (TeamsMessengerConnector.cs
+        // line ~770) AND the transient-failure retry Warning inside
+        // ExecuteWithInlineRetryAsync (TeamsMessengerConnector.cs line ~885) both need
+        // the canonical CorrelationId / TenantId / UserId enrichment. Opening the scope
+        // here propagates onto both via the AsyncLocal-backed TeamsLogContext + the
+        // ILogger scope stack (LoggerExternalScopeProvider is AsyncLocal-backed too).
+        using var logScope = TeamsLogScope.BeginScope(_logger, correlationId: questionId);
 
         var state = await _cardStateStore.GetByQuestionIdAsync(questionId, ct).ConfigureAwait(false);
         if (state is null)

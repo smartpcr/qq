@@ -64,43 +64,68 @@ public sealed class OutboxBackedProactiveNotifier : IProactiveNotifier
     }
 
     /// <inheritdoc />
-    public Task SendProactiveAsync(string tenantId, string userId, MessengerMessage message, CancellationToken ct)
+    public async Task SendProactiveAsync(string tenantId, string userId, MessengerMessage message, CancellationToken ct)
     {
         ValidateRequired(tenantId, nameof(tenantId));
         ValidateRequired(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(message);
 
-        return EnqueueUserMessageAsync(tenantId, userId, message, ct);
+        // Stage 6.3 iter-2 — enrichment scope covers the enqueue + log.
+        using var logScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: message.CorrelationId,
+            tenantId: tenantId,
+            userId: userId);
+
+        await EnqueueUserMessageAsync(tenantId, userId, message, ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
-    public Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
+    public async Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequired(tenantId, nameof(tenantId));
         ValidateRequired(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(question);
 
-        return EnqueueUserQuestionAsync(tenantId, userId, question, ct);
+        using var logScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: userId);
+
+        await EnqueueUserQuestionAsync(tenantId, userId, question, ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
-    public Task SendToChannelAsync(string tenantId, string channelId, MessengerMessage message, CancellationToken ct)
+    public async Task SendToChannelAsync(string tenantId, string channelId, MessengerMessage message, CancellationToken ct)
     {
         ValidateRequired(tenantId, nameof(tenantId));
         ValidateRequired(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(message);
 
-        return EnqueueChannelMessageAsync(tenantId, channelId, message, ct);
+        using var logScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: message.CorrelationId,
+            tenantId: tenantId,
+            userId: null);
+
+        await EnqueueChannelMessageAsync(tenantId, channelId, message, ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
-    public Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
+    public async Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequired(tenantId, nameof(tenantId));
         ValidateRequired(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(question);
 
-        return EnqueueChannelQuestionAsync(tenantId, channelId, question, ct);
+        using var logScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: null);
+
+        await EnqueueChannelQuestionAsync(tenantId, channelId, question, ct).ConfigureAwait(false);
     }
 
     private async Task EnqueueUserMessageAsync(string tenantId, string userId, MessengerMessage message, CancellationToken ct)
