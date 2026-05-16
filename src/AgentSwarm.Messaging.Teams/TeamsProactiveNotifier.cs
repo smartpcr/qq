@@ -185,8 +185,19 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         // Stage 5.2 — every proactive send emits exactly one ProactiveNotification audit
         // entry per tech-spec.md §4.3. The emit happens in `finally` so the trail is
         // durable on Success, Failed (BotFramework throws / reference missing), and
-        // Rejected (install-state gate). The audit helper swallows its own exceptions so
-        // an audit-store outage never masks the underlying send outcome.
+        // Rejected (install-state gate). The audit helper does NOT swallow its own
+        // exceptions — durable audit emission is a hard compliance requirement, so an
+        // audit-store outage MUST surface to the outbox dispatcher for retry rather
+        // than be silently logged. See the `LogProactiveNotificationAsync` XML doc and
+        // implementation comment for the rationale; see iter-1 evaluator item 7 for
+        // the explicit rejection of silent loss. Note: in the current `try{...}catch
+        // {throw;}finally{await audit}` shape an audit-store failure raised from
+        // `finally` will replace any in-flight send exception — a separate caller-side
+        // restructuring (ExceptionDispatchInfo + AggregateException, modeled on
+        // TeamsSwarmActivityHandler.OnMessageActivityAsync) is required to preserve
+        // both. That restructuring is tracked in the companion review comment and
+        // landed by the partner fix; this method's contract is unchanged: do not
+        // swallow audit failures.
         var auditTimestamp = _timeProvider.GetUtcNow();
         var outcome = AuditOutcomes.Success;
         var gateRejected = false;
@@ -955,19 +966,39 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
 
     /// <summary>
     /// Emit a single <see cref="AuditEventTypes.ProactiveNotification"/> row to
-    /// <see cref="IAuditLogger"/> per tech-spec.md §4.3. Called from <c>finally</c> blocks
-    /// in all three send paths (<see cref="SendProactiveAsync"/>,
-    /// <see cref="SendToChannelAsync"/>, <see cref="SendQuestionCoreAsync"/>) so the audit
-    /// trail is durable regardless of whether the send succeeded, was rejected by
-    /// <see cref="InstallationStateGate"/>, or threw at the Bot Framework layer.
+    /// <see cref="IAuditLogger"/> per tech-spec.md §4.3. Called from the send paths
+    /// (<see cref="SendProactiveAsync"/>, <see cref="SendToChannelAsync"/>,
+    /// <see cref="SendQuestionCoreAsync"/>) so the audit trail is durable regardless of
+    /// whether the send succeeded, was rejected by <see cref="InstallationStateGate"/>,
+    /// or threw at the Bot Framework layer.
     /// </summary>
     /// <remarks>
-    /// Swallows <see cref="IAuditLogger"/> exceptions and logs a warning. The caller's
-    /// original exception (if any) must propagate uninterrupted — otherwise a transient
-    /// audit-store outage would mask the underlying send failure from the outbox engine
-    /// and break retry semantics. Audit emission is best-effort observability around the
-    /// existing send-and-retry flow; the durability contract is satisfied by the DB-level
-    /// triggers and grants documented in <c>20260516120058_InitialAuditLog</c>.
+    /// <para>
+    /// <b>Does NOT swallow <see cref="IAuditLogger"/> exceptions.</b> Durable audit
+    /// emission is a hard compliance requirement of this workstream ("Persist immutable
+    /// audit trail suitable for enterprise review"); silently logging-and-continuing on
+    /// an audit-store outage would lose the audit row for a notification that already
+    /// went out at the Bot Framework layer. Instead, any failure from
+    /// <see cref="IAuditLogger.LogAsync"/> is rethrown so the outbox dispatcher sees it
+    /// and retries; same-correlation-id idempotency in the outbox guarantees the user
+    /// will not receive a duplicate notification on the retry attempt. This decision
+    /// reverses the iter-1 design — iter-1 evaluator item 7 explicitly rejected silent
+    /// audit loss even with a logged warning.
+    /// </para>
+    /// <para>
+    /// <b>Caller contract — preserving the in-flight send exception.</b> Because this
+    /// method may throw, awaiting it from a bare <c>finally</c> block on a send path
+    /// that is already propagating a Bot Framework exception will cause the CLR to
+    /// replace the original send failure with the audit failure (lost-exception bug).
+    /// Callers that emit audit from a failure path MUST capture the send exception via
+    /// <see cref="System.Runtime.ExceptionServices.ExceptionDispatchInfo"/>, invoke this
+    /// helper in a separate <c>try/catch</c>, and either rethrow the captured send
+    /// exception (audit succeeded) or surface both via
+    /// <see cref="AggregateException"/> (audit also failed) — the same pattern used in
+    /// <c>TeamsSwarmActivityHandler.OnMessageActivityAsync</c>. The durability
+    /// contract is further reinforced by the DB-level triggers and grants documented
+    /// in <c>20260516120058_InitialAuditLog</c>.
+    /// </para>
     /// </remarks>
     private async Task LogProactiveNotificationAsync(
         string action,
