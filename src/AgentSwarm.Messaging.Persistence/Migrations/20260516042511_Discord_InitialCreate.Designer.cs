@@ -83,7 +83,7 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<DateTimeOffset>("CreatedAt")
-                        .HasColumnType("TEXT");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("ErrorDetail")
                         .HasColumnType("TEXT");
@@ -98,7 +98,7 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                         .HasDefaultValue(5);
 
                     b.Property<DateTimeOffset?>("NextRetryAt")
-                        .HasColumnType("TEXT");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Payload")
                         .IsRequired()
@@ -108,7 +108,7 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<DateTimeOffset?>("SentAt")
-                        .HasColumnType("TEXT");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Severity")
                         .HasColumnType("INTEGER");
