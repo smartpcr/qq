@@ -106,6 +106,21 @@ public static class SlackInboundTransportServiceCollectionExtensions
         services.AddHttpClient(HttpClientSlackViewsOpenClient.HttpClientName);
         services.TryAddSingleton<ISlackViewsOpenClient, HttpClientSlackViewsOpenClient>();
 
+        // Stage 5.2: production threaded-reply poster (chat.postMessage)
+        // for the app-mention handler. Registered here -- alongside the
+        // other HTTP-backed Slack Web API clients -- so any host that
+        // wires AddSlackInboundTransport (the Worker, integration
+        // tests with real transport) automatically gets the real HTTP
+        // implementation. The dispatcher extension
+        // (AddSlackCommandDispatcher) keeps a TryAddSingleton NoOp
+        // fall-back so unit-test fixtures that skip the transport
+        // wiring still resolve a non-null binding; because both
+        // registrations use TryAdd, the FIRST extension call wins per
+        // composition. Stage 6.4's consolidated SlackDirectApiClient
+        // can supersede via pre-registration.
+        services.AddHttpClient(Pipeline.HttpClientSlackThreadedReplyPoster.HttpClientName);
+        services.TryAddSingleton<Pipeline.ISlackThreadedReplyPoster, Pipeline.HttpClientSlackThreadedReplyPoster>();
+
         services.TryAddSingleton<ISlackModalFastPathHandler, DefaultSlackModalFastPathHandler>();
 
         // Register a NO-OP ISlackInteractionFastPathHandler so the

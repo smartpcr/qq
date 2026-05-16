@@ -316,6 +316,140 @@ internal static class SlackInboundPayloadParser
         return end == 0 ? null : span[..end].ToString().ToLowerInvariant();
     }
 
+    /// <summary>
+    /// Parses <paramref name="body"/> as an Events API <c>app_mention</c>
+    /// payload and returns the bot-relevant fields. The returned
+    /// <see cref="SlackAppMentionPayload"/> carries the mention text, the
+    /// channel id, the user id, the message timestamp (<c>ts</c>), and
+    /// the optional containing <c>thread_ts</c>. Returns
+    /// <see cref="SlackAppMentionPayload.Empty"/> when the body is empty,
+    /// not JSON, or does not match the expected shape.
+    /// </summary>
+    /// <remarks>
+    /// Stage 5.2 of
+    /// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>.
+    /// The existing <see cref="ParseEvent"/> entry point only exposes the
+    /// envelope-level discriminator fields (team, channel, user, subtype)
+    /// because Stage 4.3's routing pipeline does not need the inner
+    /// <c>text</c>; Stage 5.2's
+    /// <see cref="Pipeline.SlackAppMentionHandler"/> needs the
+    /// inner <c>text</c> (to extract the sub-command), the inner
+    /// <c>ts</c> (to anchor a new thread when the mention is in the main
+    /// channel), and the inner <c>thread_ts</c> (to reply into an
+    /// existing thread).
+    /// </remarks>
+    public static SlackAppMentionPayload ParseEventAppMention(string body)
+    {
+        if (string.IsNullOrEmpty(body))
+        {
+            return SlackAppMentionPayload.Empty;
+        }
+
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(body);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return SlackAppMentionPayload.Empty;
+            }
+
+            string? teamId = ReadStringProperty(root, "team_id");
+            if (string.IsNullOrEmpty(teamId)
+                && root.TryGetProperty("team", out JsonElement teamObj)
+                && teamObj.ValueKind == JsonValueKind.Object)
+            {
+                teamId = ReadStringProperty(teamObj, "id");
+            }
+
+            if (!root.TryGetProperty("event", out JsonElement evt) || evt.ValueKind != JsonValueKind.Object)
+            {
+                return SlackAppMentionPayload.Empty;
+            }
+
+            string? subtype = ReadStringProperty(evt, "type");
+            string? text = ReadStringProperty(evt, "text");
+
+            string? channelId = ReadStringProperty(evt, "channel");
+            if (string.IsNullOrEmpty(channelId)
+                && evt.TryGetProperty("channel", out JsonElement evtChannelObj)
+                && evtChannelObj.ValueKind == JsonValueKind.Object)
+            {
+                channelId = ReadStringProperty(evtChannelObj, "id");
+            }
+
+            string? userId = ReadStringProperty(evt, "user");
+            if (string.IsNullOrEmpty(userId)
+                && evt.TryGetProperty("user", out JsonElement evtUserObj)
+                && evtUserObj.ValueKind == JsonValueKind.Object)
+            {
+                userId = ReadStringProperty(evtUserObj, "id");
+            }
+
+            string? ts = ReadStringProperty(evt, "ts");
+            string? threadTs = ReadStringProperty(evt, "thread_ts");
+
+            return new SlackAppMentionPayload(
+                TeamId: teamId,
+                ChannelId: channelId,
+                UserId: userId,
+                Text: text,
+                Ts: ts,
+                ThreadTs: threadTs,
+                EventSubtype: subtype);
+        }
+        catch (JsonException)
+        {
+            return SlackAppMentionPayload.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Strips a leading <c>&lt;@USERID&gt;</c> bot-mention prefix from
+    /// <paramref name="text"/> and returns the remainder, trimmed.
+    /// Returns the input unchanged (after trimming) when no Slack
+    /// mention token is present at the start.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stage 5.2 implementation step 2: "remove the
+    /// <c>&lt;@BOT_USER_ID&gt;</c> prefix from the mention text to
+    /// extract the raw command string". Slack always serialises user
+    /// mentions in <c>&lt;@U0123ABCD&gt;</c> form (optionally with a
+    /// display-name suffix: <c>&lt;@U0123ABCD|agentbot&gt;</c>); the
+    /// regex-free string scan here matches both shapes and is
+    /// deliberately permissive about the inner id format (Slack reserves
+    /// the <c>U</c>, <c>W</c>, and <c>B</c> prefixes for users, enterprise
+    /// users, and bots respectively, and short test workspaces use
+    /// uppercase alpha-numerics) so the helper does not need to know
+    /// which bot user id belongs to which workspace -- the brief's
+    /// test scenario 2 only requires the prefix to be stripped, not
+    /// validated.
+    /// </para>
+    /// </remarks>
+    public static string StripBotMentionPrefix(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return string.Empty;
+        }
+
+        ReadOnlySpan<char> span = text.AsSpan().TrimStart();
+        if (span.Length < 4 || span[0] != '<' || span[1] != '@')
+        {
+            return span.ToString();
+        }
+
+        int closeIdx = span.IndexOf('>');
+        if (closeIdx < 3)
+        {
+            return span.ToString();
+        }
+
+        ReadOnlySpan<char> remainder = span[(closeIdx + 1)..].TrimStart();
+        return remainder.ToString();
+    }
+
     private static SlackInteractionPayload ParseInteractionPayloadJson(string json)
     {
         try
@@ -502,4 +636,45 @@ internal readonly record struct SlackInteractionPayload(
 {
     public static SlackInteractionPayload Empty { get; } =
         new(null, null, null, null, null, null);
+}
+
+/// <summary>
+/// Field set extracted from an Events API <c>app_mention</c> event
+/// callback. Carries the inner <c>event.text</c> (so the
+/// <see cref="Pipeline.SlackAppMentionHandler"/> can strip the bot
+/// prefix and reuse the slash-command sub-command parser), the
+/// inner <c>event.ts</c> (so a top-level mention can anchor a new
+/// thread), and the optional <c>event.thread_ts</c> (so a mention
+/// already inside a thread routes its reply back into that thread).
+/// </summary>
+/// <param name="TeamId">Workspace id (<c>team_id</c> or nested
+/// <c>team.id</c>).</param>
+/// <param name="ChannelId">Channel id from <c>event.channel</c>.</param>
+/// <param name="UserId">User id of the human who posted the
+/// mention.</param>
+/// <param name="Text">Raw mention text, including the leading
+/// <c>&lt;@BOT_USER_ID&gt;</c> token. The handler strips that prefix
+/// with <see cref="SlackInboundPayloadParser.StripBotMentionPrefix"/>
+/// before parsing the sub-command.</param>
+/// <param name="Ts">Slack message timestamp of the mention itself.
+/// Used as the <c>thread_ts</c> anchor when the mention was posted to
+/// the main channel (i.e., when <see cref="ThreadTs"/> is null).</param>
+/// <param name="ThreadTs">Containing thread timestamp when the mention
+/// was posted as a reply inside an existing thread; null for top-level
+/// mentions.</param>
+/// <param name="EventSubtype">Inner <c>event.type</c> discriminator;
+/// expected to equal <c>app_mention</c> when the routing pipeline
+/// reaches this parser, but exposed so the handler can defensively
+/// log a mismatch.</param>
+internal readonly record struct SlackAppMentionPayload(
+    string? TeamId,
+    string? ChannelId,
+    string? UserId,
+    string? Text,
+    string? Ts,
+    string? ThreadTs,
+    string? EventSubtype)
+{
+    public static SlackAppMentionPayload Empty { get; } =
+        new(null, null, null, null, null, null, null);
 }

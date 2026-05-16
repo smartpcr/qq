@@ -197,19 +197,26 @@ public class Program
             .AddSlackInboundIngestor<SlackPersistenceDbContext>();
 
         // Stage 5.1 (workstream:
-        // ws-qq-slack-messenger-supp-phase-command-and-interaction-processing-stage-slash-command-dispatch):
+        // ws-qq-slack-messenger-supp-phase-command-and-interaction-processing-stage-slash-command-dispatch)
+        // + Stage 5.2 (workstream:
+        // ws-qq-slack-messenger-supp-phase-command-and-interaction-processing-stage-app-mention-processing):
         // register the real SlackCommandHandler (replaces the Stage
         // 4.3 NoOpSlackCommandHandler dev-stub for the ingestor's
-        // ISlackCommandHandler binding). The dispatcher parses
+        // ISlackCommandHandler binding) AND the real
+        // SlackAppMentionHandler (replaces the
+        // NoOpSlackAppMentionHandler dev-stub for the
+        // ISlackAppMentionHandler binding). The dispatcher parses
         // `/agent <sub-command>` text, calls IAgentTaskService for
         // ask / status / approve / reject and best-effort views.open
         // for review / escalate, and writes ephemeral error messages
-        // for unrecognised sub-commands. Must follow
-        // AddSlackInboundIngestor so the
+        // for unrecognised sub-commands; the app-mention handler
+        // strips the `<@BOT_USER_ID>` prefix and delegates through the
+        // same dispatch switch (posting replies as threaded
+        // chat.postMessage instead of ephemeral response_url replies).
+        // Must follow AddSlackInboundIngestor so the
         // AddSlackInboundDevelopmentHandlerStubs call below only
         // re-registers no-ops for the still-unimplemented
-        // ISlackAppMentionHandler / ISlackInteractionHandler
-        // contracts.
+        // ISlackInteractionHandler contract.
         builder.Services.AddSlackCommandDispatcher();
 
         // Stage 5.1 iter-2 evaluator item 3 (STRUCTURAL fix):
