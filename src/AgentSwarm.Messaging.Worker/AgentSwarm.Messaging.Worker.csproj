@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Worker">
+<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
@@ -8,16 +8,30 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!--
+      Iter-5: the Worker IS the production ASP.NET Core host that
+      exposes POST /api/telegram/webhook AND runs the background
+      services (dispatcher, recovery startup, recovery sweep).
+      Microsoft.NET.Sdk.Web (instead of Microsoft.NET.Sdk.Worker)
+      gives us routing, the Microsoft.AspNetCore.App framework
+      reference (used by AgentSwarm.Messaging.Telegram for the
+      webhook endpoint), and the WebApplication builder used in
+      Program.cs.
+    -->
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.*">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.*" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj" />
     <ProjectReference Include="..\AgentSwarm.Messaging.Telegram\AgentSwarm.Messaging.Telegram.csproj" />
     <ProjectReference Include="..\AgentSwarm.Messaging.Persistence\AgentSwarm.Messaging.Persistence.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AgentSwarm.Messaging.Tests" />
   </ItemGroup>
 </Project>
