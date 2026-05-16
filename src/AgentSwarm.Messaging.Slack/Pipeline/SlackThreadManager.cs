@@ -839,7 +839,7 @@ internal sealed class SlackThreadCreationException : Exception
         this.TaskId = taskId;
         this.TeamId = teamId;
         this.ChannelId = channelId;
-        this.ResultKind = (int)resultKind;
+        this.ResultKind = resultKind;
         this.SlackError = error;
     }
 
@@ -852,8 +852,12 @@ internal sealed class SlackThreadCreationException : Exception
     /// <summary>Slack channel the root post was attempted in.</summary>
     public string ChannelId { get; }
 
-    /// <summary>Numeric form of <see cref="SlackChatPostMessageResultKind"/>.</summary>
-    public int ResultKind { get; }
+    /// <summary>
+    /// Classified outcome of the failed <c>chat.postMessage</c> call so
+    /// the catching dispatcher can branch on the enum directly (recover
+    /// vs. retry vs. dead-letter) without an <c>int</c>-to-enum cast.
+    /// </summary>
+    public SlackChatPostMessageResultKind ResultKind { get; }
 
     /// <summary>Slack-reported error string (e.g. <c>channel_not_found</c>).</summary>
     public string SlackError { get; }
