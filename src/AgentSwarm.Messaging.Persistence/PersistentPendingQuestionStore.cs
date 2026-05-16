@@ -65,9 +65,34 @@ using Microsoft.Extensions.Logging;
 /// invocations for an already-<see cref="PendingQuestionStatus.TimedOut"/>
 /// row are no-ops so a crash mid-sweep does not double-apply.
 /// </para>
+/// <para>
+/// <b>Bounded sweep batch.</b> <see cref="GetExpiredAsync"/> caps
+/// per-call materialisation at <see cref="MaxExpiredBatchSize"/>
+/// (default <see cref="DefaultMaxExpiredBatchSize"/>) — a backlog
+/// of tens of thousands of expired rows after an extended outage
+/// can no longer be loaded into memory as one giant list.
+/// Oldest-first ordering on <c>ExpiresAt</c> guarantees forward
+/// progress: any rows that did not fit in this batch are naturally
+/// picked up by the next poll tick of
+/// <c>QuestionTimeoutService</c>.
+/// </para>
 /// </remarks>
 public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
 {
+    /// <summary>
+    /// Default upper bound on the number of expired rows
+    /// <see cref="GetExpiredAsync"/> materialises in a single
+    /// sweep. Sits inside the reviewer-suggested 100–500 band that
+    /// balances per-poll memory against drain latency: paired with
+    /// the default 30-second
+    /// <c>QuestionTimeoutOptions.PollInterval</c>, a 200-row cap
+    /// clears a 12,000-row backlog in roughly half an hour while
+    /// keeping the per-sweep heap allocation predictable. Hosts can
+    /// override via the <see cref="MaxExpiredBatchSize"/>
+    /// object-initializer on a DI factory.
+    /// </summary>
+    private const int DefaultMaxExpiredBatchSize = 200;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<PersistentPendingQuestionStore> _logger;
@@ -78,6 +103,38 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
     /// strict default for writing.
     /// </summary>
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    /// <summary>
+    /// Maximum number of expired rows
+    /// <see cref="GetExpiredAsync"/> returns in a single call.
+    /// Defaults to <see cref="DefaultMaxExpiredBatchSize"/> (200).
+    /// Non-positive values are treated as the default at query time
+    /// so a misconfiguration cannot silently disable the cap and
+    /// reintroduce the unbounded-materialisation behaviour the
+    /// bound was introduced to fix.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why a property, not <see cref="Microsoft.Extensions.Options.IOptions{TOptions}"/>.</b>
+    /// Keeping this as an <c>init</c>-only property preserves the
+    /// existing three-argument constructor so the
+    /// <c>services.Replace(ServiceDescriptor.Singleton&lt;IPendingQuestionStore, PersistentPendingQuestionStore&gt;())</c>
+    /// registration in <see cref="ServiceCollectionExtensions.AddMessagingPersistence"/>
+    /// continues to resolve unchanged. Hosts that need to tune the
+    /// cap (for example a worker with a much larger expected
+    /// backlog after a planned maintenance window) supply a DI
+    /// factory:
+    /// </para>
+    /// <code>
+    /// services.Replace(ServiceDescriptor.Singleton&lt;IPendingQuestionStore&gt;(sp =&gt;
+    ///     new PersistentPendingQuestionStore(
+    ///         sp.GetRequiredService&lt;IServiceScopeFactory&gt;(),
+    ///         sp.GetRequiredService&lt;TimeProvider&gt;(),
+    ///         sp.GetRequiredService&lt;ILogger&lt;PersistentPendingQuestionStore&gt;&gt;())
+    ///     { MaxExpiredBatchSize = 500 }));
+    /// </code>
+    /// </remarks>
+    public int MaxExpiredBatchSize { get; init; } = DefaultMaxExpiredBatchSize;
 
     public PersistentPendingQuestionStore(
         IServiceScopeFactory scopeFactory,
@@ -415,6 +472,20 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
     {
         var now = _timeProvider.GetUtcNow();
 
+        // Defensive normalisation — a host that explicitly sets
+        // MaxExpiredBatchSize to zero or a negative value must NOT
+        // disable the cap. `.Take(0)` would silently return an empty
+        // result (stalling every sweep forever) and `.Take(-1)`
+        // would either throw inside EF Core or — depending on the
+        // provider — degenerate back to the unbounded query this
+        // cap was added to prevent. Falling back to the documented
+        // default keeps the misconfiguration on the "still bounded,
+        // possibly suboptimal" side of the failure spectrum rather
+        // than "silently broken sweep".
+        var batchSize = MaxExpiredBatchSize > 0
+            ? MaxExpiredBatchSize
+            : DefaultMaxExpiredBatchSize;
+
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
 
@@ -423,12 +494,25 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
         // for timeout (an operator who tapped a RequiresComment
         // button but never followed up with text must still receive
         // the default-action timeout per architecture.md §10.3).
+        //
+        // The OrderBy(ExpiresAt) + Take(batchSize) pair caps the
+        // per-sweep materialisation so a backlog after an extended
+        // outage (or an idle period that ages out tens of thousands
+        // of pending rows simultaneously) cannot blow up the
+        // sweeper's heap with one giant list. QuestionTimeoutService
+        // already processes the returned rows one at a time, so any
+        // rows that did not fit in this batch are naturally picked
+        // up by the next poll tick — no work is dropped, only
+        // deferred. Oldest-first ordering guarantees forward
+        // progress: a flood of newer expiries cannot perpetually
+        // starve any specific row.
         var rows = await db.PendingQuestions
             .AsNoTracking()
             .Where(x => (x.Status == PendingQuestionStatus.Pending
                       || x.Status == PendingQuestionStatus.AwaitingComment)
                      && x.ExpiresAt <= now)
             .OrderBy(x => x.ExpiresAt)
+            .Take(batchSize)
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
