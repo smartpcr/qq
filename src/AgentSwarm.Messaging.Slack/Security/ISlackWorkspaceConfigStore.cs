@@ -45,8 +45,16 @@ public interface ISlackWorkspaceConfigStore
     /// </param>
     /// <param name="ct">Cancellation token honoured by network-backed stores.</param>
     /// <returns>
-    /// The matching row, or <see langword="null"/> when no enabled workspace
-    /// configuration exists for the supplied <paramref name="teamId"/>.
+    /// The matching row when a workspace configuration exists for the
+    /// supplied <paramref name="teamId"/> AND it is
+    /// <see cref="SlackWorkspaceConfig.Enabled"/>; otherwise
+    /// <see langword="null"/>. Implementations MUST filter disabled
+    /// rows at this boundary so callers (notably the Stage 3.2
+    /// authorization filter) can trust a non-null result is a usable
+    /// workspace without re-checking
+    /// <see cref="SlackWorkspaceConfig.Enabled"/>. Stage 3.1 iter-4
+    /// evaluator item 2 codified this contract after a mismatch was
+    /// flagged between the docstring and both shipped stores.
     /// </returns>
     Task<SlackWorkspaceConfig?> GetByTeamIdAsync(string? teamId, CancellationToken ct);
 

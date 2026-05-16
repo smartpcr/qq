@@ -32,10 +32,16 @@ public sealed class CompositeSecretProvider : ISecretProvider
 
     /// <summary>
     /// Selects a backend based on
-    /// <see cref="SecretProviderOptions.ProviderType"/>. Falls back to
-    /// <see cref="EnvironmentSecretProvider"/> for any value not handled
-    /// here so a typo in configuration cannot silently swap to an
-    /// in-memory store in production.
+    /// <see cref="SecretProviderOptions.ProviderType"/>. Unsupported
+    /// values that are exposed in <see cref="SecretProviderType"/> but
+    /// not yet implemented in this stage (e.g.,
+    /// <see cref="SecretProviderType.KeyVault"/> and
+    /// <see cref="SecretProviderType.Kubernetes"/>) throw
+    /// <see cref="InvalidOperationException"/> instead of silently
+    /// falling back so an operator misconfiguration cannot mask a
+    /// missing production secret backend. Truly unknown enum values
+    /// (e.g., a typo cast to <see cref="SecretProviderType"/>) raise
+    /// the same exception.
     /// </summary>
     /// <param name="options">Snapshot of resolved options.</param>
     /// <param name="environmentProvider">
@@ -69,7 +75,40 @@ public sealed class CompositeSecretProvider : ISecretProvider
         {
             SecretProviderType.InMemory => inMemoryProvider,
             SecretProviderType.Environment => environmentProvider,
-            _ => environmentProvider,
+            SecretProviderType.KeyVault => throw BuildUnsupportedException(
+                resolved.ProviderType,
+                requiresKeyVaultRegistration: true),
+            SecretProviderType.Kubernetes => throw BuildUnsupportedException(
+                resolved.ProviderType,
+                requiresKeyVaultRegistration: false),
+            _ => throw BuildUnsupportedException(resolved.ProviderType, requiresKeyVaultRegistration: false),
         };
+    }
+
+    private static InvalidOperationException BuildUnsupportedException(
+        SecretProviderType providerType,
+        bool requiresKeyVaultRegistration)
+    {
+        // Stage 3.1 evaluator iter-3 item 3: silent fall-back to the
+        // environment backend for unsupported provider types could mask
+        // a missing production secret backend in deployments that set
+        // SecretProvider:ProviderType = KeyVault or Kubernetes without
+        // registering the backing ISecretProvider. Fail loudly at
+        // construction time so the misconfiguration is impossible to
+        // miss. Stage 3.3 (KeyVault) and Stage 3.x (Kubernetes) will
+        // wire their providers by calling
+        // services.AddSingleton<ISecretProvider, ...>() BEFORE
+        // AddSecretProvider; the TryAddSingleton inside
+        // AddSecretProvider then skips the composite entirely and this
+        // exception never fires.
+        string remediation = requiresKeyVaultRegistration
+            ? "Register a KeyVault-backed ISecretProvider implementation BEFORE calling AddSecretProvider (Stage 3.3 provides one)."
+            : "Register an ISecretProvider implementation for this backend BEFORE calling AddSecretProvider so the composite is skipped.";
+
+        string message = FormattableString.Invariant(
+            $"SecretProvider:ProviderType={providerType} is not supported by the built-in {nameof(CompositeSecretProvider)}; ")
+            + "only Environment and InMemory backends are implemented in this stage. "
+            + remediation;
+        return new InvalidOperationException(message);
     }
 }

@@ -81,8 +81,17 @@ public sealed class SlackWorkspaceSeedTests
     }
 
     [Fact]
-    public async System.Threading.Tasks.Task Disabled_workspace_is_seeded_but_excluded_from_enabled_enumeration()
+    public async System.Threading.Tasks.Task Disabled_workspace_returns_null_from_GetByTeamIdAsync_per_store_contract()
     {
+        // Stage 3.1 evaluator iter-4 item 2: ISlackWorkspaceConfigStore
+        // contracts that disabled rows are filtered at the store
+        // boundary. A direct GetByTeamIdAsync lookup MUST return
+        // null for an Enabled=false row so future authorization code
+        // (Stage 3.2 ACL filter) can trust the result without
+        // re-checking Enabled. The rejection audit still records the
+        // team_id because SlackSignatureValidator passes the requested
+        // team_id through to SlackSignatureValidationResult regardless
+        // of whether the workspace was resolved.
         Dictionary<string, string?> config = new()
         {
             ["Slack:Workspaces:0:TeamId"] = "T0DISABLED",
@@ -93,12 +102,12 @@ public sealed class SlackWorkspaceSeedTests
         ISlackWorkspaceConfigStore store = BuildStore(config);
 
         SlackWorkspaceConfig? lookup = await store.GetByTeamIdAsync("T0DISABLED", CancellationToken.None);
-        lookup.Should().NotBeNull(
-            "the disabled row must remain queryable so the validator can audit attempted use of a disabled workspace");
+        lookup.Should().BeNull(
+            "the store boundary filters Enabled=false rows so callers cannot accidentally trust a disabled workspace");
 
         IReadOnlyCollection<SlackWorkspaceConfig> enabled = await store.GetAllEnabledAsync(CancellationToken.None);
         enabled.Should().BeEmpty(
-            "GetAllEnabledAsync must filter out Enabled = false rows so the url_verification handshake skips them");
+            "GetAllEnabledAsync must also filter out Enabled = false rows so the url_verification handshake skips them");
     }
 
     [Fact]

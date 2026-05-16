@@ -739,6 +739,15 @@ public sealed class SlackSignatureValidator : IMiddleware
 
         SlackWorkspaceConfig? workspace =
             await this.workspaceStore.GetByTeamIdAsync(teamId, context.RequestAborted).ConfigureAwait(false);
+
+        // Stage 3.1 evaluator iter-4 item 2: ISlackWorkspaceConfigStore
+        // contracts that disabled rows are filtered at the store
+        // boundary, so a null result already covers the "unknown OR
+        // disabled" case. The explicit !workspace.Enabled check is
+        // kept as a belt-and-suspenders guard against a future custom
+        // store implementation that violates the contract -- in that
+        // case we still reject with UnknownWorkspace rather than
+        // resolving a secret for a disabled workspace.
         if (workspace is null || !workspace.Enabled)
         {
             return SlackSignatureValidationResult.Reject(

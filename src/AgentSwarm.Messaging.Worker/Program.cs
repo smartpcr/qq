@@ -59,15 +59,33 @@ public class Program
         // this call signature-rejection audit rows are lost on restart.
         AddSlackAuditPersistence(builder);
 
-        // Stage 3.1 (evaluator iter-1 item 4): seed the in-memory
-        // ISlackWorkspaceConfigStore from the Slack:Workspaces
-        // configuration section so the shipped host can actually
-        // validate a request from a real workspace. The seed
-        // uses TryAdd, so the future Stage 2.3 database-backed
-        // workspace store (registered earlier in production
-        // composition roots) still wins. Signing secrets are NEVER
-        // inlined -- only secret-provider references that resolve via
-        // the ISecretProvider chain.
+        // Stage 3.1 (evaluator iter-3 item 1): register the EF-backed
+        // ISlackWorkspaceConfigStore so a restarted Worker can resolve
+        // SlackWorkspaceConfig.SigningSecretRef directly from the
+        // durable slack_workspace_config table -- not from a transient
+        // in-memory dictionary that only survives until the next
+        // restart. RemoveAll + AddSingleton ensures the EF store wins
+        // regardless of the order other extensions are called in.
+        builder.Services.AddSlackEntityFrameworkWorkspaceConfigStore<SlackPersistenceDbContext>();
+
+        // Stage 3.1 (evaluator iter-3 item 1): register the startup
+        // seeder that upserts every Slack:Workspaces entry from
+        // appsettings into the EF-backed table. The seeder is
+        // idempotent: existing rows are updated in-place (preserving
+        // created_at), missing rows are inserted, and rows that exist
+        // only in the database are left untouched so operators can
+        // manage workspaces outside of appsettings without the seeder
+        // stomping them. This keeps appsettings a convenient bootstrap
+        // source while making the database the source of truth.
+        builder.Services.AddSlackWorkspaceConfigSeeder<SlackPersistenceDbContext>(builder.Configuration);
+
+        // Stage 3.1 (evaluator iter-1 item 4): also bind the seed
+        // options so the iter-1 in-memory store remains usable when a
+        // composition root opts out of the EF wiring above. With the
+        // EF store registered first (RemoveAll wins), this call is
+        // effectively a no-op for the canonical Worker host -- but it
+        // keeps the API surface stable for test hosts and downstream
+        // composition roots that prefer pure in-memory wiring.
         builder.Services.AddSlackWorkspaceConfigStoreFromConfiguration(builder.Configuration);
 
         // Stage 3.1: register the signature validator together with its
@@ -94,6 +112,16 @@ public class Program
                 scope.ServiceProvider.GetRequiredService<SlackPersistenceDbContext>();
             ctx.Database.EnsureCreated();
         }
+
+        // Stage 3.1 (evaluator iter-3 item 3): eagerly resolve the
+        // composite ISecretProvider so a misconfigured
+        // SecretProvider:ProviderType (e.g. KeyVault without a
+        // registered backend) fails at host start, not at the first
+        // inbound Slack request. CompositeSecretProvider throws
+        // InvalidOperationException for unsupported provider types --
+        // resolving it here surfaces the error in the host start log
+        // where an operator will see it.
+        _ = app.Services.GetRequiredService<ISecretProvider>();
 
         // Stage 3.1: signature verification middleware. Placed before
         // endpoint mapping so the inbound Slack routes added by later

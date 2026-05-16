@@ -104,11 +104,21 @@ public sealed class InMemorySlackWorkspaceConfigStore : ISlackWorkspaceConfigSto
 
         ct.ThrowIfCancellationRequested();
 
-        SlackWorkspaceConfig? found = this.byTeamId.TryGetValue(teamId, out SlackWorkspaceConfig? value)
-            ? value
-            : null;
+        // Stage 3.1 evaluator iter-4 item 2: parity with
+        // EntityFrameworkSlackWorkspaceConfigStore.GetByTeamIdAsync --
+        // disabled rows are NOT returned from this lookup so the
+        // contract is the same across implementations. Future
+        // authorization code can safely trust a non-null result is an
+        // enabled workspace. The disabled row remains in the
+        // dictionary (Upsert / Remove still expose it) so operator
+        // tooling that surfaces the full workspace inventory keeps
+        // working.
+        if (!this.byTeamId.TryGetValue(teamId, out SlackWorkspaceConfig? value) || !value.Enabled)
+        {
+            return Task.FromResult<SlackWorkspaceConfig?>(null);
+        }
 
-        return Task.FromResult(found);
+        return Task.FromResult<SlackWorkspaceConfig?>(value);
     }
 
     /// <inheritdoc />

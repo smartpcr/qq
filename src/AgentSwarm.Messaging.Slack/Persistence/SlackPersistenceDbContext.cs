@@ -39,7 +39,7 @@ using Microsoft.EntityFrameworkCore;
 /// <see cref="SlackModelBuilderExtensions.AddSlackEntities"/> call.
 /// </para>
 /// </remarks>
-public class SlackPersistenceDbContext : DbContext, ISlackAuditEntryDbContext
+public class SlackPersistenceDbContext : DbContext, ISlackAuditEntryDbContext, ISlackWorkspaceConfigDbContext
 {
     /// <summary>
     /// Creates the context with the supplied options. The options must
@@ -63,6 +63,9 @@ public class SlackPersistenceDbContext : DbContext, ISlackAuditEntryDbContext
 
     /// <inheritdoc />
     public DbSet<SlackAuditEntry> SlackAuditEntries => this.Set<SlackAuditEntry>();
+
+    /// <inheritdoc />
+    public DbSet<SlackWorkspaceConfig> SlackWorkspaceConfigs => this.Set<SlackWorkspaceConfig>();
 
     /// <inheritdoc />
     protected override void OnModelCreating(ModelBuilder modelBuilder)

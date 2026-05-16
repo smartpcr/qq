@@ -78,6 +78,44 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
     }
 
     [Fact]
+    public void BuildApp_registers_entity_framework_workspace_config_store_not_in_memory_fallback()
+    {
+        // Stage 3.1 evaluator iter-3 item 1: the production composition
+        // root MUST register the durable EF-backed workspace store, not
+        // the in-memory seed-from-config store. A restarted Worker
+        // resolves SlackWorkspaceConfig.SigningSecretRef from the
+        // slack_workspace_config table; without this wiring every
+        // signed request would reject as UnknownWorkspace until an
+        // operator re-seeded the process.
+        WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());
+
+        ISlackWorkspaceConfigStore store = app.Services.GetRequiredService<ISlackWorkspaceConfigStore>();
+        store.Should()
+            .BeOfType<EntityFrameworkSlackWorkspaceConfigStore<SlackPersistenceDbContext>>(
+                "Stage 3.1 requires a durable workspace store so a restarted Worker can resolve "
+                + "SlackWorkspaceConfig.SigningSecretRef without first being re-seeded by the operator");
+    }
+
+    [Fact]
+    public void BuildApp_registers_workspace_config_seed_hosted_service()
+    {
+        // The seed hosted service is the bridge between
+        // appsettings.Slack:Workspaces and the durable EF table. It
+        // must be in the IHostedService set so the host runs it once at
+        // start. Resolving by IEnumerable<IHostedService> proves the
+        // AddHostedService call landed.
+        WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());
+
+        System.Collections.Generic.IEnumerable<Microsoft.Extensions.Hosting.IHostedService> hosted =
+            app.Services.GetServices<Microsoft.Extensions.Hosting.IHostedService>();
+
+        hosted.Should().Contain(
+            svc => svc is SlackWorkspaceConfigSeedHostedService<SlackPersistenceDbContext>,
+            "Stage 3.1 wires SlackWorkspaceConfigSeedHostedService so Slack:Workspaces is upserted into "
+            + "slack_workspace_config at host start");
+    }
+
+    [Fact]
     public void BuildApp_registers_signature_validator_and_sink_bridge()
     {
         WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());

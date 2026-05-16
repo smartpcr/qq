@@ -7,9 +7,9 @@
 namespace AgentSwarm.Messaging.Slack.Security;
 
 using System;
-using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Core.Identifiers;
 using AgentSwarm.Messaging.Slack.Entities;
 using AgentSwarm.Messaging.Slack.Persistence;
 using Microsoft.Extensions.Logging;
@@ -103,7 +103,7 @@ public sealed class SlackAuditEntrySignatureSink : ISlackSignatureAuditSink
     {
         ArgumentNullException.ThrowIfNull(record);
 
-        string id = NewAuditId();
+        string id = NewAuditId(record.ReceivedAt);
         return new SlackAuditEntry
         {
             Id = id,
@@ -172,11 +172,14 @@ public sealed class SlackAuditEntrySignatureSink : ISlackSignatureAuditSink
             $"reason={record.Reason}; detail={detail}; timestamp_header={record.TimestampHeader ?? "(none)"}");
     }
 
-    private static string NewAuditId()
+    private static string NewAuditId(DateTimeOffset receivedAt)
     {
-        // The SlackAuditEntry.Id column accepts any 32-character string;
-        // a GUID rendered as 32 hex digits is unique, monotonically
-        // generated, and trivially sortable for triage.
-        return Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture).ToUpperInvariant();
+        // architecture.md §3.5 (cross-referenced by SlackAuditEntry.Id's
+        // XML doc) requires the audit entry id to be a ULID-shaped string
+        // (26 chars, Crockford base32, lexicographically sortable). Using
+        // a ULID keyed on the request's received-at timestamp also gives
+        // triage queries a useful "newer ids sort after older ids" order
+        // that a Guid.NewGuid().ToString("N") value would not provide.
+        return Ulid.NewUlid(receivedAt);
     }
 }

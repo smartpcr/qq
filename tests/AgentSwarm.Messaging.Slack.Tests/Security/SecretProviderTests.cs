@@ -140,4 +140,73 @@ public sealed class SecretProviderTests
         resolved.Should().BeOfType<InMemorySecretProvider>(
             "the operator's registration must beat the AddSecretProvider default");
     }
+
+    [Theory]
+    [InlineData(SecretProviderType.KeyVault)]
+    [InlineData(SecretProviderType.Kubernetes)]
+    public void CompositeSecretProvider_throws_for_unsupported_provider_types(SecretProviderType providerType)
+    {
+        // Stage 3.1 evaluator iter-3 item 3: configuring an unsupported
+        // backend (KeyVault or Kubernetes) without first registering an
+        // ISecretProvider for it MUST fail loudly rather than silently
+        // falling back to Environment. Falling back would mask the
+        // operator's misconfiguration and route secret lookups to the
+        // wrong store.
+        EnvironmentSecretProvider environment = new(_ => "ignored");
+        InMemorySecretProvider inMemory = new();
+        Microsoft.Extensions.Options.IOptions<SecretProviderOptions> options =
+            Microsoft.Extensions.Options.Options.Create(new SecretProviderOptions { ProviderType = providerType });
+
+        System.Action act = () => new CompositeSecretProvider(options, environment, inMemory);
+
+        act.Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage($"*SecretProvider:ProviderType={providerType}*")
+            .WithMessage("*not supported*")
+            .WithMessage("*BEFORE calling AddSecretProvider*",
+                "the exception message must tell the operator how to register the missing backend");
+    }
+
+    [Fact]
+    public void CompositeSecretProvider_throws_for_unrecognized_enum_values()
+    {
+        // A cast from an unknown integer (e.g., a typo'd appsettings
+        // value bound through the enum binder's relaxed parser) must
+        // also fail loudly instead of silently routing to Environment.
+        SecretProviderType madeUp = (SecretProviderType)999;
+        EnvironmentSecretProvider environment = new(_ => "ignored");
+        InMemorySecretProvider inMemory = new();
+        Microsoft.Extensions.Options.IOptions<SecretProviderOptions> options =
+            Microsoft.Extensions.Options.Options.Create(new SecretProviderOptions { ProviderType = madeUp });
+
+        System.Action act = () => new CompositeSecretProvider(options, environment, inMemory);
+
+        act.Should().Throw<InvalidOperationException>();
+    }
+
+    [Theory]
+    [InlineData("KeyVault")]
+    [InlineData("Kubernetes")]
+    public void AddSecretProvider_with_unsupported_provider_type_fails_when_ISecretProvider_is_first_resolved(string providerTypeName)
+    {
+        // Resolving ISecretProvider through the DI container is the
+        // production failure point: the worker's Program.BuildApp
+        // eagerly resolves the composite, so the throw lands at host
+        // start instead of at the first inbound Slack request.
+        IConfiguration configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["SecretProvider:ProviderType"] = providerTypeName,
+            })
+            .Build();
+
+        ServiceCollection services = new();
+        services.AddSecretProvider(configuration);
+
+        using ServiceProvider sp = services.BuildServiceProvider(validateScopes: true);
+
+        System.Action act = () => sp.GetRequiredService<ISecretProvider>();
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage($"*ProviderType={providerTypeName}*");
+    }
 }

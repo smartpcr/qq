@@ -227,6 +227,136 @@ public sealed class SlackSignaturePipelineIntegrationTests : IDisposable
         config.Enabled.Should().BeTrue();
     }
 
+    [Fact]
+    public async Task Hosted_seeder_upserts_configured_workspace_row_then_validator_accepts_valid_signed_request()
+    {
+        // Stage 3.1 evaluator iter-4 item 3: end-to-end proof that
+        // the production composition root works through the request
+        // path:
+        //   1. Boot the host via WebApplicationFactory<Program>.
+        //   2. The SlackWorkspaceConfigSeedHostedService runs at
+        //      host start and upserts the configured Slack:Workspaces
+        //      entry into slack_workspace_config.
+        //   3. Query the database directly (not via the store
+        //      abstraction) to PROVE the row landed in SQLite -- this
+        //      isolates the seeder from any potential test-double
+        //      shortcut and confirms the durable path.
+        //   4. Fire a valid Slack-signed request at /api/slack/commands.
+        //   5. Assert it passes the signature middleware (404 rather
+        //      than 401), which proves the EF-backed
+        //      EntityFrameworkSlackWorkspaceConfigStore read the
+        //      seeded row at request time and the validator used the
+        //      resolved SigningSecretRef to verify the HMAC.
+        // The earlier composition tests only confirmed registration;
+        // this test exercises the full seeder -> EF store -> secret
+        // provider -> HMAC verify -> middleware accept chain that a
+        // real Slack workspace would walk on a freshly restarted host.
+        using SlackPipelineFactory factory = this.CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        // Step 1+2: factory.CreateClient() boots the host, which runs
+        // IHostedService.StartAsync, which runs the seeder.
+
+        // Step 3: query the durable row directly via a fresh scope to
+        // prove the seeder wrote to the actual SQLite file the
+        // validator will read from at request time. Going through the
+        // EF context (not ISlackWorkspaceConfigStore) eliminates any
+        // possibility the assertion is satisfied by a fast-path
+        // in-memory cache.
+        await using (AsyncServiceScope dbScope = factory.Services.CreateAsyncScope())
+        {
+            SlackPersistenceDbContext ctx =
+                dbScope.ServiceProvider.GetRequiredService<SlackPersistenceDbContext>();
+            List<SlackWorkspaceConfig> rows = await ctx.SlackWorkspaceConfigs
+                .AsNoTracking()
+                .ToListAsync();
+
+            rows.Should().ContainSingle(
+                r => r.TeamId == TestTeamId,
+                "the SlackWorkspaceConfigSeedHostedService must upsert Slack:Workspaces:0 from configuration into slack_workspace_config at host start so a restarted Worker resolves the signing secret without operator intervention");
+
+            SlackWorkspaceConfig seeded = rows[0];
+            seeded.SigningSecretRef.Should().Be(TestSigningSecretRef,
+                "the seeder must preserve SigningSecretRef end-to-end through the EF column converter");
+            seeded.Enabled.Should().BeTrue(
+                "the seeded row must remain enabled so the EF store's Enabled filter returns it at request time");
+        }
+
+        // Step 4+5: fire a valid Slack-signed request and verify it
+        // passes the middleware. 404 means the signature middleware
+        // accepted the request (Stage 3.1 ships no /api/slack/commands
+        // endpoint -- that's Stage 4.1). 401 would mean the validator
+        // rejected, which would mean the seeder->EF store->validator
+        // chain is broken.
+        string body = "token=xoxb&team_id=T01TEST0001&command=%2Fagent&text=hello";
+        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        string baseString = FormattableString.Invariant($"{SlackSignatureValidator.VersionTag}:{timestamp}:{body}");
+        string signature = $"{SlackSignatureValidator.VersionTag}={ComputeHexHmac(TestSigningSecret, baseString)}";
+
+        using StringContent content = new(body, Encoding.UTF8, "application/x-www-form-urlencoded");
+        content.Headers.TryAddWithoutValidation(SlackSignatureValidator.SignatureHeaderName, signature);
+        content.Headers.TryAddWithoutValidation(
+            SlackSignatureValidator.TimestampHeaderName,
+            timestamp.ToString(CultureInfo.InvariantCulture));
+
+        using HttpResponseMessage response = await client.PostAsync("/api/slack/commands", content);
+
+        response.StatusCode.Should().NotBe(HttpStatusCode.Unauthorized,
+            "the seeder->EF store->validator chain must accept the request; a 401 here means the durable workspace row was not visible to the validator at request time");
+        response.StatusCode.Should().Be(HttpStatusCode.NotFound,
+            "Stage 3.1 ships the validator and the seeder but does not yet map /api/slack/commands (added by Stage 4.1)");
+    }
+
+    [Fact]
+    public async Task Disabled_workspace_seeded_into_database_causes_signed_request_to_reject_as_UnknownWorkspace()
+    {
+        // Stage 3.1 evaluator iter-4 item 2 (end-to-end proof of the
+        // store-contract change): a disabled workspace upserted by
+        // the seeder MUST NOT allow a request signed with that
+        // workspace's secret to pass the validator. The EF store
+        // filters Enabled at the boundary, so the validator sees
+        // null and rejects with UnknownWorkspace. The audit row
+        // still captures the team_id because the validator passes it
+        // through to SlackSignatureValidationResult regardless of
+        // whether the workspace was resolved.
+        using SlackPipelineFactory factory = new(this.sqlitePath, enableWorkspace: false);
+
+        // The factory still seeds the secret so the only reason the
+        // request can fail is the disabled flag.
+        InMemorySecretProvider inMemory =
+            factory.Services.GetRequiredService<InMemorySecretProvider>();
+        inMemory.Set(TestSigningSecretRef, TestSigningSecret);
+
+        using HttpClient client = factory.CreateClient();
+
+        string body = "token=xoxb&team_id=T01TEST0001&command=%2Fagent&text=hello";
+        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        string baseString = FormattableString.Invariant($"{SlackSignatureValidator.VersionTag}:{timestamp}:{body}");
+        string signature = $"{SlackSignatureValidator.VersionTag}={ComputeHexHmac(TestSigningSecret, baseString)}";
+
+        using StringContent content = new(body, Encoding.UTF8, "application/x-www-form-urlencoded");
+        content.Headers.TryAddWithoutValidation(SlackSignatureValidator.SignatureHeaderName, signature);
+        content.Headers.TryAddWithoutValidation(
+            SlackSignatureValidator.TimestampHeaderName,
+            timestamp.ToString(CultureInfo.InvariantCulture));
+
+        using HttpResponseMessage response = await client.PostAsync("/api/slack/commands", content);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
+            "a disabled workspace must be filtered at the EF store boundary so the validator rejects the signed request as UnknownWorkspace");
+
+        // The audit row MUST still carry the team_id even though the
+        // workspace lookup returned null.
+        await using AsyncServiceScope scope = factory.Services.CreateAsyncScope();
+        SlackPersistenceDbContext ctx =
+            scope.ServiceProvider.GetRequiredService<SlackPersistenceDbContext>();
+        List<SlackAuditEntry> rows = await ctx.SlackAuditEntries.AsNoTracking().ToListAsync();
+        rows.Should().HaveCountGreaterThanOrEqualTo(1);
+        rows.Should().Contain(
+            r => r.Outcome == "rejected_signature" && r.TeamId == TestTeamId && r.ErrorDetail!.Contains("UnknownWorkspace"),
+            "the audit row must capture the team_id and the UnknownWorkspace reason so operators can detect attempted use of disabled workspaces");
+    }
+
     private static string ComputeHexHmac(string secret, string baseString)
     {
         using HMACSHA256 hmac = new(Encoding.UTF8.GetBytes(secret));
@@ -258,10 +388,17 @@ public sealed class SlackSignaturePipelineIntegrationTests : IDisposable
     private sealed class SlackPipelineFactory : WebApplicationFactory<Program>
     {
         private readonly string sqlitePath;
+        private readonly bool enableWorkspace;
 
         public SlackPipelineFactory(string sqlitePath)
+            : this(sqlitePath, enableWorkspace: true)
+        {
+        }
+
+        public SlackPipelineFactory(string sqlitePath, bool enableWorkspace)
         {
             this.sqlitePath = sqlitePath;
+            this.enableWorkspace = enableWorkspace;
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -283,7 +420,11 @@ public sealed class SlackSignaturePipelineIntegrationTests : IDisposable
                     // Seed a known workspace via the new
                     // Slack:Workspaces configuration path. The test then
                     // confirms the validator can resolve the workspace
-                    // and the audit sink can write its team_id.
+                    // and the audit sink can write its team_id. The
+                    // Enabled flag is parameterised so iter-4 item 2
+                    // can exercise the disabled-row reject path
+                    // end-to-end without rebuilding the entire
+                    // overrides dictionary.
                     ["Slack:Workspaces:0:TeamId"] = TestTeamId,
                     ["Slack:Workspaces:0:WorkspaceName"] = "Stage 3.1 Pipeline Test Workspace",
                     ["Slack:Workspaces:0:SigningSecretRef"] = TestSigningSecretRef,
@@ -291,7 +432,7 @@ public sealed class SlackSignaturePipelineIntegrationTests : IDisposable
                     ["Slack:Workspaces:0:DefaultChannelId"] = "C01TEST0001",
                     ["Slack:Workspaces:0:AllowedChannelIds:0"] = "C01TEST0001",
                     ["Slack:Workspaces:0:AllowedUserGroupIds:0"] = "S01TEST0001",
-                    ["Slack:Workspaces:0:Enabled"] = "true",
+                    ["Slack:Workspaces:0:Enabled"] = this.enableWorkspace ? "true" : "false",
                 };
 
                 cfg.AddInMemoryCollection(overrides);

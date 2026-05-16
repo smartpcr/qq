@@ -9,6 +9,7 @@ namespace AgentSwarm.Messaging.Slack.Tests.Security;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Core.Identifiers;
 using AgentSwarm.Messaging.Slack.Entities;
 using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Security;
@@ -49,8 +50,13 @@ public sealed class SlackAuditEntrySignatureSinkTests
             "/api/slack/events maps to request_type=event so triage queries can filter by audit shape");
         entry.Timestamp.Should().Be(record.ReceivedAt);
         entry.Id.Should().NotBeNullOrWhiteSpace();
-        entry.Id.Length.Should().BeLessOrEqualTo(32, "the slack_audit_entry.id column is capped at 32 chars (Stage 2.2)");
+        entry.Id.Length.Should().Be(Ulid.Length,
+            "architecture.md §3.5 (and SlackAuditEntry.Id's XML doc) require the id to be a ULID-shaped 26-char Crockford base32 string");
+        Ulid.IsValid(entry.Id).Should().BeTrue(
+            "the audit id must be a well-formed ULID so triage tools that parse the timestamp prefix do not break");
         entry.CorrelationId.Should().NotBeNullOrWhiteSpace();
+        Ulid.IsValid(entry.CorrelationId).Should().BeTrue(
+            "the correlation id reuses the audit id and therefore must satisfy the same ULID shape contract");
         entry.ErrorDetail.Should().Contain("SignatureMismatch");
         entry.ErrorDetail.Should().Contain("HMAC mismatch");
         entry.CommandText.Should().Contain("/api/slack/events");

@@ -112,7 +112,7 @@ public static class SlackConnectorServiceCollectionExtensions
 
         services
             .AddOptions<SlackWorkspaceSeedOptions>()
-            .Configure(opts => BindSeedEntries(configuration, opts));
+            .Configure(opts => SlackWorkspaceSeedBinder.BindEntries(configuration, opts));
 
         // Construct the in-memory store eagerly so the seed is observable
         // through ISlackWorkspaceConfigStore as soon as the container is
@@ -122,97 +122,10 @@ public static class SlackConnectorServiceCollectionExtensions
         {
             IOptions<SlackWorkspaceSeedOptions> opts =
                 sp.GetRequiredService<IOptions<SlackWorkspaceSeedOptions>>();
-            IEnumerable<SlackWorkspaceConfig> seed = MapToEntities(opts.Value);
+            IEnumerable<SlackWorkspaceConfig> seed = SlackWorkspaceSeedBinder.Materialize(opts.Value);
             return new InMemorySlackWorkspaceConfigStore(seed);
         });
 
         return services;
-    }
-
-    private static void BindSeedEntries(IConfiguration configuration, SlackWorkspaceSeedOptions opts)
-    {
-        // IConfiguration.GetSection().Bind() does not handle arrays
-        // wrapped under a property name as cleanly as a plain Bind call
-        // when the JSON shape is a top-level array under "Slack:Workspaces".
-        // We support BOTH shapes:
-        //   "Slack:Workspaces": [ ... ]                  // top-level array
-        //   "Slack:Workspaces": { "Entries": [ ... ] }   // wrapped form
-        // so operators are not surprised by either layout.
-        IConfigurationSection section = configuration.GetSection(SlackWorkspaceSeedOptions.SectionName);
-        if (!section.Exists())
-        {
-            return;
-        }
-
-        IConfigurationSection entriesSection = section.GetSection("Entries");
-        if (entriesSection.Exists())
-        {
-            List<SlackWorkspaceSeedEntry> wrapped = new();
-            entriesSection.Bind(wrapped);
-            opts.Entries = wrapped;
-            return;
-        }
-
-        List<SlackWorkspaceSeedEntry> flat = new();
-        section.Bind(flat);
-        opts.Entries = flat;
-    }
-
-    private static IEnumerable<SlackWorkspaceConfig> MapToEntities(SlackWorkspaceSeedOptions opts)
-    {
-        if (opts is null || opts.Entries is null || opts.Entries.Count == 0)
-        {
-            yield break;
-        }
-
-        DateTimeOffset seededAt = DateTimeOffset.UtcNow;
-        for (int index = 0; index < opts.Entries.Count; index++)
-        {
-            SlackWorkspaceSeedEntry? entry = opts.Entries[index];
-
-            // A null list slot is treated as appsettings noise (e.g., a
-            // trailing comma in a JSON array): silently skipped so it
-            // does not block startup. Any entry the binder actually
-            // materialized, however, MUST have a usable TeamId and
-            // SigningSecretRef -- security-critical config errors fail
-            // startup loudly instead of producing a half-populated store
-            // that later degrades real Slack traffic to UnknownWorkspace
-            // / SigningSecretUnresolved rejections (Stage 3.1 evaluator
-            // iter-2 item 3).
-            if (entry is null)
-            {
-                continue;
-            }
-
-            if (string.IsNullOrWhiteSpace(entry.TeamId))
-            {
-                throw new InvalidOperationException(
-                    FormattableString.Invariant(
-                        $"Invalid {SlackWorkspaceSeedOptions.SectionName} configuration: entry at index {index} has a blank TeamId. Every seeded Slack workspace must declare a non-empty team_id; remove the entry or set Slack:Workspaces:{index}:TeamId to the workspace's Slack team identifier."));
-            }
-
-            if (string.IsNullOrWhiteSpace(entry.SigningSecretRef))
-            {
-                throw new InvalidOperationException(
-                    FormattableString.Invariant(
-                        $"Invalid {SlackWorkspaceSeedOptions.SectionName} configuration: entry at index {index} (TeamId='{entry.TeamId}') has a blank SigningSecretRef. The signature validator cannot verify Slack requests for this workspace without a secret reference; set Slack:Workspaces:{index}:SigningSecretRef to a secret-provider URI (e.g. env://SLACK_SIGNING_{entry.TeamId})."));
-            }
-
-            yield return new SlackWorkspaceConfig
-            {
-                TeamId = entry.TeamId,
-                WorkspaceName = entry.WorkspaceName ?? string.Empty,
-                BotTokenSecretRef = entry.BotTokenSecretRef ?? string.Empty,
-                SigningSecretRef = entry.SigningSecretRef,
-                AppLevelTokenRef = entry.AppLevelTokenRef,
-                DefaultChannelId = entry.DefaultChannelId ?? string.Empty,
-                FallbackChannelId = entry.FallbackChannelId,
-                AllowedChannelIds = entry.AllowedChannelIds ?? Array.Empty<string>(),
-                AllowedUserGroupIds = entry.AllowedUserGroupIds ?? Array.Empty<string>(),
-                Enabled = entry.Enabled,
-                CreatedAt = seededAt,
-                UpdatedAt = seededAt,
-            };
-        }
     }
 }
