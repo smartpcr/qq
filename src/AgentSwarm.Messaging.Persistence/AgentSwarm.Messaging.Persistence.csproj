@@ -18,6 +18,13 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="8.*" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.*" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.*" />
+    <!--
+      Stage 4.2: DeadLetterQueueHealthCheck implements IHealthCheck so
+      the worker's existing AddHealthChecks() registration can report
+      the dead-letter backlog as an unhealthy signal once it exceeds
+      the configured threshold.
+    -->
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" Version="8.*" />
   </ItemGroup>
 
   <PropertyGroup>

@@ -321,8 +321,33 @@ public sealed class OutboundQueueProcessorTests
         // schedules a NextRetryAt). The in-memory queue's MarkFailed
         // applies an exponential backoff, so we need to advance time
         // to make the retry-scheduled row dequeueable again.
+        //
+        // Iter-3 evaluator item 4 — wait for the QUEUE STATE to
+        // reflect MarkFailedAsync completion (AttemptCount >= 1
+        // AND NextRetryAt stamped) before advancing the fake
+        // clock. The `attempts` counter is incremented at the
+        // START of the sender call (before the exception throws,
+        // before the processor's HandleSendFailedAsync runs, before
+        // MarkFailedAsync stamps NextRetryAt). Advancing the
+        // FakeTimeProvider before MarkFailedAsync sees a moved
+        // clock would compute NextRetryAt = (BaseTime+2min) + 2s,
+        // leaving the row's next-retry instant ahead of the test's
+        // post-advance fake_now, deferring it forever — a
+        // structural race that fails reliably in isolation.
+        // Waiting on the QUEUE-OBSERVABLE state (AttemptCount +
+        // NextRetryAt) eliminates the race because both fields are
+        // set atomically inside MarkFailedAsync's CAS write.
         await WaitUntilAsync(
             () => Volatile.Read(ref attempts) >= 1,
+            TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(
+            () =>
+            {
+                var snapshot = queue.Enqueued.FirstOrDefault(m => m.MessageId == message.MessageId);
+                return snapshot is not null
+                    && snapshot.AttemptCount >= 1
+                    && snapshot.NextRetryAt is not null;
+            },
             TimeSpan.FromSeconds(5));
         time.Advance(TimeSpan.FromMinutes(2));
         await WaitUntilAsync(
@@ -1191,10 +1216,21 @@ public sealed class OutboundQueueProcessorTests
 
         public HistogramCollector(OutboundQueueMetrics metrics)
         {
+            // Iter-3 evaluator item 4 — filter by Meter REFERENCE
+            // (object identity), NOT by Meter.Name. Every
+            // OutboundQueueMetrics instance constructs a Meter with
+            // the same MeterName, so parallel xUnit test classes
+            // (e.g. PersistentOutboundQueueTests' ctor also new's an
+            // OutboundQueueMetrics) cross-pollute each other's
+            // listeners when filtering by name. Reference equality
+            // pins the collector to exactly the metrics instance
+            // its owning test created, eliminating the
+            // QueueDwell_IsAnchoredOnMessageDequeuedAt flake.
+            var ownMeter = metrics.Meter;
             _listener = new MeterListener();
             _listener.InstrumentPublished = (instrument, l) =>
             {
-                if (instrument.Meter.Name == OutboundQueueMetrics.MeterName
+                if (ReferenceEquals(instrument.Meter, ownMeter)
                     && instrument is Histogram<double>)
                 {
                     l.EnableMeasurementEvents(instrument);

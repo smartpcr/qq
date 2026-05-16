@@ -3,6 +3,7 @@ using System;
 using AgentSwarm.Messaging.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,9 +11,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace AgentSwarm.Messaging.Persistence.Migrations
 {
     [DbContext(typeof(MessagingDbContext))]
-    partial class MessagingDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260601000008_AddOutboxAttemptHistory")]
+    partial class AddOutboxAttemptHistory
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "8.0.27");
@@ -562,29 +565,6 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                         .HasDatabaseName("ix_pending_questions_chat_user_status");
 
                     b.ToTable("pending_questions", (string)null);
-                });
-
-            modelBuilder.Entity("AgentSwarm.Messaging.Persistence.ProcessedEvent", b =>
-                {
-                    b.Property<string>("EventId")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT")
-                        .HasColumnName("event_id");
-
-                    b.Property<DateTime?>("ProcessedAt")
-                        .HasColumnType("DATETIME")
-                        .HasColumnName("processed_at");
-
-                    b.Property<DateTime>("ReservedAt")
-                        .HasColumnType("DATETIME")
-                        .HasColumnName("reserved_at");
-
-                    b.HasKey("EventId");
-
-                    b.HasIndex("ProcessedAt", "ReservedAt")
-                        .HasDatabaseName("ix_processed_events_processed_reserved");
-
-                    b.ToTable("processed_events", (string)null);
                 });
 #pragma warning restore 612, 618
         }

@@ -230,6 +230,15 @@ public static class TelegramServiceCollectionExtensions
         // InMemoryOutboundDeadLetterStore replacement pattern.
         services.TryAddSingleton<IOutboundQueue, InMemoryOutboundQueue>();
 
+        // Stage 4.2 — dev fallback for the outbox-row companion
+        // dead-letter queue. Same TryAdd-fallback + production-replace
+        // pattern as IOutboundQueue / IOutboundDeadLetterStore /
+        // IOutboundMessageIdIndex: the persistence module's
+        // PersistentDeadLetterQueue replaces this registration via
+        // AddMessagingPersistence's Replace() call so production hosts
+        // get the EF-backed durability contract.
+        services.TryAddSingleton<IDeadLetterQueue, InMemoryDeadLetterQueue>();
+
         services.AddSingleton<ITelegramUpdatePipeline, TelegramUpdatePipeline>();
 
         // Stage 2.5: long-polling receiver (development mode).
