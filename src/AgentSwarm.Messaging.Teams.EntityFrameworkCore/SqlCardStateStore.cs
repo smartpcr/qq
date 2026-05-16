@@ -9,7 +9,7 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// message identity (<c>ActivityId</c>, <c>ConversationId</c>,
 /// <c>ConversationReferenceJson</c>) for each Adaptive Card sent in response to an
 /// <see cref="AgentSwarm.Messaging.Abstractions.AgentQuestion"/> per
-/// <c>implementation-plan.md</c> §3.3 step 1.
+/// <c>implementation-plan.md</c> ┬º3.3 step 1.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -17,18 +17,23 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// <see cref="ICardStateStore"/> (<see cref="SaveAsync"/>, <see cref="GetByQuestionIdAsync"/>,
 /// <see cref="UpdateStatusAsync"/>). Any orphan-card cleanup is the responsibility of
 /// <see cref="AgentSwarm.Messaging.Teams.ITeamsCardManager"/> on
-/// <see cref="AgentSwarm.Messaging.Teams.TeamsMessengerConnector"/> — the store
+/// <see cref="AgentSwarm.Messaging.Teams.TeamsMessengerConnector"/> ΓÇö the store
 /// surface is intentionally narrow to preserve the architecture contract.
 /// </para>
 /// <para>
-/// <b>Save semantics</b>: <see cref="SaveAsync"/> performs an atomic upsert — any row
-/// already present for the question is deleted and a fresh one is inserted, all inside a
-/// <see cref="IsolationLevel.Serializable"/> transaction. The overwrite is intentional
-/// (a proactive resend must replace the stale <c>ActivityId</c>/<c>ConversationReferenceJson</c>
-/// captured by the previous send), and the SERIALIZABLE isolation level is what makes the
-/// delete-then-insert pair safe against concurrent <see cref="SaveAsync"/> callers for the
-/// same <c>QuestionId</c>: the database serialises the writers so the second caller cannot
-/// race past the first and produce a duplicate primary-key violation.
+/// <b>Save semantics</b>: <see cref="SaveAsync"/> performs an atomic upsert by issuing a
+/// raw <c>DELETE</c> followed by an <c>INSERT</c> inside a single <see
+/// cref="IsolationLevel.Serializable"/> transaction. The delete + insert pair is therefore
+/// serialised against concurrent <see cref="SaveAsync"/> callers writing the same
+/// <c>QuestionId</c>, which eliminates the read-modify-write race that the previous
+/// tracked-entity approach exhibited (two threads both observing the row absent, both
+/// attempting to insert, the loser raising a <see cref="DbUpdateException"/> on the
+/// duplicate primary key). A proactive resend still overwrites the stale
+/// <c>ActivityId</c>/<c>ConversationReferenceJson</c> captured by the previous send so
+/// the original upsert semantic is preserved. The work is dispatched through the EF
+/// Core execution strategy so a retrying provider configuration (for example SQL Server
+/// <c>EnableRetryOnFailure</c>) re-runs the entire transaction on transient failures
+/// instead of half-committing.
 /// </para>
 /// </remarks>
 public sealed class SqlCardStateStore : ICardStateStore
@@ -77,48 +82,63 @@ public sealed class SqlCardStateStore : ICardStateStore
                 nameof(state));
         }
 
-        var now = _timeProvider.GetUtcNow();
-        var entity = new CardStateEntity
-        {
-            QuestionId = state.QuestionId,
-            ActivityId = state.ActivityId,
-            ConversationId = state.ConversationId,
-            ConversationReferenceJson = state.ConversationReferenceJson,
-            Status = string.IsNullOrWhiteSpace(state.Status) ? TeamsCardStatuses.Pending : state.Status,
-            // Preserve caller-supplied CreatedAt/UpdatedAt when meaningful, otherwise stamp now.
-            CreatedAt = state.CreatedAt == default ? now : state.CreatedAt,
-            UpdatedAt = state.UpdatedAt == default ? now : state.UpdatedAt,
-        };
-
         await using var ctx = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
 
-        // Atomic upsert. The previous implementation read the row, called Remove on the
-        // tracked entity, then Add on a fresh one, and committed the pair with a single
-        // SaveChangesAsync. That sequence was a race: two callers writing the same
-        // QuestionId could both observe the row, both schedule a Remove, both schedule an
-        // Add, and one of the SaveChangesAsync calls would surface a DbUpdateException on
-        // the duplicate PK insert.
-        //
-        // The fix is to perform the delete directly at the database (ExecuteDeleteAsync)
-        // and bracket it with the insert inside a SERIALIZABLE transaction. Under
-        // SERIALIZABLE isolation the DELETE acquires a key/range lock for the QuestionId;
-        // a concurrent SaveAsync for the same QuestionId blocks until this transaction
-        // commits, then its DELETE sees and removes the freshly-written row before its
-        // own INSERT proceeds. The net result is a "last writer wins" upsert with no
-        // duplicate-PK race and no application-level retry loop.
-        await using var tx = await ctx.Database
-            .BeginTransactionAsync(IsolationLevel.Serializable, ct)
+        // Wrap the delete + insert in a SERIALIZABLE transaction so concurrent SaveAsync
+        // calls for the same QuestionId are serialised at the database level. Without the
+        // transaction two callers can both observe the row absent and both attempt to
+        // insert, with the loser raising a DbUpdateException on the duplicate primary
+        // key. The work is dispatched through the provider execution strategy so a
+        // retrying configuration (SQL Server EnableRetryOnFailure) re-runs the entire
+        // transaction on transient failures rather than half-committing. SQLite (used by
+        // the in-memory test fixture) honours IsolationLevel.Serializable via its native
+        // single-writer lock, so the same code path is exercised in tests.
+        var strategy = ctx.Database.CreateExecutionStrategy();
+        await strategy.ExecuteAsync(
+            async innerCt =>
+            {
+                await using var tx = await ctx.Database
+                    .BeginTransactionAsync(IsolationLevel.Serializable, innerCt)
+                    .ConfigureAwait(false);
+
+                await ctx.CardStates
+                    .Where(e => e.QuestionId == state.QuestionId)
+                    .ExecuteDeleteAsync(innerCt)
+                    .ConfigureAwait(false);
+
+                // Detach any tracked entry that survived a prior strategy attempt so the
+                // Add below stamps a clean tracker entry. ExecuteDeleteAsync issues a raw
+                // DELETE and does not touch the change tracker, so under a happy first
+                // attempt this loop is a no-op; it only matters when the execution
+                // strategy retries this lambda after a transient failure on a previous
+                // pass left a tracked Added entity behind.
+                foreach (var tracked in ctx.ChangeTracker
+                    .Entries<CardStateEntity>()
+                    .Where(e => e.Entity.QuestionId == state.QuestionId)
+                    .ToList())
+                {
+                    tracked.State = EntityState.Detached;
+                }
+
+                var now = _timeProvider.GetUtcNow();
+                var entity = new CardStateEntity
+                {
+                    QuestionId = state.QuestionId,
+                    ActivityId = state.ActivityId,
+                    ConversationId = state.ConversationId,
+                    ConversationReferenceJson = state.ConversationReferenceJson,
+                    Status = string.IsNullOrWhiteSpace(state.Status) ? TeamsCardStatuses.Pending : state.Status,
+                    // Preserve caller-supplied CreatedAt/UpdatedAt when meaningful, otherwise stamp now.
+                    CreatedAt = state.CreatedAt == default ? now : state.CreatedAt,
+                    UpdatedAt = state.UpdatedAt == default ? now : state.UpdatedAt,
+                };
+
+                ctx.CardStates.Add(entity);
+                await ctx.SaveChangesAsync(innerCt).ConfigureAwait(false);
+                await tx.CommitAsync(innerCt).ConfigureAwait(false);
+            },
+            ct)
             .ConfigureAwait(false);
-
-        await ctx.CardStates
-            .Where(e => e.QuestionId == state.QuestionId)
-            .ExecuteDeleteAsync(ct)
-            .ConfigureAwait(false);
-
-        ctx.CardStates.Add(entity);
-        await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
-
-        await tx.CommitAsync(ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
