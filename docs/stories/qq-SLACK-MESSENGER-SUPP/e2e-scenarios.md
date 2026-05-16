@@ -372,31 +372,48 @@ Feature: App mention invocation
       And the event is published to the orchestrator
 ```
 
-### Scenario 7.4: App mention delegates review (modal fast-path)
+### Scenario 7.4: App mention delegates reject
 
 ```gherkin
-  Scenario: User opens a review modal via app mention
-    Given a valid, authorized app_mention event with a trigger_id
+  Scenario: User rejects a question via app mention
+    Given a valid, authorized app_mention event
+      And the orchestrator has a pending AgentQuestion with QuestionId "Q-700"
+    When user posts "@AgentBot reject Q-700"
+    Then SlackAppMentionHandler strips the bot user-ID prefix and parses sub-command "reject"
+      And the command is routed to the same SlackCommandHandler logic used by slash commands
+      And a HumanDecisionEvent is produced with ActionValue "reject"
+      And the event is published to the orchestrator
+```
+
+### Scenario 7.5: App mention for modal commands falls back to text reply
+
+Events API `app_mention` payloads do not include a Slack `trigger_id`.
+The `review` and `escalate` sub-commands require `views.open`, which
+needs a valid `trigger_id`. Therefore, when these sub-commands are
+invoked via app mention, the handler cannot open a modal and must
+fall back to a text-based reply instructing the user to use the
+slash command instead.
+
+```gherkin
+  Scenario: Review via app mention falls back because no trigger_id is available
+    Given a valid, authorized app_mention event (no trigger_id in payload)
       And task "TASK-42" exists
     When user posts "@AgentBot review TASK-42"
     Then SlackAppMentionHandler parses sub-command "review" with argument "TASK-42"
-      And the modal fast-path is invoked: SlackDirectApiClient calls views.open
-      And SlackAuditLogger records request_type "modal_open"
-```
+      And the handler detects that no trigger_id is available for views.open
+      And a threaded reply is posted: "The review command requires a modal. Please use the slash command: /agent review TASK-42"
+      And no modal is opened
+      And SlackAuditLogger records the exchange with request_type "app_mention" and outcome "success"
 
-### Scenario 7.5: App mention delegates reject and escalate
-
-```gherkin
-  Scenario: Reject and escalate sub-commands work via app mention
-    Given a valid, authorized app_mention event
-    When user posts "@AgentBot reject Q-700"
-    Then SlackAppMentionHandler parses sub-command "reject" with argument "Q-700"
-      And the command follows the same path as "/agent reject Q-700"
-
-    Given a valid, authorized app_mention event with a trigger_id
+  Scenario: Escalate via app mention falls back because no trigger_id is available
+    Given a valid, authorized app_mention event (no trigger_id in payload)
+      And task "TASK-80" exists
     When user posts "@AgentBot escalate TASK-80"
     Then SlackAppMentionHandler parses sub-command "escalate" with argument "TASK-80"
-      And the modal fast-path is invoked for the escalation modal
+      And the handler detects that no trigger_id is available for views.open
+      And a threaded reply is posted: "The escalate command requires a modal. Please use the slash command: /agent escalate TASK-80"
+      And no modal is opened
+      And SlackAuditLogger records the exchange with request_type "app_mention" and outcome "success"
 ```
 
 ### Scenario 7.6: App mention with unrecognized sub-command
@@ -1144,13 +1161,13 @@ Feature: Error handling edge cases
     When user "U-ALICE" clicks "Approve" (trigger_id "trig-A", action_id "approve-Q-500")
       And user "U-BOB" clicks "Reject" (trigger_id "trig-B", action_id "reject-Q-500")
     Then both interactions have distinct idempotency keys and both pass SlackIdempotencyGuard
-      And two separate HumanDecisionEvent values are published to the orchestrator:
+      And the Slack connector publishes two separate HumanDecisionEvent values to the orchestrator:
         | ExternalUserId | ActionValue |
         | U-ALICE        | approve     |
         | U-BOB          | reject      |
-      And the orchestrator applies first-write-wins: the first event to arrive is accepted, the second is discarded by the orchestrator's own conflict resolution
       And both interactions are recorded in the Slack audit trail with outcome "success"
-      And the question message is updated to reflect the winning decision
+      And the Slack connector does NOT evaluate, enforce, or override decisions (tech-spec.md section 4, non-goal 2)
+      And conflict resolution between competing decisions is the orchestrator's responsibility (out of scope for this story)
 ```
 
 ---
