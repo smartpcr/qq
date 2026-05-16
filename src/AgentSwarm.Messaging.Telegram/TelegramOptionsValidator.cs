@@ -43,6 +43,15 @@ namespace AgentSwarm.Messaging.Telegram;
 ///   header is the only authentication on the public webhook endpoint;
 ///   running webhook mode without a secret would let any caller who
 ///   knows the URL POST forged updates.</description></item>
+///   <item><description><b>PollingTimeoutSeconds in [1, 50] when polling</b>
+///   — Telegram <c>getUpdates</c> caps the server-side long-poll
+///   timeout at 50 seconds; values &lt;= 0 degrade to short-poll and
+///   burn the API quota with tight requests, values &gt; 50 are
+///   rejected by Telegram. Only enforced when
+///   <see cref="TelegramOptions.UsePolling"/> is <c>true</c> because
+///   the field is ignored otherwise (matches the field's xmldoc and
+///   the <c>ResolvePollingTimeout</c> contract in
+///   <see cref="Polling.TelegramPollingService"/>).</description></item>
 ///   <item><description><b>OperatorBindings TenantId/WorkspaceId</b>
 ///   non-blank — see
 ///   <see cref="TelegramOperatorBindingOptions"/>: a binding with a
@@ -124,6 +133,25 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                 + "The secret is the only authentication on the public webhook endpoint; "
                 + "running webhook mode without one accepts unauthenticated POSTs from any "
                 + "caller that knows the URL.");
+        }
+
+        // Polling-mode contract: Telegram's getUpdates caps the
+        // server-side long-poll timeout at 50 seconds, and a value
+        // <= 0 degrades to short-poll (a tight request loop that
+        // burns API quota). The field is ignored when polling is
+        // disabled, so only enforce the range when UsePolling is
+        // true. Matches the xmldoc on
+        // TelegramOptions.PollingTimeoutSeconds and the contract
+        // referenced by TelegramPollingService.ResolvePollingTimeout.
+        if (options.UsePolling
+            && (options.PollingTimeoutSeconds < 1 || options.PollingTimeoutSeconds > 50))
+        {
+            failures.Add(
+                "Telegram:PollingTimeoutSeconds must be in the range [1, 50] when "
+                + "Telegram:UsePolling is true. Telegram's getUpdates caps the "
+                + "server-side long-poll timeout at 50 seconds; values <= 0 degrade "
+                + "to short-poll and burn the API quota with tight requests. "
+                + $"Configured value: {options.PollingTimeoutSeconds}.");
         }
 
         if (options.OperatorBindings is { Count: > 0 })
