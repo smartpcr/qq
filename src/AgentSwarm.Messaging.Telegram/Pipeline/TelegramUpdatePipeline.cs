@@ -359,12 +359,36 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             }
 
             // Stage: authorize. commandName drives Tier 1 (start) vs Tier 2 (binding) lookup.
+            //
+            // Stage 3.4 — when the parsed command is /start, invoke the
+            // OnboardAsync entry point so the raw chat-type token from
+            // MessengerEvent.ChatType (populated by TelegramUpdateMapper
+            // from Update.Message.Chat.Type) flows into the new
+            // OperatorBinding. The default-interface-method body in
+            // IUserAuthorizationService forwards to AuthorizeAsync for
+            // back-compat with implementations that have not been
+            // updated to override OnboardAsync (the registered
+            // TelegramUserAuthorizationService overrides it and uses
+            // the chat type to populate OperatorBinding.ChatType).
             LogStage(messengerEvent, "authorize");
-            var authz = await _authz.AuthorizeAsync(
-                messengerEvent.UserId,
-                messengerEvent.ChatId,
-                parsed?.CommandName,
-                ct).ConfigureAwait(false);
+            AuthorizationResult authz;
+            var isStartCommand = parsed is { CommandName: TelegramCommands.Start };
+            if (isStartCommand)
+            {
+                authz = await _authz.OnboardAsync(
+                    messengerEvent.UserId,
+                    messengerEvent.ChatId,
+                    messengerEvent.ChatType,
+                    ct).ConfigureAwait(false);
+            }
+            else
+            {
+                authz = await _authz.AuthorizeAsync(
+                    messengerEvent.UserId,
+                    messengerEvent.ChatId,
+                    parsed?.CommandName,
+                    ct).ConfigureAwait(false);
+            }
 
             // Defense-in-depth: BOTH the IsAuthorized boolean AND a non-empty
             // Bindings list are required. A well-behaved IUserAuthorizationService
@@ -392,32 +416,76 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
 
             // Stage: resolve operator.
             //
-            // Multi-workspace prompt is scoped (iter-2 evaluator items 1 & 2)
-            // to EXACTLY `/agents` with no arguments. Stage 3.2 only requires
-            // the `/agents` no-argument disambiguation behavior per the brief:
+            // Iter-2 evaluator item 2 (Stage 3.4) — the disambiguation
+            // gate now applies to EVERY multi-binding command except:
             //
-            //   * `/agents` (no args) with multiple bindings  → prompt
-            //   * `/agents WORKSPACE` (explicit arg)          → fall through;
-            //                                                    AgentsCommandHandler
-            //                                                    validates the
-            //                                                    explicit workspace
-            //                                                    against the
-            //                                                    operator's bindings
-            //   * `/ask`, `/status`, `/pause`, `/handoff`, …  → fall through;
-            //     (any non-`/agents` command)                   pick the first
-            //                                                    binding and route
+            //   * `/agents WORKSPACE` (explicit workspace arg)  → fall
+            //                                                      through;
+            //                                                      AgentsCommandHandler
+            //                                                      validates
+            //                                                      the
+            //                                                      explicit
+            //                                                      workspace
+            //                                                      against
+            //                                                      the
+            //                                                      operator's
+            //                                                      bindings.
+            //   * `/start` onboarding                            → fall
+            //                                                      through;
+            //                                                      /start
+            //                                                      just
+            //                                                      created
+            //                                                      the
+            //                                                      bindings —
+            //                                                      surfacing
+            //                                                      a
+            //                                                      "pick
+            //                                                      one"
+            //                                                      prompt
+            //                                                      here
+            //                                                      would
+            //                                                      confuse
+            //                                                      the
+            //                                                      operator
+            //                                                      who
+            //                                                      only
+            //                                                      wanted
+            //                                                      a
+            //                                                      welcome
+            //                                                      message.
+            //   * Non-Command event types (TextReply,            → fall
+            //     CallbackResponse, etc.)                          through;
+            //                                                      those
+            //                                                      paths
+            //                                                      route
+            //                                                      via
+            //                                                      pending-question
+            //                                                      / pending-disambiguation
+            //                                                      lookup,
+            //                                                      not
+            //                                                      via
+            //                                                      workspace
+            //                                                      selection.
             //
-            // The previous command-agnostic gate broke both `/agents WORKSPACE`
-            // (intercepted before AgentsCommandHandler ever ran) and routed
-            // other commands like `/handoff` into the disambiguation prompt
-            // instead of their handlers — Stage 3.2 explicitly does not
-            // require that behavior.
+            // Every other command (/status, /ask, /handoff, /pause,
+            // /resume, /approve, /reject, and /agents-with-no-args)
+            // now prompts for workspace selection when the operator
+            // has more than one active binding. The previous gate
+            // restricted the prompt to /agents only, which let other
+            // commands silently route to authz.Bindings[0] — the
+            // wrong workspace for the multi-workspace operator
+            // (evaluator item 2 + architecture.md §4.3 + brief test
+            // scenario "Multi-workspace bindings returned … so the
+            // pipeline can prompt for workspace disambiguation via
+            // inline keyboard").
             LogStage(messengerEvent, "resolve-operator");
-            var isAgentsNoArgPrompt = parsed is { CommandName: TelegramCommands.Agents }
-                && parsed.Arguments.Count == 0;
-            if (authz.Bindings.Count > 1
+            var hasExplicitWorkspaceArg = parsed is { CommandName: TelegramCommands.Agents }
+                && parsed.Arguments.Count > 0;
+            var needsDisambiguation = authz.Bindings.Count > 1
                 && messengerEvent.EventType == EventType.Command
-                && isAgentsNoArgPrompt)
+                && !isStartCommand
+                && !hasExplicitWorkspaceArg;
+            if (needsDisambiguation)
             {
                 var workspaceIds = authz.Bindings.Select(b => b.WorkspaceId).ToArray();
 
@@ -444,10 +512,11 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
 
                 var buttons = PipelineResponses.MultiWorkspaceButtons(token, workspaceIds);
                 _logger.LogInformation(
-                    "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} WorkspaceCount={Count} DisambiguationToken={Token}",
+                    "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} Command={Command} WorkspaceCount={Count} DisambiguationToken={Token}",
                     messengerEvent.CorrelationId,
                     messengerEvent.EventId,
                     "resolve-prompt",
+                    parsed?.CommandName ?? "(non-command)",
                     workspaceIds.Length,
                     token);
                 return new PipelineResult

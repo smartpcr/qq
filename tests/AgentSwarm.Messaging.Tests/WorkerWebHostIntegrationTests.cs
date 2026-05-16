@@ -153,31 +153,38 @@ public sealed class WorkerWebHostIntegrationTests
     }
 
     [Fact]
-    public void HostBootstrap_RegistersConfiguredOperatorAuthorizationService()
+    public void HostBootstrap_RegistersTelegramUserAuthorizationService()
     {
-        // iter-4 evaluator item 4 + iter-5 evaluator item 1: without
-        // an IUserAuthorizationService registration in the Worker host,
-        // dispatcher activation throws. AddTelegram() deliberately
-        // doesn't register one; the Worker composes
-        // ConfiguredOperatorAuthorizationService via TryAddSingleton
-        // (see Worker/Program.cs ~line 71) to keep the loud-failure
-        // semantic at the library level while still letting the host
-        // run with an authorization implementation that validates BOTH
-        // user id AND chat id against TelegramOptions.OperatorBindings.
+        // iter-4 evaluator item 4 + iter-5 evaluator item 1 + Stage 3.4:
+        // without an IUserAuthorizationService registration in the
+        // Worker host, dispatcher activation throws. AddTelegram()
+        // deliberately doesn't register one; the Worker composes
+        // TelegramUserAuthorizationService via TryAddSingleton
+        // (see Worker/Program.cs) to keep the loud-failure semantic
+        // at the library level while still letting the host run with
+        // an authorization implementation that validates both user
+        // id and chat id against the persistent IOperatorRegistry
+        // (and Telegram:UserTenantMappings for /start onboarding).
+        // TelegramUserAuthorizationService supersedes the iter-5
+        // ConfiguredOperatorAuthorizationService because Stage 3.4
+        // moves the source of truth for runtime bindings from
+        // configuration to the operator_bindings persistence table.
         // Singleton lifetime is deliberate: the service is stateless
-        // (only reads IOptionsMonitor<TelegramOptions>) and the
-        // TelegramUpdatePipeline that consumes it is itself a singleton,
-        // so a scoped registration would be a captive-dependency
-        // conflict. The resolution below intentionally pulls it out of
-        // a child scope to prove the singleton is reachable from
-        // per-update scopes the dispatcher creates at runtime.
+        // (only reads IOptionsMonitor<TelegramOptions> + delegates to
+        // the registry) and the TelegramUpdatePipeline that consumes
+        // it is itself a singleton, so a scoped registration would
+        // be a captive-dependency conflict. The resolution below
+        // intentionally pulls it out of a child scope to prove the
+        // singleton is reachable from per-update scopes the
+        // dispatcher creates at runtime.
         using var scope = _factory.Services.CreateScope();
         var auth = scope.ServiceProvider
             .GetService<AgentSwarm.Messaging.Core.IUserAuthorizationService>();
 
         auth.Should().NotBeNull(
             "Worker Program.cs must register a default IUserAuthorizationService so the dispatcher's per-row scope can resolve TelegramUpdatePipeline");
-        auth!.Should().BeOfType<AgentSwarm.Messaging.Telegram.Auth.ConfiguredOperatorAuthorizationService>();
+        auth!.Should().BeOfType<AgentSwarm.Messaging.Telegram.Auth.TelegramUserAuthorizationService>(
+            "Stage 3.4 replaces ConfiguredOperatorAuthorizationService with TelegramUserAuthorizationService — the registry-backed authz that reads OperatorBinding rows from persistence and onboards via Telegram:UserTenantMappings");
     }
 
     /// <summary>

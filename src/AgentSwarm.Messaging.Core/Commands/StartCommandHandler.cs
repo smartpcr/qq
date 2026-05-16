@@ -11,23 +11,39 @@ using Microsoft.Extensions.Logging;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Registration flow (iter-2 evaluator item 4).</b> In normal
-/// production flow the binding is materialized by the pipeline's
-/// authorization stage (<c>IUserAuthorizationService.AuthorizeAsync</c>'s
-/// Tier-1 allowlist behaviour described in <c>architecture.md</c>
-/// §"Allowlist-based /start registration") BEFORE this handler runs —
-/// the handler would not have received an <see cref="AuthorizedOperator"/>
-/// otherwise. This handler still takes a hard
-/// <see cref="IOperatorRegistry"/> dependency and explicitly invokes
-/// the registry: it calls
+/// <b>Registration flow (Stage 3.4 iter-5 evaluator item 3).</b> In
+/// normal production flow the binding is materialised by the
+/// pipeline's authorization stage
+/// (<c>IUserAuthorizationService.OnboardAsync</c>'s Tier-1 allowlist
+/// + <c>UserTenantMappings</c> batch upsert flow described in
+/// <c>architecture.md</c> §"Allowlist-based /start registration")
+/// BEFORE this handler runs — the handler would not have received an
+/// <see cref="AuthorizedOperator"/> otherwise. This handler still
+/// takes a hard <see cref="IOperatorRegistry"/> dependency and
+/// explicitly invokes the registry: it calls
 /// <see cref="IOperatorRegistry.IsAuthorizedAsync"/> to confirm the
 /// binding exists post-authorize and only falls back to
-/// <see cref="IOperatorRegistry.RegisterAsync"/> when (defensively)
-/// the binding is missing — a state that should be unreachable in
-/// production but worth surfacing as an explicit registration call
-/// so the brief's "<c>StartCommandHandler</c> — registers user"
-/// requirement is delivered as code in this file rather than left
-/// implicit at the authz boundary.
+/// <see cref="IOperatorRegistry.RegisterManyAsync"/> when
+/// (defensively) the binding is missing — a state that should be
+/// unreachable in production but worth surfacing as an explicit
+/// registration call so the brief's "<c>StartCommandHandler</c> —
+/// registers user" requirement is delivered as code in this file
+/// rather than left implicit at the authz boundary.
+/// </para>
+/// <para>
+/// The defensive fallback uses
+/// <see cref="IOperatorRegistry.RegisterManyAsync"/> with a
+/// single-entry list instead of the per-row
+/// <c>RegisterAsync</c> shape. Iter-5 evaluator item 3 flagged the
+/// per-row call as inconsistent with the iter-3 transactional batch
+/// contract (every onboarding path should go through
+/// <c>RegisterManyAsync</c> so the persistent implementation gets
+/// the same atomic-upsert + rollback semantics on a uniformly
+/// shaped batch). Submitting a one-entry list still triggers the
+/// transactional path in <see cref="PersistentOperatorRegistry"/>
+/// and lets the auth-service / command-handler distinction
+/// disappear at the registry boundary — every binding insert is a
+/// batch insert.
 /// </para>
 /// </remarks>
 public sealed class StartCommandHandler : ICommandHandler
@@ -62,11 +78,11 @@ public sealed class StartCommandHandler : ICommandHandler
         // Defensive idempotent "ensure registered" — the authz Tier-1
         // allowlist flow already created the binding by the time we got
         // here (the pipeline would not have invoked us otherwise), so in
-        // production IsAuthorizedAsync returns true and RegisterAsync is
-        // NOT called. The explicit RegisterAsync call is kept on the
-        // unreachable branch so the brief's "registers user" requirement
-        // shows up as code in this handler, not just as a side-effect of
-        // the prior pipeline stage.
+        // production IsAuthorizedAsync returns true and the batch
+        // upsert is NOT called. The explicit RegisterManyAsync call is
+        // kept on the unreachable branch so the brief's "registers
+        // user" requirement shows up as code in this handler, not just
+        // as a side-effect of the prior pipeline stage.
         var alreadyRegistered = await _registry
             .IsAuthorizedAsync(@operator.TelegramUserId, @operator.TelegramChatId, ct)
             .ConfigureAwait(false);
@@ -91,7 +107,14 @@ public sealed class StartCommandHandler : ICommandHandler
                     ? "@user-" + @operator.TelegramUserId.ToString(System.Globalization.CultureInfo.InvariantCulture)
                     : @operator.OperatorAlias,
             };
-            await _registry.RegisterAsync(registration, ct).ConfigureAwait(false);
+
+            // Iter-5 evaluator item 3 — use RegisterManyAsync (with a
+            // single-entry list) so this defensive fallback goes
+            // through the same transactional batch path that the
+            // Stage 3.4 onboarding flow uses. Keeps the registry
+            // contract uniform: every persisted insert is wrapped in
+            // a transaction, whether it carries one row or many.
+            await _registry.RegisterManyAsync(new[] { registration }, ct).ConfigureAwait(false);
         }
         else
         {

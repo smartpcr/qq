@@ -108,6 +108,7 @@ public static class TelegramUpdateMapper
                     RawCommand = text,
                     UserId = userId,
                     ChatId = chatId,
+                    ChatType = Webhook.TelegramUpdateMapper.FormatChatType(message.Chat.Type),
                     Timestamp = timestamp,
                     CorrelationId = correlationId,
                     Payload = text,
@@ -120,6 +121,7 @@ public static class TelegramUpdateMapper
                 EventType = EventType.TextReply,
                 UserId = userId,
                 ChatId = chatId,
+                ChatType = Webhook.TelegramUpdateMapper.FormatChatType(message.Chat.Type),
                 Timestamp = timestamp,
                 CorrelationId = correlationId,
                 Payload = text,
@@ -138,6 +140,7 @@ public static class TelegramUpdateMapper
                 EventType = EventType.CallbackResponse,
                 UserId = callback.From.Id.ToString(CultureInfo.InvariantCulture),
                 ChatId = callback.Message.Chat.Id.ToString(CultureInfo.InvariantCulture),
+                ChatType = Webhook.TelegramUpdateMapper.FormatChatType(callback.Message.Chat.Type),
                 // CallbackQuery has no native timestamp — using UtcNow stamps
                 // the click time rather than the (potentially stale) age of
                 // the original message the button was attached to.

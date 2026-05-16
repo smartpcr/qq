@@ -140,6 +140,67 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                     b.ToTable("outbound_message_id_mappings", (string)null);
                 });
 
+            modelBuilder.Entity("AgentSwarm.Messaging.Core.OperatorBinding", b =>
+                {
+                    b.Property<System.Guid>("Id")
+                        .ValueGeneratedNever()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ChatType")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("IsActive")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("OperatorAlias")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("RegisteredAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Roles")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("TelegramChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("TenantId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("WorkspaceId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TelegramUserId")
+                        .HasDatabaseName("ix_operator_bindings_user");
+
+                    b.HasIndex("OperatorAlias", "TenantId")
+                        .IsUnique()
+                        .HasDatabaseName("ux_operator_bindings_alias_tenant");
+
+                    b.HasIndex("TelegramUserId", "TelegramChatId")
+                        .HasDatabaseName("ix_operator_bindings_user_chat");
+
+                    b.HasIndex("TelegramUserId", "TelegramChatId", "WorkspaceId")
+                        .IsUnique()
+                        .HasDatabaseName("ux_operator_bindings_user_chat_workspace");
+
+                    b.ToTable("operator_bindings", (string)null);
+                });
+
             modelBuilder.Entity("AgentSwarm.Messaging.Core.TaskOversight", b =>
                 {
                     b.Property<string>("TaskId")

@@ -210,11 +210,280 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
             }
         }
 
+        // Stage 3.4 (iter-2 evaluator item 3) — UserTenantMappings is
+        // the Tier 1 onboarding source of truth for
+        // TelegramUserAuthorizationService. A partially invalid
+        // multi-workspace mapping (one valid entry + one entry with
+        // a blank TenantId / WorkspaceId / OperatorAlias) used to
+        // silently skip the bad entry at /start time and authorize
+        // the operator with FEWER bindings than configured. The
+        // validator now rejects any mapping with a blank key, a
+        // non-numeric key, or any entry missing TenantId,
+        // WorkspaceId, or OperatorAlias so the operator notices
+        // the misconfiguration at host startup rather than at the
+        // first /start.
+        if (options.UserTenantMappings is { Count: > 0 })
+        {
+            foreach (var pair in options.UserTenantMappings)
+            {
+                var key = pair.Key;
+                if (string.IsNullOrWhiteSpace(key))
+                {
+                    failures.Add(
+                        "Telegram:UserTenantMappings has an entry with a blank user-id key. "
+                        + "Each key must be the Telegram user id as a numeric string "
+                        + "(per architecture.md §7.1).");
+                    continue;
+                }
+
+                if (!long.TryParse(
+                        key.Trim(),
+                        System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out _))
+                {
+                    failures.Add(
+                        $"Telegram:UserTenantMappings[\"{key}\"] key is not a valid 64-bit "
+                        + "Telegram user id (must parse as a long).");
+                    continue;
+                }
+
+                var entries = pair.Value;
+                if (entries is null || entries.Count == 0)
+                {
+                    failures.Add(
+                        $"Telegram:UserTenantMappings[\"{key}\"] must contain at least one "
+                        + "TelegramUserTenantMapping entry — empty arrays cannot onboard the user.");
+                    continue;
+                }
+
+                for (var i = 0; i < entries.Count; i++)
+                {
+                    var entry = entries[i];
+                    if (entry is null)
+                    {
+                        failures.Add(
+                            $"Telegram:UserTenantMappings[\"{key}\"][{i}] is null.");
+                        continue;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(entry.TenantId))
+                    {
+                        failures.Add(
+                            $"Telegram:UserTenantMappings[\"{key}\"][{i}].TenantId must be "
+                            + "non-blank. A blank tenant id would let /start onboard the "
+                            + "operator into the empty-string tenant and break per-tenant "
+                            + "alias resolution (architecture.md lines 116-119).");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(entry.WorkspaceId))
+                    {
+                        failures.Add(
+                            $"Telegram:UserTenantMappings[\"{key}\"][{i}].WorkspaceId must be "
+                            + "non-blank. A blank workspace id would silently coalesce all "
+                            + "onboarded operators into a single workspace, breaking the "
+                            + "multi-workspace disambiguation prompt (architecture.md §4.3).");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(entry.OperatorAlias))
+                    {
+                        failures.Add(
+                            $"Telegram:UserTenantMappings[\"{key}\"][{i}].OperatorAlias must "
+                            + "be non-blank. The /handoff @alias resolver uses the alias as "
+                            + "the lookup key (architecture.md §4.3); a blank alias would "
+                            + "make the operator unreachable via /handoff.");
+                    }
+                }
+            }
+
+            // Stage 3.4 (iter-3 evaluator item 1) — the
+            // operator_bindings table has a UNIQUE index on
+            // (OperatorAlias, TenantId) (architecture.md lines
+            // 116-119: a `/handoff @alias` lookup in a given tenant
+            // must resolve to exactly one operator). Two
+            // UserTenantMappings entries that share the same
+            // (OperatorAlias, TenantId) — whether under the SAME
+            // Telegram user (an operator with multiple workspace
+            // bindings re-using one alias) or under DIFFERENT
+            // Telegram users (two operators colliding on one alias)
+            // — would let host startup succeed and then crash the
+            // first /start that hits the unique index, leaving the
+            // operator with a partial onboarding state. Detect both
+            // shapes here so misconfiguration surfaces at startup.
+            //
+            // Iter-4 doc correction: the prior comment claimed the
+            // persistence layer's HasMaxLength call applies SQLite
+            // COLLATE NOCASE — that was wrong. OperatorAlias is
+            // declared as TEXT(128) with no explicit collation, so
+            // SQLite uses its default BINARY (case-sensitive)
+            // collation and the unique index would technically
+            // accept "@Alice" and "@alice" as distinct rows. The
+            // validator nonetheless treats aliases case-INsensitively
+            // here as an operator-intent policy: when the operator
+            // configures "@Alice" in one mapping entry and "@alice"
+            // in another, that's almost certainly a typo for the
+            // SAME human handle, and silently registering two
+            // distinct bindings would break /handoff @alice (which
+            // would resolve to only one of them) and confuse the
+            // operator. The validator is intentionally STRICTER
+            // than the DB on this axis — defense-in-depth against
+            // a common configuration mistake. Tenant ids are
+            // compared case-sensitively because tenant ids are
+            // opaque identifiers (architecture.md §3.1) and any
+            // visible-only case difference indicates two distinct
+            // tenants, not a typo.
+            var aliasOwners = new Dictionary<(string Tenant, string Alias), List<string>>(
+                AliasTenantKeyComparer.Instance);
+            foreach (var pair in options.UserTenantMappings)
+            {
+                var key = pair.Key;
+                if (string.IsNullOrWhiteSpace(key) || pair.Value is null)
+                {
+                    continue;
+                }
+
+                for (var i = 0; i < pair.Value.Count; i++)
+                {
+                    var entry = pair.Value[i];
+                    if (entry is null
+                        || string.IsNullOrWhiteSpace(entry.TenantId)
+                        || string.IsNullOrWhiteSpace(entry.OperatorAlias))
+                    {
+                        continue;
+                    }
+
+                    var aliasKey = (entry.TenantId, entry.OperatorAlias);
+                    if (!aliasOwners.TryGetValue(aliasKey, out var owners))
+                    {
+                        owners = new List<string>(capacity: 2);
+                        aliasOwners[aliasKey] = owners;
+                    }
+
+                    owners.Add(
+                        $"Telegram:UserTenantMappings[\"{key}\"][{i}]");
+                }
+            }
+
+            foreach (var kvp in aliasOwners)
+            {
+                if (kvp.Value.Count <= 1)
+                {
+                    continue;
+                }
+
+                failures.Add(
+                    $"Duplicate operator alias detected: \"{kvp.Key.Alias}\" in tenant "
+                    + $"\"{kvp.Key.Tenant}\" is configured by {kvp.Value.Count} mapping "
+                    + $"entries [{string.Join(", ", kvp.Value)}]. The operator_bindings table "
+                    + "has UNIQUE (OperatorAlias, TenantId) (architecture.md lines 116-119) so "
+                    + "the first /start would succeed and every subsequent /start that tries to "
+                    + "register the duplicate would crash on the unique index mid-onboarding. "
+                    + "Use distinct OperatorAlias values per workspace (e.g. \"@alice-alpha\", "
+                    + "\"@alice-beta\") OR consolidate the duplicate entries into one row.");
+            }
+
+            // Stage 3.4 iter-4 — the operator_bindings table also has
+            // a UNIQUE index on (TelegramUserId, TelegramChatId,
+            // WorkspaceId). At /start time TelegramChatId is the chat
+            // the operator typed /start in, so for a single user
+            // every batch entry shares the same TelegramChatId. Two
+            // mapping entries under the SAME user that share a
+            // WorkspaceId would therefore both target the same
+            // (user, chat, workspace) row and the batch upsert in
+            // PersistentOperatorRegistry.RegisterManyAsync would
+            // either silently coalesce them (under the old per-entry
+            // RegisterAsync code path) or crash mid-batch and roll
+            // back (under the iter-3 transactional path). Both
+            // outcomes are wrong: the operator's intent is ambiguous
+            // when one workspace is bound twice. Fail-fast at startup
+            // so the misconfiguration surfaces immediately instead of
+            // at the first /start.
+            //
+            // The check is per-user (the outer dictionary is keyed
+            // by user id) — different users CAN legitimately share
+            // a workspace (that is the multi-operator-per-workspace
+            // pattern from architecture.md §4.3). The collision only
+            // matters within a single user's mapping list.
+            foreach (var pair in options.UserTenantMappings)
+            {
+                var key = pair.Key;
+                if (string.IsNullOrWhiteSpace(key) || pair.Value is null || pair.Value.Count < 2)
+                {
+                    continue;
+                }
+
+                var workspaceOwners = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+                for (var i = 0; i < pair.Value.Count; i++)
+                {
+                    var entry = pair.Value[i];
+                    if (entry is null || string.IsNullOrWhiteSpace(entry.WorkspaceId))
+                    {
+                        continue;
+                    }
+
+                    if (!workspaceOwners.TryGetValue(entry.WorkspaceId, out var owners))
+                    {
+                        owners = new List<string>(capacity: 2);
+                        workspaceOwners[entry.WorkspaceId] = owners;
+                    }
+
+                    owners.Add($"Telegram:UserTenantMappings[\"{key}\"][{i}]");
+                }
+
+                foreach (var kvp in workspaceOwners)
+                {
+                    if (kvp.Value.Count <= 1)
+                    {
+                        continue;
+                    }
+
+                    failures.Add(
+                        $"Duplicate workspace binding detected for Telegram user \"{key}\": "
+                        + $"WorkspaceId \"{kvp.Key}\" is configured by {kvp.Value.Count} "
+                        + $"mapping entries [{string.Join(", ", kvp.Value)}]. The "
+                        + "operator_bindings table has UNIQUE (TelegramUserId, "
+                        + "TelegramChatId, WorkspaceId) so the second /start row would "
+                        + "either silently coalesce the configurations or crash the batch "
+                        + "transaction. Consolidate the duplicate workspace entries into "
+                        + "one row with the intended TenantId / OperatorAlias / Roles.");
+                }
+            }
+        }
+
         ValidateRateLimits(options.RateLimits, failures);
 
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
+    }
+
+    /// <summary>
+    /// Case-sensitive tenant + case-insensitive alias comparer used by
+    /// the iter-3 duplicate-alias detection loop.
+    /// </summary>
+    /// <remarks>
+    /// Iter-4 doc correction: the prior comment claimed this comparer
+    /// "matches the SQLite collation applied to OperatorAlias by the
+    /// persistence layer" — that was wrong.
+    /// <see cref="OperatorBindingConfiguration"/> declares
+    /// <c>OperatorAlias</c> as <c>TEXT(128)</c> with no explicit
+    /// collation, so SQLite uses BINARY (case-sensitive). This
+    /// comparer is intentionally MORE strict than the DB on the alias
+    /// axis — see the rationale block in
+    /// <see cref="TelegramOptionsValidator.Validate(string?, TelegramOptions)"/>
+    /// near the <c>aliasOwners</c> dictionary construction.
+    /// </remarks>
+    private sealed class AliasTenantKeyComparer : IEqualityComparer<(string Tenant, string Alias)>
+    {
+        public static readonly AliasTenantKeyComparer Instance = new();
+
+        public bool Equals((string Tenant, string Alias) x, (string Tenant, string Alias) y) =>
+            string.Equals(x.Tenant, y.Tenant, StringComparison.Ordinal)
+            && string.Equals(x.Alias, y.Alias, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode((string Tenant, string Alias) obj) => HashCode.Combine(
+            obj.Tenant is null ? 0 : StringComparer.Ordinal.GetHashCode(obj.Tenant),
+            obj.Alias is null ? 0 : StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Alias));
     }
 
     /// <summary>

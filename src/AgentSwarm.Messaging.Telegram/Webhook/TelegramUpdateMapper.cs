@@ -99,6 +99,7 @@ public static class TelegramUpdateMapper
                 RawCommand = isCommand ? msg.Text : null,
                 UserId = msg.From.Id.ToString(CultureInfo.InvariantCulture),
                 ChatId = msg.Chat.Id.ToString(CultureInfo.InvariantCulture),
+                ChatType = FormatChatType(msg.Chat.Type),
                 Timestamp = receivedAt,
                 CorrelationId = correlationId,
                 Payload = isCommand ? null : msg.Text,
@@ -131,6 +132,7 @@ public static class TelegramUpdateMapper
                 RawCommand = null,
                 UserId = cb.From.Id.ToString(CultureInfo.InvariantCulture),
                 ChatId = cbMsg.Chat.Id.ToString(CultureInfo.InvariantCulture),
+                ChatType = FormatChatType(cbMsg.Chat.Type),
                 Timestamp = receivedAt,
                 CorrelationId = correlationId,
                 Payload = cb.Data,
@@ -146,6 +148,10 @@ public static class TelegramUpdateMapper
             ?? update.CallbackQuery?.From.Id
             ?? update.EditedMessage?.From?.Id
             ?? 0L;
+        var fallbackChat = update.Message?.Chat
+            ?? update.CallbackQuery?.Message?.Chat
+            ?? update.EditedMessage?.Chat
+            ?? update.ChannelPost?.Chat;
         return new MessengerEvent
         {
             EventId = eventId,
@@ -153,8 +159,31 @@ public static class TelegramUpdateMapper
             RawCommand = null,
             UserId = fallbackUserId.ToString(CultureInfo.InvariantCulture),
             ChatId = fallbackChatId.ToString(CultureInfo.InvariantCulture),
+            ChatType = fallbackChat is null ? null : FormatChatType(fallbackChat.Type),
             Timestamp = receivedAt,
             CorrelationId = correlationId,
         };
     }
+
+    /// <summary>
+    /// Stage 3.4 — render the Telegram-typed
+    /// <see cref="Telegram.Bot.Types.Enums.ChatType"/> as the
+    /// transport-agnostic lowercase string the pipeline carries on
+    /// <see cref="MessengerEvent.ChatType"/>. The downstream authz
+    /// service parses this into the Core
+    /// <see cref="AgentSwarm.Messaging.Core.ChatType"/> enum so the
+    /// onboarded <see cref="AgentSwarm.Messaging.Core.OperatorBinding"/>
+    /// records the actual chat kind (private vs. group vs. supergroup
+    /// vs. channel) instead of always defaulting to Private.
+    /// </summary>
+    internal static string FormatChatType(global::Telegram.Bot.Types.Enums.ChatType type) =>
+        type switch
+        {
+            global::Telegram.Bot.Types.Enums.ChatType.Private => "private",
+            global::Telegram.Bot.Types.Enums.ChatType.Group => "group",
+            global::Telegram.Bot.Types.Enums.ChatType.Supergroup => "supergroup",
+            global::Telegram.Bot.Types.Enums.ChatType.Channel => "channel",
+            global::Telegram.Bot.Types.Enums.ChatType.Sender => "sender",
+            _ => type.ToString().ToLowerInvariant(),
+        };
 }

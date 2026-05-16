@@ -20,16 +20,26 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 //     InboundRecoverySweep).
 //
 //   * AddMessagingPersistence wires MessagingDbContext + the
-//     DatabaseInitializer hosted service.
+//     DatabaseInitializer hosted service, AND replaces the in-memory
+//     stubs with their persistent siblings — including
+//     PersistentOperatorRegistry (Stage 3.4) which becomes the
+//     IOperatorRegistry backing the IUserAuthorizationService below.
 //
-//   * AddTelegram wires TelegramOptions (including OperatorBindings),
-//     the bot client, the inbound pipeline, and the Stage 2.2 stubs.
+//   * AddTelegram wires TelegramOptions (including OperatorBindings,
+//     DevOperators, and UserTenantMappings), the bot client, the
+//     inbound pipeline, and the Stage 2.2 stubs. UserTenantMappings
+//     (architecture.md §7.1 lines 636-650) is the source of truth
+//     for /start onboarding consumed by TelegramUserAuthorizationService.
 //
-//   * The host registers ConfiguredOperatorAuthorizationService
-//     as the IUserAuthorizationService implementation (iter-5
-//     evaluator item 1) — AddTelegram deliberately does not stub
-//     authorization, but the Worker MUST supply a binding-aware
-//     implementation or dispatcher activation throws.
+//   * The host registers TelegramUserAuthorizationService (Stage 3.4)
+//     as the IUserAuthorizationService implementation, superseding
+//     the earlier iter-5 ConfiguredOperatorAuthorizationService that
+//     read static OperatorBindings from configuration. The new
+//     implementation reads from the persistent IOperatorRegistry
+//     for Tier 2 runtime authorization (binding lookup on every
+//     non-/start command) and from Telegram:UserTenantMappings for
+//     Tier 1 /start onboarding (one OperatorBinding row per
+//     configured workspace).
 //
 //   * AddTelegramWebhook wires the channel, processor, endpoint,
 //     secret filter, and the TelegramWebhookRegistrationService that
@@ -64,19 +74,26 @@ builder.Services.AddTelegramWebhook();
 // without depending on services that don't exist yet.
 builder.Services.AddHealthChecks();
 
-// IUserAuthorizationService — iter-5 evaluator item 1. AddTelegram
-// intentionally does NOT register one to keep the loud-failure
-// semantic at the library level. The Worker registers
-// ConfiguredOperatorAuthorizationService via TryAddSingleton so any
-// production replacement supplied BEFORE this line wins (last-wins
-// semantics on TryAddSingleton are first-wins; tests can override
-// by registering their own implementation BEFORE WebApplicationFactory
-// triggers Program). Singleton lifetime matches the singleton
-// TelegramUpdatePipeline: ConfiguredOperatorAuthorizationService is
-// stateless (it only reads IOptionsMonitor<TelegramOptions>), so
-// scoping it would create a needless captive-dependency conflict
-// with the singleton pipeline.
-builder.Services.TryAddSingleton<IUserAuthorizationService, ConfiguredOperatorAuthorizationService>();
+// IUserAuthorizationService — iter-5 evaluator item 1 + Stage 3.4
+// onboarding. AddTelegram intentionally does NOT register one to
+// keep the loud-failure semantic at the library level. The Worker
+// registers TelegramUserAuthorizationService (Stage 3.4) via
+// TryAddSingleton so any production replacement supplied BEFORE
+// this line wins (TryAddSingleton is first-wins). Singleton
+// lifetime matches the singleton TelegramUpdatePipeline:
+// TelegramUserAuthorizationService is stateless (it only reads
+// IOptionsMonitor<TelegramOptions> + delegates to the registry's
+// own scope-per-call pattern), so scoping it would create a
+// needless captive-dependency conflict with the singleton pipeline.
+//
+// TelegramUserAuthorizationService supersedes the iter-5
+// ConfiguredOperatorAuthorizationService that read static
+// OperatorBindings from configuration: it now reads from the
+// persistent IOperatorRegistry (PersistentOperatorRegistry from
+// AddMessagingPersistence) for Tier 2 runtime authorization, and
+// from Telegram:UserTenantMappings configuration for Tier 1
+// /start onboarding (per architecture.md §7.1).
+builder.Services.TryAddSingleton<IUserAuthorizationService, TelegramUserAuthorizationService>();
 
 // IAlertService — iter-4 evaluator item 6. The Telegram sender's
 // dead-letter path (TelegramMessageSender.EmitDeadLetterAlertAsync)
