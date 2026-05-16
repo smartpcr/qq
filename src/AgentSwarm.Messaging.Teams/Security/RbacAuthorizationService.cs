@@ -81,6 +81,17 @@ public sealed class RbacAuthorizationService : IUserAuthorizationService
         }
 
         var options = _options.CurrentValue;
+
+        // Resolve the user's role via the injected provider first (LDAP / Graph / SCIM in
+        // production, StaticUserRoleProvider in dev). When the provider returns null we
+        // intentionally backstop with the static TenantRoleAssignments map and the
+        // DefaultRole — see IUserRoleProvider remarks for the documented contract.
+        //
+        // With the in-box StaticUserRoleProvider this fallback is a no-op because the
+        // provider already calls ResolveRoleOrDefault internally; we accept that single
+        // extra dictionary lookup so that external providers, which legitimately have no
+        // knowledge of RbacOptions, still benefit from break-glass static assignments
+        // (covered by AuthorizeAsync_ProviderReturnsNull_FallsBackToStaticAssignment).
         var role = await _roleProvider.GetRoleAsync(tenantId, userId, ct).ConfigureAwait(false)
                    ?? options.ResolveRoleOrDefault(tenantId, userId);
 
