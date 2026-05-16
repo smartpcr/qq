@@ -352,6 +352,7 @@ public class ImmutabilityRegressionTests
             Body: "hello",
             Severity: MessageSeverity.Normal,
             CorrelationId: "trace",
+            Timestamp: DateTimeOffset.UnixEpoch,
             Metadata: new Dictionary<string, string> { ["ThreadId"] = "42" });
 
         (msg.Metadata as Dictionary<string, string>).Should().BeNull();
@@ -366,6 +367,7 @@ public class ImmutabilityRegressionTests
             Body: "hello",
             Severity: MessageSeverity.Normal,
             CorrelationId: "trace",
+            Timestamp: DateTimeOffset.UnixEpoch,
             Metadata: new Dictionary<string, string> { ["ThreadId"] = "42" });
 
         var asMutable = msg.Metadata as IDictionary<string, string>;
@@ -385,6 +387,7 @@ public class ImmutabilityRegressionTests
             Body: "hello",
             Severity: MessageSeverity.Normal,
             CorrelationId: "trace",
+            Timestamp: DateTimeOffset.UnixEpoch,
             Metadata: source);
 
         source["ThreadId"] = "tampered";
@@ -405,6 +408,7 @@ public class ImmutabilityRegressionTests
             Body: "hello",
             Severity: MessageSeverity.Normal,
             CorrelationId: "trace",
+            Timestamp: DateTimeOffset.UnixEpoch,
             Metadata: bad);
 
         act.Should().Throw<ArgumentException>()
@@ -421,6 +425,7 @@ public class ImmutabilityRegressionTests
             Body: "hello",
             Severity: MessageSeverity.Normal,
             CorrelationId: "trace",
+            Timestamp: DateTimeOffset.UnixEpoch,
             Metadata: null);
 
         msg.Metadata.Should().BeNull();

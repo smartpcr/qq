@@ -82,3 +82,18 @@ public sealed class ChannelPurposeJsonConverter : StrictNamedEnumConverter<Chann
 public sealed class MessengerEventTypeJsonConverter : StrictNamedEnumConverter<MessengerEventType>
 {
 }
+
+/// <summary>Strict names-only converter for <see cref="OutboundMessageStatus"/>.</summary>
+public sealed class OutboundMessageStatusJsonConverter : StrictNamedEnumConverter<OutboundMessageStatus>
+{
+}
+
+/// <summary>Strict names-only converter for <see cref="OutboundMessageSource"/>.</summary>
+public sealed class OutboundMessageSourceJsonConverter : StrictNamedEnumConverter<OutboundMessageSource>
+{
+}
+
+/// <summary>Strict names-only converter for <see cref="PendingQuestionStatus"/>.</summary>
+public sealed class PendingQuestionStatusJsonConverter : StrictNamedEnumConverter<PendingQuestionStatus>
+{
+}
