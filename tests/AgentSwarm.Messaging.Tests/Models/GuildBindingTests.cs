@@ -163,4 +163,88 @@ public class GuildBindingTests
 
         act.Should().Throw<ArgumentNullException>();
     }
+
+    [Fact]
+    public void Constructor_ThrowsOnNullCommandRestrictionsValue()
+    {
+        // The previous implementation silently coerced a null value to
+        // Array.Empty<ulong>(), which hid malformed config / JSON. The new
+        // contract requires producers to use an explicit empty collection
+        // when they mean "no roles".
+        var bad = new Dictionary<string, IReadOnlyList<ulong>>
+        {
+            ["approve"] = null!,
+        };
+
+        var act = () => new GuildBinding(
+            Id: Guid.NewGuid(),
+            GuildId: 0,
+            ChannelId: 0,
+            ChannelPurpose: ChannelPurpose.Control,
+            TenantId: "t",
+            WorkspaceId: "w",
+            AllowedRoleIds: Array.Empty<ulong>(),
+            CommandRestrictions: bad,
+            RegisteredAt: DateTimeOffset.UnixEpoch,
+            IsActive: true);
+
+        act.Should().Throw<ArgumentException>()
+            .WithMessage("*CommandRestrictions*approve*null*");
+    }
+
+    [Fact]
+    public void Deserialize_NullCommandRestrictionsValue_FailsLoudly()
+    {
+        // Companion to Constructor_ThrowsOnNullCommandRestrictionsValue: the
+        // evaluator's concern was specifically that the previous silent
+        // coercion hid malformed JSON. This test exercises the JSON boundary
+        // by feeding payloads that contain "approve": null and confirming the
+        // deserializer surfaces a failure (System.Text.Json may wrap the
+        // constructor's ArgumentException in a JsonException, so we accept
+        // either).
+        const string json =
+            "{\"Id\":\"00000000-0000-0000-0000-000000000001\"," +
+            "\"GuildId\":1,\"ChannelId\":2," +
+            "\"ChannelPurpose\":\"Control\"," +
+            "\"TenantId\":\"t\",\"WorkspaceId\":\"w\"," +
+            "\"AllowedRoleIds\":[]," +
+            "\"CommandRestrictions\":{\"approve\":null}," +
+            "\"RegisteredAt\":\"1970-01-01T00:00:00+00:00\"," +
+            "\"IsActive\":true}";
+
+        var act = () => JsonSerializer.Deserialize<GuildBinding>(json, JsonOptions);
+
+        var thrown = act.Should().Throw<Exception>().Which;
+        (thrown is ArgumentException || thrown is JsonException)
+            .Should().BeTrue(
+                "the model must surface malformed null restriction values rather than silently accept them; got {0}: {1}",
+                thrown.GetType().FullName,
+                thrown.Message);
+    }
+
+    [Fact]
+    public void Constructor_EmptyCommandRestrictionsValue_IsAllowed()
+    {
+        // The null check above must NOT reject the explicit empty collection
+        // that callers should use to mean "this subcommand has no allowed roles".
+        var explicitEmpty = new Dictionary<string, IReadOnlyList<ulong>>
+        {
+            ["approve"] = Array.Empty<ulong>(),
+        };
+
+        var binding = new GuildBinding(
+            Id: Guid.NewGuid(),
+            GuildId: 0,
+            ChannelId: 0,
+            ChannelPurpose: ChannelPurpose.Control,
+            TenantId: "t",
+            WorkspaceId: "w",
+            AllowedRoleIds: Array.Empty<ulong>(),
+            CommandRestrictions: explicitEmpty,
+            RegisteredAt: DateTimeOffset.UnixEpoch,
+            IsActive: true);
+
+        binding.CommandRestrictions.Should().NotBeNull();
+        binding.CommandRestrictions!["approve"].Should().BeEmpty();
+    }
 }

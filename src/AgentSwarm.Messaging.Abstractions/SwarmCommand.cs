@@ -16,7 +16,9 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// </param>
 /// <param name="Arguments">
 /// Command-specific arguments captured as string key/value pairs. Keys are
-/// case-sensitive.
+/// case-sensitive. The caller-supplied dictionary is defensively copied at
+/// construction into a read-only wrapper that cannot be downcast back to
+/// <see cref="Dictionary{TKey, TValue}"/>.
 /// </param>
 /// <param name="CorrelationId">End-to-end trace identifier.</param>
 /// <param name="Timestamp">When the command was emitted by the dispatcher.</param>
@@ -26,4 +28,16 @@ public sealed record SwarmCommand(
     string AgentTarget,
     IReadOnlyDictionary<string, string> Arguments,
     string CorrelationId,
-    DateTimeOffset Timestamp);
+    DateTimeOffset Timestamp)
+{
+    private readonly IReadOnlyDictionary<string, string> _arguments =
+        ImmutableSnapshot.FromRequiredStringMap(Arguments, nameof(Arguments));
+
+    /// <inheritdoc cref="SwarmCommand(Guid, string, string, IReadOnlyDictionary{string, string}, string, DateTimeOffset)"/>
+    public IReadOnlyDictionary<string, string> Arguments
+    {
+        get => _arguments;
+        init => _arguments = ImmutableSnapshot.FromRequiredStringMap(value, nameof(Arguments));
+    }
+}
+

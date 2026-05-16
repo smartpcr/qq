@@ -15,8 +15,25 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// <param name="RoutingMetadata">
 /// Connector-specific routing keys (e.g. <c>DiscordChannelId</c>,
 /// <c>DiscordThreadId</c>, <c>SlackChannelId</c>). Keys are case-sensitive.
+/// The caller-supplied dictionary is defensively copied at construction into a
+/// read-only wrapper that cannot be downcast back to
+/// <see cref="Dictionary{TKey, TValue}"/>; mutating members on the
+/// <see cref="IDictionary{TKey, TValue}"/> view throw
+/// <see cref="NotSupportedException"/>.
 /// </param>
 public sealed record AgentQuestionEnvelope(
     AgentQuestion Question,
     string? ProposedDefaultActionId,
-    IReadOnlyDictionary<string, string> RoutingMetadata);
+    IReadOnlyDictionary<string, string> RoutingMetadata)
+{
+    private readonly IReadOnlyDictionary<string, string> _routingMetadata =
+        ImmutableSnapshot.FromRequiredStringMap(RoutingMetadata, nameof(RoutingMetadata));
+
+    /// <inheritdoc cref="AgentQuestionEnvelope(AgentQuestion, string?, IReadOnlyDictionary{string, string})"/>
+    public IReadOnlyDictionary<string, string> RoutingMetadata
+    {
+        get => _routingMetadata;
+        init => _routingMetadata = ImmutableSnapshot.FromRequiredStringMap(value, nameof(RoutingMetadata));
+    }
+}
+

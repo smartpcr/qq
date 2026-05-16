@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using AgentSwarm.Messaging.Abstractions.Json;
 
 namespace AgentSwarm.Messaging.Abstractions;
 
@@ -16,13 +17,16 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// </para>
 /// <para>
 /// Wire format: serialized as the member name string (e.g. <c>"High"</c>)
-/// via <see cref="JsonStringEnumConverter"/>. Numeric values stay stable for
-/// in-process priority comparisons but the externalised JSON contract uses
-/// names so cross-connector consumers and audit log readers remain robust to
-/// future value re-ordering.
+/// via <see cref="MessageSeverityJsonConverter"/>. The wire contract is
+/// <em>names-only</em>: numeric tokens, numeric-string tokens (e.g. <c>"1"</c>),
+/// case-mismatched names, and undefined values are rejected with
+/// <see cref="System.Text.Json.JsonException"/>. Numeric values stay stable for
+/// in-process priority comparisons but are not part of the externalised JSON
+/// contract, so cross-connector consumers and audit log readers remain robust
+/// to future value re-ordering.
 /// </para>
 /// </remarks>
-[JsonConverter(typeof(JsonStringEnumConverter))]
+[JsonConverter(typeof(MessageSeverityJsonConverter))]
 public enum MessageSeverity
 {
     Critical = 0,

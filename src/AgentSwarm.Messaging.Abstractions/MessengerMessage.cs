@@ -18,7 +18,9 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// <param name="CorrelationId">End-to-end trace identifier.</param>
 /// <param name="Metadata">
 /// Optional connector-specific routing or rendering hints (e.g. <c>ThreadId</c>,
-/// <c>EmbedJson</c>, <c>AgentId</c>). Keys are case-sensitive.
+/// <c>EmbedJson</c>, <c>AgentId</c>). Keys are case-sensitive. The caller-supplied
+/// dictionary is defensively copied at construction into a read-only wrapper that
+/// cannot be downcast back to <see cref="Dictionary{TKey, TValue}"/>.
 /// </param>
 public sealed record MessengerMessage(
     string Messenger,
@@ -26,4 +28,16 @@ public sealed record MessengerMessage(
     string Body,
     MessageSeverity Severity,
     string CorrelationId,
-    IReadOnlyDictionary<string, string>? Metadata = null);
+    IReadOnlyDictionary<string, string>? Metadata = null)
+{
+    private readonly IReadOnlyDictionary<string, string>? _metadata =
+        ImmutableSnapshot.FromStringMap(Metadata, nameof(Metadata));
+
+    /// <inheritdoc cref="MessengerMessage(string, string, string, MessageSeverity, string, IReadOnlyDictionary{string, string}?)"/>
+    public IReadOnlyDictionary<string, string>? Metadata
+    {
+        get => _metadata;
+        init => _metadata = ImmutableSnapshot.FromStringMap(value, nameof(Metadata));
+    }
+}
+

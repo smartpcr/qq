@@ -1,3 +1,5 @@
+using System.Collections.ObjectModel;
+
 namespace AgentSwarm.Messaging.Abstractions;
 
 /// <summary>
@@ -18,9 +20,15 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// <param name="Severity">Priority severity (drives queue ordering).</param>
 /// <param name="AllowedActions">
 /// Operator-selectable actions. Rendered as buttons (Discord, Slack, Teams) or as
-/// an inline keyboard (Telegram). Stored as a defensively-copied snapshot so the
-/// shared contract cannot be mutated after construction; the typed surface is
-/// <see cref="IReadOnlyList{T}"/> to keep callers honest. Validate each
+/// an inline keyboard (Telegram). The caller-supplied collection is defensively
+/// copied at construction into a <see cref="ReadOnlyCollection{T}"/>; the value
+/// exposed to consumers cannot be mutated through the public collection API
+/// after construction -- it cannot be downcast to <see cref="System.Array"/>,
+/// <c>HumanAction[]</c>, <see cref="List{T}"/>, or any other mutable
+/// <see cref="IList{T}"/> implementation, and mutating members of the
+/// <see cref="IList{T}"/> view throw <see cref="NotSupportedException"/>.
+/// (Immutability is shallow: callers should treat <see cref="HumanAction"/>
+/// elements themselves as the immutable records they already are.) Validate each
 /// <see cref="HumanAction.ActionId"/> with <see cref="ActionIdValidator"/>.
 /// </param>
 /// <param name="ExpiresAt">Deadline after which the question is considered timed out.</param>
@@ -36,17 +44,27 @@ public sealed record AgentQuestion(
     DateTimeOffset ExpiresAt,
     string CorrelationId)
 {
-    private readonly IReadOnlyList<HumanAction> _allowedActions = CopyOrThrow(AllowedActions);
+    private readonly IReadOnlyList<HumanAction> _allowedActions = ToImmutable(AllowedActions);
 
     /// <inheritdoc cref="AgentQuestion(string, string, string, string, string, MessageSeverity, IReadOnlyList{HumanAction}, DateTimeOffset, string)"/>
     public IReadOnlyList<HumanAction> AllowedActions
     {
         get => _allowedActions;
-        init => _allowedActions = CopyOrThrow(value);
+        init => _allowedActions = ToImmutable(value);
     }
 
-    private static IReadOnlyList<HumanAction> CopyOrThrow(IReadOnlyList<HumanAction>? value)
-        => value is null
-            ? throw new ArgumentNullException(nameof(AllowedActions))
-            : value.ToArray();
+    private static IReadOnlyList<HumanAction> ToImmutable(IReadOnlyList<HumanAction>? value)
+    {
+        if (value is null)
+        {
+            throw new ArgumentNullException(nameof(AllowedActions));
+        }
+
+        // Snapshot to a private array first so caller mutations cannot affect the
+        // wrapped view, then wrap in ReadOnlyCollection so callers cannot downcast
+        // the IReadOnlyList<HumanAction> back to HumanAction[] / List<HumanAction>
+        // and mutate the model.
+        return new ReadOnlyCollection<HumanAction>(value.ToArray());
+    }
 }
+
