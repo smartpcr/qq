@@ -649,6 +649,32 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
         }
 
         string ephemeralMessage = BuildOpenCommentModalEphemeralMessage(result, isTerminalTrigger);
+
+        // Stage 6.4 evaluator iter-3 round-3 item #1 (HARDENING of the
+        // round-2 structural reversal): guard against a null / empty
+        // response_url BEFORE the SendEphemeralAsync try/catch so the
+        // dropped-user-feedback case is logged at Warning severity with
+        // the views.open failure correlation context (question_id,
+        // idempotency_key) instead of being absorbed by
+        // HttpClientSlackEphemeralResponder's generic LogInformation
+        // skip-line. The whole point of the no-retry contract is "tell
+        // the user to click again so a fresh trigger_id is generated";
+        // if response_url is absent (payload-shape variation or a
+        // future Slack API change) the human gets zero notice and the
+        // entire structural reversal degrades silently. Surfacing this
+        // explicitly makes the degraded path auditable -- operators
+        // can correlate the warning with the audit row recorded above
+        // and the views.open failure log emitted in the
+        // isTerminalTrigger branch.
+        if (string.IsNullOrWhiteSpace(detail.ResponseUrl))
+        {
+            this.logger.LogWarning(
+                "SlackInteractionHandler cannot surface views.open failure ephemeral for question_id={QuestionId} envelope idempotency_key={IdempotencyKey}: interaction payload did not carry a response_url, so the user will not see the 'please click again' notice. The audit row above remains the durable operator-visible trace.",
+                questionId,
+                envelope.IdempotencyKey);
+            return;
+        }
+
         try
         {
             await this.ephemeralResponder
