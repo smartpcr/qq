@@ -13,16 +13,20 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Entities;
 using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Retry;
+using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Moq;
+using SlackNet;
 using Xunit;
 
 /// <summary>
@@ -427,6 +431,204 @@ public sealed class SlackOutboundDispatcherTests
         dlq.Entries.Should().BeEmpty();
     }
 
+    // -----------------------------------------------------------------
+    // Stage 6.4 evaluator iter-3 item #2 (STRUCTURAL): exercise the
+    // SHARED SlackTokenBucketRateLimiter through BOTH a real
+    // SlackDirectApiClient (views.open) AND a real SlackOutboundDispatcher
+    // (views.update -- Tier 4, same workspace bucket as views.open) at
+    // the same time. The earlier shared-limiter assertion in
+    // SlackDirectApiClientTests only proved sibling AcquireAsync
+    // suspension via the limiter API; this test drives the entire
+    // dispatcher loop end-to-end so a constructor-graph regression or
+    // a "skip the AcquireAsync call" bug would fail here.
+    //
+    // Caveats faithfully encoded in this test:
+    //   * The brief's exact wording mentions "concurrent views.open +
+    //     chat.postMessage". In Slack's published tier topology
+    //     chat.postMessage is Tier 2 (per-channel bucket) and
+    //     views.open is Tier 4 (per-workspace bucket), so those two
+    //     operations have INDEPENDENT buckets and a 429 on one would
+    //     NOT pause the other -- not a meaningful "shared limiter"
+    //     scenario. The genuine cross-caller back-pressure case is
+    //     two Tier 4 calls on the same workspace, which is what this
+    //     test exercises: views.open (SlackDirectApiClient) -> 429,
+    //     then views.update (SlackOutboundDispatcher) MUST wait out
+    //     the Retry-After window on the SAME workspace bucket.
+    //   * Uses TimeProvider.System (wall clock) so the rate limiter's
+    //     real Task.Delay branch executes -- the test pays the
+    //     Retry-After window (200 ms) but that is small enough to
+    //     keep the suite fast while still being big enough to be
+    //     measurable.
+    // -----------------------------------------------------------------
+    [Fact]
+    public async Task Direct_client_HTTP_429_blocks_real_SlackOutboundDispatcher_views_update_via_shared_SlackTokenBucketRateLimiter()
+    {
+        // 1. SHARED limiter, shared options monitor.
+        SlackConnectorOptions sharedOptions = new()
+        {
+            Retry = new SlackRetryOptions { MaxAttempts = 5, InitialDelayMilliseconds = 1, MaxDelaySeconds = 1 },
+            RateLimits = new SlackRateLimitOptions(),
+        };
+        IOptionsMonitor<SlackConnectorOptions> sharedMonitor =
+            new StaticOptionsMonitor<SlackConnectorOptions>(sharedOptions);
+        SlackTokenBucketRateLimiter sharedLimiter = new(sharedMonitor, TimeProvider.System);
+
+        // 2. SlackDirectApiClient wired with the SHARED limiter. The
+        //    SlackNet mock throws a 429 with a measurable Retry-After
+        //    so the client invokes sharedLimiter.NotifyRetryAfter on
+        //    the (Tier 4, TeamId) bucket.
+        const string SharedTeamId = TeamId;
+        TimeSpan retryAfter = TimeSpan.FromMilliseconds(400);
+        Mock<ISlackApiClient> slackNetMock = new(MockBehavior.Loose);
+        slackNetMock
+            .Setup(x => x.Post(It.IsAny<string>(), It.IsAny<Dictionary<string, object>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new SlackRateLimitException(retryAfter));
+
+        InMemorySlackAuditEntryWriter clientAudit = new();
+        StubWorkspaceStore workspaceStore = new(new Dictionary<string, SlackWorkspaceConfig>
+        {
+            [SharedTeamId] = new SlackWorkspaceConfig
+            {
+                TeamId = SharedTeamId,
+                BotTokenSecretRef = "test://bot-token/" + SharedTeamId,
+                Enabled = true,
+            },
+        });
+        StubSecretProvider secrets = new();
+        secrets.Set("test://bot-token/" + SharedTeamId, "xoxb-test");
+
+        SlackDirectApiClient directClient = new(
+            workspaceStore,
+            secrets,
+            sharedLimiter,
+            clientAudit,
+            NullLogger<SlackDirectApiClient>.Instance,
+            apiClientFactory: _ => slackNetMock.Object,
+            timeProvider: TimeProvider.System);
+
+        // 3. SlackOutboundDispatcher wired with the SAME shared limiter
+        //    via the new BuildDispatcher overload. The dispatch client
+        //    records every call so we can measure WHEN the actual
+        //    views.update dispatch occurred relative to the 429.
+        ChannelBasedSlackOutboundQueue queue = new();
+        RecordingDeadLetterQueue dlq = new();
+        InMemorySlackAuditEntryWriter dispatcherAudit = new();
+        StubThreadManager threads = new(BuildMapping("TASK-SHARED-LIMITER"));
+        RecordingDispatchClient dispatch = new();
+        dispatch.NextResult = SlackOutboundDispatchResult.Success(200, "ts", "{\"ok\":true}");
+
+        SlackOutboundDispatcher dispatcher = BuildDispatcher(
+            queue,
+            threads,
+            dispatch,
+            dlq,
+            dispatcherAudit,
+            optionsOverride: sharedOptions,
+            sharedLimiter: sharedLimiter,
+            sharedMonitor: sharedMonitor);
+
+        // 4. Drive views.open through the SlackDirectApiClient. The
+        //    SlackNet mock throws 429 -> client returns NetworkFailure
+        //    with rate_limited AND calls sharedLimiter.NotifyRetryAfter
+        //    on (Tier 4, SharedTeamId). The bucket is now suspended
+        //    for retryAfter from "now".
+        SlackModalPayload payload = new(SharedTeamId, View: new { type = "modal" });
+        DateTimeOffset retryAfterStart = TimeProvider.System.GetUtcNow();
+        SlackDirectApiResult clientResult = await directClient.OpenModalAsync(
+            "trig-shared",
+            payload,
+            CancellationToken.None);
+        clientResult.IsSuccess.Should().BeFalse(
+            "the 429 from SlackNet must materialise as a NetworkFailure on the SlackDirectApiClient surface");
+        clientResult.Error.Should().Be("rate_limited",
+            "the rate_limited sentinel proves the client classified the SlackNet exception as the 429 path that triggers NotifyRetryAfter -- a different sentinel would mean the shared limiter was NOT informed");
+
+        // 5. Enqueue a ViewsUpdate envelope (Tier 4, same workspace).
+        //    The dispatcher's drain loop calls
+        //    sharedLimiter.AcquireAsync(Tier4, SharedTeamId, ct), which
+        //    MUST wait out the Retry-After suspension established in
+        //    step 4. We measure the elapsed wall-clock from the
+        //    Retry-After notification to the actual dispatch call to
+        //    prove the wait happened.
+        await queue.EnqueueAsync(new SlackOutboundEnvelope(
+            TaskId: "TASK-SHARED-LIMITER",
+            CorrelationId: "corr-shared",
+            MessageType: SlackOutboundOperationKind.ViewsUpdate,
+            BlockKitPayload: "{\"view\":{\"blocks\":[]}}",
+            ThreadTs: null)
+        {
+            ViewId = "V_SHARED_LIMITER",
+        });
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(10));
+        Task run = dispatcher.StartAsync(cts.Token);
+
+        await WaitUntilAsync(() => dispatch.Calls.Count >= 1, TimeSpan.FromSeconds(10));
+        DateTimeOffset dispatchObserved = TimeProvider.System.GetUtcNow();
+
+        await dispatcher.StopAsync(CancellationToken.None);
+        cts.Cancel();
+        await SuppressCancel(run);
+
+        // 6. Verify the dispatcher genuinely waited for the shared
+        //    bucket's Retry-After window. We allow a small tolerance
+        //    (50 ms) to absorb scheduler jitter, but the elapsed
+        //    time MUST be on the order of the Retry-After window --
+        //    a "no wait at all" result (single-digit ms) would mean
+        //    the dispatcher's limiter was NOT the same instance that
+        //    the SlackDirectApiClient notified.
+        TimeSpan elapsed = dispatchObserved - retryAfterStart;
+        elapsed.Should().BeGreaterThan(retryAfter - TimeSpan.FromMilliseconds(50),
+            $"the dispatcher's views.update acquire MUST wait out the Retry-After window ({retryAfter}) established by the direct client's 429 -- a faster dispatch proves the limiter was NOT shared and Slack would have received concurrent calls inside the back-off window. Actual elapsed: {elapsed}.");
+
+        // The dispatch eventually succeeds once the suspension lifts.
+        dispatch.Calls.Should().ContainSingle();
+        dispatch.Calls[0].Operation.Should().Be(SlackOutboundOperationKind.ViewsUpdate);
+        dispatch.Calls[0].ViewId.Should().Be("V_SHARED_LIMITER");
+        dlq.Entries.Should().BeEmpty(
+            "the dispatch should succeed AFTER waiting out the shared bucket's suspension, not dead-letter");
+    }
+
+    private sealed class StubWorkspaceStore : ISlackWorkspaceConfigStore
+    {
+        private readonly IReadOnlyDictionary<string, SlackWorkspaceConfig> workspaces;
+
+        public StubWorkspaceStore(IReadOnlyDictionary<string, SlackWorkspaceConfig> workspaces)
+        {
+            this.workspaces = workspaces;
+        }
+
+        public Task<SlackWorkspaceConfig?> GetByTeamIdAsync(string? teamId, CancellationToken ct)
+        {
+            if (!string.IsNullOrEmpty(teamId) && this.workspaces.TryGetValue(teamId, out SlackWorkspaceConfig? cfg))
+            {
+                return Task.FromResult<SlackWorkspaceConfig?>(cfg);
+            }
+
+            return Task.FromResult<SlackWorkspaceConfig?>(null);
+        }
+
+        public Task<IReadOnlyCollection<SlackWorkspaceConfig>> GetAllEnabledAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyCollection<SlackWorkspaceConfig>>(new List<SlackWorkspaceConfig>(this.workspaces.Values));
+    }
+
+    private sealed class StubSecretProvider : ISecretProvider
+    {
+        private readonly Dictionary<string, string> values = new(StringComparer.Ordinal);
+
+        public void Set(string secretRef, string value) => this.values[secretRef] = value;
+
+        public Task<string> GetSecretAsync(string secretRef, CancellationToken ct)
+        {
+            if (this.values.TryGetValue(secretRef, out string? v))
+            {
+                return Task.FromResult(v);
+            }
+
+            throw new SecretNotFoundException(secretRef);
+        }
+    }
+
     [Fact]
     public async Task Permanent_failure_records_actual_attempt_count_not_max_attempts()
     {
@@ -613,7 +815,9 @@ public sealed class SlackOutboundDispatcherTests
         ISlackOutboundDispatchClient dispatch,
         ISlackDeadLetterQueue dlq,
         ISlackAuditEntryWriter audit,
-        SlackConnectorOptions? optionsOverride = null)
+        SlackConnectorOptions? optionsOverride = null,
+        ISlackRateLimiter? sharedLimiter = null,
+        IOptionsMonitor<SlackConnectorOptions>? sharedMonitor = null)
     {
         SlackConnectorOptions opts = optionsOverride ?? new SlackConnectorOptions
         {
@@ -621,10 +825,17 @@ public sealed class SlackOutboundDispatcherTests
             RateLimits = new SlackRateLimitOptions(),
         };
 
-        IOptionsMonitor<SlackConnectorOptions> monitor =
-            new StaticOptionsMonitor<SlackConnectorOptions>(opts);
+        IOptionsMonitor<SlackConnectorOptions> monitor = sharedMonitor
+            ?? new StaticOptionsMonitor<SlackConnectorOptions>(opts);
 
-        SlackTokenBucketRateLimiter limiter = new(monitor, TimeProvider.System);
+        // Stage 6.4 evaluator iter-3 item #2: allow callers to inject
+        // a SHARED limiter so a sibling SlackDirectApiClient can drive
+        // the bucket into a Retry-After suspension and the dispatcher's
+        // subsequent Tier 4 acquire observes the back-pressure via the
+        // SAME instance. The default factory still constructs a fresh
+        // limiter so unrelated dispatcher tests are unaffected.
+        ISlackRateLimiter limiter = sharedLimiter
+            ?? new SlackTokenBucketRateLimiter(monitor, TimeProvider.System);
         DefaultSlackRetryPolicy retry = new(monitor);
 
         return new SlackOutboundDispatcher(
