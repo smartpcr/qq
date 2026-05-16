@@ -360,33 +360,24 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
             // worse than no onboarding because subsequent commands
             // would route to a subset of workspaces with no
             // operator-visible signal.
-            //
-            // SECURITY: the DenialReason flows back to the Telegram
-            // user via AuthorizationResult.DenialReason and is surfaced
-            // verbatim in the bot's reply. Do NOT interpolate
-            // ex.Message into the user-facing reason ΓÇö EF Core and
-            // ADO.NET providers routinely embed internal schema details
-            // (table names, unique-index names, constraint names, and
-            // in some providers fragments of the connection string)
-            // into their exception messages, and leaking that to an
-            // untrusted Telegram user is an information-disclosure
-            // vector. The full exception (including the provider-
-            // specific Message and stack) is captured by the
-            // _logger.LogError(ex, ...) call above, so operators can
-            // still diagnose the failure from the server logs without
-            // exposing it to the inbound user.
             _logger.LogError(
                 ex,
                 "/start denied ΓÇö RegisterManyAsync failed for user {TelegramUserId} chat {TelegramChatId} after staging {BindingCount} workspace binding(s); transaction rolled back, no rows persisted.",
                 userId,
                 chatIdValue,
                 registrations.Count);
+            // Iter-N review fix (security) -- do NOT include ex.Message in the
+            // user-facing DenialReason: it flows through AuthorizationResult.DenialReason
+            // into the bot reply and DB exceptions can leak constraint names, table
+            // names, or (depending on provider) connection-string fragments to the
+            // Telegram operator. The full exception is already captured on the
+            // preceding _logger.LogError(ex, ...) call; operators correlate via logs.
             return Deny(
-                $"User {userId} onboarding failed: the persistent operator registry could not store the workspace bindings. "
+                $"User {userId} onboarding failed due to a persistence error. "
                 + "All workspace bindings were rolled back atomically; no rows were persisted. "
                 + "Common cause: a (OperatorAlias, TenantId) collision with another operator's binding "
                 + "(per architecture.md lines 116-119 alias uniqueness). "
-                + "Contact your administrator and check the server logs for the underlying error detail.");
+                + "See server logs for diagnostic detail.");
         }
 
         // Re-query to return the persistent records (with their real
