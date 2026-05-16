@@ -110,6 +110,29 @@ public sealed class EntityFrameworkSlackFastPathIdempotencyStoreTests : IDisposa
     }
 
     [Fact]
+    public async Task MarkCompletedAsync_via_interface_also_flips_processing_status_to_modal_opened()
+    {
+        // Iter-4 fix: the new ISlackFastPathIdempotencyStore.MarkCompletedAsync
+        // surface MUST drive the same state transition as the legacy
+        // MarkOpenedAsync method. Callers that depend on the interface
+        // (composite store, fast-path handler) should not need to know
+        // about the legacy concrete API.
+        ISlackFastPathIdempotencyStore store = this.BuildStore();
+        SlackInboundEnvelope envelope = BuildEnvelope(idempotencyKey: "cmd:T1:U1:/agent:trig-iface");
+
+        await store.TryAcquireAsync(envelope.IdempotencyKey, envelope, lifetime: null, ct: CancellationToken.None);
+        await store.MarkCompletedAsync(envelope.IdempotencyKey, CancellationToken.None);
+
+        using IServiceScope scope = this.serviceProvider.CreateScope();
+        SlackTestDbContext ctx = scope.ServiceProvider.GetRequiredService<SlackTestDbContext>();
+        AgentSwarm.Messaging.Slack.Entities.SlackInboundRequestRecord row = ctx.InboundRequests.Single();
+        row.ProcessingStatus.Should().Be(
+            EntityFrameworkSlackFastPathIdempotencyStore<SlackTestDbContext>.ProcessingStatusModalOpened,
+            "MarkCompletedAsync via the interface delegates to the same SaveChanges path as MarkOpenedAsync");
+        row.CompletedAt.Should().NotBeNull();
+    }
+
+    [Fact]
     public async Task ReleaseAsync_only_deletes_rows_that_are_still_in_reserved_state()
     {
         EntityFrameworkSlackFastPathIdempotencyStore<SlackTestDbContext> store = this.BuildStore();

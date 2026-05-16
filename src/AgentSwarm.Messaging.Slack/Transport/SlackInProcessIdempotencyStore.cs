@@ -136,6 +136,16 @@ internal sealed class SlackInProcessIdempotencyStore : ISlackFastPathIdempotency
         return ValueTask.CompletedTask;
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// In-process stores have no durable "processing_status" column to
+    /// flip -- the live dictionary entry IS the dedup signal, and the
+    /// TTL handles cleanup. Implemented as a no-op so the composite
+    /// store can safely delegate to L1 + L2 without special-casing.
+    /// </remarks>
+    public ValueTask MarkCompletedAsync(string key, CancellationToken ct = default)
+        => ValueTask.CompletedTask;
+
     /// <summary>
     /// Explicitly forgets an entry. Used by failing fast-path runs
     /// (views.open returned an error) so the user can retry without

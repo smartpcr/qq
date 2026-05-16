@@ -214,6 +214,13 @@ internal sealed class EntityFrameworkSlackFastPathIdempotencyStore<TContext>
     /// dedup anchor for the full retention window. Called by the
     /// handler on success.
     /// </summary>
+    /// <remarks>
+    /// Retained as a public method so callers that hold a concrete
+    /// reference (e.g., older Stage 4.3 prototypes) keep compiling.
+    /// New callers should depend on the
+    /// <see cref="ISlackFastPathIdempotencyStore.MarkCompletedAsync"/>
+    /// interface method, which delegates here.
+    /// </remarks>
     public async Task MarkOpenedAsync(string key, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(key))
@@ -249,6 +256,19 @@ internal sealed class EntityFrameworkSlackFastPathIdempotencyStore<TContext>
                 "Slack fast-path durable idempotency mark-opened failed for key={IdempotencyKey}; the row stays in 'reserved' state.",
                 key);
         }
+    }
+
+    /// <inheritdoc />
+    public async ValueTask MarkCompletedAsync(string key, CancellationToken ct = default)
+    {
+        // Iter-4 fix: the modal fast-path handler invokes this AFTER a
+        // successful views.open so the durable row is transitioned out
+        // of the "reserved" status that TryAcquireAsync wrote. Without
+        // this call Stage 4.3's ingestor would see every successfully-
+        // opened modal as an in-flight reservation and either re-process
+        // it through the async pipeline (duplicate work) or wait for a
+        // reservation owner that already terminated (stuck row).
+        await this.MarkOpenedAsync(key, ct).ConfigureAwait(false);
     }
 
     private static string HashRawPayload(string raw)

@@ -139,4 +139,42 @@ internal sealed class CompositeSlackFastPathIdempotencyStore : ISlackFastPathIde
                 key);
         }
     }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Iter-4 fix: the composite delegates the completion marker to
+    /// the L2 backend ONLY. The L1 entry must remain in place until
+    /// its TTL expires so a Slack-side retry of the same trigger_id
+    /// still hits the L1 dedup check (it does not need to round-trip
+    /// the database to know it is a duplicate). The L2 backend
+    /// converts its reserved row to <c>modal_opened</c> so the async
+    /// ingestor knows the row is terminal.
+    /// </remarks>
+    public async ValueTask MarkCompletedAsync(string key, CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(key))
+        {
+            return;
+        }
+
+        try
+        {
+            await this.l2.MarkCompletedAsync(key, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Best-effort: the user has already seen the modal. A failure
+            // to flip the marker means Stage 4.3's ingestor may
+            // re-process the row, but the durable record's own
+            // raw-payload-hash dedup will still prevent duplicate work.
+            this.logger.LogWarning(
+                ex,
+                "Slack fast-path durable idempotency mark-completed failed for key={IdempotencyKey}; the L2 row stays in 'reserved' until the ingestor reclaims it.",
+                key);
+        }
+    }
 }

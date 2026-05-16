@@ -120,6 +120,48 @@ public sealed class CompositeSlackFastPathIdempotencyStoreTests
         l1.LiveCount.Should().Be(0, "the L1 token must be released so a retry isn't blocked by the leak");
     }
 
+    [Fact]
+    public async Task MarkCompletedAsync_delegates_to_L2_only_and_keeps_L1_token_live()
+    {
+        // Iter-4 fix: success path must flip the durable L2 row from
+        // 'reserved' to 'modal_opened' so Stage 4.3's ingestor knows
+        // the fast-path completed. The L1 token must STAY in place
+        // until its TTL expires so a Slack-side retry of the same
+        // trigger_id is rejected by L1 without a DB round-trip.
+        SlackInProcessIdempotencyStore l1 = new();
+        RecordingL2 l2 = new() { Plan = SlackFastPathIdempotencyResult.Acquired() };
+        CompositeSlackFastPathIdempotencyStore composite = new(l1, l2, NullLogger<CompositeSlackFastPathIdempotencyStore>.Instance);
+
+        SlackInboundEnvelope envelope = BuildEnvelope("key-7");
+        await composite.TryAcquireAsync("key-7", envelope, lifetime: null, ct: CancellationToken.None);
+        l1.LiveCount.Should().Be(1);
+
+        await composite.MarkCompletedAsync("key-7", CancellationToken.None);
+
+        l2.CompletedKeys.Should().ContainSingle().Which.Should().Be("key-7",
+            "the durable backend MUST receive the mark-completed call so the row exits the 'reserved' state");
+        l1.LiveCount.Should().Be(1,
+            "the L1 token must NOT be released on success -- it is what gates retries within the TTL window");
+    }
+
+    [Fact]
+    public async Task MarkCompletedAsync_swallows_L2_exception_and_does_not_throw()
+    {
+        // Iter-4 fix: by the time the handler calls MarkCompletedAsync
+        // the user has ALREADY seen their modal -- a downstream audit /
+        // status-flip failure MUST NOT surface to the caller.
+        SlackInProcessIdempotencyStore l1 = new();
+        ThrowingL2 l2 = new();
+        CompositeSlackFastPathIdempotencyStore composite = new(l1, l2, NullLogger<CompositeSlackFastPathIdempotencyStore>.Instance);
+
+        Func<Task> act = () => composite
+            .MarkCompletedAsync("key-8", CancellationToken.None)
+            .AsTask();
+
+        await act.Should().NotThrowAsync(
+            "the L2 mark-completed failure is best-effort and must not propagate to the caller");
+    }
+
     private static SlackInboundEnvelope BuildEnvelope(string idempotencyKey)
     {
         return new SlackInboundEnvelope(
@@ -141,6 +183,8 @@ public sealed class CompositeSlackFastPathIdempotencyStoreTests
 
         public List<string> ReleasedKeys { get; } = new();
 
+        public List<string> CompletedKeys { get; } = new();
+
         public ValueTask<SlackFastPathIdempotencyResult> TryAcquireAsync(
             string key,
             SlackInboundEnvelope envelope,
@@ -156,6 +200,12 @@ public sealed class CompositeSlackFastPathIdempotencyStoreTests
             this.ReleasedKeys.Add(key);
             return ValueTask.CompletedTask;
         }
+
+        public ValueTask MarkCompletedAsync(string key, CancellationToken ct = default)
+        {
+            this.CompletedKeys.Add(key);
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class ThrowingL2 : ISlackFastPathIdempotencyStore
@@ -169,5 +219,8 @@ public sealed class CompositeSlackFastPathIdempotencyStoreTests
 
         public ValueTask ReleaseAsync(string key, CancellationToken ct = default)
             => ValueTask.CompletedTask;
+
+        public ValueTask MarkCompletedAsync(string key, CancellationToken ct = default)
+            => throw new InvalidOperationException("L2 blew up on mark-completed");
     }
 }

@@ -195,6 +195,37 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
 
         if (viewsResult.IsSuccess)
         {
+            // Iter-4 fix: transition the durable idempotency row from
+            // "reserved" to "modal_opened" so Stage 4.3's async ingestor
+            // recognises this row as terminal and does NOT replay the
+            // command through the async pipeline. Without this call the
+            // row leaks at "reserved" forever (the EF backend exposes
+            // MarkOpenedAsync but the iter-3 handler never invoked it),
+            // defeating the cross-replica / cross-restart dedup contract
+            // that justified pulling forward the durable backend.
+            //
+            // Iter-5 fix (evaluator item 2): pass CancellationToken.None
+            // and wrap in try/catch so request-token cancellation cannot
+            // surface as an OperationCanceledException AFTER the user has
+            // already seen the modal. The interface contract
+            // (ISlackFastPathIdempotencyStore.cs:101-103) explicitly
+            // requires this call to be best-effort and non-throwing once
+            // views.open has succeeded -- the modal exists in Slack's UI
+            // and the caller cannot recover by retrying.
+            try
+            {
+                await this.idempotencyStore
+                    .MarkCompletedAsync(envelope.IdempotencyKey, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception markEx)
+            {
+                this.logger.LogWarning(
+                    markEx,
+                    "Slack modal fast-path failed to mark idempotency key={IdempotencyKey} as completed after a successful views.open. The user-visible modal is unaffected; the durable row will be reconciled by Stage 4.3's async ingestor on the next retry.",
+                    envelope.IdempotencyKey);
+            }
+
             this.logger.LogInformation(
                 "Slack modal fast-path opened {SubCommand} modal for team={TeamId} user={UserId} trigger_id={TriggerId} idempotency_key={IdempotencyKey}.",
                 payload.SubCommand,

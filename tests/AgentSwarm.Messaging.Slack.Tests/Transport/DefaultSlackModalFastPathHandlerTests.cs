@@ -247,12 +247,56 @@ public sealed class DefaultSlackModalFastPathHandlerTests
             "Slack's error code must be captured so it's queryable in the audit log");
     }
 
+    [Fact]
+    public async Task Success_calls_MarkCompletedAsync_on_the_idempotency_store_to_flip_durable_row_to_modal_opened()
+    {
+        // Iter-4 fix: the iter-3 handler invoked TryAcquireAsync (which
+        // inserts the durable slack_inbound_request_record row with
+        // processing_status='reserved') but NEVER invoked
+        // MarkCompletedAsync on success, so every row leaked at
+        // 'reserved' forever. Stage 4.3's async ingestor would then
+        // mis-route those rows (either replay them or wait indefinitely
+        // for a reservation owner that already terminated). Pin the
+        // success-path call so this regression cannot reappear.
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        RecordingIdempotencyStore store = new() { Plan = SlackFastPathIdempotencyResult.Acquired() };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views, idempotencyStore: store);
+
+        await handler.HandleAsync(BuildEnvelope("review pr 42"), new DefaultHttpContext(), CancellationToken.None);
+
+        store.MarkCompletedCalls.Should().ContainSingle(
+            "successful views.open MUST flip the durable row from 'reserved' to 'modal_opened'");
+        store.ReleaseCalls.Should().BeEmpty(
+            "the success path must NOT delete the durable row -- it stays as the dedup anchor for the retention window");
+    }
+
+    [Fact]
+    public async Task Views_open_failure_calls_ReleaseAsync_not_MarkCompletedAsync()
+    {
+        // Iter-4 fix: the failure path must Release (delete the row) so
+        // a retry can take a fresh reservation; it must NOT
+        // MarkCompleted (which would preserve the row and silently
+        // ACK every future retry as a duplicate).
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Failure("internal_error") };
+        RecordingIdempotencyStore store = new() { Plan = SlackFastPathIdempotencyResult.Acquired() };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views, idempotencyStore: store);
+
+        await handler.HandleAsync(BuildEnvelope("review pr 42"), new DefaultHttpContext(), CancellationToken.None);
+
+        store.MarkCompletedCalls.Should().BeEmpty(
+            "the failure path must NOT mark the reservation completed -- the user must be able to retry");
+        store.ReleaseCalls.Should().ContainSingle(
+            "the failure path MUST release the reservation so a retry can succeed");
+    }
+
     private static DefaultSlackModalFastPathHandler BuildHandler(
         FakeViewsOpenClient views,
         SlackInProcessIdempotencyStore? store = null,
-        SlackModalAuditRecorder? auditRecorder = null)
+        SlackModalAuditRecorder? auditRecorder = null,
+        ISlackFastPathIdempotencyStore? idempotencyStore = null)
     {
-        SlackInProcessIdempotencyStore resolvedStore = store ?? new SlackInProcessIdempotencyStore();
+        ISlackFastPathIdempotencyStore resolvedStore =
+            idempotencyStore ?? store ?? new SlackInProcessIdempotencyStore();
         SlackModalAuditRecorder resolvedAudit = auditRecorder ?? new SlackModalAuditRecorder(
             new InMemorySlackAuditEntryWriter(),
             NullLogger<SlackModalAuditRecorder>.Instance);
@@ -288,6 +332,46 @@ public sealed class DefaultSlackModalFastPathHandlerTests
             this.Invocations++;
             this.LastRequest = request;
             return Task.FromResult(this.Result);
+        }
+    }
+
+    /// <summary>
+    /// Recording <see cref="ISlackFastPathIdempotencyStore"/> double
+    /// used by the iter-4 success/failure-path pins to assert which of
+    /// <see cref="ISlackFastPathIdempotencyStore.ReleaseAsync"/> and
+    /// <see cref="ISlackFastPathIdempotencyStore.MarkCompletedAsync"/>
+    /// the handler invokes.
+    /// </summary>
+    private sealed class RecordingIdempotencyStore : ISlackFastPathIdempotencyStore
+    {
+        public SlackFastPathIdempotencyResult Plan { get; set; } = SlackFastPathIdempotencyResult.Acquired();
+
+        public List<string> AcquireCalls { get; } = new();
+
+        public List<string> ReleaseCalls { get; } = new();
+
+        public List<string> MarkCompletedCalls { get; } = new();
+
+        public ValueTask<SlackFastPathIdempotencyResult> TryAcquireAsync(
+            string key,
+            SlackInboundEnvelope envelope,
+            TimeSpan? lifetime = null,
+            CancellationToken ct = default)
+        {
+            this.AcquireCalls.Add(key);
+            return new ValueTask<SlackFastPathIdempotencyResult>(this.Plan);
+        }
+
+        public ValueTask ReleaseAsync(string key, CancellationToken ct = default)
+        {
+            this.ReleaseCalls.Add(key);
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask MarkCompletedAsync(string key, CancellationToken ct = default)
+        {
+            this.MarkCompletedCalls.Add(key);
+            return ValueTask.CompletedTask;
         }
     }
 }

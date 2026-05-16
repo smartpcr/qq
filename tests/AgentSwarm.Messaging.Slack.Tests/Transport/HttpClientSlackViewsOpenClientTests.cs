@@ -120,10 +120,91 @@ public sealed class HttpClientSlackViewsOpenClientTests
         handler.LastRequest.Should().BeNull("an empty bot token must not result in an unauthenticated views.open call");
     }
 
+    /// <summary>
+    /// Stage 4.1 iter-3 / iter-4 evaluator item 3 regression pin:
+    /// when the caller's CancellationToken is cancelled DURING bot-token
+    /// resolution, the client MUST re-throw <see cref="OperationCanceledException"/>
+    /// rather than swallow it into the broad <c>catch (Exception)</c>
+    /// that converts secret-resolution failures into a
+    /// <see cref="SlackViewsOpenResultKind.MissingConfiguration"/>
+    /// ephemeral error. Misclassifying a cancelled request as a
+    /// missing-config error would (a) confuse operators with a fake
+    /// configuration alert and (b) hide the fact that the upstream
+    /// request was aborted.
+    /// </summary>
+    [Fact]
+    public async Task Caller_cancelled_token_during_bot_token_resolution_propagates_OperationCanceledException()
+    {
+        StubHttpMessageHandler handler = new(
+            (req, _) => CreateResponse(HttpStatusCode.OK, "{\"ok\":true}"));
+        CancellingSecretProvider secrets = new();
+
+        ISlackViewsOpenClient client = BuildClient(handler, secretsOverride: secrets);
+
+        using CancellationTokenSource cts = new();
+
+        Func<Task> act = async () =>
+        {
+            await client.OpenAsync(
+                new SlackViewsOpenRequest(TeamId, "trig.X", new { type = "modal" }),
+                cts.Token);
+        };
+
+        // The secrets provider cancels the supplied token as soon as
+        // it is invoked, then throws OperationCanceledException -- this
+        // is the exact race the OCE filter at HttpClientSlackViewsOpenClient.cs:135
+        // is designed to honour.
+        secrets.OnGetSecret = providedCt =>
+        {
+            cts.Cancel();
+            providedCt.ThrowIfCancellationRequested();
+        };
+
+        await act.Should().ThrowAsync<OperationCanceledException>(
+            "OperationCanceledException MUST propagate when the caller's token is cancelled; the broad catch must NOT convert it to MissingConfiguration");
+
+        handler.LastRequest.Should().BeNull(
+            "the HTTP call must not be attempted when the secret resolution was cancelled");
+    }
+
+    /// <summary>
+    /// Defence-in-depth: a non-caller-token OCE (e.g., the secret
+    /// provider's own internal timeout) must NOT propagate because
+    /// the filter at <c>HttpClientSlackViewsOpenClient.cs:135</c>
+    /// is intentionally scoped to <c>when (ct.IsCancellationRequested)</c>.
+    /// Such a failure should still surface as
+    /// <see cref="SlackViewsOpenResultKind.MissingConfiguration"/>.
+    /// </summary>
+    [Fact]
+    public async Task Internal_OperationCanceledException_with_live_caller_token_still_returns_MissingConfiguration()
+    {
+        StubHttpMessageHandler handler = new(
+            (req, _) => CreateResponse(HttpStatusCode.OK, "{\"ok\":true}"));
+        CancellingSecretProvider secrets = new()
+        {
+            OnGetSecret = _ =>
+            {
+                // Throw OCE with a token that is NOT the caller's.
+                using CancellationTokenSource internalCts = new();
+                internalCts.Cancel();
+                throw new OperationCanceledException(internalCts.Token);
+            },
+        };
+
+        ISlackViewsOpenClient client = BuildClient(handler, secretsOverride: secrets);
+
+        SlackViewsOpenResult result = await client.OpenAsync(
+            new SlackViewsOpenRequest(TeamId, "trig.X", new { type = "modal" }),
+            CancellationToken.None);
+
+        result.Kind.Should().Be(SlackViewsOpenResultKind.MissingConfiguration,
+            "the OCE filter is scoped to ct.IsCancellationRequested; an internal OCE that does not match the caller's token must be classified as a missing-config error, not propagated");
+    }
+
     private static ISlackViewsOpenClient BuildClient(
         StubHttpMessageHandler messageHandler,
         IReadOnlyDictionary<string, SlackWorkspaceConfig>? workspaces = null,
-        StubSecretProvider? secretsOverride = null)
+        ISecretProvider? secretsOverride = null)
     {
         StubHttpClientFactory factory = new(messageHandler);
         StubWorkspaceConfigStore store = new(workspaces ?? new Dictionary<string, SlackWorkspaceConfig>
@@ -136,10 +217,16 @@ public sealed class HttpClientSlackViewsOpenClientTests
             },
         });
 
-        StubSecretProvider secrets = secretsOverride ?? new StubSecretProvider();
-        if (secretsOverride is null)
+        ISecretProvider secrets;
+        if (secretsOverride is not null)
         {
-            secrets.Set(SecretRef, BotToken);
+            secrets = secretsOverride;
+        }
+        else
+        {
+            StubSecretProvider stub = new();
+            stub.Set(SecretRef, BotToken);
+            secrets = stub;
         }
 
         return new HttpClientSlackViewsOpenClient(
@@ -231,6 +318,22 @@ public sealed class HttpClientSlackViewsOpenClientTests
             }
 
             throw new SecretNotFoundException(secretRef);
+        }
+    }
+
+    /// <summary>
+    /// Test double that runs a caller-supplied callback against every
+    /// <see cref="GetSecretAsync"/> invocation. Used to pin the OCE
+    /// propagation contract on <see cref="HttpClientSlackViewsOpenClient"/>.
+    /// </summary>
+    private sealed class CancellingSecretProvider : ISecretProvider
+    {
+        public Action<CancellationToken>? OnGetSecret { get; set; }
+
+        public Task<string> GetSecretAsync(string secretRef, CancellationToken ct)
+        {
+            this.OnGetSecret?.Invoke(ct);
+            return Task.FromResult("xoxb-unreached");
         }
     }
 }

@@ -71,9 +71,7 @@ public static class SlackInboundTransportServiceCollectionExtensions
         // production host registers a durable sink BEFORE this call.
         services.TryAddSingleton<InMemorySlackInboundEnqueueDeadLetterSink>();
         services.TryAddSingleton<ISlackInboundEnqueueDeadLetterSink>(sp =>
-            sp.GetRequiredService<InMemorySlackInboundEnqueueDeadLetterSink>());
-
-        // Default modal fast-path handler is a real implementation that
+            sp.GetRequiredService<InMemorySlackInboundEnqueueDeadLetterSink>());        // Default modal fast-path handler is a real implementation that
         // runs idempotency + views.open synchronously inside the HTTP
         // request lifetime (architecture.md §5.3, tech-spec.md §5.2).
         // Iter-3 (evaluator items 2 + 3) introduces the
@@ -119,5 +117,44 @@ public static class SlackInboundTransportServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
         return builder.AddApplicationPart(typeof(SlackEventsController).Assembly);
+    }
+
+    /// <summary>
+    /// Replaces the default in-memory
+    /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> with the
+    /// durable <see cref="FileSystemSlackInboundEnqueueDeadLetterSink"/>
+    /// that writes every dead-lettered envelope as a JSONL line under
+    /// <paramref name="directoryPath"/>. Hosts that survive process
+    /// restarts (worker daemons, web hosts behind orchestrators that
+    /// reschedule the pod) MUST opt in to a durable sink so post-ACK
+    /// enqueue failures captured before the restart are not lost --
+    /// Stage 4.1 iter-4 evaluator item 2.
+    /// </summary>
+    /// <param name="services">Target service collection.</param>
+    /// <param name="directoryPath">Absolute or relative directory path
+    /// where the JSONL file is appended. Created if absent.</param>
+    /// <returns>The same <paramref name="services"/> for chaining.</returns>
+    public static IServiceCollection AddFileSystemSlackInboundEnqueueDeadLetterSink(
+        this IServiceCollection services,
+        string directoryPath)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        if (string.IsNullOrWhiteSpace(directoryPath))
+        {
+            throw new ArgumentException("Dead-letter directory path must be supplied.", nameof(directoryPath));
+        }
+
+        // Remove the default in-memory registration so the file sink
+        // is the single resolved implementation of the interface.
+        services.RemoveAll<ISlackInboundEnqueueDeadLetterSink>();
+        services.RemoveAll<InMemorySlackInboundEnqueueDeadLetterSink>();
+
+        services.AddSingleton(sp => new FileSystemSlackInboundEnqueueDeadLetterSink(
+            directoryPath,
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<FileSystemSlackInboundEnqueueDeadLetterSink>>()));
+        services.AddSingleton<ISlackInboundEnqueueDeadLetterSink>(sp =>
+            sp.GetRequiredService<FileSystemSlackInboundEnqueueDeadLetterSink>());
+
+        return services;
     }
 }

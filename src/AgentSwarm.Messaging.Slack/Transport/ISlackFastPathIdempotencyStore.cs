@@ -72,6 +72,38 @@ internal interface ISlackFastPathIdempotencyStore
     /// attempt's reservation.
     /// </summary>
     ValueTask ReleaseAsync(string key, CancellationToken ct = default);
+
+    /// <summary>
+    /// Marks the previously-acquired key as terminal-success so the
+    /// durable row is retained as a dedup anchor for the full
+    /// retention window AND the row's processing-status marker flips
+    /// from <c>reserved</c> to <c>modal_opened</c>. Called by the
+    /// fast-path handler ONLY after <c>views.open</c> returned
+    /// success.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the success-path counterpart to
+    /// <see cref="ReleaseAsync"/>. The difference matters for the
+    /// durable backend: <see cref="ReleaseAsync"/> DELETES the row
+    /// (so a retry can take a fresh reservation), whereas
+    /// <see cref="MarkCompletedAsync"/> KEEPS the row but flips its
+    /// processing status. Stage 4.3's ingestor uses the status marker
+    /// to skip rows the fast-path already handled -- without this
+    /// transition the row would stay in <c>reserved</c> indefinitely
+    /// and the ingestor would never know whether to wait for the
+    /// fast-path or recover an abandoned reservation.
+    /// </para>
+    /// <para>
+    /// In-process implementations may treat this as a no-op (the
+    /// in-process TTL handles cleanup); the durable EF backend MUST
+    /// stamp <c>completed_at</c> and update <c>processing_status</c>.
+    /// Errors from the durable write are best-effort: a failure here
+    /// MUST NOT throw to the caller because the user-visible modal
+    /// has already opened successfully.
+    /// </para>
+    /// </remarks>
+    ValueTask MarkCompletedAsync(string key, CancellationToken ct = default);
 }
 
 /// <summary>

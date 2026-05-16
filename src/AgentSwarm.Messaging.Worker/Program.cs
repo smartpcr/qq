@@ -151,6 +151,25 @@ public class Program
         builder.Services
             .AddSlackFastPathDurableIdempotency<SlackPersistenceDbContext>();
 
+        // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the
+        // durable file-system dead-letter sink for post-ACK enqueue
+        // failures. The default registration inside
+        // AddSlackInboundTransport is InMemorySlackInboundEnqueueDeadLetterSink,
+        // which loses captured envelopes on process restart -- the
+        // operator-uploaded story attachment's FR-005 / FR-007
+        // "no message loss" requirements (and the iter-4 evaluator)
+        // require durable persistence so a worker restart cannot
+        // erase the recovery log. Hosts configure the destination via
+        // Slack:Inbound:DeadLetterDirectory; the default value points
+        // at a relative "data/slack-inbound-dead-letter" path so a
+        // missing config does NOT silently fall back to in-memory.
+        string deadLetterDir = builder.Configuration["Slack:Inbound:DeadLetterDirectory"]
+            ?? "data/slack-inbound-dead-letter";
+        if (!string.IsNullOrWhiteSpace(deadLetterDir))
+        {
+            builder.Services.AddFileSystemSlackInboundEnqueueDeadLetterSink(deadLetterDir);
+        }
+
         WebApplication app = builder.Build();
 
         // Stage 3.1: ensure the durable Slack audit schema is provisioned
