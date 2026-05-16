@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Telegram;
+using AgentSwarm.Messaging.Telegram.Sending;
 using FluentAssertions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -76,6 +77,101 @@ public class TelegramOptionsTests
 
         act.Should().NotThrow();
         options.ToString().Should().Contain("0 ids");
+    }
+
+    [Fact]
+    public void ToString_IncludesOperatorBindingCount_ButNotBindingPayload()
+    {
+        // Iter-7 — operator startup-log fidelity. The previous ToString
+        // omitted OperatorBindings entirely, so a misconfigured host
+        // (zero bindings) was indistinguishable from a correctly-bound
+        // one in the startup banner. The count surfaces the binding-
+        // shape WITHOUT echoing the per-binding chat IDs (which, while
+        // not credentials, are operator PII we deliberately keep out
+        // of every log sink).
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            OperatorBindings = new List<TelegramOperatorBindingOptions>
+            {
+                new() { TelegramUserId = 11111, TelegramChatId = 22222, TenantId = "tenant-a", WorkspaceId = "ws-1" },
+                new() { TelegramUserId = 33333, TelegramChatId = 44444, TenantId = "tenant-b", WorkspaceId = "ws-2" },
+                new() { TelegramUserId = 55555, TelegramChatId = 66666, TenantId = "tenant-c", WorkspaceId = "ws-3" },
+            }
+        };
+
+        var text = options.ToString();
+
+        text.Should().Contain("OperatorBindings = [3 bindings]",
+            "the count of configured (user, chat, tenant, workspace) bindings is the load-bearing fact for the startup banner");
+        text.Should().NotContain("11111", "individual user/chat IDs must not leak into ToString output");
+        text.Should().NotContain("22222", "individual user/chat IDs must not leak into ToString output");
+        text.Should().NotContain("tenant-a", "binding tenant ids must not leak into ToString output");
+        text.Should().NotContain("ws-1", "binding workspace ids must not leak into ToString output");
+    }
+
+    [Fact]
+    public void ToString_IsSafe_WhenOperatorBindingsIsNull()
+    {
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            OperatorBindings = null!
+        };
+
+        var act = () => options.ToString();
+
+        act.Should().NotThrow();
+        options.ToString().Should().Contain("[0 bindings]",
+            "a null bindings list must render as zero, not throw, so the startup-log path stays safe even on misconfigured hosts");
+    }
+
+    [Fact]
+    public void ToString_IncludesRateLimitEnvelope_ForOperatorVisibility()
+    {
+        // Iter-7 — the dual-bucket rate-limit envelope (architecture
+        // §10.4) drives the P95 send-latency SLO. A misconfigured
+        // operator who lowers GlobalPerSecond from 30 to 3 silently
+        // collapses the throughput ceiling by 10×; surfacing the
+        // envelope in the startup log lets the operator catch this
+        // BEFORE a burst alert exposes the bottleneck via timeouts.
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            RateLimits = new RateLimitOptions
+            {
+                GlobalPerSecond = 25,
+                GlobalBurstCapacity = 50,
+                PerChatPerMinute = 15,
+                PerChatBurstCapacity = 7
+            }
+        };
+
+        var text = options.ToString();
+
+        text.Should().Contain("GlobalPerSecond = 25");
+        text.Should().Contain("GlobalBurstCapacity = 50");
+        text.Should().Contain("PerChatPerMinute = 15");
+        text.Should().Contain("PerChatBurstCapacity = 7");
+    }
+
+    [Fact]
+    public void ToString_IsSafe_WhenRateLimitsIsNull()
+    {
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            RateLimits = null!
+        };
+
+        var act = () => options.ToString();
+
+        act.Should().NotThrow();
+        // Falls back to defaults so the startup log still shows a
+        // sensible envelope rather than "null" / "0" everywhere.
+        var text = options.ToString();
+        text.Should().Contain("GlobalPerSecond = 30", "the default 30 msg/s envelope must surface when RateLimits is null");
+        text.Should().Contain("PerChatPerMinute = 20", "the default 20 msg/min per-chat envelope must surface when RateLimits is null");
     }
 
     // Hardens the story-brief "token never logged" acceptance criterion

@@ -1189,6 +1189,50 @@ public sealed class TelegramMessageSenderTests
     }
 
     [Fact]
+    public void ResolveCorrelationIdAndFooter_DualMarker_TrailingWins_AndStripsOnlyTrailing()
+    {
+        // Iter-7 — companion to TryExtractTraceFooter's dual-marker
+        // pin, but for the full ResolveCorrelationIdAndFooter +
+        // StripTrailingTraceFooter pair that drives the actual sender
+        // (SendTextAsync / SendQuestionAsync). The risk in iter-5's
+        // structural fix was that the strip helper might trim the
+        // mid-body marker even though the resolver correctly picked
+        // the trailing id — a half-fix that would still leak quoted
+        // context out of the on-wire body. Pins:
+        //   * the returned correlation id is the TRAILING marker's
+        //     id (not the mid-body quote),
+        //   * the returned body retains the mid-body marker text
+        //     verbatim (no silent truncation), and
+        //   * the returned footer is the literal trailing footer
+        //     line (used by SplitForTelegramWithFooter to re-append
+        //     the exact same string to every chunk).
+        const string body =
+            "upstream replied: \"failed → 🔗 trace: upstream-noise saw HTTP 500\"\n"
+            + "retrying with backoff\n\n"
+            + "🔗 trace: tail-real-id";
+
+        var (stripped, correlationId, footer) =
+            TelegramMessageSender.ResolveCorrelationIdAndFooter(body);
+
+        correlationId.Should().Be("tail-real-id",
+            "iter-7 dual-marker pin: the LAST-line marker wins; the mid-body quoted id must never be persisted as the send's correlation id");
+        stripped.Should().Contain("upstream-noise",
+            "iter-7 dual-marker pin: the mid-body quote is part of the body content and must be preserved verbatim through the strip");
+        stripped.Should().NotEndWith("tail-real-id",
+            "iter-7 dual-marker pin: the trailing footer line must be removed from the body half of the tuple so SplitForTelegramWithFooter can re-add it once per chunk without doubling");
+        footer.Should().Be("🔗 trace: tail-real-id",
+            "iter-7 dual-marker pin: the returned footer is the LITERAL trailing line so the per-chunk re-append matches byte-for-byte");
+
+        // The strip-only helper must independently honour the same
+        // contract — used by the question renderer path.
+        var strippedOnly = TelegramMessageSender.StripTrailingTraceFooter(body);
+        strippedOnly.Should().Contain("upstream-noise",
+            "iter-7 dual-marker pin: StripTrailingTraceFooter must also preserve the mid-body quoted marker; trimming from any '🔗 trace:' occurrence would silently lose the operator's error context");
+        strippedOnly.Should().NotEndWith("tail-real-id",
+            "iter-7 dual-marker pin: StripTrailingTraceFooter must remove ONLY the trailing footer line");
+    }
+
+    [Fact]
     public async Task EmitDeadLetter_PersistenceFailureIsRetried_ThenSurfacedViaTypedException()
     {
         // Iter-5 evaluator item 4 — the previous EmitDeadLetterAsync

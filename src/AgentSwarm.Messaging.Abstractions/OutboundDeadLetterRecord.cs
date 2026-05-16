@@ -12,8 +12,12 @@ namespace AgentSwarm.Messaging.Abstractions;
 public enum OutboundFailureCategory
 {
     /// <summary>
-    /// Exhausted <see cref="int"/> retries against
-    /// <c>HttpRequestException</c> / Telegram 5xx / request timeout.
+    /// Exhausted the sender's transient-error retry budget
+    /// (<c>TelegramMessageSender.MaxTransientRetries</c>) against
+    /// <c>HttpRequestException</c>, Telegram 5xx
+    /// <c>ApiRequestException</c>, or a base-class
+    /// <c>RequestException</c> (network-level DNS/TLS/connection-refused
+    /// failure that did not parse into a typed Bot API error).
     /// Operator action: check Telegram status page; verify network
     /// egress.
     /// </summary>
