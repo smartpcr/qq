@@ -561,11 +561,11 @@ public sealed class SlackSignatureValidator : IMiddleware
                 correlationId: null,
                 taskId: null,
                 agentId: null,
-                teamId: workspace?.TeamId,
+                teamId: workspace.TeamId,
                 channelId: null);
 
             SecretResolutionOutcome outcome = await this
-                .TryResolveSigningSecretAsync(workspace!, context.RequestAborted)
+                .TryResolveSigningSecretAsync(workspace, context.RequestAborted)
                 .ConfigureAwait(false);
 
             if (outcome.Status == SecretResolutionStatus.Malformed)
@@ -573,7 +573,7 @@ public sealed class SlackSignatureValidator : IMiddleware
                 anyMalformedRef = true;
                 this.logger.LogWarning(
                     "Slack workspace {TeamId} has a malformed signing_secret_ref ({Detail}); skipping during url_verification handshake.",
-                    workspace?.TeamId,
+                    workspace.TeamId,
                     outcome.ErrorDetail);
                 continue;
             }
@@ -590,7 +590,7 @@ public sealed class SlackSignatureValidator : IMiddleware
             byte[] computed = ComputeHmacSha256(outcome.Secret!, baseString);
             if (CryptographicOperations.FixedTimeEquals(computed, signatureBytes))
             {
-                return SlackSignatureValidationResult.AcceptUrlVerification(workspace!);
+                return SlackSignatureValidationResult.AcceptUrlVerification(workspace);
             }
         }
 

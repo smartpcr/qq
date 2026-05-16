@@ -118,15 +118,21 @@ public sealed class SlackTelemetryCoverageTests
         cts.Cancel();
         await SuppressCancel(run);
 
-        // Wait briefly for the activity to be stopped (ActivityStopped
-        // fires after the using-block disposes, which is on the
-        // background-service loop iteration boundary).
+        // xUnit runs sibling test classes against the same
+        // process-wide SlackTelemetry.ActivitySource; filter by this
+        // test's per-envelope correlation_id so the assertion is
+        // deterministic when run alongside other outbound-dispatch
+        // tests that also produce slack.outbound.send spans.
         await WaitUntilAsync(
-            () => listener.Activities.Any(a => a.OperationName == SlackTelemetry.OutboundSendSpanName),
+            () => listener.Activities.Any(a =>
+                a.OperationName == SlackTelemetry.OutboundSendSpanName
+                && string.Equals(TagValue(a, SlackTelemetry.AttributeCorrelationId), "corr-agent-7", StringComparison.Ordinal)),
             TimeSpan.FromSeconds(5));
 
         Activity sendSpan = listener.Activities
-            .Should().ContainSingle(a => a.OperationName == SlackTelemetry.OutboundSendSpanName,
+            .Should().ContainSingle(a =>
+                a.OperationName == SlackTelemetry.OutboundSendSpanName
+                && string.Equals(TagValue(a, SlackTelemetry.AttributeCorrelationId), "corr-agent-7", StringComparison.Ordinal),
                 "Stage 7.2 step 2 mandates a span on every outbound send")
             .Subject;
 
@@ -284,8 +290,13 @@ public sealed class SlackTelemetryCoverageTests
         views.Invocations.Should().Be(1,
             "the modal MUST be opened so the dispatch span timing is real");
 
+        // Same parallel-class isolation: filter by this test's
+        // per-envelope idempotency key so the modal span we assert
+        // on is the one this test produced, not a sibling test's.
         Activity modalSpan = listener.Activities
-            .Should().ContainSingle(a => a.OperationName == SlackTelemetry.ModalOpenSpanName,
+            .Should().ContainSingle(a =>
+                a.OperationName == SlackTelemetry.ModalOpenSpanName
+                && string.Equals(TagValue(a, SlackTelemetry.AttributeIdempotencyKey), envelope.IdempotencyKey, StringComparison.Ordinal),
                 "Stage 7.2 step 2 mandates a span on the modal-open path")
             .Subject;
 
@@ -367,7 +378,9 @@ public sealed class SlackTelemetryCoverageTests
         outcome.Should().Be(SlackInboundProcessingOutcome.Processed);
 
         Activity dispatchSpan = listener.Activities
-            .First(a => a.OperationName == SlackTelemetry.CommandDispatchSpanName);
+            .First(a =>
+                a.OperationName == SlackTelemetry.CommandDispatchSpanName
+                && string.Equals(BaggageValue(a, SlackTelemetry.AttributeCorrelationId), envelope.IdempotencyKey, StringComparison.Ordinal));
 
         BaggageValue(dispatchSpan, SlackTelemetry.AttributeCorrelationId).Should().Be(envelope.IdempotencyKey,
             "correlation_id MUST flow as baggage so downstream services see the same handle that's in the span tag");

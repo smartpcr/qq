@@ -98,12 +98,31 @@ public sealed class SlackTelemetrySpanTests
             "the command handler MUST be invoked once so the dispatch span captures the handler frame");
 
         // === Assertions: all four mandated spans present. ===
+        // Filter the process-wide listener's catch to spans this test
+        // produced. xUnit runs test classes in parallel against the
+        // SAME ActivitySource; without a per-test correlation filter
+        // the FirstOrDefault below could grab a span emitted by a
+        // sibling test (e.g. SlackTelemetryMetricsTests' ingestor
+        // also fires inbound.receive / authorization spans), and the
+        // bonus correlation_id assertion would then fail comparing
+        // this test's idempotency key against the other test's span.
+        // The signature span pre-dates the envelope so it does not
+        // carry envelope.IdempotencyKey; we filter that one by HTTP
+        // route instead (DefaultPath is unique to this test class).
         IReadOnlyList<Activity> activities = listener.Activities;
 
-        Activity? signatureSpan = activities.FirstOrDefault(a => a.OperationName == SlackTelemetry.SignatureValidationSpanName);
-        Activity? authSpan = activities.FirstOrDefault(a => a.OperationName == SlackTelemetry.AuthorizationSpanName);
-        Activity? idemSpan = activities.FirstOrDefault(a => a.OperationName == SlackTelemetry.IdempotencyCheckSpanName);
-        Activity? commandSpan = activities.FirstOrDefault(a => a.OperationName == SlackTelemetry.CommandDispatchSpanName);
+        Activity? signatureSpan = activities.FirstOrDefault(a =>
+            a.OperationName == SlackTelemetry.SignatureValidationSpanName
+            && string.Equals(TagValue(a, "http.route"), DefaultPath, StringComparison.Ordinal));
+        Activity? authSpan = activities.FirstOrDefault(a =>
+            a.OperationName == SlackTelemetry.AuthorizationSpanName
+            && string.Equals(TagValue(a, SlackTelemetry.AttributeCorrelationId), envelope.IdempotencyKey, StringComparison.Ordinal));
+        Activity? idemSpan = activities.FirstOrDefault(a =>
+            a.OperationName == SlackTelemetry.IdempotencyCheckSpanName
+            && string.Equals(TagValue(a, SlackTelemetry.AttributeCorrelationId), envelope.IdempotencyKey, StringComparison.Ordinal));
+        Activity? commandSpan = activities.FirstOrDefault(a =>
+            a.OperationName == SlackTelemetry.CommandDispatchSpanName
+            && string.Equals(TagValue(a, SlackTelemetry.AttributeCorrelationId), envelope.IdempotencyKey, StringComparison.Ordinal));
 
         signatureSpan.Should().NotBeNull("Stage 7.2 step 2 mandates a span on the signature-validation path");
         authSpan.Should().NotBeNull("Stage 7.2 step 2 mandates a span on the authorization path");
@@ -156,15 +175,26 @@ public sealed class SlackTelemetrySpanTests
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
         Task run = ingestor.StartAsync(cts.Token);
 
+        // xUnit runs sibling test classes in parallel; the same
+        // SlackTelemetry.ActivitySource is process-wide so the
+        // listener captures inbound.receive spans from any other
+        // ingestor-driven test that happens to be running. Filter by
+        // this test's per-envelope correlation_id (= IdempotencyKey)
+        // so we deterministically pick up the span THIS test produced
+        // regardless of execution order.
         await WaitUntilAsync(
-            () => listener.Activities.Any(a => a.OperationName == SlackTelemetry.InboundReceiveSpanName),
+            () => listener.Activities.Any(a =>
+                a.OperationName == SlackTelemetry.InboundReceiveSpanName
+                && string.Equals(TagValue(a, SlackTelemetry.AttributeCorrelationId), env.IdempotencyKey, StringComparison.Ordinal)),
             TimeSpan.FromSeconds(5));
 
         await ingestor.StopAsync(CancellationToken.None);
         cts.Cancel();
         await run;
 
-        Activity receiveSpan = listener.Activities.First(a => a.OperationName == SlackTelemetry.InboundReceiveSpanName);
+        Activity receiveSpan = listener.Activities.First(a =>
+            a.OperationName == SlackTelemetry.InboundReceiveSpanName
+            && string.Equals(TagValue(a, SlackTelemetry.AttributeCorrelationId), env.IdempotencyKey, StringComparison.Ordinal));
         receiveSpan.Kind.Should().Be(ActivityKind.Consumer,
             "the queue-drain boundary MUST be ActivityKind.Consumer per OTel semantic conventions for queue-based ingest");
         TagValue(receiveSpan, SlackTelemetry.AttributeCorrelationId).Should().Be(env.IdempotencyKey);
