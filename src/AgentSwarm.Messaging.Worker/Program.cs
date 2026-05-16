@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Queues;
@@ -47,6 +48,20 @@ public class Program
         WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
         builder.Services.AddRouting();
         builder.Services.AddSlackConnectorOptions(builder.Configuration);
+
+        // Stage 7.2 (workstream:
+        // ws-qq-slack-messenger-supp-phase-observability-and-operations-stage-opentelemetry-traces-and-metrics):
+        // surface the Slack connector's `ActivitySource` / `Meter`
+        // primitives in DI BEFORE any downstream registration so the
+        // OpenTelemetry .NET SDK (when the host opts in) can resolve
+        // them by injected instance and so any test composition root
+        // sees the same singletons production code emits to. The
+        // call is idempotent -- TryAddSingleton means re-registration
+        // by a sibling composition root never produces a second
+        // instance. The ActivitySource is named
+        // "AgentSwarm.Messaging.Slack" and the Meter shares the same
+        // name (per architecture.md §6.3 / tech-spec.md §2.6).
+        builder.Services.AddSlackTelemetry();
 
         // Stage 3.1: register the secret-provider chain BEFORE the
         // signature middleware so the appsettings

@@ -7,8 +7,11 @@
 namespace AgentSwarm.Messaging.Slack.Pipeline;
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Retry;
 using AgentSwarm.Messaging.Slack.Transport;
@@ -107,12 +110,42 @@ internal sealed class SlackInboundProcessingPipeline
         ArgumentNullException.ThrowIfNull(envelope);
         ct.ThrowIfCancellationRequested();
 
+        // Stage 7.2: the pipeline owns the child spans for the
+        // architecture.md §6.3 instrumentation surface that runs
+        // INSIDE the BackgroundService -- authorization, idempotency,
+        // and dispatch. The outermost `slack.inbound.receive` span is
+        // already started by SlackInboundIngestor.ExecuteAsync (or by
+        // the controller for synchronous fast-path requests), so each
+        // child here is created via Activity.Current as the parent.
+        // The §6.3 attribute set (correlation_id, team_id,
+        // channel_id, source_type, idempotency_key) is stamped on
+        // every span through SlackTelemetry.StampInboundEnvelope so
+        // attribute coverage is uniform across the call graph.
+        using IDisposable scope = SlackTelemetry.CreateScope(this.logger, envelope);
+
         // Step 1: authorize. Per architecture.md §574-575 this runs
         // BEFORE any idempotency-table write so a rejected request
         // cannot consume a dedup slot.
-        SlackInboundAuthorizationResult authResult = await this.authorizer
-            .AuthorizeAsync(envelope, ct)
-            .ConfigureAwait(false);
+        SlackInboundAuthorizationResult authResult;
+        using (Activity? authSpan = SlackTelemetry.StartInboundSpan(
+            SlackTelemetry.AuthorizationSpanName,
+            envelope))
+        {
+            authResult = await this.authorizer
+                .AuthorizeAsync(envelope, ct)
+                .ConfigureAwait(false);
+
+            if (authResult.IsAuthorized)
+            {
+                authSpan?.SetTag(SlackTelemetry.AttributeOutcome, "authorized");
+            }
+            else
+            {
+                authSpan?.SetTag(SlackTelemetry.AttributeOutcome, "rejected");
+                authSpan?.SetTag(SlackTelemetry.AttributeRejectionReason, authResult.Reason.ToString());
+                authSpan?.SetStatus(ActivityStatusCode.Error, authResult.Detail);
+            }
+        }
 
         if (!authResult.IsAuthorized)
         {
@@ -124,6 +157,17 @@ internal sealed class SlackInboundProcessingPipeline
                 envelope.IdempotencyKey,
                 envelope.SourceType,
                 authResult.Reason);
+
+            // Stage 7.2: the pipeline-level authorizer rejection is
+            // emitted by SlackInboundAuthorizer (which writes its
+            // own audit row); also bump the shared rejection
+            // counter so EVERY pipeline-side rejection is visible
+            // on the same SLI as Stage 3.2 HTTP rejections.
+            SlackTelemetry.AuthRejectedCount.Add(
+                1,
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeRejectionReason, authResult.Reason.ToString()),
+                new KeyValuePair<string, object?>("slack.rejection_stage", "pipeline_authorization"),
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, envelope.TeamId ?? string.Empty));
             return SlackInboundProcessingOutcome.Unauthorized;
         }
 
@@ -136,7 +180,15 @@ internal sealed class SlackInboundProcessingPipeline
         // cases share the 'outcome = duplicate' audit marker below
         // but operators can disambiguate via the persisted row's
         // status (terminal => true duplicate, processing => deferred).
-        bool acquired = await this.guard.TryAcquireAsync(envelope, ct).ConfigureAwait(false);
+        bool acquired;
+        using (Activity? idemSpan = SlackTelemetry.StartInboundSpan(
+            SlackTelemetry.IdempotencyCheckSpanName,
+            envelope))
+        {
+            acquired = await this.guard.TryAcquireAsync(envelope, ct).ConfigureAwait(false);
+            idemSpan?.SetTag(SlackTelemetry.AttributeOutcome, acquired ? "acquired" : "duplicate");
+        }
+
         string requestType = SlackInboundAuditRecorder.DescribeRequestType(envelope, this.TryReadEventSubtype(envelope));
 
         if (!acquired)
@@ -147,6 +199,16 @@ internal sealed class SlackInboundProcessingPipeline
                 envelope.SourceType,
                 envelope.TeamId,
                 envelope.ChannelId);
+
+            // Stage 7.2: every guard-rejected envelope bumps
+            // `slack.idempotency.duplicate_count`. Tagged with the
+            // source type so dashboards split true duplicates by
+            // command vs. interaction vs. event surfaces.
+            SlackTelemetry.IdempotencyDuplicateCount.Add(
+                1,
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeSourceType, envelope.SourceType.ToString()),
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, envelope.TeamId ?? string.Empty));
+
             await this.auditRecorder.RecordDuplicateAsync(envelope, requestType, ct).ConfigureAwait(false);
             return SlackInboundProcessingOutcome.Duplicate;
         }
@@ -291,30 +353,78 @@ internal sealed class SlackInboundProcessingPipeline
         switch (envelope.SourceType)
         {
             case SlackInboundSourceType.Command:
-                await this.commandHandler.HandleAsync(envelope, ct).ConfigureAwait(false);
-                return SlackRetryDispatchResult.Success;
+                using (Activity? cmdSpan = SlackTelemetry.StartInboundSpan(
+                    SlackTelemetry.CommandDispatchSpanName,
+                    envelope))
+                {
+                    try
+                    {
+                        await this.commandHandler.HandleAsync(envelope, ct).ConfigureAwait(false);
+                        cmdSpan?.SetTag(SlackTelemetry.AttributeOutcome, "dispatched");
+                        return SlackRetryDispatchResult.Success;
+                    }
+                    catch (Exception ex)
+                    {
+                        cmdSpan?.SetTag(SlackTelemetry.AttributeOutcome, "exception");
+                        cmdSpan?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                        throw;
+                    }
+                }
 
             case SlackInboundSourceType.Interaction:
-                await this.interactionHandler.HandleAsync(envelope, ct).ConfigureAwait(false);
-                return SlackRetryDispatchResult.Success;
+                using (Activity? interactionSpan = SlackTelemetry.StartInboundSpan(
+                    SlackTelemetry.InteractionDispatchSpanName,
+                    envelope))
+                {
+                    try
+                    {
+                        await this.interactionHandler.HandleAsync(envelope, ct).ConfigureAwait(false);
+                        interactionSpan?.SetTag(SlackTelemetry.AttributeOutcome, "dispatched");
+                        return SlackRetryDispatchResult.Success;
+                    }
+                    catch (Exception ex)
+                    {
+                        interactionSpan?.SetTag(SlackTelemetry.AttributeOutcome, "exception");
+                        interactionSpan?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                        throw;
+                    }
+                }
 
             case SlackInboundSourceType.Event:
                 string? subtype = this.TryReadEventSubtype(envelope);
-                if (string.Equals(subtype, "app_mention", StringComparison.Ordinal))
+                using (Activity? eventSpan = SlackTelemetry.StartInboundSpan(
+                    SlackTelemetry.EventDispatchSpanName,
+                    envelope))
                 {
-                    await this.appMentionHandler.HandleAsync(envelope, ct).ConfigureAwait(false);
-                    return SlackRetryDispatchResult.Success;
-                }
+                    eventSpan?.SetTag("slack.event_subtype", subtype ?? "(none)");
 
-                // Stage 4.3 only dispatches app_mention events; other
-                // Events API subtypes are claimed by the dedup row
-                // but acknowledged without invocation so Stage 5+ can
-                // add new handlers without breaking the ingestor.
-                this.logger.LogInformation(
-                    "Slack inbound pipeline acknowledged event without dispatch: idempotency_key={IdempotencyKey} event_subtype={EventSubtype}.",
-                    envelope.IdempotencyKey,
-                    subtype ?? "(none)");
-                return SlackRetryDispatchResult.Acknowledged;
+                    if (string.Equals(subtype, "app_mention", StringComparison.Ordinal))
+                    {
+                        try
+                        {
+                            await this.appMentionHandler.HandleAsync(envelope, ct).ConfigureAwait(false);
+                            eventSpan?.SetTag(SlackTelemetry.AttributeOutcome, "dispatched");
+                            return SlackRetryDispatchResult.Success;
+                        }
+                        catch (Exception ex)
+                        {
+                            eventSpan?.SetTag(SlackTelemetry.AttributeOutcome, "exception");
+                            eventSpan?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                            throw;
+                        }
+                    }
+
+                    // Stage 4.3 only dispatches app_mention events; other
+                    // Events API subtypes are claimed by the dedup row
+                    // but acknowledged without invocation so Stage 5+ can
+                    // add new handlers without breaking the ingestor.
+                    eventSpan?.SetTag(SlackTelemetry.AttributeOutcome, "acknowledged");
+                    this.logger.LogInformation(
+                        "Slack inbound pipeline acknowledged event without dispatch: idempotency_key={IdempotencyKey} event_subtype={EventSubtype}.",
+                        envelope.IdempotencyKey,
+                        subtype ?? "(none)");
+                    return SlackRetryDispatchResult.Acknowledged;
+                }
 
             case SlackInboundSourceType.Unspecified:
             default:

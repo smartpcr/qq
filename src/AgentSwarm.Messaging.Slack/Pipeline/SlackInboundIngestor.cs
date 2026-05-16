@@ -7,8 +7,11 @@
 namespace AgentSwarm.Messaging.Slack.Pipeline;
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.Hosting;
@@ -86,11 +89,32 @@ internal sealed class SlackInboundIngestor : BackgroundService
                     break;
                 }
 
+                // Stage 7.2: bump `slack.inbound.count` for every
+                // envelope drained from the queue, tagged with the
+                // source type so dashboards can split command /
+                // interaction / event traffic. Wrap the per-envelope
+                // pipeline work in a parent `slack.inbound.receive`
+                // span (ActivityKind.Consumer marks the queue-drain
+                // boundary per OTel semantic conventions).
+                SlackTelemetry.InboundCount.Add(
+                    1,
+                    new KeyValuePair<string, object?>(SlackTelemetry.AttributeSourceType, envelope.SourceType.ToString()),
+                    new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, envelope.TeamId ?? string.Empty));
+
+                using Activity? receiveSpan = SlackTelemetry.StartInboundSpan(
+                    SlackTelemetry.InboundReceiveSpanName,
+                    envelope,
+                    ActivityKind.Consumer);
+
+                using IDisposable scope = SlackTelemetry.CreateScope(this.logger, envelope);
+
                 try
                 {
                     SlackInboundProcessingOutcome outcome = await this.pipeline
                         .ProcessAsync(envelope, stoppingToken)
                         .ConfigureAwait(false);
+
+                    receiveSpan?.SetTag(SlackTelemetry.AttributeOutcome, outcome.ToString());
 
                     this.logger.LogDebug(
                         "SlackInboundIngestor processed envelope idempotency_key={IdempotencyKey} source={SourceType} outcome={Outcome}.",
