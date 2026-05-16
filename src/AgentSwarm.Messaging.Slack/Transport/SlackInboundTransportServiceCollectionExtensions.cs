@@ -9,8 +9,11 @@ namespace AgentSwarm.Messaging.Slack.Transport;
 using System;
 using AgentSwarm.Messaging.Slack.Queues;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 /// <summary>
 /// DI extensions that register the Stage 4.1 Slack inbound HTTP
@@ -99,6 +102,85 @@ public static class SlackInboundTransportServiceCollectionExtensions
         services.TryAddSingleton<ISlackViewsOpenClient, HttpClientSlackViewsOpenClient>();
 
         services.TryAddSingleton<ISlackModalFastPathHandler, DefaultSlackModalFastPathHandler>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers the Stage 4.2 Socket Mode WebSocket transport services
+    /// (<see cref="ISlackSocketModeConnectionFactory"/>,
+    /// <see cref="ISlackInboundTransportFactory"/>, options binding,
+    /// named <see cref="System.Net.Http.HttpClient"/> for
+    /// <c>apps.connections.open</c>) on the supplied service
+    /// collection.
+    /// </summary>
+    /// <param name="services">Target service collection.</param>
+    /// <param name="configuration">
+    /// Optional configuration root. When supplied the extension binds
+    /// the <c>Slack:SocketMode</c> section into
+    /// <see cref="SlackSocketModeOptions"/> so operators can override
+    /// the reconnect bounds, ACK timeout, and receive-buffer size from
+    /// <c>appsettings.json</c> / environment variables without
+    /// recompiling the host. Stage 4.2 evaluator iter-1 item 3.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// All bindings use <c>TryAdd*</c> so a composition root can
+    /// override any single component by registering its own
+    /// implementation BEFORE calling this method (e.g., tests inject
+    /// a fake <see cref="ISlackSocketModeConnectionFactory"/>).
+    /// </para>
+    /// <para>
+    /// The Worker host calls
+    /// <see cref="AddSlackInboundTransport(IServiceCollection)"/> for
+    /// the Stage 4.1 HTTP transport AND
+    /// <see cref="AddSlackSocketModeTransport(IServiceCollection, IConfiguration)"/>
+    /// for the Stage 4.2 Socket Mode transport; the per-workspace
+    /// <see cref="ISlackInboundTransportFactory"/> chooses which one
+    /// to use for each registered workspace.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddSlackSocketModeTransport(
+        this IServiceCollection services,
+        IConfiguration? configuration = null)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.TryAddSingleton(TimeProvider.System);
+
+        // Bind the Slack:SocketMode section so operators can override
+        // any field (initial/max reconnect delay, ACK timeout,
+        // receive-buffer size) from appsettings.json or environment
+        // variables. When no configuration is supplied (test hosts,
+        // composition roots that wire the options manually) the
+        // default SlackSocketModeOptions values apply.
+        OptionsBuilder<SlackSocketModeOptions> optionsBuilder =
+            services.AddOptions<SlackSocketModeOptions>();
+        if (configuration is not null)
+        {
+            IConfigurationSection section = configuration.GetSection(SlackSocketModeOptions.SectionName);
+            optionsBuilder.Bind(section);
+        }
+
+        // Eagerly resolve a value-instance of SlackSocketModeOptions
+        // so the receiver / connection factory can take it by value
+        // without forcing every consumer to depend on IOptions<T>. The
+        // TryAdd registration lets a test host override the options
+        // block before this call.
+        services.TryAddSingleton<SlackSocketModeOptions>(sp =>
+            sp.GetRequiredService<IOptions<SlackSocketModeOptions>>().Value);
+
+        services.AddHttpClient(DefaultSlackSocketModeConnectionFactory.HttpClientName);
+        services.TryAddSingleton<ISlackSocketModeConnectionFactory, DefaultSlackSocketModeConnectionFactory>();
+
+        services.TryAddSingleton<ISlackInboundTransportFactory, SlackInboundTransportFactory>();
+
+        // Stage 4.2 evaluator iter-1 item 1: register the hosted
+        // service that enumerates ISlackWorkspaceConfigStore and
+        // actually starts the per-workspace transports on host boot.
+        // Without this AddHostedService call the receiver classes
+        // exist in the container but no Slack workspace ever connects.
+        services.AddHostedService<SlackInboundTransportHostedService>();
 
         return services;
     }

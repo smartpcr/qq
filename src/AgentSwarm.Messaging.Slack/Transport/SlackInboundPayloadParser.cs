@@ -184,7 +184,21 @@ internal static class SlackInboundPayloadParser
             return SlackInteractionPayload.Empty;
         }
 
-        return ParseInteractionPayloadJson(payloadValues.ToString());
+        return ParseInteractionJson(payloadValues.ToString());
+    }
+
+    /// <summary>
+    /// Parses a Slack interactive payload's inner JSON document.
+    /// Exposed so the Stage 4.2 Socket Mode receiver
+    /// (<see cref="SlackSocketModePayloadNormalizer"/>) can decode an
+    /// <c>interactive</c> frame -- whose payload is the same JSON
+    /// shape that the HTTP transport delivers inside the
+    /// <c>payload</c> form field -- without first having to wrap the
+    /// JSON in a synthetic form body.
+    /// </summary>
+    public static SlackInteractionPayload ParseInteractionJson(string json)
+    {
+        return ParseInteractionPayloadJson(json);
     }
 
     /// <summary>

@@ -1,0 +1,204 @@
+// -----------------------------------------------------------------------
+// <copyright file="SlackSocketModePayloadNormalizer.cs" company="Microsoft Corp.">
+//     Copyright (c) Microsoft Corp. All rights reserved.
+// </copyright>
+// -----------------------------------------------------------------------
+
+namespace AgentSwarm.Messaging.Slack.Transport;
+
+using System;
+using System.Globalization;
+using System.Text.Json;
+
+/// <summary>
+/// Converts a Socket Mode <see cref="SlackSocketModeFrame"/> into a
+/// normalized <see cref="SlackInboundEnvelope"/> for enqueueing on
+/// <see cref="Queues.ISlackInboundQueue"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Stage 4.2 of
+/// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>.
+/// The HTTP <see cref="SlackInboundEnvelopeFactory"/> expects the
+/// transport-native body shape (JSON for events, form-encoded for
+/// commands and interactions). Slack's Socket Mode delivers everything
+/// as JSON inside the frame's <c>payload</c> sub-object, so this
+/// normalizer parses the JSON directly rather than re-encoding into
+/// form bodies.
+/// </para>
+/// <para>
+/// Idempotency keys follow architecture.md §3.4 verbatim so the Stage
+/// 4.3 <c>SlackIdempotencyGuard</c> sees the same key shape regardless
+/// of which transport delivered the payload.
+/// </para>
+/// </remarks>
+internal static class SlackSocketModePayloadNormalizer
+{
+    private const string EventKeyPrefix = "event:";
+    private const string CommandKeyPrefix = "cmd:";
+    private const string InteractionKeyPrefix = "interact:";
+
+    /// <summary>
+    /// Builds a <see cref="SlackInboundEnvelope"/> from the supplied
+    /// Socket Mode <paramref name="frame"/>, stamping
+    /// <see cref="SlackInboundEnvelope.ReceivedAt"/> with
+    /// <paramref name="receivedAt"/>. Returns <see langword="null"/>
+    /// when the frame type is not one of the three Slack event
+    /// surfaces (<c>events_api</c>, <c>slash_commands</c>,
+    /// <c>interactive</c>) -- callers ACK such frames but do not
+    /// enqueue them.
+    /// </summary>
+    public static SlackInboundEnvelope? Normalize(SlackSocketModeFrame frame, DateTimeOffset receivedAt)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+
+        return frame.Type switch
+        {
+            SlackSocketModeFrame.EventsApiType => NormalizeEvent(frame, receivedAt),
+            SlackSocketModeFrame.SlashCommandsType => NormalizeCommand(frame, receivedAt),
+            SlackSocketModeFrame.InteractiveType => NormalizeInteraction(frame, receivedAt),
+            _ => null,
+        };
+    }
+
+    private static SlackInboundEnvelope NormalizeEvent(SlackSocketModeFrame frame, DateTimeOffset receivedAt)
+    {
+        // The events_api Socket Mode payload IS the Events API JSON
+        // body verbatim; SlackInboundPayloadParser.ParseEvent already
+        // handles every field we need.
+        SlackEventPayload payload = SlackInboundPayloadParser.ParseEvent(frame.Payload);
+        string idempotencyKey = !string.IsNullOrEmpty(payload.EventId)
+            ? EventKeyPrefix + payload.EventId
+            : EventKeyPrefix + HashFallback(frame.RawFrameJson);
+
+        return new SlackInboundEnvelope(
+            IdempotencyKey: idempotencyKey,
+            SourceType: SlackInboundSourceType.Event,
+            TeamId: payload.TeamId ?? string.Empty,
+            ChannelId: NullIfEmpty(payload.ChannelId),
+            UserId: payload.UserId ?? string.Empty,
+            RawPayload: frame.Payload,
+            TriggerId: null,
+            ReceivedAt: receivedAt);
+    }
+
+    private static SlackInboundEnvelope NormalizeCommand(SlackSocketModeFrame frame, DateTimeOffset receivedAt)
+    {
+        // The slash_commands Socket Mode payload mirrors the HTTP
+        // form fields but is JSON. Parse the JSON directly so the
+        // canonical command field set is populated without re-encoding.
+        SlackCommandPayload payload = ParseCommandJson(frame.Payload);
+
+        string team = payload.TeamId ?? string.Empty;
+        string user = payload.UserId ?? string.Empty;
+        string cmd = payload.Command ?? string.Empty;
+        string trigger = payload.TriggerId ?? HashFallback(frame.RawFrameJson);
+        string idempotencyKey = string.Format(
+            CultureInfo.InvariantCulture,
+            "{0}{1}:{2}:{3}:{4}",
+            CommandKeyPrefix,
+            team,
+            user,
+            cmd,
+            trigger);
+
+        return new SlackInboundEnvelope(
+            IdempotencyKey: idempotencyKey,
+            SourceType: SlackInboundSourceType.Command,
+            TeamId: team,
+            ChannelId: NullIfEmpty(payload.ChannelId),
+            UserId: user,
+            RawPayload: frame.Payload,
+            TriggerId: NullIfEmpty(payload.TriggerId),
+            ReceivedAt: receivedAt);
+    }
+
+    private static SlackInboundEnvelope NormalizeInteraction(SlackSocketModeFrame frame, DateTimeOffset receivedAt)
+    {
+        // The interactive Socket Mode payload is the SAME JSON shape
+        // that the HTTP path delivers in the form's `payload` field;
+        // SlackInboundPayloadParser.ParseInteractionJson handles it
+        // without the form-wrapping step.
+        SlackInteractionPayload payload = SlackInboundPayloadParser.ParseInteractionJson(frame.Payload);
+
+        string team = payload.TeamId ?? string.Empty;
+        string user = payload.UserId ?? string.Empty;
+        string actionOrView = payload.ActionOrViewId ?? HashFallback(frame.RawFrameJson);
+        string trigger = payload.TriggerId ?? actionOrView;
+        string idempotencyKey = string.Format(
+            CultureInfo.InvariantCulture,
+            "{0}{1}:{2}:{3}:{4}",
+            InteractionKeyPrefix,
+            team,
+            user,
+            actionOrView,
+            trigger);
+
+        return new SlackInboundEnvelope(
+            IdempotencyKey: idempotencyKey,
+            SourceType: SlackInboundSourceType.Interaction,
+            TeamId: team,
+            ChannelId: NullIfEmpty(payload.ChannelId),
+            UserId: user,
+            RawPayload: frame.Payload,
+            TriggerId: NullIfEmpty(payload.TriggerId),
+            ReceivedAt: receivedAt);
+    }
+
+    private static SlackCommandPayload ParseCommandJson(string json)
+    {
+        if (string.IsNullOrEmpty(json))
+        {
+            return SlackCommandPayload.Empty;
+        }
+
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(json);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return SlackCommandPayload.Empty;
+            }
+
+            string? command = ReadString(root, "command");
+            string? text = ReadString(root, "text");
+            return new SlackCommandPayload(
+                TeamId: ReadString(root, "team_id"),
+                ChannelId: ReadString(root, "channel_id"),
+                UserId: ReadString(root, "user_id"),
+                Command: command,
+                Text: text,
+                TriggerId: ReadString(root, "trigger_id"),
+                SubCommand: SlackInboundPayloadParser.ParseSubCommand(text));
+        }
+        catch (JsonException)
+        {
+            return SlackCommandPayload.Empty;
+        }
+    }
+
+    private static string? ReadString(JsonElement element, string name)
+    {
+        if (!element.TryGetProperty(name, out JsonElement value))
+        {
+            return null;
+        }
+
+        return value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+    }
+
+    private static string HashFallback(string body)
+    {
+        if (string.IsNullOrEmpty(body))
+        {
+            return "empty";
+        }
+
+        byte[] hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(body));
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static string? NullIfEmpty(string? value)
+        => string.IsNullOrEmpty(value) ? null : value;
+}
