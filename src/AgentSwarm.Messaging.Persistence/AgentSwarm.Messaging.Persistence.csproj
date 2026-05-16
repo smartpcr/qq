@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj" />
+    <ProjectReference Include="..\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>

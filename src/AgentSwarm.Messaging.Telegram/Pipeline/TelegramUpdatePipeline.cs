@@ -390,9 +390,34 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                 return Denial(messengerEvent, PipelineResponses.Unauthorized);
             }
 
-            // Stage: resolve operator. Multi-workspace prompt is reserved for Command events.
+            // Stage: resolve operator.
+            //
+            // Multi-workspace prompt is scoped (iter-2 evaluator items 1 & 2)
+            // to EXACTLY `/agents` with no arguments. Stage 3.2 only requires
+            // the `/agents` no-argument disambiguation behavior per the brief:
+            //
+            //   * `/agents` (no args) with multiple bindings  → prompt
+            //   * `/agents WORKSPACE` (explicit arg)          → fall through;
+            //                                                    AgentsCommandHandler
+            //                                                    validates the
+            //                                                    explicit workspace
+            //                                                    against the
+            //                                                    operator's bindings
+            //   * `/ask`, `/status`, `/pause`, `/handoff`, …  → fall through;
+            //     (any non-`/agents` command)                   pick the first
+            //                                                    binding and route
+            //
+            // The previous command-agnostic gate broke both `/agents WORKSPACE`
+            // (intercepted before AgentsCommandHandler ever ran) and routed
+            // other commands like `/handoff` into the disambiguation prompt
+            // instead of their handlers — Stage 3.2 explicitly does not
+            // require that behavior.
             LogStage(messengerEvent, "resolve-operator");
-            if (authz.Bindings.Count > 1 && messengerEvent.EventType == EventType.Command)
+            var isAgentsNoArgPrompt = parsed is { CommandName: TelegramCommands.Agents }
+                && parsed.Arguments.Count == 0;
+            if (authz.Bindings.Count > 1
+                && messengerEvent.EventType == EventType.Command
+                && isAgentsNoArgPrompt)
             {
                 var workspaceIds = authz.Bindings.Select(b => b.WorkspaceId).ToArray();
 
@@ -443,6 +468,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                 Roles = binding.Roles,
                 TelegramUserId = binding.TelegramUserId,
                 TelegramChatId = binding.TelegramChatId,
+                OperatorAlias = binding.OperatorAlias,
             };
 
             // Stage: role enforcement. Only commands carry role gates.
@@ -540,6 +566,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                     Handled = true,
                     Succeeded = false,
                     ResponseText = failureText,
+                    ResponseButtons = result.ResponseButtons,
                     ErrorCode = result.ErrorCode,
                     CorrelationId = messengerEvent.CorrelationId,
                 };
@@ -555,6 +582,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                 Handled = true,
                 Succeeded = true,
                 ResponseText = result.ResponseText,
+                ResponseButtons = result.ResponseButtons,
                 CorrelationId = messengerEvent.CorrelationId,
             };
         }

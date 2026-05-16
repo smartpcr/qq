@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Core.Commands;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using AgentSwarm.Messaging.Telegram.Polling;
@@ -128,7 +129,37 @@ public static class TelegramServiceCollectionExtensions
         // Stage 2.2 StubCommandParser at registration time. Singleton
         // lifetime because the parser is stateless.
         services.AddSingleton<ICommandParser, TelegramCommandParser>();
-        services.AddSingleton<ICommandRouter, StubCommandRouter>();
+        // Stage 3.2: production CommandRouter replaces the Stage 2.2
+        // StubCommandRouter. The router accepts every
+        // IEnumerable<ICommandHandler> registered below and dispatches
+        // by ICommandHandler.CommandName at the boundary.
+        services.AddSingleton<ICommandRouter, CommandRouter>();
+
+        // Stage 3.2 command handlers. Registered individually so the
+        // CommandRouter constructor receives all nine through
+        // IEnumerable<ICommandHandler> injection. Singleton lifetime —
+        // handlers are stateless beyond their injected dependencies
+        // (ISwarmCommandBus, IPendingQuestionStore, IOperatorRegistry,
+        // ITaskOversightRepository, IAuditLogger, TimeProvider).
+        services.AddSingleton<ICommandHandler, StartCommandHandler>();
+        services.AddSingleton<ICommandHandler, StatusCommandHandler>();
+        services.AddSingleton<ICommandHandler, AgentsCommandHandler>();
+        services.AddSingleton<ICommandHandler, AskCommandHandler>();
+        services.AddSingleton<ICommandHandler, ApproveCommandHandler>();
+        services.AddSingleton<ICommandHandler, RejectCommandHandler>();
+        services.AddSingleton<ICommandHandler, PauseCommandHandler>();
+        services.AddSingleton<ICommandHandler, ResumeCommandHandler>();
+        services.AddSingleton<ICommandHandler, HandoffCommandHandler>();
+
+        // Stage 3.2: no-op audit logger as the TryAdd fallback so the
+        // approve / reject / handoff handlers can take a hard
+        // IAuditLogger dependency in dev / unit-test bootstraps that
+        // skip the persistence module. AddMessagingPersistence
+        // (Stage 3.2 iter-2 evaluator item 5) REPLACES this with
+        // PersistentAuditLogger so production audit writes actually
+        // hit the database — last-wins semantics on Replace().
+        services.TryAddSingleton<IAuditLogger, NullAuditLogger>();
+
         services.AddSingleton<ICallbackHandler, StubCallbackHandler>();
         // TimeProvider.System is the production default; tests register a
         // FakeTimeProvider via TryAddSingleton-replacement before AddTelegram.

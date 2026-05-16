@@ -139,6 +139,103 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.ToTable("outbound_message_id_mappings", (string)null);
                 });
+
+            modelBuilder.Entity("AgentSwarm.Messaging.Core.TaskOversight", b =>
+                {
+                    b.Property<string>("TaskId")
+                        .ValueGeneratedNever()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("AssignedAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("AssignedBy")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CorrelationId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<System.Guid>("OperatorBindingId")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("TaskId");
+
+                    b.HasIndex("OperatorBindingId")
+                        .HasDatabaseName("ix_task_oversights_operator");
+
+                    b.HasIndex("TaskId")
+                        .HasDatabaseName("ix_task_oversights_task_id");
+
+                    b.ToTable("task_oversights", (string)null);
+                });
+
+            modelBuilder.Entity("AgentSwarm.Messaging.Persistence.AuditLogEntry", b =>
+                {
+                    b.Property<System.Guid>("EntryId")
+                        .ValueGeneratedNever()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Action")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ActionValue")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AgentId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Comment")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CorrelationId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Details")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("EntryKind")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("MessageId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("QuestionId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("Timestamp")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("UserId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("EntryId");
+
+                    b.HasIndex("CorrelationId")
+                        .HasDatabaseName("ix_audit_log_entries_correlation_id");
+
+                    b.HasIndex("Timestamp")
+                        .HasDatabaseName("ix_audit_log_entries_timestamp");
+
+                    b.HasIndex("UserId")
+                        .HasDatabaseName("ix_audit_log_entries_user_id");
+
+                    b.ToTable("audit_log_entries", (string)null);
+                });
 #pragma warning restore 612, 618
         }
     }

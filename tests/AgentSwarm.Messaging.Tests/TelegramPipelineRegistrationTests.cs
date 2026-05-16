@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core.Commands;
 using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
@@ -26,7 +27,10 @@ public class TelegramPipelineRegistrationTests
     // TelegramCommandParser, so the locked-down registration now
     // points at the real parser type.
     [InlineData(typeof(ICommandParser), typeof(TelegramCommandParser))]
-    [InlineData(typeof(ICommandRouter), typeof(StubCommandRouter))]
+    // Stage 3.2 swapped StubCommandRouter for the production
+    // CommandRouter — the dispatch dictionary is built from the nine
+    // ICommandHandler registrations injected via IEnumerable<>.
+    [InlineData(typeof(ICommandRouter), typeof(CommandRouter))]
     [InlineData(typeof(ICallbackHandler), typeof(StubCallbackHandler))]
     [InlineData(typeof(ITelegramUpdatePipeline), typeof(TelegramUpdatePipeline))]
     public void AddTelegram_RegistersStage22Service(Type serviceType, Type implementationType)
