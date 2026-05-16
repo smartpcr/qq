@@ -52,6 +52,35 @@ public interface IPendingQuestionStore
     Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct);
 
     /// <summary>
+    /// <para>
+    /// <b>Atomic claim primitive.</b> Transitions the question to
+    /// <see cref="PendingQuestionStatus.TimedOut"/> in a single
+    /// row-level conditional update (provider-neutral; implemented via
+    /// EF Core's <c>ExecuteUpdateAsync</c> against the persistent
+    /// store, and <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}.TryUpdate"/>
+    /// against the in-memory stub).
+    /// </para>
+    /// <para>
+    /// Returns <see langword="true"/> only when THIS caller actually
+    /// moved the row from <see cref="PendingQuestionStatus.Pending"/>
+    /// or <see cref="PendingQuestionStatus.AwaitingComment"/> to
+    /// <see cref="PendingQuestionStatus.TimedOut"/>. Returns
+    /// <see langword="false"/> when the row is missing or already in a
+    /// terminal state (e.g. another worker beat us to it, or the
+    /// operator answered between <c>GetExpiredAsync</c> and the claim
+    /// attempt). <c>QuestionTimeoutService</c> calls this method
+    /// <b>BEFORE</b> publishing
+    /// <see cref="HumanDecisionEvent"/> so a cross-process sweep race
+    /// cannot double-publish — only the winning claimant publishes.
+    /// Per architecture.md §10.3 the claim is the cross-process
+    /// concurrency primitive; the polling query in
+    /// <see cref="GetExpiredAsync"/> is a snapshot that races with
+    /// every other sweeper running against the same store.
+    /// </para>
+    /// </summary>
+    Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct);
+
+    /// <summary>
     /// Persist the operator's tapped selection, its canonical
     /// <see cref="HumanAction.Value"/>, and Telegram user ID on the pending
     /// question record. Invoked by <c>CallbackQueryHandler</c> before

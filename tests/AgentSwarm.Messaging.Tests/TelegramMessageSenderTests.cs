@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Telegram;
+using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using AgentSwarm.Messaging.Telegram.Sending;
 using FluentAssertions;
 using Microsoft.Extensions.Caching.Distributed;
@@ -64,13 +65,15 @@ public sealed class TelegramMessageSenderTests
             Func<IRequest<Message>, Message>? respond = null,
             Queue<Exception>? throwSequence = null,
             ITelegramRateLimiter? limiterOverride = null,
-            IAlertService? alertOverride = null)
+            IAlertService? alertOverride = null,
+            IPendingQuestionStore? pendingQuestionStoreOverride = null)
     {
         var cache = new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions()));
         var time = FixedTime();
         var limiter = limiterOverride ?? new TokenBucketTelegramRateLimiter(Opts(), time);
         var index = new InMemoryOutboundMessageIdIndex();
         var deadLetters = new InMemoryOutboundDeadLetterStore();
+        var pendingQuestions = pendingQuestionStoreOverride ?? new InMemoryPendingQuestionStore();
         var mock = new Mock<ITelegramBotClient>(MockBehavior.Strict);
         var captured = new List<SendMessageRequest>();
 
@@ -99,6 +102,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            pendingQuestions,
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertOverride);
@@ -160,6 +164,111 @@ public sealed class TelegramMessageSenderTests
     }
 
     [Fact]
+    public async Task SendQuestionAsync_PersistsPendingQuestionRecordAfterSuccessfulSend()
+    {
+        // Stage 3.5 workstream scenario:
+        //   "Given an AgentQuestion is sent to Telegram successfully,
+        //    When SendQuestionAsync completes, Then a PendingQuestionRecord
+        //    exists in the store with status Pending and the correct
+        //    TelegramMessageId."
+        var pendingStore = new InMemoryPendingQuestionStore();
+        var (sut, captured, _, _, _, _, _) = BuildSut(pendingQuestionStoreOverride: pendingStore);
+        var envelope = new AgentQuestionEnvelope
+        {
+            Question = BuildQuestion(),
+            ProposedDefaultActionId = "reject",
+        };
+
+        await sut.SendQuestionAsync(chatId: 999, envelope, CancellationToken.None);
+
+        captured.Should().HaveCount(1, "sanity — the question was actually sent");
+        var sentMessageId = 1000 + captured.Count; // BuildSut returns Id = 1000 + captured.Count
+
+        var stored = await pendingStore.GetAsync("q-001", default);
+        stored.Should().NotBeNull("the sender must persist the pending question after a successful Telegram ack");
+        stored!.Status.Should().Be(PendingQuestionStatus.Pending);
+        stored.TelegramChatId.Should().Be(999);
+        stored.TelegramMessageId.Should().Be(sentMessageId,
+            "the persisted TelegramMessageId must match the ack id returned by the Telegram send so the timeout sweep can edit the right message");
+        stored.QuestionId.Should().Be("q-001");
+        stored.DefaultActionId.Should().Be("reject");
+        stored.DefaultActionValue.Should().Be("reject",
+            "the store denormalises the matching HumanAction.Value at persist time so QuestionTimeoutService never needs IDistributedCache");
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_ThrowsPendingQuestionPersistenceException_WhenStoreFails()
+    {
+        // Iter-2 evaluator item 6: previously the sender logged and
+        // swallowed pending-store failures, so SendQuestionAsync
+        // returned success even when the load-bearing pending row
+        // failed to persist. The Stage 3.5 contract is that a missing
+        // row makes callbacks unresolvable AND timeouts unrecoverable
+        // (since the sweep is the only place DefaultActionId lives by
+        // architecture.md §10.3), so the sender now propagates the
+        // failure as a typed PendingQuestionPersistenceException
+        // carrying enough context for recovery tooling to either
+        // retry the StoreAsync (the Telegram message already
+        // delivered — Stage 4.1 OutboundQueueProcessor must NOT
+        // re-send) or roll up an alert.
+        var failingStore = new ThrowingPendingQuestionStore(
+            new InvalidOperationException("simulated database failure"));
+        var (sut, captured, _, _, _, _, _) = BuildSut(pendingQuestionStoreOverride: failingStore);
+        var envelope = new AgentQuestionEnvelope
+        {
+            Question = BuildQuestion(),
+            ProposedDefaultActionId = "reject",
+        };
+
+        var act = async () => await sut.SendQuestionAsync(chatId: 999, envelope, CancellationToken.None);
+
+        var ex = await act.Should().ThrowAsync<PendingQuestionPersistenceException>();
+        ex.Which.QuestionId.Should().Be("q-001");
+        ex.Which.TelegramChatId.Should().Be(999);
+        ex.Which.TelegramMessageId.Should().BeGreaterThan(0,
+            "the Telegram message was already sent before persistence failed — recovery tooling must NOT re-send");
+        ex.Which.CorrelationId.Should().Be("trace-7f3a",
+            "the exception must carry the correlation id so the outbound queue's dead-letter envelope can stitch end-to-end traces");
+        ex.Which.InnerException.Should().BeOfType<InvalidOperationException>(
+            "the original store failure must be wrapped, not lost");
+
+        captured.Should().HaveCount(1,
+            "sanity — the Telegram send succeeded BEFORE the persistence failure; the exception type signals 'message delivered, row missing' so callers do not re-send");
+    }
+
+    private sealed class ThrowingPendingQuestionStore : IPendingQuestionStore
+    {
+        private readonly Exception _toThrow;
+
+        public ThrowingPendingQuestionStore(Exception toThrow) => _toThrow = toThrow;
+
+        public Task StoreAsync(AgentQuestionEnvelope envelope, long telegramChatId, long telegramMessageId, CancellationToken ct)
+            => throw _toThrow;
+
+        public Task<PendingQuestion?> GetAsync(string questionId, CancellationToken ct)
+            => Task.FromResult<PendingQuestion?>(null);
+
+        public Task<PendingQuestion?> GetByTelegramMessageAsync(long telegramChatId, long telegramMessageId, CancellationToken ct)
+            => Task.FromResult<PendingQuestion?>(null);
+
+        public Task MarkAnsweredAsync(string questionId, CancellationToken ct) => Task.CompletedTask;
+
+        public Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
+            => Task.FromResult(false);
+
+        public Task RecordSelectionAsync(string questionId, string selectedActionId, string selectedActionValue, long respondentUserId, CancellationToken ct)
+            => Task.CompletedTask;
+
+        public Task<PendingQuestion?> GetAwaitingCommentAsync(long telegramChatId, long respondentUserId, CancellationToken ct)
+            => Task.FromResult<PendingQuestion?>(null);
+
+        public Task<IReadOnlyList<PendingQuestion>> GetExpiredAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<PendingQuestion>>(Array.Empty<PendingQuestion>());
+    }
+
+    [Fact]
     public async Task SendQuestionAsync_HonorsRetryAfter_OnApiRequestException429()
     {
         var time = FixedTime();
@@ -186,7 +295,8 @@ public sealed class TelegramMessageSenderTests
 
         var sut = new TelegramMessageSender(
             mock.Object, limiter, cache, new InMemoryOutboundMessageIdIndex(),
-            new InMemoryOutboundDeadLetterStore(), time, NullLogger<TelegramMessageSender>.Instance);
+            new InMemoryOutboundDeadLetterStore(), new InMemoryPendingQuestionStore(),
+            time, NullLogger<TelegramMessageSender>.Instance);
         var envelope = new AgentQuestionEnvelope { Question = BuildQuestion() };
 
         var task = sut.SendQuestionAsync(chatId: 999, envelope, CancellationToken.None);
@@ -355,7 +465,8 @@ public sealed class TelegramMessageSenderTests
 
         var sut = new TelegramMessageSender(
             mock.Object, trace, cache, new InMemoryOutboundMessageIdIndex(),
-            new InMemoryOutboundDeadLetterStore(), time, NullLogger<TelegramMessageSender>.Instance);
+            new InMemoryOutboundDeadLetterStore(), new InMemoryPendingQuestionStore(),
+            time, NullLogger<TelegramMessageSender>.Instance);
         var envelope = new AgentQuestionEnvelope { Question = BuildQuestion() };
 
         await sut.SendQuestionAsync(chatId: 7, envelope, CancellationToken.None);
@@ -520,6 +631,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             new InMemoryOutboundDeadLetterStore(),
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: null,
@@ -562,6 +674,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             new InMemoryOutboundDeadLetterStore(),
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: alert,
@@ -773,6 +886,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: null,
@@ -828,6 +942,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: alert,
@@ -1051,6 +1166,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: alert,
@@ -1218,6 +1334,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: alert,
@@ -1267,6 +1384,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: alert,
@@ -1327,6 +1445,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: alert,
@@ -1389,6 +1508,7 @@ public sealed class TelegramMessageSenderTests
             cache,
             index,
             deadLetters,
+            new InMemoryPendingQuestionStore(),
             time,
             NullLogger<TelegramMessageSender>.Instance,
             alertService: alert,

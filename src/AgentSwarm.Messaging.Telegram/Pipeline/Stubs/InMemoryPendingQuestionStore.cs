@@ -86,6 +86,34 @@ internal sealed class InMemoryPendingQuestionStore : IPendingQuestionStore
         return Task.CompletedTask;
     }
 
+    public Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
+    {
+        // Atomic claim via ConcurrentDictionary.TryUpdate — the
+        // (key, newValue, comparisonValue) overload performs a
+        // compare-and-swap, succeeding only when the current value
+        // still equals comparisonValue. Two concurrent sweepers
+        // both calling MarkTimedOutAsync therefore see exactly ONE
+        // true result; the loser sees false. Mirrors the
+        // ExecuteUpdateAsync-based atomic claim in
+        // PersistentPendingQuestionStore.MarkTimedOutAsync.
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.Pending &&
+            current.Status != PendingQuestionStatus.AwaitingComment)
+        {
+            // Already terminal (TimedOut or Answered) — another
+            // sweeper / a callback won the claim before us.
+            return Task.FromResult(false);
+        }
+
+        var updated = current with { Status = PendingQuestionStatus.TimedOut };
+        var claimed = _byQuestionId.TryUpdate(questionId, updated, current);
+        return Task.FromResult(claimed);
+    }
+
     public Task RecordSelectionAsync(
         string questionId,
         string selectedActionId,

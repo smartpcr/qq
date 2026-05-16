@@ -209,6 +209,21 @@ public static class ServiceCollectionExtensions
         // explicit "auth ↔ registry" synchronization is required.
         services.Replace(ServiceDescriptor.Singleton<IOperatorRegistry, PersistentOperatorRegistry>());
 
+        // Stage 3.5 — durable pending-question store backing the
+        // callback resolution, the RequiresComment text-reply
+        // correlation, and the QuestionTimeoutService default-action
+        // sweep. Same singleton + IServiceScopeFactory pattern as the
+        // other persistent implementations; replaces the
+        // InMemoryPendingQuestionStore that AddTelegram registers via
+        // TryAddSingleton. Persisting the AgentQuestion JSON plus the
+        // denormalised hot-path columns (DefaultActionId /
+        // DefaultActionValue / ExpiresAt / Status) is required by
+        // architecture.md §3.1 and §10.3 — the timeout service reads
+        // DefaultActionValue directly from this row and never touches
+        // IDistributedCache (whose entries are likely evicted by the
+        // time the timeout fires).
+        services.Replace(ServiceDescriptor.Singleton<IPendingQuestionStore, PersistentPendingQuestionStore>());
+
         return services;
     }
 
