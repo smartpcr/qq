@@ -837,12 +837,42 @@ public sealed class OutboundQueueProcessor : BackgroundService
         // Step 3 — terminal outbox transition. The audit row is
         // already persisted, so the operator UI's "DeadLettered" row
         // is observable end-to-end.
+        //
+        // Failure handling: a thrown exception here (e.g. DbUpdateConcurrencyException
+        // from an EF Core optimistic-concurrency conflict, or a transient SQLite
+        // I/O error) MUST NOT propagate. ExecuteShutdownSafeBookkeepingAsync only
+        // swallows OperationCanceledException — every other exception would bubble
+        // out of DispatchTerminalFailureAsync, through the catch handlers in
+        // ProcessMessageAsync (we are already inside one), out of ProcessMessageAsync,
+        // and into the unguarded `await ProcessMessageAsync(...)` line of
+        // WorkerLoopAsync — faulting the worker task.
+        //
+        // The dead-letter ledger row from Step 1 is already persisted, so the
+        // audit invariant "every Telegram message that hit terminal failure has a
+        // dead_letter_messages row" is preserved even when this flip fails. We
+        // log the error and return; the outbox row is left in Sending and a
+        // future recovery sweep reconciles the orphaned row by observing the
+        // matching dead-letter ledger entry and flipping the outbox row to
+        // DeadLettered without re-sending.
         var queueReason = $"{category}: {finalError}";
-        await ExecuteShutdownSafeBookkeepingAsync(
-            token => _queue.DeadLetterAsync(message.MessageId, queueReason, token),
-            operationName: "DeadLetterAsync",
-            messageId: message.MessageId,
-            ct).ConfigureAwait(false);
+        try
+        {
+            await ExecuteShutdownSafeBookkeepingAsync(
+                token => _queue.DeadLetterAsync(message.MessageId, queueReason, token),
+                operationName: "DeadLetterAsync",
+                messageId: message.MessageId,
+                ct).ConfigureAwait(false);
+        }
+        catch (Exception queueEx) when (queueEx is not OperationCanceledException)
+        {
+            _logger.LogError(
+                queueEx,
+                "OutboundQueueProcessor worker {WorkerId} DeadLetterAsync (Step 3) failed for MessageId={MessageId} CorrelationId={CorrelationId} — outbox row left in Sending. Dead-letter ledger row is already persisted (Step 1), so the audit invariant is preserved; the recovery sweep will reconcile the orphaned Sending row without re-sending. Step 4 (MarkAlertSent) is skipped because the outbox row never reached DeadLettered.",
+                workerId,
+                message.MessageId,
+                message.CorrelationId);
+            return;
+        }
 
         // Step 4 — iter-2 evaluator item 3: flip the dead-letter
         // row's AlertStatus to Sent so the persisted ledger reflects
