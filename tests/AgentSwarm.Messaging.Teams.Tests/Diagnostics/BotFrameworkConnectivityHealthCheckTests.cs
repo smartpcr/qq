@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http;
 using AgentSwarm.Messaging.Teams.Diagnostics;
@@ -382,6 +383,79 @@ public sealed class BotFrameworkConnectivityHealthCheckTests
         Assert.Throws<ArgumentNullException>(() => new MicrosoftAppCredentialsTokenProbe(messagingOptions: null!));
     }
 
+    // -----------------------------------------------------------------------------------
+    // Iter-6 regression — race-against-cancellation guard added in iter-5
+    // (src/AgentSwarm.Messaging.Teams/Diagnostics/IBotFrameworkTokenProbe.cs:182-219).
+    // The Bot Framework SDK's MicrosoftAppCredentials.GetTokenAsync does NOT accept
+    // a CancellationToken, so without the explicit Task.WhenAny guard a hanging
+    // Entra ID token endpoint (or a paused mock handler) would block the probe
+    // indefinitely and defeat the host's /health timeout. These tests pin the
+    // guard's contract end-to-end through the public probe surface.
+    // -----------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task MicrosoftAppCredentialsTokenProbe_HangingEndpoint_CancellationTokenAborts()
+    {
+        // Given a fake HttpClient whose handler never returns and a cancellation
+        // token that fires after ~250 ms, AcquireTokenAsync MUST surface an
+        // OperationCanceledException within a few seconds — not block on the
+        // hanging HTTP call. A failure here means the iter-5 cancellation race
+        // has regressed and /health probes can hang indefinitely behind a slow
+        // Entra ID endpoint.
+        var options = new TeamsMessagingOptions
+        {
+            // Use a unique AppId per test run so the SDK's process-wide
+            // MicrosoftAppCredentials token cache cannot short-circuit
+            // GetTokenAsync from a sibling test's cached entry.
+            MicrosoftAppId = $"hang-{Guid.NewGuid():N}",
+            MicrosoftAppPassword = "non-empty-password",
+            AuthenticationMode = TeamsAuthenticationMode.SharedSecret,
+        };
+        var probe = new MicrosoftAppCredentialsTokenProbe(
+            messagingOptions: new StaticOptionsMonitor<TeamsMessagingOptions>(options),
+            httpClientFactory: new HangingHttpClientFactory());
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+
+        var sw = Stopwatch.StartNew();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => probe.AcquireTokenAsync(cts.Token));
+        sw.Stop();
+
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(10),
+            $"AcquireTokenAsync must honor the CancellationToken within seconds; observed elapsed={sw.Elapsed.TotalSeconds:F2}s. " +
+            "If this assertion fires the iter-5 race-against-cancellation guard in IBotFrameworkTokenProbe.cs has regressed.");
+    }
+
+    [Fact]
+    public async Task MicrosoftAppCredentialsTokenProbe_PrefiredCancellationToken_ThrowsBeforeNetworkCall()
+    {
+        // The early ThrowIfCancellationRequested above the SDK call (line 170 of
+        // IBotFrameworkTokenProbe.cs) must short-circuit before any HTTP work
+        // happens when the caller passes an already-cancelled token. The
+        // HangingHttpClientFactory's invocation counter proves no HTTP call
+        // was initiated (otherwise the test would either hang or count > 0).
+        var hangingFactory = new HangingHttpClientFactory();
+        var options = new TeamsMessagingOptions
+        {
+            MicrosoftAppId = $"prefire-{Guid.NewGuid():N}",
+            MicrosoftAppPassword = "non-empty-password",
+            AuthenticationMode = TeamsAuthenticationMode.SharedSecret,
+        };
+        var probe = new MicrosoftAppCredentialsTokenProbe(
+            messagingOptions: new StaticOptionsMonitor<TeamsMessagingOptions>(options),
+            httpClientFactory: hangingFactory);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => probe.AcquireTokenAsync(cts.Token));
+
+        Assert.Equal(0, hangingFactory.SendCount);
+    }
+
     private static BotFrameworkConnectivityHealthCheck BuildCheck(
         Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter? adapter = null,
         Microsoft.Bot.Connector.Authentication.BotFrameworkAuthentication? auth = null,
@@ -451,6 +525,48 @@ public sealed class BotFrameworkConnectivityHealthCheckTests
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 return Task.FromResult(_responder(request));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Iter-6 — HTTP client factory whose handler returns a never-completing
+    /// <see cref="Task{HttpResponseMessage}"/>. Used to simulate a hanging Entra ID
+    /// token endpoint so the iter-5 race-against-cancellation guard in
+    /// <see cref="MicrosoftAppCredentialsTokenProbe.AcquireTokenAsync"/> can be
+    /// pinned by a dedicated regression test. <see cref="SendCount"/> exposes how
+    /// many times the handler was actually invoked so a sibling test can prove the
+    /// pre-fire cancellation path short-circuits BEFORE any HTTP call is started.
+    /// </summary>
+    private sealed class HangingHttpClientFactory : IHttpClientFactory
+    {
+        private readonly HangingHandler _handler = new();
+
+        public int SendCount => _handler.SendCount;
+
+        public HttpClient CreateClient(string name)
+            => new(_handler, disposeHandler: false) { Timeout = TimeSpan.FromMinutes(5) };
+
+        private sealed class HangingHandler : HttpMessageHandler
+        {
+            private int _sendCount;
+
+            public int SendCount => Volatile.Read(ref _sendCount);
+
+            protected override async Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request,
+                CancellationToken cancellationToken)
+            {
+                Interlocked.Increment(ref _sendCount);
+                var tcs = new TaskCompletionSource<HttpResponseMessage>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                using (cancellationToken.Register(
+                    static state => ((TaskCompletionSource<HttpResponseMessage>)state!)
+                        .TrySetCanceled(),
+                    tcs))
+                {
+                    return await tcs.Task.ConfigureAwait(false);
+                }
             }
         }
     }

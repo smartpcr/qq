@@ -85,16 +85,29 @@ public sealed class BotFrameworkConnectivityHealthCheck : IHealthCheck
     /// <summary>Default per-probe HTTP timeout (5 s) used when no override is configured.</summary>
     public static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(5);
 
-    // Process-wide singleton used only when no IHttpClientFactory is wired (e.g. minimal
-    // test hosts or callers who opted out of the factory registration). Constructed
-    // lazily so production wiring — which always provides a factory — pays no cost,
-    // and intentionally NEVER disposed: disposing an HttpClient closes its underlying
-    // HttpMessageHandler/socket pool, and recreating-then-disposing per invocation is
-    // exactly the ephemeral-port-exhaustion pattern this field exists to prevent
-    // (reviewer feedback, iter-2). HttpClient is documented as thread-safe for
-    // concurrent GetAsync calls, so a single shared instance is correct here.
-    private static readonly Lazy<HttpClient> FallbackHttpClient = new(
-        () => new HttpClient { Timeout = DefaultProbeTimeout });
+    /// <summary>
+    /// Process-wide fallback <see cref="HttpClient"/> used when no
+    /// <see cref="IHttpClientFactory"/> is supplied. Held as a <c>static readonly</c>
+    /// singleton so repeated health-check invocations reuse a single client (and the
+    /// single underlying <see cref="HttpMessageHandler"/> + socket pool) instead of
+    /// allocating and disposing a fresh <see cref="HttpClient"/> per probe.
+    /// </summary>
+    /// <remarks>
+    /// The previous implementation returned <c>new HttpClient { Timeout = ... }</c>
+    /// on every invocation and the call site wrapped the result in <c>using</c>.
+    /// Health checks fire on a timer (the ASP.NET default is 30 s but operators can
+    /// configure tighter intervals — and external probes, k8s liveness, etc. can
+    /// fire more aggressively still), so the create-then-dispose pattern would
+    /// accumulate <see cref="HttpMessageHandler"/> / socket instances in TIME_WAIT
+    /// and eventually exhaust the ephemeral port pool on the host. A shared client
+    /// avoids that entirely; <see cref="HttpClient"/> is thread-safe for the
+    /// operations used here (a single <see cref="HttpClient.GetAsync(string, CancellationToken)"/>
+    /// per probe).
+    /// </remarks>
+    private static readonly HttpClient FallbackHttpClient = new()
+    {
+        Timeout = DefaultProbeTimeout,
+    };
 
     private readonly CloudAdapter? _adapter;
     private readonly BotFrameworkAuthentication _botAuthentication;
@@ -115,9 +128,10 @@ public sealed class BotFrameworkConnectivityHealthCheck : IHealthCheck
     /// <param name="httpClientFactory">
     /// HTTP client factory used to acquire the named <see cref="HttpClientName"/> client
     /// for the OIDC discovery probe. Optional — when null, the health check falls back
-    /// to a process-wide shared <see cref="HttpClient"/> with <see cref="DefaultProbeTimeout"/>
-    /// (see <see cref="FallbackHttpClient"/>); that shared instance is never disposed
-    /// to avoid socket-pool churn under frequent probing.
+    /// to a process-wide shared <see cref="HttpClient"/> singleton
+    /// (<see cref="FallbackHttpClient"/>) with <see cref="DefaultProbeTimeout"/>. Passing
+    /// a real <see cref="IHttpClientFactory"/> is still strongly recommended in
+    /// production so handler pooling, DNS rotation, and policy handlers apply.
     /// </param>
     /// <param name="tokenProbe">
     /// Optional <see cref="IBotFrameworkTokenProbe"/> used to exercise real app-credential
@@ -181,8 +195,15 @@ public sealed class BotFrameworkConnectivityHealthCheck : IHealthCheck
         // actually accepted by Entra ID.
         try
         {
-            using var lease = AcquireHttpClient();
-            using var response = await lease.Client
+            // NOTE: the HttpClient instance is intentionally NOT wrapped in `using`.
+            // Factory-created clients are owned by IHttpClientFactory (their handlers
+            // are pooled), and the fallback path returns the shared
+            // FallbackHttpClient singleton. Disposing either would defeat handler
+            // pooling and / or exhaust sockets under frequent probing. The HTTP
+            // response is still disposed via `using` because it owns the response
+            // stream allocated for this single call.
+            var http = CreateHttpClient();
+            using var response = await http
                 .GetAsync(TokenEndpointProbeUrl, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -325,50 +346,21 @@ public sealed class BotFrameworkConnectivityHealthCheck : IHealthCheck
             data: data);
     }
 
-    private HttpClientLease AcquireHttpClient()
+    private HttpClient CreateHttpClient()
     {
-        // IHttpClientFactory pools the underlying HttpMessageHandler, so the HttpClient
-        // it returns is cheap to create per call AND safe to dispose — disposal only
-        // releases the lightweight wrapper, not the pooled handler. The lease owns the
-        // factory-supplied client and forwards Dispose to it.
         if (_httpClientFactory is not null)
         {
-            return new HttpClientLease(_httpClientFactory.CreateClient(HttpClientName), ownsClient: true);
+            // IHttpClientFactory owns disposal of the returned HttpClient (its
+            // underlying HttpMessageHandler is pooled and rotated by the factory).
+            // The caller MUST NOT wrap this in `using` — see the call site comment.
+            return _httpClientFactory.CreateClient(HttpClientName);
         }
 
-        // Fallback: hand out the static singleton; lease does NOT dispose it (the
-        // singleton lives for the process lifetime — see FallbackHttpClient comment).
-        return new HttpClientLease(FallbackHttpClient.Value, ownsClient: false);
-    }
-
-    /// <summary>
-    /// Disposable wrapper that lets the OIDC probe site keep its <c>using</c> idiom
-    /// while letting <see cref="AcquireHttpClient"/> decide whether the underlying
-    /// <see cref="HttpClient"/> should actually be disposed. Factory-supplied clients
-    /// are disposed (cheap — handler is pooled); the fallback singleton is not
-    /// (disposing it would close its socket pool and defeat the whole point of the
-    /// singleton, reintroducing the ephemeral-port-exhaustion problem this fix
-    /// addresses).
-    /// </summary>
-    private readonly struct HttpClientLease : IDisposable
-    {
-        private readonly HttpClient _client;
-        private readonly bool _ownsClient;
-
-        public HttpClientLease(HttpClient client, bool ownsClient)
-        {
-            _client = client;
-            _ownsClient = ownsClient;
-        }
-
-        public HttpClient Client => _client;
-
-        public void Dispose()
-        {
-            if (_ownsClient)
-            {
-                _client.Dispose();
-            }
-        }
+        // Fallback path: reuse the static singleton instead of allocating a new
+        // HttpClient per invocation. Repeatedly creating + disposing HttpClient
+        // (one per health-check tick) is the classic socket-exhaustion antipattern
+        // — each Dispose leaves a TIME_WAIT socket behind and under tight probing
+        // intervals the ephemeral port pool is drained.
+        return FallbackHttpClient;
     }
 }
