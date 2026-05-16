@@ -59,6 +59,21 @@ using Microsoft.Extensions.Options;
 /// next candidate; Worker B wins and proceeds to send.
 /// </para>
 /// <para>
+/// <b>Atomic terminal/retry transitions.</b> <see cref="MarkSentAsync"/>,
+/// <see cref="MarkFailedAsync"/>, and <see cref="DeadLetterAsync"/>
+/// all emit a single <c>ExecuteUpdateAsync</c> whose WHERE clause
+/// pins the row to the state observed at read time (Status, plus
+/// AttemptCount where the new value depends on prior state). The
+/// AttemptCount column doubles as a per-row concurrency token because
+/// every transition out of <c>Sending</c> bumps it monotonically; if
+/// a rival worker has already advanced the row between our read and
+/// our update, the WHERE filter no-ops the UPDATE and we log a CAS-
+/// lost warning instead of silently overwriting the rival's
+/// transition (the prior load+SaveChanges shape was last-writer-wins
+/// and would have clobbered concurrent <c>MarkFailed</c>/<c>DeadLetter</c>
+/// calls against the same row).
+/// </para>
+/// <para>
 /// <b>Backpressure.</b> Per architecture.md §10.4, when the queue
 /// depth (Pending + Sending) exceeds
 /// <see cref="OutboundQueueOptions.MaxQueueDepth"/> (default 5000),
@@ -321,15 +336,22 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
 
-        // Read-then-conditional-update so we can compute the new
-        // AttemptCount + NextRetryAt + Status transition. EF Core's
-        // ExecuteUpdateAsync cannot express "set AttemptCount =
-        // AttemptCount + 1" portably across providers for the
-        // OutboundMessage row shape, so a load+save is the simplest
-        // safe shape. The WHERE filter on Status==Sending prevents a
-        // late MarkFailed from clobbering a row another worker has
-        // already transitioned to DeadLettered.
+        // Read the row so we can compute the new AttemptCount, the
+        // Status branch (Pending vs Failed when budget exhausted),
+        // and the backoff NextRetryAt — none of which can be
+        // expressed inside a single conditional UPDATE without
+        // leaking provider-specific CASE WHEN translation through
+        // the value converter on the Status column. The atomic
+        // guard lives in the UPDATE's WHERE clause below:
+        // Status==Sending AND AttemptCount==observed is an
+        // optimistic CAS so a concurrent MarkFailed, MarkSent, or
+        // DeadLetter cannot silently overwrite the rival's
+        // transition (last-writer-wins was the prior shape; the
+        // AttemptCount column doubles as a row-level concurrency
+        // token because every transition out of Sending bumps it
+        // monotonically).
         var current = await db.OutboundMessages
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.MessageId == messageId, ct)
             .ConfigureAwait(false);
         if (current is null)
@@ -348,7 +370,8 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
             return;
         }
 
-        var nextAttempt = current.AttemptCount + 1;
+        var observedAttemptCount = current.AttemptCount;
+        var nextAttempt = observedAttemptCount + 1;
         var hasBudgetLeft = nextAttempt < current.MaxAttempts;
         var truncated = error.Length > 2048 ? error.Substring(0, 2048) : error;
 
@@ -359,18 +382,37 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
         var nextRetryAt = hasBudgetLeft
             ? (DateTimeOffset?)_timeProvider.GetUtcNow().AddSeconds(delaySeconds)
             : null;
+        var newStatus = hasBudgetLeft
+            ? OutboundMessageStatus.Pending
+            : OutboundMessageStatus.Failed;
 
-        var updated = current with
+        // Optimistic CAS — the WHERE filter on
+        // Status==Sending AND AttemptCount==observed makes the
+        // UPDATE a no-op when another worker has already advanced
+        // the row between our read and our write. The prior
+        // load+SaveChanges shape used last-writer-wins and would
+        // silently clobber a concurrent MarkFailed / DeadLetter /
+        // MarkSent transition.
+        var rowsAffected = await db.OutboundMessages
+            .Where(x => x.MessageId == messageId
+                        && x.Status == OutboundMessageStatus.Sending
+                        && x.AttemptCount == observedAttemptCount)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.Status, newStatus)
+                    .SetProperty(x => x.AttemptCount, nextAttempt)
+                    .SetProperty(x => x.ErrorDetail, truncated)
+                    .SetProperty(x => x.NextRetryAt, nextRetryAt),
+                ct)
+            .ConfigureAwait(false);
+
+        if (rowsAffected == 0)
         {
-            Status = hasBudgetLeft ? OutboundMessageStatus.Pending : OutboundMessageStatus.Failed,
-            AttemptCount = nextAttempt,
-            ErrorDetail = truncated,
-            NextRetryAt = nextRetryAt,
-        };
-
-        db.Entry(current).State = EntityState.Detached;
-        db.OutboundMessages.Update(updated);
-        await db.SaveChangesAsync(ct).ConfigureAwait(false);
+            _logger.LogWarning(
+                "MarkFailedAsync CAS lost for MessageId={MessageId} ObservedAttemptCount={ObservedAttemptCount} — row was advanced by a concurrent MarkFailed/MarkSent/DeadLetter between read and update; this MarkFailed is dropped to avoid overwriting the rival transition.",
+                messageId,
+                observedAttemptCount);
+        }
     }
 
     /// <inheritdoc />
@@ -393,6 +435,7 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
         // canonical backpressure DLQ path in EnqueueAsync that has
         // always stamped ErrorDetail.
         var current = await db.OutboundMessages
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.MessageId == messageId, ct)
             .ConfigureAwait(false);
         if (current is null)
@@ -412,23 +455,50 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
             return;
         }
 
+        var observedStatus = current.Status;
+        var observedAttemptCount = current.AttemptCount;
+        var nextAttempt = observedAttemptCount + 1;
         var truncated = reason.Length > 2048 ? reason.Substring(0, 2048) : reason;
-        var updated = current with
-        {
-            Status = OutboundMessageStatus.DeadLettered,
-            AttemptCount = current.AttemptCount + 1,
-            ErrorDetail = truncated,
-        };
 
-        db.Entry(current).State = EntityState.Detached;
-        db.OutboundMessages.Update(updated);
-        await db.SaveChangesAsync(ct).ConfigureAwait(false);
+        // Optimistic CAS — the WHERE filter pins the row to the
+        // (Status, AttemptCount) tuple we just read so a concurrent
+        // MarkFailed, MarkSent, or sibling DeadLetter cannot be
+        // silently overwritten. The prior load+SaveChanges shape
+        // was last-writer-wins and would clobber a rival's reason
+        // string / Sent timestamp / intermediate Pending hop with
+        // our stale view. If the CAS loses we log and bail; the
+        // caller's terminal-disposition intent is already satisfied
+        // by whatever rival transition won (either the row is now
+        // Sent, or it's DeadLettered with a different reason, or
+        // it's been bumped back to Pending for another retry — in
+        // every case the rival's record is the source of truth).
+        var rowsAffected = await db.OutboundMessages
+            .Where(x => x.MessageId == messageId
+                        && x.Status == observedStatus
+                        && x.AttemptCount == observedAttemptCount)
+            .ExecuteUpdateAsync(
+                setters => setters
+                    .SetProperty(x => x.Status, OutboundMessageStatus.DeadLettered)
+                    .SetProperty(x => x.AttemptCount, nextAttempt)
+                    .SetProperty(x => x.ErrorDetail, truncated),
+                ct)
+            .ConfigureAwait(false);
+
+        if (rowsAffected == 0)
+        {
+            _logger.LogWarning(
+                "DeadLetterAsync CAS lost for MessageId={MessageId} ObservedStatus={ObservedStatus} ObservedAttemptCount={ObservedAttemptCount} — row was advanced by a concurrent MarkFailed/MarkSent/DeadLetter between read and update; this DeadLetter is dropped to avoid overwriting the rival transition.",
+                messageId,
+                observedStatus,
+                observedAttemptCount);
+            return;
+        }
 
         _logger.LogWarning(
             "DeadLetterAsync MessageId={MessageId} CorrelationId={CorrelationId} AttemptCount={AttemptCount} Reason={Reason}",
             messageId,
             current.CorrelationId,
-            updated.AttemptCount,
+            nextAttempt,
             truncated);
     }
 
