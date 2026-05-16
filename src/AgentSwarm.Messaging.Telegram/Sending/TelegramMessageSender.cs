@@ -163,7 +163,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// invariant (outbound)". Question sends include the same trace
     /// footer via <see cref="TelegramQuestionRenderer.BuildBody"/>.
     /// </summary>
-    public const string TraceFooterPrefix = "≡ƒöù trace: ";
+    public const string TraceFooterPrefix = "🔗 trace: ";
 
     /// <summary>
     /// <see cref="IDistributedCache"/> key prefix for the Telegram
@@ -400,7 +400,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// footer ONLY when it is the final line of the message (after
     /// stripping trailing whitespace). A body that quotes a trace
     /// line earlier in the message (e.g. an agent log that contains
-    /// "previous trace: ≡ƒöù trace: abc-123" followed by more body
+    /// "previous trace: 🔗 trace: abc-123" followed by more body
     /// text) does NOT mistake the quoted marker for the message
     /// footer. The pre-iter-5 logic used <c>LastIndexOf</c> on the
     /// raw text and would truncate the body from that marker

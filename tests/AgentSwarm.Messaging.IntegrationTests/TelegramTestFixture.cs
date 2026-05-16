@@ -10,6 +10,7 @@ using System.Linq;
 using System.Net.Http;
 using AgentSwarm.Messaging.Persistence;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -45,7 +46,11 @@ namespace AgentSwarm.Messaging.IntegrationTests;
 /// schema is created on startup by a small
 /// <see cref="IHostedService"/>, so the Stage 2.4 inbound store and
 /// the Stage 2.3 sender's downstream Stage 4.1 outbox (once it
-/// exists) can read/write without touching the file system.
+/// exists) can read/write without touching the file system. A
+/// dedicated <see cref="SqliteConnection"/> keepalive is held for
+/// the fixture's lifetime so the shared-cache database survives EF
+/// Core's connection pool churn between operations — see the
+/// constructor for the full rationale.
 /// </para>
 /// </remarks>
 public sealed class TelegramTestFixture : IDisposable
@@ -54,11 +59,29 @@ public sealed class TelegramTestFixture : IDisposable
     public const string SecretToken = "integration-test-secret-token-value";
 
     private readonly WireMockBackedFactory _factory;
+    private readonly SqliteConnection _keepAlive;
 
     public TelegramTestFixture()
     {
         FakeApi = new FakeTelegramApi();
-        _factory = new WireMockBackedFactory(FakeApi.BaseUrl);
+
+        // SQLite shared-cache in-memory databases are destroyed the
+        // moment the LAST connection with that data source name
+        // closes; the TestSchemaInitializer's scope is disposed at
+        // the end of StartAsync, and EF Core's connection pool may
+        // close all idle connections between operations (e.g. under
+        // GC pressure or during a test pause). Holding an open
+        // keepalive here matches the pattern in
+        // PersistentOutboundDeadLetterStoreIntegrationTests and
+        // PersistentOutboundMessageIdIndexIntegrationTests and
+        // guarantees the schema survives for the lifetime of the
+        // fixture, eliminating the "no such table" flake.
+        var dbName = $"integration-test-{Guid.NewGuid():N}";
+        var connectionString = $"DataSource={dbName};Mode=Memory;Cache=Shared";
+        _keepAlive = new SqliteConnection(connectionString);
+        _keepAlive.Open();
+
+        _factory = new WireMockBackedFactory(FakeApi.BaseUrl, connectionString);
     }
 
     /// <summary>
@@ -87,15 +110,22 @@ public sealed class TelegramTestFixture : IDisposable
     {
         _factory.Dispose();
         FakeApi.Dispose();
+
+        // Dispose the keepalive last so the in-memory database is
+        // only torn down after the host (and any background services
+        // that might still be flushing) has stopped.
+        _keepAlive.Dispose();
     }
 
     private sealed class WireMockBackedFactory : WebApplicationFactory<Program>
     {
         private readonly string _fakeApiBaseUrl;
+        private readonly string _connectionString;
 
-        public WireMockBackedFactory(string fakeApiBaseUrl)
+        public WireMockBackedFactory(string fakeApiBaseUrl, string connectionString)
         {
             _fakeApiBaseUrl = fakeApiBaseUrl;
+            _connectionString = connectionString;
         }
 
         protected override IHost CreateHost(IHostBuilder builder)
@@ -105,9 +135,11 @@ public sealed class TelegramTestFixture : IDisposable
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     // Shared in-memory SQLite — no disk artifacts; schema
-                    // created by TestSchemaInitializer below.
-                    ["ConnectionStrings:MessagingDb"] =
-                        $"DataSource=integration-test-{Guid.NewGuid():N};Mode=Memory;Cache=Shared",
+                    // created by TestSchemaInitializer below. The
+                    // matching keepalive connection is owned by the
+                    // outer TelegramTestFixture so the database
+                    // survives EF Core connection pool churn.
+                    ["ConnectionStrings:MessagingDb"] = _connectionString,
                     ["MessagingDb:UseMigrations"] = "false",
                     ["Telegram:BotToken"] = BotToken,
                     // UsePolling=false + WebhookUrl=null leaves the
