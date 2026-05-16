@@ -46,8 +46,10 @@ public sealed class TelegramOptions
 
     /// <summary>
     /// Public HTTPS URL Telegram POSTs updates to (production mode).
-    /// Mutually exclusive with <see cref="UsePolling"/> — validated by a
-    /// later stage's options validator (Stage 2.5).
+    /// Mutually exclusive with <see cref="UsePolling"/> — validated by
+    /// <see cref="TelegramOptionsValidator"/> at startup, which also
+    /// enforces an absolute HTTPS scheme and rejects a webhook URL
+    /// configured without a matching <see cref="SecretToken"/>.
     /// </summary>
     public string? WebhookUrl { get; set; }
 
@@ -66,6 +68,23 @@ public sealed class TelegramOptions
     /// <see cref="HashSet{T}"/> downstream.
     /// </summary>
     public List<long> AllowedUserIds { get; set; } = new();
+
+    /// <summary>
+    /// Per-(user, chat) operator bindings — the structural mapping
+    /// required by the story brief's "Validate chat/user allowlist
+    /// before accepting commands" + "Map Telegram chat ID to authorized
+    /// human operator and tenant/workspace" rows. Each entry pins one
+    /// (<see cref="TelegramOperatorBindingOptions.TelegramUserId"/>,
+    /// <see cref="TelegramOperatorBindingOptions.TelegramChatId"/>)
+    /// pair and supplies the
+    /// <see cref="TelegramOperatorBindingOptions.TenantId"/> /
+    /// <see cref="TelegramOperatorBindingOptions.WorkspaceId"/> the
+    /// pipeline must use when emitting downstream events. Consumed by
+    /// <see cref="Auth.ConfiguredOperatorAuthorizationService"/>; the
+    /// validator (<see cref="TelegramOptionsValidator"/>) rejects
+    /// blank tenant/workspace at startup.
+    /// </summary>
+    public List<TelegramOperatorBindingOptions> OperatorBindings { get; set; } = new();
 
     /// <summary>
     /// Shared secret echoed by Telegram in the
