@@ -27,9 +27,20 @@ namespace AgentSwarm.Messaging.Telegram.Webhook;
 ///   <see cref="MessengerEvent.Payload"/> so the text-reply handler can
 ///   read it (the pipeline reads <c>Payload</c> rather than
 ///   <c>RawCommand</c> for non-command events).</description></item>
-///   <item><description><see cref="Update.CallbackQuery"/> maps to
+///   <item><description><see cref="Update.CallbackQuery"/> with a
+///   non-null/whitespace <see cref="CallbackQuery.Data"/> AND a non-null
+///   <see cref="CallbackQuery.Message"/> maps to
 ///   <see cref="EventType.CallbackResponse"/>; the inline-button
 ///   callback data flows through <see cref="MessengerEvent.Payload"/>.
+///   Game-button callbacks (<c>callback_game</c>, where <c>Data</c> is
+///   null and <c>GameShortName</c> is set instead) and orphaned
+///   inline-mode callbacks (where only <c>InlineMessageId</c> is set
+///   and <c>Message</c> is null because the originating message is too
+///   old or was sent via inline mode) fall through to the Unknown
+///   branch — the approval handler expects a non-null callback payload
+///   to parse <c>QuestionId+ActionId</c> out of, and we only ever send
+///   approval cards as regular bot messages so an orphaned inline
+///   callback cannot belong to any approval flow we initiated.
 ///   </description></item>
 ///   <item><description>Anything else — edited messages, channel posts,
 ///   chat member updates, polls, anonymous admin posts and channel
@@ -94,7 +105,24 @@ public static class TelegramUpdateMapper
             };
         }
 
-        if (update.CallbackQuery is { } cb)
+        // Require cb.Data to be non-null/whitespace AND cb.Message to be
+        // non-null before emitting a typed CallbackResponse. Telegram
+        // delivers callback queries with a null Data for game-button
+        // callbacks (callback_game carries GameShortName instead of Data)
+        // and with a null Message when the originating message was sent
+        // via inline mode or is too old (only InlineMessageId is set in
+        // those cases). Synthesizing Payload=null would NRE the approval
+        // handler, which expects a non-null payload to parse QuestionId
+        // and ActionId out of, and synthesizing ChatId="0" for an
+        // orphaned inline callback would misroute the event to a chat
+        // we never sent an approval card to. Falling through to the
+        // Unknown branch matches the polling-stage sibling mapper and
+        // the previous webhook mapper's behaviour, and lets the
+        // pipeline's classify stage short-circuit before any reservation
+        // slot is consumed.
+        if (update.CallbackQuery is { } cb
+            && !string.IsNullOrWhiteSpace(cb.Data)
+            && cb.Message is { } cbMsg)
         {
             return new MessengerEvent
             {
@@ -102,7 +130,7 @@ public static class TelegramUpdateMapper
                 EventType = EventType.CallbackResponse,
                 RawCommand = null,
                 UserId = cb.From.Id.ToString(CultureInfo.InvariantCulture),
-                ChatId = (cb.Message?.Chat.Id ?? 0L).ToString(CultureInfo.InvariantCulture),
+                ChatId = cbMsg.Chat.Id.ToString(CultureInfo.InvariantCulture),
                 Timestamp = receivedAt,
                 CorrelationId = correlationId,
                 Payload = cb.Data,
