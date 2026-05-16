@@ -207,7 +207,7 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// violation, cancellation, transient DB error), the
     /// <c>await using</c> disposal of the transaction rolls back
     /// every change in the batch — there is no
-    /// <see cref="CommitAsync(IDbContextTransaction, CancellationToken)"/>
+    /// <see cref="Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction.CommitAsync(CancellationToken)"/>
     /// path that runs in the presence of a thrown exception.
     /// </para>
     /// <para>
@@ -222,23 +222,24 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// event and surface a structured error to the operator.
     /// </para>
     /// <para>
-    /// <b>Round-trip cost (review-r0 item).</b> Earlier iterations of
-    /// this method drove the staging loop through
+    /// <b>Round-trip cost (review-r0 item).</b> Earlier iterations
+    /// drove the staging loop through
     /// <see cref="StageUpsertAsync(MessagingDbContext, OperatorRegistration, CancellationToken)"/>,
-    /// which issues a tracking <see cref="EntityFrameworkQueryableExtensions.FirstOrDefaultAsync{TSource}(IQueryable{TSource}, CancellationToken)"/>
+    /// which issues a tracking
+    /// <see cref="EntityFrameworkQueryableExtensions.FirstOrDefaultAsync{TSource}(IQueryable{TSource}, CancellationToken)"/>
     /// per registration. For an operator onboarded with N workspace
-    /// bindings under <c>Telegram:UserTenantMappings</c> that
-    /// produced an N+1 query pattern (N SELECTs + 1
-    /// <c>SaveChangesAsync</c>). The current implementation collapses
-    /// the lookup phase into a single batched SELECT via
-    /// <see cref="PreloadExistingForBatchAsync"/> — EF Core's
-    /// identity-resolved tracking query attaches every pre-existing
-    /// row to the change tracker before the staging loop runs, so
-    /// the loop performs zero database round-trips and the entire
-    /// batch settles into <b>1 SELECT + 1 SaveChanges</b> regardless
-    /// of N. The transaction wrapper, all-or-nothing semantics, and
-    /// no-retry-on-<see cref="DbUpdateException"/> behaviour are
-    /// preserved exactly.
+    /// bindings under <c>Telegram:UserTenantMappings</c> that produced
+    /// an N+1 query pattern (N SELECTs + 1 <c>SaveChangesAsync</c>).
+    /// The current implementation collapses the lookup phase into a
+    /// single batched tracking SELECT via
+    /// <see cref="PreloadExistingForBatchAsync"/>; EF Core's identity
+    /// resolution attaches every pre-existing row to the change
+    /// tracker, so the staging loop performs zero database round-trips
+    /// and the entire batch settles into <b>1 SELECT + 1 SaveChanges</b>
+    /// regardless of N. The transaction wrapper, all-or-nothing
+    /// rollback semantics, and no-retry-on-<see cref="DbUpdateException"/>
+    /// behaviour are preserved exactly, and the
+    /// <c>RegisterManyAsync_*</c> test cases continue to pin them.
     /// </para>
     /// </remarks>
     public async Task RegisterManyAsync(
@@ -272,8 +273,8 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
         // Pre-load every (TelegramUserId, TelegramChatId, WorkspaceId)
         // row that already exists for the batch in ONE tracking SELECT.
         // The returned dictionary lets the staging loop below decide
-        // insert-vs-update without issuing additional round-trips —
-        // EF Core's identity resolution has already attached each
+        // insert-vs-update without issuing additional round-trips — EF
+        // Core's identity resolution has already attached each
         // pre-existing row to the change tracker, so the
         // `db.Entry(existing).CurrentValues.SetValues(...)` update
         // path inside StageUpsertForBatch runs against tracked
@@ -382,7 +383,8 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> later in
     /// the same batch merges onto the already-staged entity rather
     /// than enqueuing a second INSERT that would collide with the
-    /// unique index at <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
+    /// unique index at
+    /// <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
     /// time.
     /// </summary>
     private static void StageUpsertForBatch(
@@ -405,8 +407,8 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// <see langword="null"/>) or an UPDATE (when present) for
     /// <paramref name="registration"/> against the tracked
     /// <paramref name="db"/>. Returns the entity that ended up in the
-    /// change tracker so batch callers can register fresh INSERTs
-    /// back into their pre-loaded dictionary.
+    /// change tracker so batch callers can register fresh INSERTs back
+    /// into their pre-loaded dictionary.
     /// </summary>
     private static OperatorBinding ApplyUpsert(
         MessagingDbContext db,
@@ -483,12 +485,16 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// <see cref="OperatorBinding"/> row whose
     /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> tuple
     /// appears in <paramref name="registrations"/>, keyed for O(1)
-    /// in-memory lookup. The query uses three
+    /// in-memory lookup. The query uses three axis-wise
     /// <see cref="Enumerable.Contains{TSource}(IEnumerable{TSource}, TSource)"/>
-    /// filters (one per axis) so EF Core can translate it to a
-    /// stable parameterised <c>WHERE … IN (…)</c> form on every
-    /// supported provider; tuple-shaped <c>IN</c> support varies
-    /// across providers and would force a raw-SQL escape hatch.
+    /// filters (one per column) rather than a row-value
+    /// <c>WHERE (UserId, ChatId, WorkspaceId) IN (…)</c> because
+    /// EF Core 8's translation of row-value <c>IN</c> across
+    /// SQLite / PostgreSQL / SQL Server is uneven and would either
+    /// fall back to client evaluation or force a provider-specific
+    /// raw-SQL escape hatch. The axis-wise form translates to a
+    /// stable parameterised SQL <c>WHERE … IN (…)</c> per axis on
+    /// every supported provider.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -515,6 +521,17 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// update path produce an UPDATE statement at
     /// <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
     /// time instead of a duplicate INSERT.
+    /// </para>
+    /// <para>
+    /// The lookup intentionally does NOT filter on
+    /// <see cref="OperatorBinding.IsActive"/>: a previously
+    /// deactivated row for the same
+    /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> tuple
+    /// must be re-activated by an upsert rather than ignored
+    /// (which would let
+    /// <see cref="MessagingDbContext.OperatorBindings"/>'s
+    /// <c>ux_operator_bindings_user_chat_workspace</c> unique index
+    /// reject a fresh INSERT against the dead row).
     /// </para>
     /// </remarks>
     private static async Task<Dictionary<(long TelegramUserId, long TelegramChatId, string WorkspaceId), OperatorBinding>> PreloadExistingForBatchAsync(
