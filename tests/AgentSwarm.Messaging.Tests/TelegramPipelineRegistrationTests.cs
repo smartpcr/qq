@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Core.Commands;
 using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Pipeline;
@@ -20,7 +21,7 @@ public class TelegramPipelineRegistrationTests
     private const string SampleToken = "1234567890:AAH9hyTeleGramSecRetToken_test_value_only";
 
     [Theory]
-    [InlineData(typeof(IDeduplicationService), typeof(InMemoryDeduplicationService))]
+    [InlineData(typeof(IDeduplicationService), typeof(SlidingWindowDeduplicationService))]
     [InlineData(typeof(IPendingQuestionStore), typeof(InMemoryPendingQuestionStore))]
     [InlineData(typeof(IPendingDisambiguationStore), typeof(InMemoryPendingDisambiguationStore))]
     // Stage 3.1 swapped StubCommandParser for the production

@@ -310,8 +310,8 @@ public sealed class OutboundQueueProcessor : BackgroundService
                     new KeyValuePair<string, object?>("source_type", message.SourceType.ToString()));
             }
 
-            await _queue
-                .MarkSentAsync(message.MessageId, sendResult.TelegramMessageId, ct)
+            await ExecuteShutdownSafeBookkeepingAsync(token => _queue
+                .MarkSentAsync(message.MessageId, sendResult.TelegramMessageId, token))
                 .ConfigureAwait(false);
 
             _logger.LogInformation(
@@ -367,8 +367,11 @@ public sealed class OutboundQueueProcessor : BackgroundService
 
             // Unknown exception — let the queue's retry/dead-letter
             // logic decide based on the row's remaining attempt budget.
-            await _queue
-                .MarkFailedAsync(message.MessageId, ex.Message, ct)
+            // Wrap in the shutdown-safe helper so the bookkeeping
+            // write completes even when the host's stoppingToken raced
+            // (iter-7 evaluator item 4).
+            await ExecuteShutdownSafeBookkeepingAsync(token => _queue
+                .MarkFailedAsync(message.MessageId, ex.Message, token))
                 .ConfigureAwait(false);
         }
     }
@@ -453,8 +456,8 @@ public sealed class OutboundQueueProcessor : BackgroundService
                     new KeyValuePair<string, object?>("recovered", "pending_question_persistence"));
             }
 
-            await _queue
-                .MarkSentAsync(message.MessageId, ex.TelegramMessageId, ct)
+            await ExecuteShutdownSafeBookkeepingAsync(token => _queue
+                .MarkSentAsync(message.MessageId, ex.TelegramMessageId, token))
                 .ConfigureAwait(false);
 
             _logger.LogInformation(
@@ -538,7 +541,9 @@ public sealed class OutboundQueueProcessor : BackgroundService
             // human message body — enough for operator triage without
             // chasing across the dead-letter ledger.
             var reason = $"{ex.FailureCategory}: {BuildErrorDetail(ex)}";
-            await _queue.DeadLetterAsync(message.MessageId, reason, ct).ConfigureAwait(false);
+            await ExecuteShutdownSafeBookkeepingAsync(token => _queue
+                .DeadLetterAsync(message.MessageId, reason, token))
+                .ConfigureAwait(false);
             return;
         }
 
@@ -561,14 +566,37 @@ public sealed class OutboundQueueProcessor : BackgroundService
             ex.FailureCategory,
             expectedToRetry ? "Pending (retry)" : "Failed (budget exhausted)");
 
-        await _queue
-            .MarkFailedAsync(message.MessageId, BuildErrorDetail(ex), ct)
+        await ExecuteShutdownSafeBookkeepingAsync(token => _queue
+            .MarkFailedAsync(message.MessageId, BuildErrorDetail(ex), token))
             .ConfigureAwait(false);
     }
 
     private static string BuildErrorDetail(TelegramSendFailedException ex)
     {
         return $"[{ex.FailureCategory}] {ex.Message}";
+    }
+
+    /// <summary>
+    /// Stage 4.1 iter-7 evaluator items 2 + 4 — runs a queue-state
+    /// bookkeeping write (MarkSent / MarkFailed / DeadLetter) on a
+    /// fresh, time-bounded <see cref="CancellationTokenSource"/> that
+    /// is independent of the processor's
+    /// <see cref="BackgroundService.ExecuteAsync(CancellationToken)"/>
+    /// stoppingToken. The post-send / post-exception bookkeeping MUST
+    /// land regardless of host shutdown timing — otherwise the row
+    /// stays in <see cref="OutboundMessageStatus.Sending"/>, the
+    /// recovery sweep re-claims it on the next start, and Telegram
+    /// receives a duplicate delivery (for the happy path) or the row
+    /// loops permanently without ever decrementing its retry budget
+    /// (for the failure paths). The 30 s upper bound prevents a
+    /// pathologically slow DB write from hanging shutdown
+    /// indefinitely.
+    /// </summary>
+    private static async Task ExecuteShutdownSafeBookkeepingAsync(
+        Func<CancellationToken, Task> bookkeeping)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await bookkeeping(cts.Token).ConfigureAwait(false);
     }
 
     private static async Task SafeDelayAsync(TimeSpan delay, CancellationToken ct)
