@@ -96,6 +96,33 @@ public class Program
         // composition root) registered before this call win.
         builder.Services.AddSlackSignatureValidation(builder.Configuration);
 
+        // Stage 3.2: register the authorization filter (workspace ->
+        // channel -> user-group ACL) and its supporting services
+        // (ISlackMembershipResolver, ISlackUserGroupClient,
+        // ISlackAuthorizationAuditSink). All registrations use
+        // TryAdd*, so the in-memory fall-backs only apply when no
+        // production override is already present (the EF
+        // ISlackWorkspaceConfigStore and EF ISlackAuditEntryWriter
+        // registered above win for the Worker host).
+        builder.Services.AddSlackAuthorization(builder.Configuration);
+
+        // Stage 3.2: mount the SlackAuthorizationFilter on the MVC
+        // pipeline as a global service filter. Controllers land in
+        // Stage 4.1, but registering the filter at the
+        // composition-root level now (rather than waiting for Stage
+        // 4.1) means every controller added later automatically
+        // inherits the ACL gate without needing to decorate each
+        // controller with [ServiceFilter(typeof(SlackAuthorizationFilter))].
+        // The signature middleware (UseSlackSignatureValidation
+        // below) runs first and stamps HttpContext.Items with the
+        // resolved SlackWorkspaceConfig, which the filter re-uses
+        // to avoid a second workspace lookup.
+        builder.Services
+            .AddControllers(options =>
+            {
+                options.Filters.AddService<SlackAuthorizationFilter>();
+            });
+
         WebApplication app = builder.Build();
 
         // Stage 3.1: ensure the durable Slack audit schema is provisioned
@@ -132,6 +159,13 @@ public class Program
 
         app.MapGet("/health/live", () => Results.Ok(new { status = "live" }));
         app.MapGet("/health/ready", () => Results.Ok(new { status = "ready" }));
+
+        // Stage 3.2: map controller endpoints so the
+        // SlackAuthorizationFilter registered as a global MVC filter
+        // above is invoked when Stage 4.1 lands the inbound Slack
+        // controllers. Stage 4.1 only needs to add controller types
+        // -- no further composition-root edits are required.
+        app.MapControllers();
 
         return app;
     }
