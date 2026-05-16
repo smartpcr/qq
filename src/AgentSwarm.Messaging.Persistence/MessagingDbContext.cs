@@ -38,6 +38,17 @@ public class MessagingDbContext : DbContext
     public DbSet<OutboundDeadLetterRecord> OutboundDeadLetters => Set<OutboundDeadLetterRecord>();
 
     /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the durable outbox
+    /// (Stage 4.1). One row per outbound Telegram message: the
+    /// <c>OutboundQueueProcessor</c> drains the queue in
+    /// severity-priority order and the connector's
+    /// <c>SendMessageAsync</c> / <c>SendQuestionAsync</c> path
+    /// enqueues into it. Configured via
+    /// <see cref="OutboundMessageConfiguration"/>.
+    /// </summary>
+    public DbSet<OutboundMessage> OutboundMessages => Set<OutboundMessage>();
+
+    /// <summary>
     /// <see cref="DbSet{TEntity}"/> backing the task-to-operator
     /// oversight assignment table (Stage 3.2). One row per task; the
     /// <c>/handoff</c> command upserts the row, the Stage 2.7

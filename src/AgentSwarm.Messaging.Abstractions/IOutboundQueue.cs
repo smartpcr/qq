@@ -57,10 +57,33 @@ public interface IOutboundQueue
     Task MarkFailedAsync(Guid messageId, string error, CancellationToken ct);
 
     /// <summary>
-    /// Move a message that has exhausted its retry budget to the
-    /// dead-letter queue (status <c>DeadLettered</c>); the caller is
-    /// expected to fan out to <see cref="IAlertService.SendAlertAsync"/> on
-    /// a secondary channel.
+    /// Move a message that has exhausted its retry budget — or hit a
+    /// permanent failure — to the dead-letter queue (status
+    /// <c>DeadLettered</c>); the caller is expected to fan out to
+    /// <see cref="IAlertService.SendAlertAsync"/> on a secondary
+    /// channel.
     /// </summary>
-    Task DeadLetterAsync(Guid messageId, CancellationToken ct);
+    /// <param name="messageId">
+    /// The <see cref="OutboundMessage.MessageId"/> of the row to
+    /// dead-letter.
+    /// </param>
+    /// <param name="reason">
+    /// <b>Stage 4.1 iter-2 evaluator item 5.</b> Human- and
+    /// machine-readable failure reason persisted to
+    /// <see cref="OutboundMessage.ErrorDetail"/> so the dead-letter
+    /// transition does NOT lose the original failure category /
+    /// message. The Stage 4.1 <c>OutboundQueueProcessor</c> passes a
+    /// stringified <see cref="OutboundFailureCategory"/> plus the
+    /// last error message; the in-line backpressure DLQ path inside
+    /// <see cref="EnqueueAsync"/> passes the canonical
+    /// <c>backpressure:queue_depth_exceeded</c> reason per
+    /// architecture.md §10.4. Implementations MUST persist the
+    /// reason and MUST increment
+    /// <see cref="OutboundMessage.AttemptCount"/> by one so the audit
+    /// trail records the final failure attempt rather than freezing
+    /// the count at the last successfully-recorded
+    /// <see cref="MarkFailedAsync"/> attempt.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    Task DeadLetterAsync(Guid messageId, string reason, CancellationToken ct);
 }

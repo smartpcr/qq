@@ -161,6 +161,31 @@ public sealed record OutboundMessage
 
     public required DateTimeOffset CreatedAt { get; init; }
 
+    /// <summary>
+    /// <b>Stage 4.1 iter-2 evaluator item 2.</b> Wall-clock timestamp
+    /// (UTC) at which the row was atomically claimed by
+    /// <c>IOutboundQueue.DequeueAsync</c> — i.e. the moment its
+    /// <see cref="Status"/> transitioned from
+    /// <see cref="OutboundMessageStatus.Pending"/> to
+    /// <see cref="OutboundMessageStatus.Sending"/>. Required by the
+    /// Stage 4.1 brief: "each worker independently dequeues the
+    /// highest-severity pending message, <b>records DequeuedAt
+    /// timestamp</b>, transitions to Sending, sends via
+    /// TelegramMessageSender, ...". Persisted alongside
+    /// <see cref="CreatedAt"/> and <see cref="SentAt"/> so the
+    /// architecture.md §10.4 enqueue-vs-dequeue dwell-time histogram
+    /// (<c>telegram.send.queue_dwell_ms</c>) can be reconstructed
+    /// post-hoc from the outbox even when the in-process meter samples
+    /// have already been scraped, and so an orphan
+    /// <see cref="OutboundMessageStatus.Sending"/> row can be aged
+    /// out by a recovery sweep based on a clear "stuck since"
+    /// timestamp distinct from the original enqueue instant.
+    /// <see langword="null"/> for rows that are still
+    /// <see cref="OutboundMessageStatus.Pending"/> and have never
+    /// been claimed.
+    /// </summary>
+    public DateTimeOffset? DequeuedAt { get; init; }
+
     public DateTimeOffset? SentAt { get; init; }
 
     /// <summary>

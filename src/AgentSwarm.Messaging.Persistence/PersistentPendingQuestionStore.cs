@@ -344,7 +344,7 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
     /// <c>false</c> — otherwise the system double-publishes for the
     /// same <c>QuestionId</c>.
     /// </summary>
-    public async Task<bool> MarkAnsweredAsync(string questionId, CancellationToken ct)
+    public async Task MarkAnsweredAsync(string questionId, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(questionId);
 
@@ -353,19 +353,17 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
 
         // Atomic cross-process claim — same pattern as
         // MarkTimedOutAsync. The WHERE filter on
-        // (Status == Pending || Status == AwaitingComment) is what
-        // closes the callback-vs-sweep race: a callback that arrives
-        // microseconds AFTER QuestionTimeoutService has already
-        // claimed the row (Status = TimedOut) will see rowsAffected
-        // == 0 here and return false, letting the callback handler
-        // skip its HumanDecisionEvent emit. Without this guard the
-        // previous load-then-set-then-save would silently overwrite
-        // TimedOut → Answered, producing TWO HumanDecisionEvent
-        // publishes for the same QuestionId. Implemented via EF
-        // Core 8's ExecuteUpdateAsync so the single provider-native
-        // UPDATE is atomic at row-level under SQLite, PostgreSQL,
-        // and SQL Server alike.
-        var rowsAffected = await db.PendingQuestions
+        // (Status == Pending || Status == AwaitingComment) closes the
+        // callback-vs-sweep race: a callback that arrives microseconds
+        // AFTER QuestionTimeoutService has already claimed the row
+        // (Status = TimedOut) will see rowsAffected == 0 here and the
+        // UPDATE becomes a no-op — Telegram callbacks ignore the
+        // outcome because the interface returns Task per
+        // IPendingQuestionStore.MarkAnsweredAsync. The bool result of
+        // the CAS is currently discarded; if a future caller needs to
+        // branch on the win/lose outcome, the interface signature
+        // would have to change to Task<bool> first.
+        _ = await db.PendingQuestions
             .Where(x => x.QuestionId == questionId
                      && (x.Status == PendingQuestionStatus.Pending
                       || x.Status == PendingQuestionStatus.AwaitingComment))
@@ -373,8 +371,6 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
                 setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.Answered),
                 ct)
             .ConfigureAwait(false);
-
-        return rowsAffected > 0;
     }
 
     /// <summary>
@@ -392,7 +388,7 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
     /// <c>false</c> so the operator does not get prompted for text
     /// against a question the system has already defaulted.
     /// </summary>
-    public async Task<bool> MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
+    public async Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(questionId);
 
@@ -404,19 +400,17 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
         // Same race-closing rationale as MarkAnsweredAsync /
         // MarkTimedOutAsync: a callback that arrives after a
         // QuestionTimeoutService sweep has already flipped the row
-        // to TimedOut will see rowsAffected == 0 here and return
-        // false, letting the callback handler skip the
-        // awaiting-comment prompt instead of silently restoring a
-        // non-terminal status on top of a terminal one.
-        var rowsAffected = await db.PendingQuestions
+        // to TimedOut will see rowsAffected == 0 here, and the UPDATE
+        // is a no-op — the row stays TimedOut. The interface returns
+        // Task per IPendingQuestionStore.MarkAwaitingCommentAsync so
+        // the bool CAS outcome is currently discarded.
+        _ = await db.PendingQuestions
             .Where(x => x.QuestionId == questionId
                      && x.Status == PendingQuestionStatus.Pending)
             .ExecuteUpdateAsync(
                 setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.AwaitingComment),
                 ct)
             .ConfigureAwait(false);
-
-        return rowsAffected > 0;
     }
 
     public async Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)

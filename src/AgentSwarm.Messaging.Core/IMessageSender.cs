@@ -4,7 +4,10 @@ using AgentSwarm.Messaging.Abstractions;
 
 /// <summary>
 /// Return value from <see cref="IMessageSender"/> methods, carrying the
-/// Telegram-assigned <c>message_id</c> for the freshly-sent message.
+/// Telegram-assigned <c>message_id</c> for the freshly-sent message
+/// and (iter-2 evaluator item 1) sender-side metadata the Stage 4.1
+/// <c>OutboundQueueProcessor</c> needs to decide which canonical
+/// latency histograms to emit.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -25,9 +28,30 @@ using AgentSwarm.Messaging.Abstractions;
 /// never re-sends), see architecture.md §5.2 invariant 1.
 /// </para>
 /// <para>
-/// Defined as a <c>sealed</c> positional record per architecture.md §4.12,
+/// <b>Caller responsibilities for <see cref="RateLimited"/>
+/// (Stage 4.1 iter-2 evaluator item 1).</b> The acceptance-gate
+/// histogram <c>telegram.send.first_attempt_latency_ms</c> per
+/// architecture.md §10.4 is scoped to "first-attempt sends that did
+/// NOT receive a Telegram 429". Without a signal from the sender,
+/// the processor cannot tell whether a successful send waited
+/// internally for a 429 retry-after — and silently including those
+/// samples poisons the SLO histogram. The sender sets
+/// <see cref="RateLimited"/> = <see langword="true"/> when the
+/// underlying <c>SendWithRetry</c> waited on at least one 429
+/// retry-after for any chunk of the send; the processor then emits
+/// <c>all_attempts_latency_ms</c> only, not
+/// <c>first_attempt_latency_ms</c>.
+/// </para>
+/// <para>
+/// Defined as a <c>sealed</c> record per architecture.md §4.12,
 /// living in <c>AgentSwarm.Messaging.Core</c> alongside
-/// <see cref="IMessageSender"/>.
+/// <see cref="IMessageSender"/>. The positional <see cref="TelegramMessageId"/>
+/// constructor is preserved for source compatibility; the
+/// <see cref="RateLimited"/> flag is exposed as an init-only property
+/// so the single-positional-arg ctor at every existing call site
+/// continues to compile (<c>new SendResult(123L)</c> stays valid;
+/// rate-limit-aware callers use
+/// <c>new SendResult(123L) { RateLimited = true }</c>).
 /// </para>
 /// <para>
 /// <see cref="TelegramMessageId"/> is typed as <see cref="long"/> per the
@@ -39,7 +63,25 @@ using AgentSwarm.Messaging.Abstractions;
 /// <param name="TelegramMessageId">
 /// The Telegram-assigned <c>message_id</c> for the freshly-sent message.
 /// </param>
-public sealed record SendResult(long TelegramMessageId);
+public sealed record SendResult(long TelegramMessageId)
+{
+    /// <summary>
+    /// <b>Iter-2 evaluator item 1.</b> <see langword="true"/> when
+    /// the underlying Bot API call retried internally after at least
+    /// one Telegram 429 (flood-control) response before succeeding —
+    /// i.e. the elapsed time from enqueue to HTTP 200 included a
+    /// <c>retry_after</c> wait. <see langword="false"/> for sends
+    /// that returned HTTP 200 on the first wire attempt with no
+    /// rate-limit retry. The Stage 4.1
+    /// <c>OutboundQueueProcessor</c> uses this flag to satisfy the
+    /// architecture.md §10.4 scope rule for
+    /// <c>telegram.send.first_attempt_latency_ms</c> (SLO histogram
+    /// excludes 429-retried sends) without polluting
+    /// <c>telegram.send.all_attempts_latency_ms</c> (capacity-
+    /// planning histogram includes them).
+    /// </summary>
+    public bool RateLimited { get; init; }
+}
 
 /// <summary>
 /// Platform-agnostic outbound sending contract used by the

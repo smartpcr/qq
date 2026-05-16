@@ -812,6 +812,6 @@ public class TelegramMessengerConnectorTests
 
         public Task MarkFailedAsync(Guid messageId, string error, CancellationToken ct) => Task.CompletedTask;
 
-        public Task DeadLetterAsync(Guid messageId, CancellationToken ct) => Task.CompletedTask;
+        public Task DeadLetterAsync(Guid messageId, string reason, CancellationToken ct) => Task.CompletedTask;
     }
 }

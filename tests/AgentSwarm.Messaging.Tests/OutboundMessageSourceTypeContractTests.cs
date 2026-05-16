@@ -328,7 +328,7 @@ public class OutboundMessageSourceTypeContractTests
         public Task MarkFailedAsync(Guid messageId, string error, CancellationToken ct)
             => Task.CompletedTask;
 
-        public Task DeadLetterAsync(Guid messageId, CancellationToken ct)
+        public Task DeadLetterAsync(Guid messageId, string reason, CancellationToken ct)
             => Task.CompletedTask;
     }
 }
