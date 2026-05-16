@@ -55,6 +55,36 @@ public sealed class CommandDispatcherTests
         return (ctx, adapter);
     }
 
+    /// <summary>
+    /// Build a turn context whose <see cref="Activity"/> carries the real Bot Framework
+    /// mention metadata used by production Teams channel messages: <c>Recipient.Id == BotId</c>
+    /// plus a matching <c>Mention</c> entity (via <see cref="HandlerFactory.BuildMentionEntity"/>).
+    /// This shape is the precondition for <c>Activity.RemoveRecipientMention()</c> to
+    /// actually strip <c>&lt;at&gt;AgentBot&lt;/at&gt;</c> from <see cref="Activity.Text"/>;
+    /// the plain <see cref="BuildTurnContext"/> fixture omits the entity and recipient id,
+    /// so it cannot detect a regression that adds a <c>RemoveRecipientMention</c> call
+    /// inside the dispatcher.
+    /// </summary>
+    private static (TurnContext Context, InertBotAdapter Adapter, Activity Activity) BuildRealisticBotMentionTurnContext(string text)
+    {
+        var activity = new Activity
+        {
+            Type = ActivityTypes.Message,
+            Id = "activity-1",
+            Text = text,
+            Conversation = new ConversationAccount { Id = "19:channel-conv-1", ConversationType = "channel" },
+            From = new ChannelAccount(id: "29:from-channel", name: "Channel User"),
+            Recipient = new ChannelAccount(id: HandlerFactory.BotId, name: HandlerFactory.BotName),
+            Entities = new List<Entity>
+            {
+                HandlerFactory.BuildMentionEntity(HandlerFactory.BotId, HandlerFactory.BotName, "<at>AgentBot</at>"),
+            },
+        };
+        var adapter = new InertBotAdapter();
+        var ctx = new TurnContext(adapter, activity);
+        return (ctx, adapter, activity);
+    }
+
     private sealed class RecordingCommandHandler : ICommandHandler
     {
         public string CommandName { get; }
@@ -218,14 +248,13 @@ public sealed class CommandDispatcherTests
     }
 
     /// <summary>
-    /// Direct contract test for impl-plan §3.2 step 6: <see cref="CommandDispatcher"/>
-    /// MUST NOT call <c>Activity.RemoveMentionText</c> or strip <c>&lt;at&gt;...&lt;/at&gt;</c>
-    /// markup itself. If raw mention markup leaks into <see cref="CommandContext.NormalizedText"/>,
-    /// the dispatcher must treat the input as unrecognised text — NOT silently strip and
-    /// route it. Complements the E2E mention-stripping test in
-    /// <c>TeamsSwarmActivityHandlerTests</c> by isolating the dispatcher: if a future
-    /// refactor adds mention-stripping inside the dispatcher, this test fails even though
-    /// the E2E test would still pass.
+    /// Dispatcher contract (impl-plan §3.2 step 6): when raw <c>&lt;at&gt;...&lt;/at&gt;</c>
+    /// markup leaks into <see cref="CommandContext.NormalizedText"/>, the dispatcher MUST
+    /// treat it as unrecognised text — it MUST NOT regex-strip the markup itself before
+    /// keyword matching. Catches the "naive <c>&lt;at&gt;</c> regex stripping" regression.
+    /// The complementary <see cref="DispatchAsync_RealisticBotMention_DispatcherDoesNotCallRemoveRecipientMention"/>
+    /// test (below) covers the <c>Activity.RemoveRecipientMention()</c> regression, which
+    /// requires realistic Bot Framework mention metadata to trigger.
     /// </summary>
     [Fact]
     public async Task DispatchAsync_RawAtMentionText_DoesNotRouteToHandler_AndPublishesTextEvent()
@@ -243,18 +272,83 @@ public sealed class CommandDispatcherTests
         var (turn, adapter) = BuildTurnContext(raw);
         await dispatcher.DispatchAsync(BuildContext(raw, turn), CancellationToken.None);
 
-        // Contract: no command handler is invoked when the dispatcher sees mention markup.
         Assert.Empty(status.Invocations);
         Assert.Empty(ask.Invocations);
         Assert.Empty(approve.Invocations);
 
-        // Contract: unrecognised input publishes a TextEvent carrying the *raw* payload
-        // (mention markup intact — dispatcher did not strip).
         var ev = Assert.IsType<TextEvent>(Assert.Single(publisher.Published));
         Assert.Equal(raw, ev.Payload);
         Assert.Equal(MessengerEventTypes.Text, ev.EventType);
+        Assert.Single(adapter.Sent);
+    }
 
-        // Contract: dispatcher replies with the help card on the unknown path.
+    /// <summary>
+    /// Dispatcher contract (impl-plan §3.2 step 6): the dispatcher MUST NOT call
+    /// <c>Activity.RemoveRecipientMention()</c>. This test wires a realistic Bot Framework
+    /// mention activity (<c>Recipient.Id == BotId</c> + matching <c>Mention</c> entity via
+    /// <see cref="HandlerFactory.BuildMentionEntity"/>) so the Bot Framework API has the
+    /// metadata it needs to actually strip <c>&lt;at&gt;AgentBot&lt;/at&gt;</c> from
+    /// <c>Activity.Text</c> if invoked. If a future regression added
+    /// <c>turnContext.Activity.RemoveRecipientMention()</c> inside
+    /// <see cref="CommandDispatcher.DispatchAsync"/>, <c>Activity.Text</c> would become
+    /// <c>" agent status"</c> and (with any subsequent re-read) the status handler would
+    /// be invoked — this test asserts the opposite: activity text untouched, no handler
+    /// invoked, raw payload published as <see cref="TextEvent"/>. Fixture realism is
+    /// proven by asserting <c>Activity.GetMentions()</c> returns the AgentBot mention
+    /// (the same lookup <c>RemoveRecipientMention</c> performs internally), then by
+    /// actually invoking <c>RemoveRecipientMention</c> on a sibling clone activity and
+    /// confirming it strips, so the test fails loudly if the fixture ever drifts out of
+    /// alignment with <see cref="HandlerFactory.NewChannelMentionMessage"/>.
+    /// </summary>
+    [Fact]
+    public async Task DispatchAsync_RealisticBotMention_DispatcherDoesNotCallRemoveRecipientMention()
+    {
+        var status = new RecordingCommandHandler(CommandNames.AgentStatus);
+        var ask = new RecordingCommandHandler(CommandNames.AgentAsk);
+        var approve = new RecordingCommandHandler(CommandNames.Approve);
+        var publisher = new RecordingInboundEventPublisher();
+        var dispatcher = new CommandDispatcher(
+            new ICommandHandler[] { status, ask, approve },
+            publisher,
+            NullLogger<CommandDispatcher>.Instance);
+
+        const string raw = "<at>AgentBot</at> agent status";
+        var (turn, adapter, activity) = BuildRealisticBotMentionTurnContext(raw);
+
+        // Fixture self-check #1: Activity.GetMentions() — the exact lookup
+        // RemoveRecipientMention() uses internally — finds the AgentBot mention. If this
+        // ever returns empty, the realistic-mention guarantee of this test has regressed
+        // and a future RemoveRecipientMention() call would silently no-op (false pass).
+        var mentions = activity.GetMentions();
+        var botMention = Assert.Single(mentions);
+        Assert.Equal(HandlerFactory.BotId, botMention.Mentioned.Id);
+        Assert.Equal("<at>AgentBot</at>", botMention.Text);
+
+        // Fixture self-check #2: a sibling clone with the same shape strips correctly
+        // when RemoveRecipientMention() is invoked. Proves the fixture is identical in
+        // behavior to a real Teams channel mention message.
+        var (_, _, sibling) = BuildRealisticBotMentionTurnContext(raw);
+        sibling.RemoveRecipientMention();
+        Assert.NotEqual(raw, sibling.Text);
+        Assert.DoesNotContain("<at>AgentBot</at>", sibling.Text, StringComparison.Ordinal);
+
+        await dispatcher.DispatchAsync(BuildContext(raw, turn), CancellationToken.None);
+
+        // Contract: dispatcher did not invoke any command handler. A regression adding
+        // RemoveRecipientMention() + a re-read of Activity.Text would route to status.
+        Assert.Empty(status.Invocations);
+        Assert.Empty(ask.Invocations);
+        Assert.Empty(approve.Invocations);
+
+        // Contract: dispatcher did not mutate Activity.Text via RemoveRecipientMention()
+        // or any other in-place stripping API on the inbound activity.
+        Assert.Equal(raw, activity.Text);
+
+        // Contract: unrecognised input publishes a TextEvent with the *raw* payload —
+        // mention markup intact — and a help card is sent in reply.
+        var ev = Assert.IsType<TextEvent>(Assert.Single(publisher.Published));
+        Assert.Equal(raw, ev.Payload);
+        Assert.Equal(MessengerEventTypes.Text, ev.EventType);
         Assert.Single(adapter.Sent);
     }
 
