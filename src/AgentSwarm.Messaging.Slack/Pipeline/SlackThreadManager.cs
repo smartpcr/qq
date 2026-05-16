@@ -391,30 +391,8 @@ internal sealed class SlackThreadManager<TContext> : ISlackThreadManager
 
         ct.ThrowIfCancellationRequested();
 
-        await using AsyncServiceScope scope = this.scopeFactory.CreateAsyncScope();
-        TContext context = scope.ServiceProvider.GetRequiredService<TContext>();
-
-        SlackThreadMapping? row = await context.SlackThreadMappings
-            .FirstOrDefaultAsync(m => m.TaskId == taskId, ct)
-            .ConfigureAwait(false);
-
-        if (row is null)
-        {
-            return false;
-        }
-
-        DateTimeOffset now = this.timeProvider.GetUtcNow();
-        if (row.LastMessageAt >= now)
-        {
-            // Avoid pointless writes when an in-flight call already
-            // bumped past 'now' (can happen with a coarse-grained
-            // TimeProvider in tests).
-            return true;
-        }
-
-        row.LastMessageAt = now;
-        await context.SaveChangesAsync(ct).ConfigureAwait(false);
-        return true;
+        SlackThreadMapping? bumped = await this.BumpLastMessageAtAsync(taskId, ct).ConfigureAwait(false);
+        return bumped is not null;
     }
 
     /// <inheritdoc />
@@ -546,8 +524,18 @@ internal sealed class SlackThreadManager<TContext> : ISlackThreadManager
 
         if (result.IsSuccess && !string.IsNullOrEmpty(result.Ts))
         {
-            await this.TouchAsync(taskId, ct).ConfigureAwait(false);
-            SlackThreadMapping? refreshed = await this.LookupAsync(taskId, ct).ConfigureAwait(false);
+            // Single scope: load the tracked entity, bump
+            // LastMessageAt, save, and return the updated row. This
+            // replaces the earlier TouchAsync + LookupAsync pair, which
+            // opened two extra scopes (one to bump, one to re-read) on
+            // every successful threaded reply. The bumped entity is
+            // returned directly so the audit row and the
+            // SlackThreadPostResult observe the new timestamp without
+            // a redundant round-trip.
+            SlackThreadMapping refreshed =
+                await this.BumpLastMessageAtAsync(taskId, ct).ConfigureAwait(false)
+                ?? mapping;
+
             await this.WriteAuditAsync(
                 outcome: OutcomeSuccess, requestType: RequestTypeThreadMessage,
                 taskId: taskId, agentId: mapping.AgentId,
@@ -555,7 +543,7 @@ internal sealed class SlackThreadManager<TContext> : ISlackThreadManager
                 teamId: mapping.TeamId, channelId: mapping.ChannelId,
                 threadTs: mapping.ThreadTs, messageTs: result.Ts,
                 errorDetail: null, ct).ConfigureAwait(false);
-            return SlackThreadPostResult.Posted(refreshed ?? mapping, result.Ts!);
+            return SlackThreadPostResult.Posted(refreshed, result.Ts!);
         }
 
         // Recovery path: if the persisted thread is gone, recreate on
@@ -590,8 +578,13 @@ internal sealed class SlackThreadManager<TContext> : ISlackThreadManager
 
             if (retry.IsSuccess && !string.IsNullOrEmpty(retry.Ts))
             {
-                await this.TouchAsync(taskId, ct).ConfigureAwait(false);
-                SlackThreadMapping? refreshed = await this.LookupAsync(taskId, ct).ConfigureAwait(false);
+                // Same single-scope consolidation as the happy path
+                // above: avoid a separate TouchAsync + re-LookupAsync
+                // on the retry-after-recovery branch.
+                SlackThreadMapping refreshed =
+                    await this.BumpLastMessageAtAsync(taskId, ct).ConfigureAwait(false)
+                    ?? recovered;
+
                 await this.WriteAuditAsync(
                     outcome: OutcomeFallbackUsed, requestType: RequestTypeThreadMessage,
                     taskId: taskId, agentId: recovered.AgentId,
@@ -599,7 +592,7 @@ internal sealed class SlackThreadManager<TContext> : ISlackThreadManager
                     teamId: recovered.TeamId, channelId: recovered.ChannelId,
                     threadTs: recovered.ThreadTs, messageTs: retry.Ts,
                     errorDetail: null, ct).ConfigureAwait(false);
-                return SlackThreadPostResult.Recovered(refreshed ?? recovered, retry.Ts!);
+                return SlackThreadPostResult.Recovered(refreshed, retry.Ts!);
             }
 
             string retryDetail = retry.Error ?? "no error detail";
@@ -651,6 +644,52 @@ internal sealed class SlackThreadManager<TContext> : ISlackThreadManager
 
         context.SlackThreadMappings.Add(mapping);
         await context.SaveChangesAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Opens a single EF scope, loads the mapping for <paramref name="taskId"/>
+    /// as a tracked entity, bumps <see cref="SlackThreadMapping.LastMessageAt"/>
+    /// to the current UTC time, saves, and returns the updated row.
+    /// Returns <see langword="null"/> when no mapping exists for
+    /// <paramref name="taskId"/>. The caller-observed entity is a
+    /// detached snapshot once the scope's DbContext is disposed --
+    /// callers only consume the data, never re-attach it.
+    /// </summary>
+    /// <remarks>
+    /// Replaces the previous "TouchAsync (open scope, load tracked,
+    /// save) + LookupAsync (open scope, AsNoTracking read)" pair that
+    /// PostThreadedReplyAsync used on every successful send: one scope
+    /// instead of two, no redundant re-read, and the returned entity
+    /// is guaranteed to carry the freshly-bumped timestamp without an
+    /// extra round-trip.
+    /// </remarks>
+    private async Task<SlackThreadMapping?> BumpLastMessageAtAsync(string taskId, CancellationToken ct)
+    {
+        await using AsyncServiceScope scope = this.scopeFactory.CreateAsyncScope();
+        TContext context = scope.ServiceProvider.GetRequiredService<TContext>();
+
+        SlackThreadMapping? row = await context.SlackThreadMappings
+            .FirstOrDefaultAsync(m => m.TaskId == taskId, ct)
+            .ConfigureAwait(false);
+
+        if (row is null)
+        {
+            return null;
+        }
+
+        DateTimeOffset now = this.timeProvider.GetUtcNow();
+        if (row.LastMessageAt < now)
+        {
+            // Avoid a pointless UPDATE when an in-flight caller already
+            // bumped past 'now' (can happen with a coarse-grained
+            // TimeProvider in tests, or when two threaded replies land
+            // in the same tick). The row we hand back to the caller
+            // still reflects the latest persisted state.
+            row.LastMessageAt = now;
+            await context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+
+        return row;
     }
 
     private async Task<SlackThreadMapping> UpsertRecoveredMappingAsync(
