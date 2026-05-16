@@ -75,14 +75,31 @@ using Microsoft.Extensions.Logging;
 /// replay re-creates the envelope instance from disk.
 /// </para>
 /// <para>
-/// <b>Injected clock</b>. The journal filename's leading sortable
-/// tick prefix is sourced from an injected <see cref="TimeProvider"/>
-/// (matching the pattern used by
-/// <see cref="Pipeline.SlackOutboundDispatcher"/>,
+/// <b>Injected clock</b>. The sortable-timestamp prefix of the
+/// journal file name is sourced from an injected
+/// <see cref="TimeProvider"/> -- the same testability pattern used
+/// by <see cref="Pipeline.SlackOutboundDispatcher"/>,
 /// <see cref="Pipeline.SlackTokenBucketRateLimiter"/>, and
-/// <see cref="Pipeline.HttpClientSlackOutboundDispatchClient"/>) so
-/// tests can control journal-file ordering deterministically. The
-/// production DI path resolves <see cref="TimeProvider.System"/>.
+/// <see cref="Pipeline.HttpClientSlackOutboundDispatchClient"/>. The
+/// production no-arg path delegates to <see cref="TimeProvider.System"/>;
+/// the internal constructor lets unit tests pin the clock and assert
+/// deterministic journal file ordering across same-millisecond
+/// enqueues without relying on wall-clock races.
+/// </para>
+/// <para>
+/// <b>Cancellation propagation</b>. The single-arg
+/// <see cref="EnqueueAsync(SlackOutboundEnvelope)"/> overload exists
+/// to satisfy the <see cref="ISlackOutboundQueue"/> contract; it
+/// delegates to the
+/// <see cref="EnqueueAsync(SlackOutboundEnvelope, CancellationToken)"/>
+/// overload with <see cref="CancellationToken.None"/>. Hosts /
+/// connector producers that hold a stopping token should call the
+/// CT overload so that a stuck file-system I/O operation holding the
+/// internal write gate cannot block subsequent producers indefinitely
+/// -- the gate, the journal write, and the in-memory channel write
+/// all honour the supplied token. This mirrors
+/// <see cref="AcknowledgeAsync"/>, which already forwards its token
+/// to <c>writeGate.WaitAsync(ct)</c>.
 /// </para>
 /// </remarks>
 internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutboundQueue, IDisposable
@@ -104,11 +121,11 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
     private bool disposed;
 
     /// <summary>
-    /// DI-friendly constructor that defaults the clock to
-    /// <see cref="TimeProvider.System"/>. Production hosts resolve
-    /// this overload through the
-    /// <see cref="FileSystemSlackOutboundQueueServiceCollectionExtensions.AddFileSystemSlackOutboundQueue"/>
-    /// extension.
+    /// Production constructor: uses <see cref="TimeProvider.System"/>
+    /// as the wall clock so hosts get monotonic UTC timestamps in
+    /// journal file names. Delegates to the internal
+    /// clock-injecting overload so the implementation lives in one
+    /// place.
     /// </summary>
     public FileSystemSlackOutboundQueue(
         string directoryPath,
@@ -118,11 +135,11 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
     }
 
     /// <summary>
-    /// Test-friendly constructor that lets the fixture inject a
-    /// fake <see cref="TimeProvider"/> so the journal filename's
-    /// leading sortable tick prefix is deterministic. Tests can use
-    /// a <c>FakeTimeProvider</c> to assert FIFO ordering of replay
-    /// without relying on wall-clock granularity.
+    /// Test-friendly constructor that lets the fixture inject a fake
+    /// <see cref="TimeProvider"/> so the sortable-timestamp prefix
+    /// of journal file names is deterministic. Used by the durable
+    /// queue's unit tests to assert FIFO replay ordering across
+    /// same-millisecond enqueues without relying on wall-clock races.
     /// </summary>
     internal FileSystemSlackOutboundQueue(
         string directoryPath,
@@ -169,10 +186,45 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
             : 0;
 
     /// <inheritdoc />
-    public async ValueTask EnqueueAsync(SlackOutboundEnvelope envelope)
+    /// <remarks>
+    /// Interface-contract shim. The
+    /// <see cref="ISlackOutboundQueue.EnqueueAsync(SlackOutboundEnvelope)"/>
+    /// signature does not carry a cancellation token, so this entry
+    /// point delegates to the CT-aware overload with
+    /// <see cref="CancellationToken.None"/>. Producers that hold a
+    /// stopping token (hosted services, connector shutdown paths)
+    /// should call
+    /// <see cref="EnqueueAsync(SlackOutboundEnvelope, CancellationToken)"/>
+    /// directly so a stuck I/O operation holding the write gate
+    /// cannot block them indefinitely.
+    /// </remarks>
+    public ValueTask EnqueueAsync(SlackOutboundEnvelope envelope)
+        => this.EnqueueAsync(envelope, CancellationToken.None);
+
+    /// <summary>
+    /// Cancellation-aware overload of <see cref="EnqueueAsync(SlackOutboundEnvelope)"/>.
+    /// </summary>
+    /// <param name="envelope">The envelope to persist and publish.</param>
+    /// <param name="ct">
+    /// Caller-supplied token. Honoured at three points:
+    /// (1) acquiring the internal write gate -- so a stuck I/O
+    /// operation holding the gate does NOT block subsequent producers
+    /// indefinitely (the symmetric concern that <see cref="AcknowledgeAsync"/>
+    /// already addresses by forwarding <c>ct</c> to
+    /// <c>writeGate.WaitAsync(ct)</c>); (2) the journal file write /
+    /// flush, so cancellation pre-empts a slow disk; (3) the
+    /// in-memory channel publish, for symmetry. On
+    /// <see cref="OperationCanceledException"/> any partial
+    /// <c>.tmp</c> file is best-effort deleted and the exception
+    /// propagates unwrapped so callers can distinguish cancellation
+    /// from a genuine persistence failure (which surfaces as
+    /// <see cref="SlackOutboundQueuePersistenceException"/>).
+    /// </param>
+    public async ValueTask EnqueueAsync(SlackOutboundEnvelope envelope, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(envelope);
         this.ThrowIfDisposed();
+        ct.ThrowIfCancellationRequested();
 
         // Sortable filename so directory enumeration yields FIFO order
         // on replay. The leading sortable UTC tick prefix preserves
@@ -180,23 +232,30 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
         // suffix gives us a stable per-envelope handle for ack
         // (deletion) without having to reopen the file to read its
         // contents. The clock is sourced from the injected
-        // TimeProvider so tests can control ordering deterministically.
+        // TimeProvider so unit tests can pin ordering deterministically
+        // -- matching the testability pattern used by the dispatcher,
+        // rate limiter, and dispatch client in this stage.
+        long utcTicks = this.timeProvider.GetUtcNow().UtcDateTime.Ticks;
         string fileName = string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
-            $"{this.timeProvider.GetUtcNow().UtcDateTime.Ticks:D19}-{envelope.EnvelopeId:N}.json");
+            $"{utcTicks:D19}-{envelope.EnvelopeId:N}.json");
         string filePath = Path.Combine(this.PendingDirectoryPath, fileName);
 
         FileSystemSlackOutboundRecord record = ToRecord(envelope);
         string json = JsonSerializer.Serialize(record, JsonOptions);
 
-        await this.writeGate.WaitAsync().ConfigureAwait(false);
+        // Forward the token to WaitAsync so a stuck I/O operation
+        // holding the gate cannot block this producer indefinitely.
+        // Matches the AcknowledgeAsync path which already does
+        // writeGate.WaitAsync(ct).
+        await this.writeGate.WaitAsync(ct).ConfigureAwait(false);
+        string tempPath = filePath + ".tmp";
         try
         {
             // Write to a temp file then atomically rename so a crash
             // mid-write does not leave a partial JSON line that the
             // replay parser would have to skip. File.Move with
             // overwrite=false is atomic on the same volume.
-            string tempPath = filePath + ".tmp";
             await using (FileStream stream = new(
                 tempPath,
                 FileMode.Create,
@@ -206,11 +265,26 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
                 useAsync: true))
             {
                 byte[] bytes = Encoding.UTF8.GetBytes(json);
-                await stream.WriteAsync(bytes).ConfigureAwait(false);
-                await stream.FlushAsync().ConfigureAwait(false);
+                await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
+                await stream.FlushAsync(ct).ConfigureAwait(false);
             }
 
             File.Move(tempPath, filePath, overwrite: false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is a first-class outcome distinct from a
+            // persistence failure -- propagate unwrapped so the
+            // producer can react (typically: stop accepting new work
+            // because the host is shutting down) without triggering
+            // the operator-facing CRITICAL log path that
+            // SlackOutboundQueuePersistenceException implies. The
+            // *.tmp orphan does not affect replay because
+            // ReplayUnacknowledgedFromDisk enumerates with the
+            // "*.json" mask, but we still best-effort delete it to
+            // keep the pending directory tidy.
+            TryDeleteIfExists(tempPath);
+            throw;
         }
         catch (Exception ex)
         {
@@ -220,6 +294,10 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
                 envelope.TaskId,
                 envelope.CorrelationId,
                 filePath);
+
+            // Best-effort cleanup of the temp file so a retry by the
+            // producer does not collide with leftover state.
+            TryDeleteIfExists(tempPath);
 
             // Re-throw so the producer (SlackConnector) sees the
             // failure and can surface it upstream. We do NOT silently
@@ -234,9 +312,14 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
         }
 
         // Only publish to the in-memory channel AFTER the durable
-        // journal write succeeds.
+        // journal write succeeds. The token is forwarded for symmetry;
+        // on an unbounded channel WriteAsync normally completes
+        // synchronously, but a cancelled token will still short-circuit
+        // it. If cancellation lands between the file write and the
+        // channel write, the journal entry remains on disk and will
+        // replay on next start -- the at-least-once contract holds.
         this.inFlightFilePaths[envelope.EnvelopeId] = filePath;
-        await this.backing.Writer.WriteAsync(envelope).ConfigureAwait(false);
+        await this.backing.Writer.WriteAsync(envelope, ct).ConfigureAwait(false);
 
         this.logger.LogDebug(
             "FileSystemSlackOutboundQueue enqueued envelope task_id={TaskId} correlation_id={CorrelationId} envelope_id={EnvelopeId} file={FilePath}.",
@@ -307,6 +390,24 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
         this.disposed = true;
         this.backing.Writer.TryComplete();
         this.writeGate.Dispose();
+    }
+
+    private static void TryDeleteIfExists(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup of an interrupted journal write. The
+            // replay path enumerates with the "*.json" mask, so a
+            // surviving "*.tmp" orphan is benign; operator triage can
+            // pick it up out-of-band.
+        }
     }
 
     private void ThrowIfDisposed()
@@ -454,14 +555,19 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
 
 /// <summary>
 /// Raised when the file-system journal write inside
-/// <see cref="FileSystemSlackOutboundQueue.EnqueueAsync"/> fails.
-/// The wrapped IO exception (typically full disk, permission denied,
-/// network share dropped) is preserved on
+/// <see cref="FileSystemSlackOutboundQueue.EnqueueAsync(SlackOutboundEnvelope, CancellationToken)"/>
+/// fails. The wrapped IO exception (typically full disk, permission
+/// denied, network share dropped) is preserved on
 /// <see cref="Exception.InnerException"/> so operators can triage.
 /// Propagating instead of swallowing preserves the FR-005 / FR-007
 /// zero-message-loss guarantee: the producer (SlackConnector) sees
 /// the failure and can surface it upstream rather than the channel
 /// silently buffering a message that has no durable backing.
+/// <see cref="OperationCanceledException"/> is intentionally NOT
+/// wrapped by this type -- cancellation is a first-class outcome and
+/// the producer needs to distinguish it from a genuine persistence
+/// failure (an operator-facing CRITICAL log line vs an expected
+/// shutdown signal).
 /// </summary>
 [Serializable]
 internal sealed class SlackOutboundQueuePersistenceException : Exception
@@ -498,10 +604,13 @@ public static class FileSystemSlackOutboundQueueServiceCollectionExtensions
     /// are created eagerly if missing.
     /// </param>
     /// <remarks>
-    /// The queue resolves <see cref="TimeProvider"/> from DI if one
-    /// is registered (matching the rest of the Slack pipeline's
-    /// testability pattern); otherwise it falls back to
-    /// <see cref="TimeProvider.System"/>.
+    /// The queue resolves its <see cref="TimeProvider"/> from DI when
+    /// one is registered (matching the dispatcher / rate-limiter /
+    /// dispatch-client wiring); otherwise it falls back to
+    /// <see cref="TimeProvider.System"/>. This keeps the production
+    /// no-config path working while letting integration test hosts
+    /// substitute a fake clock to assert deterministic journal
+    /// file ordering.
     /// </remarks>
     public static IServiceCollection AddFileSystemSlackOutboundQueue(
         this IServiceCollection services,
