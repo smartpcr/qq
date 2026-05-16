@@ -220,6 +220,17 @@ public sealed class ProcessedCardActionSet
     /// background eviction service for structured-log diagnostics. Concurrent waiters
     /// on evicted entries are signalled with <c>null</c> so they retry.
     /// </summary>
+    /// <remarks>
+    /// Uses the <see cref="KeyValuePair{TKey,TValue}"/>-based <c>TryRemove</c> overload
+    /// so the dictionary only deletes the entry when the value reference still matches
+    /// the one observed by the enumerator. This prevents a race where another thread
+    /// calls <see cref="Remove"/> + <see cref="Claim"/> between the enumeration
+    /// snapshot and the removal, inserting a <i>fresh</i> entry under the same key —
+    /// a key-only <c>TryRemove</c> would silently delete that fresh entry and signal
+    /// its in-flight waiters with <c>null</c>, dropping the new pipeline's slot. The
+    /// sibling <see cref="Outbox.OutboundMessageDeduplicator.EvictExpired"/> uses the
+    /// same value-checked pattern.
+    /// </remarks>
     public int EvictExpired(DateTimeOffset now)
     {
         if (_entries.IsEmpty)
@@ -232,9 +243,9 @@ public sealed class ProcessedCardActionSet
         {
             if (now - kvp.Value.RecordedAt > _entryLifetime)
             {
-                if (_entries.TryRemove(kvp.Key, out var existing))
+                if (_entries.TryRemove(new KeyValuePair<(string QuestionId, string UserId), Entry>(kvp.Key, kvp.Value)))
                 {
-                    existing.CompletionSource.TrySetResult(null);
+                    kvp.Value.CompletionSource.TrySetResult(null);
                     removed++;
                 }
             }
