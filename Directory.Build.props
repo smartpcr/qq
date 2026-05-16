@@ -1,0 +1,19 @@
+<Project>
+
+  <!--
+    Shared MSBuild properties for every project in the AgentSwarm.Messaging solution.
+    Settings live here so individual *.csproj files stay focused on project-specific
+    concerns (target framework, package and project references, output type).
+  -->
+
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+</Project>
