@@ -300,7 +300,23 @@ public class MessagingDbContext : DbContext
             entity.Property(x => x.ChatId).IsRequired();
             entity.Property(x => x.Payload).IsRequired();
             entity.Property(x => x.ErrorReason).IsRequired();
-            entity.Property(x => x.FailedAt).IsRequired();
+
+            // FailedAt mirrors the OutboundMessage timestamp storage contract:
+            // UTC ticks as INTEGER via UtcDateTimeOffsetTicksConverter rather
+            // than the EF Core SQLite default ISO-8601 TEXT. Operator triage
+            // queries routinely correlate dead-letter rows with their source
+            // OutboundMessage timestamps (CreatedAt / NextRetryAt / SentAt),
+            // and mixed TEXT/INTEGER storage would break range comparisons
+            // and joins across the two tables. Keeping the format identical
+            // across all timestamp columns in the messaging schema means
+            // SQLite-side comparisons (FailedAt vs OutboundMessage.SentAt,
+            // etc.) are unambiguous and translate cleanly under the EF Core
+            // 8 SQLite query translator.
+            entity.Property(x => x.FailedAt)
+                .HasConversion(UtcDateTimeOffsetTicksConverter.Instance)
+                .HasColumnType("INTEGER")
+                .IsRequired();
+
             entity.Property(x => x.AttemptCount).IsRequired();
 
             // Architecture.md Section 3.2 pins the relationship as
