@@ -104,6 +104,25 @@ public sealed class CallbackQueryHandler : ICallbackHandler
     /// </summary>
     public const string QuestionRespondentDedupKeyPrefix = "qa:";
 
+    /// <summary>
+    /// <see cref="IDeduplicationService"/> key prefix for the text-reply
+    /// analogue of <see cref="QuestionRespondentDedupKeyPrefix"/>. Closes
+    /// the race window in <see cref="HandleCommentReplyAsync"/> where two
+    /// concurrent text replies from the same operator targeting the same
+    /// AwaitingComment question carry DIFFERENT <see cref="MessengerEvent.EventId"/>
+    /// values (so the pipeline-level dedup gate cannot collapse them) and
+    /// both pass <see cref="IPendingQuestionStore.GetAwaitingCommentAsync"/>
+    /// before either reaches <see cref="IPendingQuestionStore.MarkAnsweredAsync"/>,
+    /// double-publishing the <see cref="HumanDecisionEvent"/>. The
+    /// namespace is intentionally distinct from
+    /// <see cref="QuestionRespondentDedupKeyPrefix"/> so the leftover tap
+    /// reservation from the originating
+    /// <see cref="HumanAction.RequiresComment"/> callback does NOT block
+    /// the follow-up text reply on the same question. Combined with
+    /// <c>{questionId}:{userId}</c>.
+    /// </summary>
+    public const string QuestionRespondentCommentDedupKeyPrefix = "qa-comment:";
+
     /// <summary>Callback-data separator agreed with <c>TelegramQuestionRenderer</c>.</summary>
     public const char CallbackDataSeparator = ':';
 
@@ -643,47 +662,99 @@ public sealed class CallbackQueryHandler : ICallbackHandler
             return SilentAck(evt);
         }
 
-        var receivedAt = _time.GetUtcNow();
-        var externalMessageId = pending.TelegramMessageId.ToString(CultureInfo.InvariantCulture);
-        var externalUserId = userId.ToString(CultureInfo.InvariantCulture);
-
-        var decision = new HumanDecisionEvent
+        // Per-(question, respondent) dedup gate — text-reply analogue of
+        // the callback path's composite key. Pipeline-level EventId dedup
+        // is PER-UPDATE: two text messages from the same operator
+        // addressing the same AwaitingComment question carry DIFFERENT
+        // update_ids and thus pass that gate. Without this reservation
+        // the GetAwaitingCommentAsync → PublishHumanDecisionAsync →
+        // MarkAnsweredAsync window admits a double-publish (two events
+        // reach the inner block, both pass the AwaitingComment status
+        // check, both publish before either flips the status). Mirrors
+        // ProcessCallbackInsideReservationAsync's composite gate so the
+        // text-reply path matches the three-layer idempotency contract
+        // the callback path advertises.
+        var commentDedupKey = QuestionRespondentCommentDedupKeyPrefix
+            + pending.QuestionId
+            + CallbackDataSeparator
+            + userId.ToString(CultureInfo.InvariantCulture);
+        var commentReserved = await _dedup
+            .TryReserveAsync(commentDedupKey, ct)
+            .ConfigureAwait(false);
+        if (!commentReserved)
         {
-            QuestionId = pending.QuestionId,
-            ActionValue = pending.SelectedActionValue!,
-            Comment = comment,
-            Messenger = MessengerName,
-            ExternalUserId = externalUserId,
-            ExternalMessageId = externalMessageId,
-            ReceivedAt = receivedAt,
-            CorrelationId = pending.CorrelationId,
-        };
-        await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
+            // A concurrent reply already won the race; the text-reply
+            // path has no callback-id to ack, so SilentAck is the
+            // correct terminal — Telegram does not show a spinner for
+            // chat messages.
+            _logger.LogInformation(
+                "Comment reply short-circuited: duplicate (QuestionId, RespondentUserId). CorrelationId={CorrelationId} QuestionId={QuestionId} RespondentUserId={RespondentUserId}",
+                evt.CorrelationId,
+                pending.QuestionId,
+                userId);
+            return SilentAck(evt);
+        }
 
-        await _audit.LogHumanResponseAsync(
-            new HumanResponseAuditEntry
+        try
+        {
+            var receivedAt = _time.GetUtcNow();
+            var externalMessageId = pending.TelegramMessageId.ToString(CultureInfo.InvariantCulture);
+            var externalUserId = userId.ToString(CultureInfo.InvariantCulture);
+
+            var decision = new HumanDecisionEvent
             {
-                EntryId = Guid.NewGuid(),
-                MessageId = externalMessageId,
-                UserId = externalUserId,
-                AgentId = pending.AgentId,
                 QuestionId = pending.QuestionId,
                 ActionValue = pending.SelectedActionValue!,
                 Comment = comment,
-                Timestamp = receivedAt,
+                Messenger = MessengerName,
+                ExternalUserId = externalUserId,
+                ExternalMessageId = externalMessageId,
+                ReceivedAt = receivedAt,
                 CorrelationId = pending.CorrelationId,
-            },
-            ct).ConfigureAwait(false);
+            };
+            await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
 
-        await _store.MarkAnsweredAsync(pending.QuestionId, ct).ConfigureAwait(false);
+            await _audit.LogHumanResponseAsync(
+                new HumanResponseAuditEntry
+                {
+                    EntryId = Guid.NewGuid(),
+                    MessageId = externalMessageId,
+                    UserId = externalUserId,
+                    AgentId = pending.AgentId,
+                    QuestionId = pending.QuestionId,
+                    ActionValue = pending.SelectedActionValue!,
+                    Comment = comment,
+                    Timestamp = receivedAt,
+                    CorrelationId = pending.CorrelationId,
+                },
+                ct).ConfigureAwait(false);
 
-        _logger.LogInformation(
-            "Comment reply handled: HumanDecisionEvent emitted. CorrelationId={CorrelationId} QuestionId={QuestionId} ActionValue={ActionValue}",
-            evt.CorrelationId,
-            pending.QuestionId,
-            pending.SelectedActionValue);
+            await _store.MarkAnsweredAsync(pending.QuestionId, ct).ConfigureAwait(false);
 
-        return new CommandResult { Success = true, CorrelationId = evt.CorrelationId };
+            // Seal the comment reservation only on the success path so a
+            // post-publish transient failure (handled below) releases the
+            // slot and the pipeline can re-deliver a fresh reply normally.
+            await _dedup.MarkProcessedAsync(commentDedupKey, ct).ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "Comment reply handled: HumanDecisionEvent emitted. CorrelationId={CorrelationId} QuestionId={QuestionId} ActionValue={ActionValue}",
+                evt.CorrelationId,
+                pending.QuestionId,
+                pending.SelectedActionValue);
+
+            return new CommandResult { Success = true, CorrelationId = evt.CorrelationId };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Release-on-throw symmetry with the callback path: if any
+            // step after the reservation (publish / audit / mark-answered)
+            // fails, the slot must NOT remain reserved — otherwise a
+            // live retry would falsely short-circuit as "already
+            // responded" without ever publishing the decision (the same
+            // class of bug the callback path's iter-1 fix eliminated).
+            await SafeReleaseAsync(commentDedupKey, evt, ct).ConfigureAwait(false);
+            throw;
+        }
     }
 
     // ============================================================
