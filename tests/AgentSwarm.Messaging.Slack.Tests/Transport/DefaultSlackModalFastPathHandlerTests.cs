@@ -289,6 +289,74 @@ public sealed class DefaultSlackModalFastPathHandlerTests
             "the failure path MUST release the reservation so a retry can succeed");
     }
 
+    [Fact]
+    public async Task Success_swallows_MarkCompletedAsync_exception_so_caller_does_not_see_failure()
+    {
+        // Iter-4 evaluator item 2 pin: ISlackFastPathIdempotencyStore
+        // §101-103 says the MarkCompletedAsync call MUST be best-effort
+        // and MUST NOT throw to the caller once views.open has
+        // succeeded -- the user-visible modal is already open and the
+        // controller has nothing useful to do with a late exception.
+        // Pin the handler's try/catch so a future refactor that drops
+        // it surfaces here, not as a 5xx after a successful modal open.
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        RecordingIdempotencyStore store = new()
+        {
+            Plan = SlackFastPathIdempotencyResult.Acquired(),
+            MarkCompletedThrow = new InvalidOperationException("L2 store is down."),
+        };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views, idempotencyStore: store);
+
+        // No try/catch -- if HandleAsync rethrows the inner exception
+        // the test fails naturally. The success path is contractually
+        // required to swallow the MarkCompletedAsync failure.
+        SlackModalFastPathResult result = await handler.HandleAsync(
+            BuildEnvelope("review pr 42"),
+            new DefaultHttpContext(),
+            CancellationToken.None);
+
+        result.ResultKind.Should().Be(
+            SlackModalFastPathResultKind.Handled,
+            "views.open succeeded -- the handler must surface Handled even when MarkCompletedAsync subsequently throws");
+        store.MarkCompletedCalls.Should().ContainSingle(
+            "the handler still INVOKES MarkCompletedAsync; it only suppresses the thrown exception");
+        views.Invocations.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Success_calls_MarkCompletedAsync_with_uncancellable_token_even_when_request_token_was_cancelled()
+    {
+        // Iter-4 evaluator item 2 pin: when the request-scope
+        // CancellationToken is cancelled during the best-effort
+        // durable status flip, the durable store
+        // (CompositeSlackFastPathIdempotencyStore.MarkCompletedAsync)
+        // rethrows OperationCanceledException -- which would propagate
+        // through HandleAsync if the handler passed the request token.
+        // The fix is two layers of defense: pass CancellationToken.None
+        // to MarkCompletedAsync, AND wrap it in try/catch. Pin BOTH so
+        // a future refactor that drops either one surfaces here.
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        RecordingIdempotencyStore store = new() { Plan = SlackFastPathIdempotencyResult.Acquired() };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views, idempotencyStore: store);
+
+        using CancellationTokenSource alreadyCancelled = new();
+        alreadyCancelled.Cancel();
+
+        SlackModalFastPathResult result = await handler.HandleAsync(
+            BuildEnvelope("escalate to oncall"),
+            new DefaultHttpContext(),
+            alreadyCancelled.Token);
+
+        result.ResultKind.Should().Be(
+            SlackModalFastPathResultKind.Handled,
+            "an already-cancelled request token must not cause the success path to throw -- the modal is open in Slack");
+        store.MarkCompletedCalls.Should().ContainSingle(
+            "the handler must STILL invoke MarkCompletedAsync so the durable row transitions out of 'reserved'");
+        store.MarkCompletedTokens.Should().ContainSingle()
+            .Which.CanBeCanceled.Should().BeFalse(
+                "the handler MUST pass CancellationToken.None (which has CanBeCanceled = false) so the durable store cannot see the cancelled request token and rethrow OperationCanceledException");
+    }
+
     private static DefaultSlackModalFastPathHandler BuildHandler(
         FakeViewsOpenClient views,
         SlackInProcessIdempotencyStore? store = null,
@@ -340,7 +408,11 @@ public sealed class DefaultSlackModalFastPathHandlerTests
     /// used by the iter-4 success/failure-path pins to assert which of
     /// <see cref="ISlackFastPathIdempotencyStore.ReleaseAsync"/> and
     /// <see cref="ISlackFastPathIdempotencyStore.MarkCompletedAsync"/>
-    /// the handler invokes.
+    /// the handler invokes. Iter-5 extends it with a captured-token
+    /// list and an optional throw-from-MarkCompleted toggle so the
+    /// iter-4 evaluator-item-2 pins can assert the handler passes
+    /// <see cref="CancellationToken.None"/> AND swallows late
+    /// exceptions on the success path.
     /// </summary>
     private sealed class RecordingIdempotencyStore : ISlackFastPathIdempotencyStore
     {
@@ -351,6 +423,25 @@ public sealed class DefaultSlackModalFastPathHandlerTests
         public List<string> ReleaseCalls { get; } = new();
 
         public List<string> MarkCompletedCalls { get; } = new();
+
+        /// <summary>
+        /// Captures the <see cref="CancellationToken"/> the handler
+        /// passes to every <see cref="MarkCompletedAsync"/> invocation.
+        /// Used by the iter-5 pin to assert
+        /// <see cref="CancellationToken.None"/> is forwarded (the
+        /// uncancellable token has
+        /// <see cref="CancellationToken.CanBeCanceled"/> = false).
+        /// </summary>
+        public List<CancellationToken> MarkCompletedTokens { get; } = new();
+
+        /// <summary>
+        /// When set, <see cref="MarkCompletedAsync"/> throws this
+        /// exception synchronously. The iter-5 pin uses this to
+        /// reproduce the "L2 store unavailable AFTER the modal opened"
+        /// failure mode that ISlackFastPathIdempotencyStore.cs:101-103
+        /// requires the handler to swallow.
+        /// </summary>
+        public Exception? MarkCompletedThrow { get; set; }
 
         public ValueTask<SlackFastPathIdempotencyResult> TryAcquireAsync(
             string key,
@@ -371,6 +462,12 @@ public sealed class DefaultSlackModalFastPathHandlerTests
         public ValueTask MarkCompletedAsync(string key, CancellationToken ct = default)
         {
             this.MarkCompletedCalls.Add(key);
+            this.MarkCompletedTokens.Add(ct);
+            if (this.MarkCompletedThrow is not null)
+            {
+                throw this.MarkCompletedThrow;
+            }
+
             return ValueTask.CompletedTask;
         }
     }

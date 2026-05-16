@@ -233,9 +233,34 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
                 envelope.UserId,
                 envelope.TriggerId,
                 envelope.IdempotencyKey);
-            await this.auditRecorder
-                .RecordSuccessAsync(envelope, payload.SubCommand!, ct)
-                .ConfigureAwait(false);
+
+            // Iter-6 fix (regression caught by
+            // Success_calls_MarkCompletedAsync_with_uncancellable_token_even_when_request_token_was_cancelled):
+            // the audit row write is ALSO a best-effort durable
+            // side-effect that runs AFTER the user-visible modal has
+            // opened. Forwarding the request CancellationToken here
+            // leaks the same OperationCanceledException the iter-5 fix
+            // suppressed on MarkCompletedAsync -- if Slack drops the
+            // connection (or any upstream cancels) during this final
+            // await, the user sees a 5xx for a request that already
+            // succeeded from their perspective. Pass
+            // CancellationToken.None and wrap in try/catch so the
+            // success path is fully cancellation-safe: a missing audit
+            // row is recoverable via log mining, a 5xx is not.
+            try
+            {
+                await this.auditRecorder
+                    .RecordSuccessAsync(envelope, payload.SubCommand!, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception auditEx)
+            {
+                this.logger.LogWarning(
+                    auditEx,
+                    "Slack modal fast-path failed to record the modal_open success audit row for idempotency_key={IdempotencyKey} after a successful views.open. The user-visible modal is unaffected; the structured log line above is the fallback observability surface.",
+                    envelope.IdempotencyKey);
+            }
+
             return SlackModalFastPathResult.Handled();
         }
 
