@@ -73,6 +73,13 @@ public sealed class SlackConnectorOptions
 public sealed class SlackRetryOptions
 {
     /// <summary>
+    /// Configuration section name (<c>"Slack:Retry"</c>) the options are
+    /// bound from. Exposed as a constant so the extension method and
+    /// consumers can agree without duplicating the literal.
+    /// </summary>
+    public const string SectionName = "Slack:Retry";
+
+    /// <summary>
     /// Maximum number of attempts (including the initial try) before
     /// dead-lettering the message. Defaults to <c>5</c>.
     /// </summary>

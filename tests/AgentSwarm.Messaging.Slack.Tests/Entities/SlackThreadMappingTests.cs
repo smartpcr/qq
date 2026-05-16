@@ -1,8 +1,10 @@
 using System.Linq;
 using System.Reflection;
 using AgentSwarm.Messaging.Slack.Entities;
+using AgentSwarm.Messaging.Slack.Tests.Persistence;
 using FluentAssertions;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Xunit;
 
 namespace AgentSwarm.Messaging.Slack.Tests.Entities;
@@ -61,23 +63,30 @@ public sealed class SlackThreadMappingTests
     [Fact]
     public void Has_unique_index_on_TeamId_ChannelId_ThreadTs_per_architecture_section_3_2()
     {
-        // Implements Stage 2.1 requirement: "add unique constraint on
-        // (TeamId, ChannelId, ThreadTs)". The constraint is declared at
-        // the entity level via the EF Core IndexAttribute so it is part
-        // of the entity contract and is picked up by both the
-        // production MessagingDbContext (Stage 2.2) and the in-memory
-        // schema tests (Stage 2.3) without requiring an
-        // IEntityTypeConfiguration to be present.
-        IndexAttribute[] indexes = typeof(SlackThreadMapping)
-            .GetCustomAttributes<IndexAttribute>(inherit: false)
-            .ToArray();
+        // The unique constraint on (TeamId, ChannelId, ThreadTs) is
+        // declared by SlackThreadMappingConfiguration (Stage 2.2). Build
+        // the test DbContext model and verify the configuration produces
+        // the required unique index. This test stays in the Stage 2.1
+        // entity test file because it pins the same SEMANTIC contract
+        // the entity carries -- only the declaration mechanism shifted
+        // from an [Index] attribute to the fluent configuration.
+        DbContextOptions<SlackTestDbContext> options =
+            new DbContextOptionsBuilder<SlackTestDbContext>()
+                .UseSqlite("Filename=:memory:")
+                .Options;
+        using SlackTestDbContext context = new(options);
 
-        indexes.Should().NotBeEmpty(
+        IEntityType entity = context.Model.FindEntityType(typeof(SlackThreadMapping))
+            ?? throw new InvalidOperationException("SlackThreadMapping not registered.");
+
+        IIndex[] uniqueIndexes = entity.GetIndexes().Where(i => i.IsUnique).ToArray();
+
+        uniqueIndexes.Should().NotBeEmpty(
             because: "Stage 2.1 step 2 requires a unique constraint on (TeamId, ChannelId, ThreadTs)");
 
-        IndexAttribute uniqueIndex = indexes.Should().ContainSingle(idx => idx.IsUnique).Subject;
+        IIndex uniqueIndex = uniqueIndexes.Should().ContainSingle().Subject;
 
-        uniqueIndex.PropertyNames.Should().Equal(
+        uniqueIndex.Properties.Select(p => p.Name).Should().Equal(
             new[]
             {
                 nameof(SlackThreadMapping.TeamId),
