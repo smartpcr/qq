@@ -74,17 +74,48 @@ using Microsoft.Extensions.Options;
 /// calls against the same row).
 /// </para>
 /// <para>
-/// <b>Backpressure.</b> Per architecture.md §10.4, when the queue
-/// depth (Pending + Sending) exceeds
-/// <see cref="OutboundQueueOptions.MaxQueueDepth"/> (default 5000),
-/// <see cref="MessageSeverity.Low"/>-severity enqueues are
-/// dead-lettered immediately with
-/// <see cref="OutboundQueueOptions.BackpressureDeadLetterReason"/> and
-/// the canonical <c>telegram.messages.backpressure_dlq</c> counter is
-/// incremented. <see cref="MessageSeverity.Normal"/>,
+/// <b>Backpressure (best-effort, not transactional).</b> Per
+/// architecture.md §10.4, when the queue depth (Pending + Sending)
+/// exceeds <see cref="OutboundQueueOptions.MaxQueueDepth"/>
+/// (default 5000), <see cref="MessageSeverity.Low"/>-severity
+/// enqueues are dead-lettered immediately with
+/// <see cref="OutboundQueueOptions.BackpressureDeadLetterReason"/>
+/// and the canonical <c>telegram.messages.backpressure_dlq</c>
+/// counter is incremented.
+/// <see cref="MessageSeverity.Normal"/>,
 /// <see cref="MessageSeverity.High"/>, and
 /// <see cref="MessageSeverity.Critical"/> messages are always
 /// accepted regardless of depth.
+/// </para>
+/// <para>
+/// The depth probe (a <c>CountAsync</c>) and the subsequent
+/// <c>INSERT</c> are deliberately NOT wrapped in a serialisable
+/// transaction, so the gate is an approximation rather than a
+/// hard ceiling. Under a concurrent Low-enqueue burst two
+/// observable races exist: (a) N callers each reading the same
+/// pre-INSERT depth all decide the same way (all admit, or all
+/// dead-letter) when a serialised view would have split the
+/// decision, and (b) the depth can drift between our read and
+/// our insert — so a Low row may slip in just over
+/// <c>MaxQueueDepth</c>, or be dead-lettered when a concurrent
+/// drain has already taken depth back under the cap. The drift
+/// is bounded by the concurrent-enqueue fan-in (one extra row
+/// per racing caller per measurement window) and is
+/// intentionally tolerated because: (i) only the Low tier pays
+/// the cost — Normal/High/Critical bypass the guard so the
+/// priority queue still drains urgent traffic during a burst,
+/// (ii) a single conditional <c>INSERT … WHERE
+/// (SELECT COUNT(*) …) &lt;= @cap</c> would require provider-
+/// specific raw SQL incompatible with the SQLite/PostgreSQL/SQL
+/// Server portability surface this class advertises, and (iii)
+/// the recovery / housekeeping sweep is the authoritative
+/// invariant restorer for any Low overflow that slips past the
+/// gate. Callers should treat <c>MaxQueueDepth</c> as a soft
+/// high-water mark, not a transactional ceiling — the canonical
+/// "messages are never lost" contract (story AC #5,
+/// implementation-plan.md PERF002) is upheld by the durable
+/// Pending/Sending/Sent/DeadLettered state machine, not by this
+/// approximate gate.
 /// </para>
 /// <para>
 /// <b>Idempotency dedup.</b> The <c>ux_outbox_idempotency_key</c>
@@ -146,14 +177,49 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
             return;
         }
 
-        // Backpressure check. Count the non-terminal outbox depth
-        // (Pending + Sending) and dead-letter Low-severity enqueues
-        // when the depth exceeds the configured threshold. Per
-        // architecture.md §10.4 the guard is severity-asymmetric:
+        // Backpressure check (BEST-EFFORT — read-then-insert, not
+        // transactionally atomic). Count the non-terminal outbox
+        // depth (Pending + Sending) and dead-letter Low-severity
+        // enqueues when the depth exceeds the configured threshold.
+        // Per architecture.md §10.4 the guard is severity-asymmetric:
         // Normal/High/Critical messages bypass the gate so the
         // priority queue still drains the urgent traffic during a
         // burst, only Low-severity status updates / acks pay the
         // cost.
+        //
+        // The CountAsync probe and the SaveChangesAsync below are
+        // NOT wrapped in a serialisable transaction. Under a
+        // concurrent Low-enqueue burst two races are observable:
+        //   (a) N callers each reading the same pre-INSERT depth
+        //       all decide the same way (all admit or all dead-
+        //       letter) when a serialised view would have split
+        //       the decision; and
+        //   (b) the depth can drift between our read and our
+        //       insert — so a Low row may slip in just over the
+        //       cap, or be dead-lettered when a concurrent drain
+        //       has already taken depth back under the cap.
+        // We deliberately accept this drift instead of switching to
+        // a serialisable transaction or a raw conditional INSERT
+        // because:
+        //   (i)   only Low pays the cost (Normal/High/Critical
+        //         bypass the guard so urgent traffic never
+        //         starves);
+        //   (ii)  a single conditional-INSERT against the count
+        //         would require provider-specific raw SQL
+        //         incompatible with the SQLite/PostgreSQL/SQL
+        //         Server portability surface advertised on the
+        //         class docstring (each provider spells the
+        //         INSERT … WHERE (SELECT COUNT(*) …) construct
+        //         differently and ExecuteUpdateAsync does not
+        //         model it); and
+        //   (iii) the durable Pending/Sending/Sent/DeadLettered
+        //         state machine + housekeeping sweep is the
+        //         authoritative invariant restorer — the canonical
+        //         "messages are never lost" contract (story AC #5,
+        //         implementation-plan.md PERF002) does not depend
+        //         on this gate being transactionally exact.
+        // Treat MaxQueueDepth as a soft high-water mark, not a hard
+        // ceiling.
         if (message.Severity == MessageSeverity.Low)
         {
             var depth = await db.OutboundMessages
