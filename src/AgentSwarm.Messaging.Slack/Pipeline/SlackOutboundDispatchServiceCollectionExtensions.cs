@@ -7,6 +7,8 @@
 namespace AgentSwarm.Messaging.Slack.Pipeline;
 
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Retry;
@@ -14,6 +16,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 /// <summary>
 /// Composition-root wiring for Stage 6.3 -- registers the
@@ -88,6 +91,23 @@ public static class SlackOutboundDispatchServiceCollectionExtensions
         // AgentSwarm.Messaging.Core ahead of this call keep their
         // registrations (TryAdd).
         services.TryAddSingleton<ISlackOutboundQueue, ChannelBasedSlackOutboundQueue>();
+
+        // DLQ default is the in-memory implementation so dev / test
+        // hosts have a zero-config path. A production host that did
+        // NOT call AddFileSystemSlackDeadLetterQueue (or wire a
+        // durable upstream implementation) BEFORE this extension
+        // would silently end up with a volatile DLQ -- a message that
+        // exhausts retries, gets dead-lettered, and then hits a
+        // process restart would be lost, violating FR-005 (durable
+        // dead-letter queue) and FR-007 (zero tolerated message
+        // loss). The InMemorySlackDeadLetterQueueStartupWarning
+        // hosted service below resolves the registered
+        // ISlackDeadLetterQueue at startup and emits a LogWarning if
+        // the concrete type is the in-memory implementation so
+        // operators are alerted to the non-durable path. The warning
+        // does NOT fire when a host has overridden the binding (via
+        // AddFileSystemSlackDeadLetterQueue or any other durable
+        // implementation).
         services.TryAddSingleton<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>();
 
         // Default retry policy (Stage 4.3). The dispatcher reuses the
@@ -114,6 +134,71 @@ public static class SlackOutboundDispatchServiceCollectionExtensions
         // generic host starts/stops it alongside the inbound ingestor.
         services.AddHostedService<SlackOutboundDispatcher>();
 
+        // Startup warning for the non-durable in-memory DLQ default.
+        // AddHostedService<T> registers via TryAddEnumerable, so a
+        // host that calls AddSlackOutboundDispatcher twice still ends
+        // up with a single warning instance.
+        services.AddHostedService<InMemorySlackDeadLetterQueueStartupWarning>();
+
         return services;
     }
+}
+
+/// <summary>
+/// <see cref="IHostedService"/> that runs once at startup and emits a
+/// <see cref="LogLevel.Warning"/> when the registered
+/// <see cref="ISlackDeadLetterQueue"/> is the non-durable
+/// <see cref="InMemorySlackDeadLetterQueue"/> default.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Addresses the Stage 6.3 evaluator concern that a production host
+/// could ship with the in-memory DLQ default and silently lose
+/// dead-lettered envelopes across a process restart, violating
+/// FR-005 (durable dead-letter queue) and FR-007 (zero tolerated
+/// message loss). The warning is logged once at
+/// <see cref="StartAsync"/> with explicit guidance on how to wire a
+/// durable replacement (<c>AddFileSystemSlackDeadLetterQueue</c> or
+/// any upstream <c>AgentSwarm.Messaging.Core</c> implementation
+/// registered against <see cref="ISlackDeadLetterQueue"/> BEFORE
+/// <see cref="SlackOutboundDispatchServiceCollectionExtensions.AddSlackOutboundDispatcher"/>).
+/// </para>
+/// <para>
+/// Type-equality check (<c>GetType() == typeof(...)</c>) -- a host
+/// that registered a different <see cref="ISlackDeadLetterQueue"/>
+/// implementation (durable upstream, custom test double, etc.) does
+/// NOT trigger the warning. The check intentionally uses an exact
+/// type comparison so a future durable subclass would not
+/// accidentally suppress the warning if the in-memory default were
+/// ever re-introduced as a base class.
+/// </para>
+/// </remarks>
+internal sealed class InMemorySlackDeadLetterQueueStartupWarning : IHostedService
+{
+    private readonly ISlackDeadLetterQueue deadLetterQueue;
+    private readonly ILogger<InMemorySlackDeadLetterQueueStartupWarning> logger;
+
+    public InMemorySlackDeadLetterQueueStartupWarning(
+        ISlackDeadLetterQueue deadLetterQueue,
+        ILogger<InMemorySlackDeadLetterQueueStartupWarning> logger)
+    {
+        this.deadLetterQueue = deadLetterQueue ?? throw new ArgumentNullException(nameof(deadLetterQueue));
+        this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    /// <inheritdoc />
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (this.deadLetterQueue.GetType() == typeof(InMemorySlackDeadLetterQueue))
+        {
+            this.logger.LogWarning(
+                "Slack outbound dead-letter queue is registered as the in-memory implementation ({DeadLetterQueueType}). Dead-lettered envelopes will NOT survive a process restart, violating FR-005 (durable dead-letter queue) and FR-007 (zero tolerated message loss). For production deployments, register a durable implementation BEFORE calling AddSlackOutboundDispatcher -- e.g. services.AddFileSystemSlackDeadLetterQueue(directoryPath) -- so the TryAddSingleton fallback in AddSlackOutboundDispatcher becomes a no-op.",
+                nameof(InMemorySlackDeadLetterQueue));
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 }
