@@ -3,13 +3,13 @@
 Shared contracts (interfaces, records, enums) consumed by every messaging
 connector in the AgentSwarm gateway (Slack, Telegram, Discord, Teams).
 
-## ⚠️ Stage 1.2 status: compile stubs only
+## ΓÜá∩╕Å Stage 1.2 status: compile stubs only
 
 Every public type in this project is currently a **compile-target stub**
 introduced by the Slack story
 (`qq-SLACK-MESSENGER-SUPP`, stage `prerequisite-abstraction-compile-stubs`).
-They exist solely to unblock compilation of the platform connectors —
-notably `AgentSwarm.Messaging.Slack` — while the canonical Abstractions
+They exist solely to unblock compilation of the platform connectors ΓÇö
+notably `AgentSwarm.Messaging.Slack` ΓÇö while the canonical Abstractions
 story is still in flight.
 
 **Do not treat any type in this assembly as a stable contract yet.**
@@ -23,14 +23,13 @@ hierarchies) may shift.
 
 | File | Source contract |
 |---|---|
-| `IMessengerConnector.cs` | architecture.md §4.1 — `SendMessageAsync`, `SendQuestionAsync`, `ReceiveAsync` |
-| `MessengerMessage.cs` | architecture.md §3.6.4 — `MessageId, AgentId, TaskId, Content, MessageType, CorrelationId, Timestamp` |
-| `AgentQuestion.cs` | architecture.md §3.6.1 — `QuestionId, AgentId, TaskId, Title, Body, Severity, AllowedActions, ExpiresAt, CorrelationId` |
-| `HumanAction.cs` | architecture.md §3.6.2 — `ActionId, Label, Value, RequiresComment` |
-| `HumanDecisionEvent.cs` | architecture.md §3.6.3 — `QuestionId, ActionValue, Comment, Messenger, ExternalUserId, ExternalMessageId, ReceivedAt, CorrelationId` |
-| `MessengerEvent.cs` | architecture.md §4.1 — abstract base of inbound events returned from `ReceiveAsync` |
-| `MessageType.cs` | implementation-plan.md Stage 4 — `Unspecified`, `StatusUpdate`, `Completion`, `Error` |
-| `AssemblyMarker.cs` | reflection anchor for the assembly |
+| `IMessengerConnector.cs` | architecture.md ┬º4.1 ΓÇö `SendMessageAsync`, `SendQuestionAsync`, `ReceiveAsync` |
+| `MessengerMessage.cs` | architecture.md ┬º3.6.4 ΓÇö `MessageId, AgentId, TaskId, Content, MessageType, CorrelationId, Timestamp` |
+| `AgentQuestion.cs` | architecture.md ┬º3.6.1 ΓÇö `QuestionId, AgentId, TaskId, Title, Body, Severity, AllowedActions, ExpiresAt, CorrelationId` |
+| `HumanAction.cs` | architecture.md ┬º3.6.2 ΓÇö `ActionId, Label, Value, RequiresComment` |
+| `HumanDecisionEvent.cs` | architecture.md ┬º3.6.3 ΓÇö `QuestionId, ActionValue, Comment, Messenger, ExternalUserId, ExternalMessageId, ReceivedAt, CorrelationId` |
+| `MessengerEvent.cs` | architecture.md ┬º4.1 ΓÇö abstract base of inbound events returned from `ReceiveAsync` |
+| `MessageType.cs` | implementation-plan.md Stage 4 ΓÇö `Unspecified`, `StatusUpdate`, `Completion`, `Error` |
 
 ## What replaces these stubs
 
@@ -43,5 +42,5 @@ changes.
 
 If you discover a connector relying on a property name, default value, or
 nullability that is *not* spelled out in `architecture.md` section 3.6,
-treat that as a bug in the connector — it is binding to a stub-specific
+treat that as a bug in the connector ΓÇö it is binding to a stub-specific
 quirk that will not survive the canonical swap.
