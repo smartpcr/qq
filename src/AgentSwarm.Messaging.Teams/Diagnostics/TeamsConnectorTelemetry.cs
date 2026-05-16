@@ -39,6 +39,18 @@ namespace AgentSwarm.Messaging.Teams.Diagnostics;
 /// same instrument name, and tests that exercise only the connector observe the
 /// histogram via the meter on <see cref="MeterName"/>.
 /// </para>
+/// <para>
+/// <b>Cardinality boundary.</b> <see cref="CorrelationIdTag"/> is stamped on
+/// <see cref="Activity"/> spans only — spans are sampled per-request and never
+/// aggregated by tag-tuple, so unique per-request values are safe. The counter and
+/// histogram instruments deliberately omit <c>correlationId</c> from their tag sets:
+/// metric backends (Prometheus, OTLP) materialise one time-series per unique
+/// tag-tuple, and a per-request value would create unbounded cardinality that
+/// eventually OOMs the exporter or kills scrape performance. The metric tag set is
+/// restricted to the bounded classifiers <see cref="MessageTypeTag"/> and
+/// <see cref="DestinationTypeTag"/>; per-request correlation is recovered by joining
+/// metrics with traces on the canonical correlation ID exposed on the span.
+/// </para>
 /// </remarks>
 public sealed class TeamsConnectorTelemetry : IDisposable
 {
@@ -69,7 +81,11 @@ public sealed class TeamsConnectorTelemetry : IDisposable
     /// <summary>Observable gauge instrument name for the outbox queue depth.</summary>
     public const string OutboxQueueDepthInstrumentName = "teams.outbox.queue_depth";
 
-    /// <summary>Canonical tag key for the correlation ID stamped on every signal.</summary>
+    /// <summary>
+    /// Canonical tag key for the correlation ID. Stamped on <see cref="Activity"/> spans
+    /// only — deliberately NOT applied to counter / histogram instruments because
+    /// per-request values would explode the metric time-series cardinality.
+    /// </summary>
     public const string CorrelationIdTag = "correlationId";
 
     /// <summary>Canonical tag key for the payload classification.</summary>
@@ -183,34 +199,44 @@ public sealed class TeamsConnectorTelemetry : IDisposable
         return activity;
     }
 
-    /// <summary>Increment <see cref="MessagesSentInstrumentName"/> by 1 with the canonical tag set.</summary>
-    public void RecordMessageSent(string? correlationId, string messageType, string destinationType)
+    /// <summary>
+    /// Increment <see cref="MessagesSentInstrumentName"/> by 1 with the canonical tag set.
+    /// The tag set is intentionally restricted to <see cref="MessageTypeTag"/> and
+    /// <see cref="DestinationTypeTag"/> to keep the time-series cardinality bounded;
+    /// per-request correlation lives on the span emitted by
+    /// <see cref="StartSendActivity"/>.
+    /// </summary>
+    public void RecordMessageSent(string messageType, string destinationType)
     {
-        _messagesSent.Add(1, BuildTags(correlationId, messageType, destinationType));
+        _messagesSent.Add(1, BuildTags(messageType, destinationType));
     }
 
-    /// <summary>Increment <see cref="MessagesReceivedInstrumentName"/> by 1 with the canonical tag set.</summary>
-    public void RecordMessageReceived(string? correlationId, string messageType, string destinationType)
+    /// <summary>
+    /// Increment <see cref="MessagesReceivedInstrumentName"/> by 1 with the canonical
+    /// tag set. See <see cref="RecordMessageSent"/> for the cardinality rationale.
+    /// </summary>
+    public void RecordMessageReceived(string messageType, string destinationType)
     {
-        _messagesReceived.Add(1, BuildTags(correlationId, messageType, destinationType));
+        _messagesReceived.Add(1, BuildTags(messageType, destinationType));
     }
 
     /// <summary>
     /// Record a card-delivery latency sample on the <see cref="CardDeliveryDurationInstrumentName"/>
     /// histogram. The same instrument name is also published by
     /// <see cref="AgentSwarm.Messaging.Core.OutboxMetrics"/>; OpenTelemetry exporters
-    /// aggregate both contributions against the §4.4 P95 budget.
+    /// aggregate both contributions against the §4.4 P95 budget. The tag set is
+    /// restricted to the bounded classifiers (see <see cref="RecordMessageSent"/>);
+    /// the per-request correlation ID is carried on the surrounding span.
     /// </summary>
-    public void RecordCardDeliveryDurationMs(double durationMs, string? correlationId, string messageType, string destinationType)
+    public void RecordCardDeliveryDurationMs(double durationMs, string messageType, string destinationType)
     {
-        _cardDeliveryDurationMs.Record(durationMs, BuildTags(correlationId, messageType, destinationType));
+        _cardDeliveryDurationMs.Record(durationMs, BuildTags(messageType, destinationType));
     }
 
-    private static KeyValuePair<string, object?>[] BuildTags(string? correlationId, string messageType, string destinationType)
+    private static KeyValuePair<string, object?>[] BuildTags(string messageType, string destinationType)
     {
         return new KeyValuePair<string, object?>[]
         {
-            new(CorrelationIdTag, correlationId ?? string.Empty),
             new(MessageTypeTag, messageType),
             new(DestinationTypeTag, destinationType),
         };
