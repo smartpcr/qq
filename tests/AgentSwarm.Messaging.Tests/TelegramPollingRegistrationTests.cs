@@ -181,6 +181,14 @@ public class TelegramPollingRegistrationTests
             BotToken = SampleToken,
             UsePolling = false,
             WebhookUrl = "https://example.com/wh",
+            // SecretToken is required whenever WebhookUrl is set —
+            // architecture.md §11.3: the X-Telegram-Bot-Api-Secret-Token
+            // header is the only authentication on the public webhook
+            // endpoint, so the validator rejects webhook mode without
+            // it. This test pins the "polling-disabled does not block
+            // webhook acceptance" decision, so we satisfy the secret
+            // requirement explicitly rather than weaken the validator.
+            SecretToken = "valid-webhook-secret-token-value",
         };
 
         validator.Validate(Microsoft.Extensions.Options.Options.DefaultName, options)

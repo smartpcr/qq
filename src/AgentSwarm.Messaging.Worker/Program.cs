@@ -56,6 +56,14 @@ builder.Services.AddMessagingPersistence(builder.Configuration);
 builder.Services.AddTelegram(builder.Configuration);
 builder.Services.AddTelegramWebhook();
 
+// Stage 6.3: a minimal /healthz endpoint is mapped below so the
+// Dockerfile HEALTHCHECK has something to poll. Phase 6 (observability)
+// will replace this with a real composite check (Telegram getMe,
+// queue depth, dead-letter depth, database) — for now the bare
+// AddHealthChecks() registration gives us a 200-OK liveness probe
+// without depending on services that don't exist yet.
+builder.Services.AddHealthChecks();
+
 // IUserAuthorizationService — iter-5 evaluator item 1. AddTelegram
 // intentionally does NOT register one to keep the loud-failure
 // semantic at the library level. The Worker registers
@@ -69,6 +77,19 @@ builder.Services.AddTelegramWebhook();
 // scoping it would create a needless captive-dependency conflict
 // with the singleton pipeline.
 builder.Services.TryAddSingleton<IUserAuthorizationService, ConfiguredOperatorAuthorizationService>();
+
+// IAlertService — iter-4 evaluator item 6. The Telegram sender's
+// dead-letter path (TelegramMessageSender.EmitDeadLetterAlertAsync)
+// resolves IAlertService as an optional dependency; without a
+// registered concrete the alert path falls back to the sender's own
+// LogCritical line and the operator never sees the alert in any
+// dedicated alert sink. Register the LoggingAlertService default
+// here via TryAddSingleton so a later out-of-band channel
+// (Slack / PagerDuty / second-bot) wired in a future stage can
+// replace it without touching this file. Singleton lifetime — the
+// service has no per-request state; logger injection is the only
+// dependency.
+builder.Services.TryAddSingleton<IAlertService, LoggingAlertService>();
 
 // Persistent inbound update store. Scoped because it consumes the
 // scoped MessagingDbContext.
@@ -135,5 +156,11 @@ var app = builder.Build();
 // are rejected with 403 before the controller deserializes the body.
 app.UseRouting();
 app.MapTelegramWebhook();
+
+// Liveness probe consumed by the Dockerfile HEALTHCHECK and the
+// Stage 7.1 integration-test fixture. Kept on the bare
+// AddHealthChecks() registration above so the endpoint is always
+// reachable even before Phase 6 adds the composite check.
+app.MapHealthChecks("/healthz");
 
 app.Run();

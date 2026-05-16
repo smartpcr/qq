@@ -179,8 +179,66 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
             }
         }
 
+        ValidateRateLimits(options.RateLimits, failures);
+
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
+    }
+
+    /// <summary>
+    /// Rate-limit configuration is load-bearing for the §10.4 burst
+    /// envelope and for the documented Telegram per-bot / per-chat
+    /// soft caps. Zero or negative values would have been silently
+    /// clamped by <see cref="Sending.TokenBucketTelegramRateLimiter"/>'s
+    /// <c>Math.Max(1, …)</c> guards, hiding a configuration error
+    /// behind a "default-feeling" runtime behaviour. We fail fast at
+    /// host startup instead so the operator notices the misconfiguration
+    /// immediately. <see langword="null"/> <paramref name="options"/>
+    /// is accepted — <see cref="TelegramOptions.RateLimits"/> defaults
+    /// to a fresh <see cref="Sending.RateLimitOptions"/> instance via
+    /// the property initialiser, but a future hand-constructed
+    /// <see cref="TelegramOptions"/> could leave it null; that case is
+    /// not a misconfiguration (the limiter would fall back to defaults).
+    /// </summary>
+    private static void ValidateRateLimits(Sending.RateLimitOptions? options, List<string> failures)
+    {
+        if (options is null)
+        {
+            return;
+        }
+
+        if (options.GlobalPerSecond <= 0)
+        {
+            failures.Add(
+                "Telegram:RateLimits:GlobalPerSecond must be > 0 (token-bucket refill rate, tokens per second). "
+                + $"Configured value: {options.GlobalPerSecond}. A non-positive value silently clamped at runtime "
+                + "would mask the configuration error and degrade the §10.4 burst SLO envelope.");
+        }
+
+        if (options.GlobalBurstCapacity <= 0)
+        {
+            failures.Add(
+                "Telegram:RateLimits:GlobalBurstCapacity must be > 0 (token-bucket capacity). "
+                + $"Configured value: {options.GlobalBurstCapacity}. A non-positive value silently clamped "
+                + "at runtime would mask the configuration error.");
+        }
+
+        if (options.PerChatPerMinute <= 0)
+        {
+            failures.Add(
+                "Telegram:RateLimits:PerChatPerMinute must be > 0 (per-chat token-bucket refill rate, tokens per minute). "
+                + $"Configured value: {options.PerChatPerMinute}. A non-positive value silently clamped "
+                + "at runtime would mask the configuration error and risk violating Telegram's documented "
+                + "20-msg/min per-chat soft cap.");
+        }
+
+        if (options.PerChatBurstCapacity <= 0)
+        {
+            failures.Add(
+                "Telegram:RateLimits:PerChatBurstCapacity must be > 0 (per-chat token-bucket capacity). "
+                + $"Configured value: {options.PerChatBurstCapacity}. A non-positive value silently clamped "
+                + "at runtime would mask the configuration error and degrade the §10.4 D-BURST envelope.");
+        }
     }
 }

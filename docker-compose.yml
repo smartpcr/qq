@@ -1,0 +1,105 @@
+# docker-compose.yml — Stage 6.3 deliverable for the
+# Telegram messenger Worker. Brings up:
+#
+#   * `worker`            — the AgentSwarm.Messaging.Worker image,
+#                           exposing the webhook receiver on port 8443
+#                           and the liveness endpoint on /healthz.
+#
+#   * `ngrok`             — OPTIONAL local-tunnel sidecar that fronts
+#                           the worker with a public HTTPS URL so a
+#                           developer can register the resulting URL
+#                           as the bot's webhook against the real
+#                           api.telegram.org without exposing their
+#                           laptop port directly. Gated behind the
+#                           `tunnel` profile (`docker compose
+#                           --profile tunnel up`) so day-to-day
+#                           polling-mode dev workflows don't have to
+#                           pay the cost of starting it.
+#
+# Local-dev workflow (polling mode):
+#   1) Set TELEGRAM_BOT_TOKEN in your shell or a .env file at the
+#      repo root (do NOT commit .env).
+#   2) `docker compose up worker`
+#   3) The worker boots with appsettings.Development.json (UsePolling=true)
+#      and starts long-polling the bot. Webhook setup is skipped because
+#      WebhookUrl is unset.
+#
+# Webhook-mode workflow:
+#   1) Set TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_TOKEN, NGROK_AUTHTOKEN.
+#   2) `docker compose --profile tunnel up`
+#   3) Read the public URL from `docker compose logs ngrok`, then set
+#      TELEGRAM_WEBHOOK_URL=https://<ngrok-id>.ngrok.io/api/telegram/webhook
+#      and restart `worker`. TelegramWebhookRegistrationService calls
+#      setWebhook against api.telegram.org on startup.
+
+services:
+  worker:
+    image: agentswarm-messaging-worker:latest
+    build:
+      # Build context is the REPO ROOT so the Dockerfile can copy the
+      # solution + every src/* project. The Dockerfile path is
+      # relative to that context.
+      context: .
+      dockerfile: src/AgentSwarm.Messaging.Worker/Dockerfile
+    container_name: agentswarm-messaging-worker
+    restart: unless-stopped
+    ports:
+      # 8443 is the conventional Telegram webhook port (one of the
+      # four ports Telegram is willing to POST to). The host-side
+      # mapping is kept identical for ngrok / direct-curl simplicity.
+      - "8443:8443"
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+      ASPNETCORE_URLS: http://+:8443
+      # Telegram credentials are sourced from the host env / .env
+      # file — NEVER from a committed appsettings.json (per the
+      # story's "Store bot token in Key Vault or equivalent" row).
+      # Empty defaults let `docker compose config` validate without
+      # the user having set them yet; the worker's
+      # TelegramOptionsValidator throws at startup if BotToken is
+      # blank, so a silent misconfiguration is impossible.
+      Telegram__BotToken: ${TELEGRAM_BOT_TOKEN:-}
+      Telegram__SecretToken: ${TELEGRAM_SECRET_TOKEN:-}
+      Telegram__WebhookUrl: ${TELEGRAM_WEBHOOK_URL:-}
+      Telegram__UsePolling: ${TELEGRAM_USE_POLLING:-true}
+      # Persist SQLite under /data so the volume below survives
+      # container restarts. Production deployments swap this for
+      # PostgreSQL via the connection string override.
+      ConnectionStrings__MessagingDb: Data Source=/data/messaging.db
+      ConnectionStrings__AuditDb: Data Source=/data/audit.db
+      MessagingDb__UseMigrations: "true"
+    volumes:
+      - worker-data:/data
+    healthcheck:
+      # Mirrors the Dockerfile HEALTHCHECK so `docker compose ps`
+      # surfaces the same state the container reports internally.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  ngrok:
+    # Optional local-tunnel sidecar. Only started when the `tunnel`
+    # profile is selected: `docker compose --profile tunnel up`.
+    image: ngrok/ngrok:latest
+    container_name: agentswarm-ngrok
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command:
+      - http
+      - --log=stdout
+      - worker:8443
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    ports:
+      # ngrok's local inspector dashboard for `docker compose logs`-free
+      # tunnel URL discovery: http://localhost:4040/status
+      - "4040:4040"
+    depends_on:
+      worker:
+        condition: service_healthy
+
+volumes:
+  worker-data:
+    driver: local

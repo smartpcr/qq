@@ -1,5 +1,7 @@
 namespace AgentSwarm.Messaging.Telegram;
 
+using AgentSwarm.Messaging.Telegram.Sending;
+
 /// <summary>
 /// Configuration POCO bound from the <c>Telegram</c> section of
 /// <see cref="Microsoft.Extensions.Configuration.IConfiguration"/>.
@@ -103,6 +105,17 @@ public sealed class TelegramOptions
     /// <see cref="UsePolling"/> is <c>true</c>.
     /// </summary>
     public int PollingTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Dual-layer token-bucket rate-limit configuration consumed by
+    /// <see cref="Sending.TokenBucketTelegramRateLimiter"/> and the
+    /// Stage 2.3 <see cref="Sending.TelegramMessageSender"/>. Bound from
+    /// the <c>Telegram:RateLimits</c> sub-section; defaults match
+    /// architecture.md §10.4. Never null — the <c>= new()</c> initialiser
+    /// guarantees the limiter can be constructed even when the section
+    /// is omitted from configuration.
+    /// </summary>
+    public RateLimitOptions RateLimits { get; set; } = new();
 
     /// <summary>
     /// Returns a diagnostic representation of this options instance with
