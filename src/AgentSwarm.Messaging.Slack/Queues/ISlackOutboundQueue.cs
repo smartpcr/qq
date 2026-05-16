@@ -1,0 +1,56 @@
+using AgentSwarm.Messaging.Slack.Transport;
+
+namespace AgentSwarm.Messaging.Slack.Queues;
+
+/// <summary>
+/// Buffers rendered <see cref="SlackOutboundEnvelope"/> instances between
+/// the <c>SlackConnector</c> (which renders Block Kit and resolves the
+/// destination thread) and the <c>SlackOutboundDispatcher</c> background
+/// service (which calls the Slack Web API). Provides at-least-once
+/// delivery semantics for outbound messages and absorbs Slack rate-limit
+/// pauses without back-pressuring the agent producer.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Stage 1.3 contract.</b> The in-process
+/// <see cref="ChannelBasedSlackQueue{T}"/> backs this interface for
+/// development and tests. In production, the swap-in implementation will
+/// be a durable outbox (database-backed, Service Bus, etc.) supplied by
+/// the upstream <c>AgentSwarm.Messaging.Core</c> project per Stage 1.3 of
+/// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>.
+/// </para>
+/// <para>
+/// <c>views.open</c> calls bypass this queue (see architecture.md section
+/// 2.16 and 3.4) because they require the short-lived <c>trigger_id</c>
+/// from a slash-command request; only the deferable
+/// <see cref="SlackOutboundOperationKind.PostMessage"/>,
+/// <see cref="SlackOutboundOperationKind.UpdateMessage"/>, and
+/// <see cref="SlackOutboundOperationKind.ViewsUpdate"/> verbs are queued.
+/// </para>
+/// </remarks>
+internal interface ISlackOutboundQueue
+{
+    /// <summary>
+    /// Buffers a rendered outbound envelope. Implementations backed by a
+    /// bounded queue MAY block while at capacity; the in-process
+    /// <see cref="ChannelBasedSlackOutboundQueue"/> uses an unbounded
+    /// channel and completes synchronously.
+    /// </summary>
+    /// <remarks>
+    /// Signature matches the Stage 1.3 brief literally
+    /// (<c>EnqueueAsync(SlackOutboundEnvelope)</c>) -- a cancellation token
+    /// is intentionally NOT exposed here so the agent-side producer (which
+    /// has already handed off ownership of the rendered message) cannot
+    /// retract a queued send. Implementations that require per-call
+    /// cancellation expose it on their concrete type, not on this
+    /// interface.
+    /// </remarks>
+    ValueTask EnqueueAsync(SlackOutboundEnvelope envelope);
+
+    /// <summary>
+    /// Asynchronously dequeues the next envelope, waiting if the queue is
+    /// empty. Throws <see cref="OperationCanceledException"/> when
+    /// <paramref name="ct"/> is cancelled while waiting.
+    /// </summary>
+    ValueTask<SlackOutboundEnvelope> DequeueAsync(CancellationToken ct);
+}
