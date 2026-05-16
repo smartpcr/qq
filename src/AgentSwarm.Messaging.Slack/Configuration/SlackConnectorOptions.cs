@@ -198,14 +198,19 @@ public sealed class SlackRateLimitOptions
     };
 
     /// <summary>
-    /// Tier 2 (~20+ requests/min). Applies to <c>chat.postMessage</c>,
-    /// which Slack documents as "roughly 1 message per second per
-    /// channel". Default <see cref="SlackRateLimitTier.Scope"/> is
-    /// <see cref="SlackRateLimitScope.Channel"/>.
+    /// Tier 2 (~20+ requests/min general; <c>chat.postMessage</c>
+    /// specifically ~1 message/sec/channel). The default is therefore
+    /// 60 req/min per channel rather than the umbrella 20 req/min,
+    /// because the Stage 6.3 brief and architecture.md §2.12 both
+    /// pin the connector's outbound rate at "~1 req/s/channel". A
+    /// small <see cref="SlackRateLimitTier.BurstCapacity"/> of 5
+    /// absorbs short producer bursts without exceeding Slack's
+    /// short-window ceiling. Default <see cref="SlackRateLimitTier.Scope"/>
+    /// is <see cref="SlackRateLimitScope.Channel"/>.
     /// </summary>
     public SlackRateLimitTier Tier2 { get; set; } = new()
     {
-        RequestsPerMinute = 20,
+        RequestsPerMinute = 60,
         BurstCapacity = 5,
         Scope = SlackRateLimitScope.Channel,
     };
