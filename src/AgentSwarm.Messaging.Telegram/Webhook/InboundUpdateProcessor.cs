@@ -26,14 +26,23 @@ namespace AgentSwarm.Messaging.Telegram.Webhook;
 ///   <see cref="IdempotencyStatus.Processing"/> so a parallel sweep
 ///   does not pick the same row twice.</description></item>
 ///   <item><description><b>RawPayload deserialization failure</b>
-///   (JsonException or null result) — transitions to
-///   <see cref="IdempotencyStatus.Completed"/> with a diagnostic
-///   <c>HandlerErrorDetail</c>. The persisted payload is immutable, so
-///   this is a deterministic / permanent error per the hybrid retry
-///   contract ("return = terminal"); marking <see cref="IdempotencyStatus.Failed"/>
-///   would cause the sweep to replay the same poison row up to
-///   <c>MaxRetries</c> times before alerting on exhausted retries.
-///   </description></item>
+///   (<see cref="JsonException"/> or <c>null</c> deserialized result) —
+///   transitions to <see cref="IdempotencyStatus.Completed"/> with a
+///   diagnostic <c>HandlerErrorDetail</c>. The persisted RawPayload
+///   bytes are immutable, so a deserializer failure is deterministic
+///   against the row — replaying through the sweep would fail
+///   identically every tick. Per the
+///   <see cref="IInboundUpdateStore"/> hybrid retry contract
+///   ("return = terminal, throw = retryable") this is a permanent
+///   failure, so it lands via <see cref="IInboundUpdateStore.MarkCompletedAsync"/>
+///   in a single hop rather than burning <c>MaxRetries</c> sweep
+///   iterations through <see cref="IInboundUpdateStore.MarkFailedAsync"/>
+///   before surfacing as an exhausted-retry alert. This deliberately
+///   broadens the semantics of <c>HandlerErrorDetail</c> from
+///   "routed-handler diagnostic" to "terminal non-retryable
+///   diagnostic"; the alternative
+///   <see cref="InboundUpdate.ErrorDetail"/> column is reserved for
+///   retryable uncaught-exception text.</description></item>
 ///   <item><description><b>Pipeline returns Succeeded=true</b> —
 ///   transitions to <see cref="IdempotencyStatus.Completed"/> with
 ///   <c>HandlerErrorDetail = null</c>.</description></item>
@@ -149,17 +158,18 @@ public sealed class InboundUpdateProcessor
         }
         catch (JsonException ex)
         {
-            // Deserialization failure is deterministic — the persisted
-            // RawPayload is immutable, so a sweep replay would fail
-            // identically. Per the hybrid retry contract
-            // ("return = terminal, throw = retryable") this is a
-            // permanent error, so mark Completed with a diagnostic
-            // detail rather than Failed (which would be retried up to
-            // MaxRetries before exhausting). Mirrors the Succeeded=false
-            // disposition further below.
+            // Deserialization is deterministic against the persisted
+            // RawPayload bytes — a sweep replay would fail identically
+            // every tick. Per the IInboundUpdateStore hybrid retry
+            // contract ("return = terminal, throw = retryable"), this
+            // is a permanent error, so land via MarkCompletedAsync with
+            // a HandlerErrorDetail snapshot rather than MarkFailedAsync,
+            // which would burn MaxRetries sweep iterations before
+            // surfacing as an exhausted-retry alert. Mirrors the
+            // Succeeded=false disposition further below.
             _logger.LogError(
                 ex,
-                "Failed to deserialize InboundUpdate.RawPayload — marking InboundUpdate Completed (terminal, non-retryable). UpdateId={UpdateId} CorrelationId={CorrelationId}",
+                "Failed to deserialize InboundUpdate.RawPayload — marking InboundUpdate Completed (terminal, deterministic failure). UpdateId={UpdateId} CorrelationId={CorrelationId}",
                 row.UpdateId,
                 correlationId);
             await _store.MarkCompletedAsync(
@@ -171,10 +181,12 @@ public sealed class InboundUpdateProcessor
 
         if (update is null)
         {
-            // Same rationale as the JsonException branch: deterministic
-            // and permanent — mark Completed (terminal), not Failed.
+            // Same rationale as the JsonException branch — the
+            // deserializer's null result is deterministic against the
+            // persisted RawPayload bytes, so this is terminal, not
+            // retryable.
             _logger.LogError(
-                "InboundUpdate.RawPayload deserialized to null — marking InboundUpdate Completed (terminal, non-retryable). UpdateId={UpdateId} CorrelationId={CorrelationId}",
+                "InboundUpdate.RawPayload deserialized to null — marking InboundUpdate Completed (terminal, deterministic failure). UpdateId={UpdateId} CorrelationId={CorrelationId}",
                 row.UpdateId,
                 correlationId);
             await _store.MarkCompletedAsync(
