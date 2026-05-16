@@ -99,14 +99,8 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// </para>
     /// <para>
     /// <b>Idempotent.</b> Calling this method more than once is a no-op for the inner
-    /// marker registrations — the second call finds the marker already present and
-    /// skips the swap. The <see cref="OutboxRetryEngine"/> hosted-service registration
-    /// is also guarded so a second composition never stacks a duplicate retry worker
-    /// against the same outbox (iter-7 fix for the evaluator's duplicate-IHostedService
-    /// critique). The <see cref="OutboxOptions"/> singleton is always replaced so the
-    /// host's latest <c>configure</c> callback wins; everything else uses
-    /// <c>TryAdd*</c> / <c>RemoveAll</c>+<c>AddSingleton</c> so the descriptor count
-    /// per affected service type is invariant under repeat invocation.
+    /// marker registrations — the second call finds the marker already present and skips
+    /// the swap.
     /// </para>
     /// </remarks>
     /// <param name="services">DI container.</param>
@@ -158,71 +152,9 @@ public static class TeamsOutboxServiceCollectionExtensions
         DecorateProactiveNotifier(services);
         DecorateMessengerConnector(services);
 
-        // Iter-7 evaluator critique #1 — idempotent hosted-service guard. The
-        // documented "second call is a no-op" contract on AddTeamsOutboxEngine is
-        // only true if EVERY descriptor it touches is de-duped. AddHostedService<T>()
-        // internally calls TryAddEnumerable, which de-dupes by (ServiceType,
-        // ImplementationType); the extra HasHostedService<T>() guard below makes the
-        // idempotency contract observable to a static scan of the collection (a
-        // host's diagnostic tooling that counts IHostedService descriptors by
-        // ImplementationType sees exactly one OutboxRetryEngine entry) AND keeps the
-        // semantics intact if a future runtime relaxes TryAddEnumerable. The
-        // companion test
-        // <c>AddTeamsOutboxEngine_OutboxRetryEngineDescriptorIsRegisteredOnce</c>
-        // asserts exactly one descriptor after two compositions.
-        if (!HasHostedService<OutboxRetryEngine>(services))
-        {
-            services.AddHostedService<OutboxRetryEngine>();
-        }
+        services.AddHostedService<OutboxRetryEngine>();
 
         return services;
-    }
-
-    /// <summary>
-    /// True when the service collection already exposes an <see cref="IHostedService"/>
-    /// descriptor whose implementation type is <typeparamref name="T"/>. Used as the
-    /// idempotency guard for hosted-service registrations so a second call to
-    /// <see cref="AddTeamsOutboxEngine"/> on the same collection never stacks a
-    /// duplicate <see cref="OutboxRetryEngine"/> worker.
-    /// </summary>
-    private static bool HasHostedService<T>(IServiceCollection services)
-        where T : class, IHostedService
-    {
-        for (var i = 0; i < services.Count; i++)
-        {
-            var d = services[i];
-            if (d.ServiceType != typeof(IHostedService))
-            {
-                continue;
-            }
-
-            if (d.ImplementationType == typeof(T))
-            {
-                return true;
-            }
-
-            if (d.ImplementationInstance is T)
-            {
-                return true;
-            }
-
-            // AddHostedService<T>() registers the hosted descriptor as
-            // ServiceDescriptor.Singleton<IHostedService, T>(), which materialises as
-            // an ImplementationType-bearing descriptor on .NET 8 — the two checks above
-            // cover it. The factory branch is preserved for hosts that registered the
-            // hosted service via a custom factory pointing at the same concrete type.
-            if (d.ImplementationFactory is not null)
-            {
-                // We cannot introspect the factory's return type without invoking it,
-                // and invoking it here would build T outside the host's lifetime. Leave
-                // factory-shaped descriptors alone — the AddHostedService<T>() helper
-                // does not use this shape, so this branch is unreachable from the
-                // canonical Teams composition; a host that wires its own factory is
-                // responsible for its own idempotency contract.
-            }
-        }
-
-        return false;
     }
 
     private static void DecorateProactiveNotifier(IServiceCollection services)
@@ -491,17 +423,20 @@ public static class TeamsOutboxServiceCollectionExtensions
     private sealed class KeyedTeamsConnectorInterceptor : IServiceProvider, IKeyedServiceProvider
     {
         private readonly IServiceProvider _inner;
-        private readonly IKeyedServiceProvider _keyedInner;
 
-        // Lazy<T> with the default constructor uses LazyThreadSafetyMode.ExecutionAndPublication,
-        // which guarantees the captured factory is invoked AT MOST ONCE even under concurrent
-        // GetKeyedService / GetRequiredKeyedService calls. The previous implementation used
-        // `_field ??= factory(...)`, which compiles to a non-atomic read-then-write pair and
-        // would silently leak a duplicate connector if two threads observed the field as null
-        // simultaneously. In practice the interceptor is constructed inside a DI singleton
-        // factory (serialised by the container's lock), but we make the single-invocation
-        // guarantee explicit here so the interceptor remains correct if it is ever reused
-        // outside that implicit serialisation envelope.
+        // Single-invocation guarantee for the captured keyed Teams connector. The
+        // earlier shape was `_capturedKeyedTeamsResult ??= _capturedKeyedTeamsFactory(_inner)`,
+        // which compiles to a non-atomic read-then-write pair on a reference field —
+        // two concurrent callers that both observe the field as null would each invoke
+        // the factory, materialising two connector instances. The loser of the write
+        // race is silently overwritten and leaked along with whatever sockets,
+        // background pumps, or auth tokens it captured. The container's own singleton
+        // lock currently serialises construction here, so the race window is empty in
+        // practice, but that's an implicit and fragile invariant: any future refactor
+        // that resolves the interceptor outside that envelope would re-introduce the
+        // bug with no obvious warning. Using Lazy<T> with the default constructor
+        // (LazyThreadSafetyMode.ExecutionAndPublication) makes the at-most-once factory
+        // invocation a type-enforced contract that survives such refactors.
         private readonly Lazy<IMessengerConnector> _capturedKeyedTeams;
 
         public KeyedTeamsConnectorInterceptor(
@@ -509,28 +444,9 @@ public static class TeamsOutboxServiceCollectionExtensions
             Func<IServiceProvider, IMessengerConnector> capturedKeyedTeamsFactory)
         {
             _inner = inner ?? throw new ArgumentNullException(nameof(inner));
-
-            // Fail at decoration time with a clear, actionable message rather than at
-            // first keyed resolution with a cryptic InvalidCastException. The interceptor
-            // only makes sense if the host's IServiceProvider supports keyed lookups —
-            // the .NET 8 default ServiceProvider does, but a third-party DI container or
-            // a wrapping decorator may not.
-            _keyedInner = inner as IKeyedServiceProvider
-                ?? throw new ArgumentException(
-                    $"The supplied IServiceProvider ({inner.GetType().Name}) must implement " +
-                    "IKeyedServiceProvider. AddTeamsOutboxEngine relies on keyed-service " +
-                    "lookups when the host registered both an unkeyed IMessengerConnector " +
-                    "factory and a keyed IMessengerConnector under " +
-                    $"TeamsServiceCollectionExtensions.MessengerKey (\"{TeamsServiceCollectionExtensions.MessengerKey}\"). " +
-                    "Use a DI container that implements IKeyedServiceProvider (the default " +
-                    "Microsoft.Extensions.DependencyInjection container does) or avoid this " +
-                    "decorator path by registering only one of the two shapes.",
-                    nameof(inner));
-            if (capturedKeyedTeamsFactory is null)
-            {
-                throw new ArgumentNullException(nameof(capturedKeyedTeamsFactory));
-            }
-            _capturedKeyedTeams = new Lazy<IMessengerConnector>(() => capturedKeyedTeamsFactory(inner));
+            ArgumentNullException.ThrowIfNull(capturedKeyedTeamsFactory);
+            _capturedKeyedTeams = new Lazy<IMessengerConnector>(
+                () => capturedKeyedTeamsFactory(inner));
         }
 
         public object? GetService(Type serviceType) => _inner.GetService(serviceType);
@@ -542,7 +458,7 @@ public static class TeamsOutboxServiceCollectionExtensions
             {
                 return _capturedKeyedTeams.Value;
             }
-            return _keyedInner.GetKeyedService(serviceType, serviceKey);
+            return ((IKeyedServiceProvider)_inner).GetKeyedService(serviceType, serviceKey);
         }
 
         public object GetRequiredKeyedService(Type serviceType, object? serviceKey)
@@ -552,7 +468,7 @@ public static class TeamsOutboxServiceCollectionExtensions
             {
                 return _capturedKeyedTeams.Value;
             }
-            return _keyedInner.GetRequiredKeyedService(serviceType, serviceKey);
+            return ((IKeyedServiceProvider)_inner).GetRequiredKeyedService(serviceType, serviceKey);
         }
     }
 }
