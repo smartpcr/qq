@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
@@ -82,15 +81,15 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 public sealed class CardActionHandler : ICardActionHandler
 {
     /// <summary>
-    /// Retention window for the in-memory processed-action dedupe set
-    /// (<c>architecture.md</c> ┬º2.6 layer 2). Entries older than this are pruned on
-    /// every <see cref="HandleAsync"/> entry so the set does not grow unbounded.
-    /// Five minutes is intentionally wider than the typical card-double-tap window but
-    /// narrow enough that a user who genuinely retries after a transient failure can
-    /// recover. Tests opt in to a shorter window via the
-    /// <c>internal</c> 8-argument constructor.
+    /// Default retention window applied when the legacy constructors allocate an internal
+    /// <see cref="ProcessedCardActionSet"/>. Stage 6.2 of <c>implementation-plan.md</c>
+    /// canonically uses a 24-hour TTL (with a 5-minute background eviction cadence,
+    /// honoured by <see cref="ProcessedCardActionEvictionService"/>). The pre-Stage-6.2
+    /// inline dedupe used 5 minutes; that legacy value is preserved in the test-only
+    /// 8-argument constructor below so existing tests that opt into a shorter window
+    /// continue to behave identically.
     /// </summary>
-    internal static readonly TimeSpan DedupeRetentionPeriod = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan DedupeRetentionPeriod = TimeSpan.FromHours(24);
 
     private readonly IAgentQuestionStore _questionStore;
     private readonly ICardStateStore _cardStateStore;
@@ -100,17 +99,15 @@ public sealed class CardActionHandler : ICardActionHandler
     private readonly ILogger<CardActionHandler> _logger;
     private readonly CardActionMapper _mapper;
     private readonly TimeProvider _timeProvider;
-    private readonly TimeSpan _dedupeRetention;
-
-    // architecture.md ┬º2.6 layer 2 ΓÇö fast-path dedupe keyed on "{questionId}|{actorAad}".
-    // Tracks the timestamp the key was first claimed so stale entries (older than
-    // _dedupeRetention) can be evicted lazily on every HandleAsync entry.
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _processedActions = new(StringComparer.Ordinal);
+    private readonly ProcessedCardActionSet _processedActions;
 
     /// <summary>
     /// Construct the handler with the six dependencies required by
     /// <c>implementation-plan.md</c> ┬º3.3 step 3. Every parameter is null-guarded so DI
-    /// mis-registration fails loudly.
+    /// mis-registration fails loudly. Allocates a fresh
+    /// <see cref="ProcessedCardActionSet"/> with default options (24-hour entry
+    /// lifetime) — used by tests that pre-date Stage 6.2 and by production-DI fallback
+    /// when no shared <see cref="ProcessedCardActionSet"/> singleton is registered.
     /// </summary>
     public CardActionHandler(
         IAgentQuestionStore questionStore,
@@ -119,15 +116,54 @@ public sealed class CardActionHandler : ICardActionHandler
         IInboundEventPublisher inboundEventPublisher,
         IAuditLogger auditLogger,
         ILogger<CardActionHandler> logger)
-        : this(questionStore, cardStateStore, cardManager, inboundEventPublisher, auditLogger, logger, TimeProvider.System, DedupeRetentionPeriod)
+        : this(
+            questionStore,
+            cardStateStore,
+            cardManager,
+            inboundEventPublisher,
+            auditLogger,
+            logger,
+            TimeProvider.System,
+            new ProcessedCardActionSet(new CardActionDedupeOptions(), TimeProvider.System))
     {
+    }
+
+    /// <summary>
+    /// Stage 6.2 canonical DI constructor — accepts a shared singleton
+    /// <see cref="ProcessedCardActionSet"/> so the in-memory dedupe state is shared
+    /// between every handler resolution AND the
+    /// <see cref="ProcessedCardActionEvictionService"/> background timer. Resolved
+    /// preferentially by .NET DI because it is strictly longer than the legacy 6-arg
+    /// overload above and every parameter has a registered service descriptor.
+    /// </summary>
+    public CardActionHandler(
+        IAgentQuestionStore questionStore,
+        ICardStateStore cardStateStore,
+        ITeamsCardManager cardManager,
+        IInboundEventPublisher inboundEventPublisher,
+        IAuditLogger auditLogger,
+        ILogger<CardActionHandler> logger,
+        TimeProvider timeProvider,
+        ProcessedCardActionSet processedActions)
+    {
+        _questionStore = questionStore ?? throw new ArgumentNullException(nameof(questionStore));
+        _cardStateStore = cardStateStore ?? throw new ArgumentNullException(nameof(cardStateStore));
+        _cardManager = cardManager ?? throw new ArgumentNullException(nameof(cardManager));
+        _inboundEventPublisher = inboundEventPublisher ?? throw new ArgumentNullException(nameof(inboundEventPublisher));
+        _auditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _processedActions = processedActions ?? throw new ArgumentNullException(nameof(processedActions));
+        _mapper = new CardActionMapper();
     }
 
     /// <summary>
     /// Test-friendly constructor that accepts a deterministic
     /// <see cref="TimeProvider"/> and a configurable dedupe retention window. Hosts
-    /// resolve the public 6-arg constructor via DI; unit tests opt in to this overload
-    /// to advance the dedupe clock without sleeping.
+    /// resolve the canonical 8-arg constructor via DI; unit tests opt in to this
+    /// overload to advance the dedupe clock without sleeping. Allocates a private
+    /// <see cref="ProcessedCardActionSet"/> seeded with the supplied retention window
+    /// so tests can verify both the short-circuit and the eviction behaviour.
     /// </summary>
     public CardActionHandler(
         IAgentQuestionStore questionStore,
@@ -138,16 +174,21 @@ public sealed class CardActionHandler : ICardActionHandler
         ILogger<CardActionHandler> logger,
         TimeProvider timeProvider,
         TimeSpan dedupeRetention)
+        : this(
+            questionStore,
+            cardStateStore,
+            cardManager,
+            inboundEventPublisher,
+            auditLogger,
+            logger,
+            timeProvider ?? throw new ArgumentNullException(nameof(timeProvider)),
+            new ProcessedCardActionSet(
+                new CardActionDedupeOptions
+                {
+                    EntryLifetime = dedupeRetention > TimeSpan.Zero ? dedupeRetention : DedupeRetentionPeriod,
+                },
+                timeProvider ?? throw new ArgumentNullException(nameof(timeProvider))))
     {
-        _questionStore = questionStore ?? throw new ArgumentNullException(nameof(questionStore));
-        _cardStateStore = cardStateStore ?? throw new ArgumentNullException(nameof(cardStateStore));
-        _cardManager = cardManager ?? throw new ArgumentNullException(nameof(cardManager));
-        _inboundEventPublisher = inboundEventPublisher ?? throw new ArgumentNullException(nameof(inboundEventPublisher));
-        _auditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
-        _dedupeRetention = dedupeRetention > TimeSpan.Zero ? dedupeRetention : DedupeRetentionPeriod;
-        _mapper = new CardActionMapper();
     }
 
     /// <inheritdoc />
@@ -205,59 +246,127 @@ public sealed class CardActionHandler : ICardActionHandler
             : ResolveCorrelationId(activity, fallback: Guid.NewGuid().ToString("N"));
 
         // architecture.md ┬º2.6 layer 2 ΓÇö in-memory processed-action dedupe set, keyed on
-        // (QuestionId + UserId). Fast-path short-circuits within-session duplicate
-        // submissions (e.g. user double-tapped the Approve button or the Bot Framework
-        // delivered the same invoke twice) before any I/O. Entries are kept for
-        // _dedupeRetention on every terminal outcome (success or planned rejection); only
-        // unhandled exceptions evict the entry so transient infrastructure failures stay
-        // retryable.
-        var dedupeKey = BuildDedupeKey(payload.QuestionId, actorAad);
-        var nowForDedupe = _timeProvider.GetUtcNow();
-        PruneStaleDedupeEntries(nowForDedupe);
-        if (!_processedActions.TryAdd(dedupeKey, nowForDedupe))
+        // (QuestionId, UserId) per the Stage 6.2 canonical brief. Fast-path short-circuits
+        // within-session duplicate submissions (e.g. user double-tapped the Approve button
+        // or the Bot Framework delivered the same invoke twice) before any I/O. The first
+        // submission's terminal response is cached on the entry so duplicate calls return
+        // the SAME response (Stage 6.2 step 2: "If so, return the previous result without
+        // re-executing"). Entries live for CardActionDedupeOptions.EntryLifetime
+        // (24 hours by default) and are purged by ProcessedCardActionEvictionService on a
+        // 5-minute cadence. Only unhandled exceptions evict the entry inline so transient
+        // infrastructure failures stay retryable.
+        //
+        // Iter-2 evaluator fix #2: a concurrent second invocation that arrives BEFORE the
+        // first finishes must also receive the same terminal response. The Claim API
+        // returns a Task<AdaptiveCardInvokeResponse?> that resolves either immediately
+        // (prior caller already RecordedResult) or once the prior caller completes —
+        // the waiter then returns that exact response rather than a generic rejection.
+        // When the prior caller fails (Remove evicts the slot) the task resolves to null
+        // and we re-claim, which naturally retries the pipeline.
+        //
+        // Iter-2 evaluator fix #3: only *durable* outcomes (success + server-state-based
+        // rejections like already-Resolved / Expired / lost-CAS) are cached. Transient
+        // rejections (question not found, action not in AllowedActions) are NOT cached
+        // so a later valid submission for the same (QuestionId, UserId) — once the
+        // server-side state changes or the user corrects their action — can run end-to-
+        // end. See ProcessedHandlerOutcome.IsDurable below.
+        var dedupeKey = (QuestionId: payload.QuestionId, UserId: actorAad);
+        const int maxClaimRetries = 2;
+        for (var claimAttempt = 0; ; claimAttempt++)
         {
-            _logger.LogInformation(
-                "Card action {ActionValue} for question {QuestionId} by actor {Actor} short-circuited by in-memory dedupe.",
-                payload.ActionValue,
-                payload.QuestionId,
-                actorAad);
-            return Reject($"Decision for question '{payload.QuestionId}' has already been submitted.");
-        }
-
-        var keepDedupeEntry = false;
-        try
-        {
-            var response = await ProcessHandledAsync(
-                turnContext,
-                activity,
-                payload,
-                actorAad,
-                actorDisplayName,
-                tenantId,
-                receivedAt,
-                correlationId,
-                ct).ConfigureAwait(false);
-            keepDedupeEntry = true;
-            return response;
-        }
-        catch
-        {
-            // Unhandled exception means we never reached a terminal outcome ΓÇö let the
-            // user retry the action by evicting the dedupe entry. Planned rejections and
-            // the Failed-audit branch flow through the normal return path above and keep
-            // the entry.
-            throw;
-        }
-        finally
-        {
-            if (!keepDedupeEntry)
+            var claim = _processedActions.Claim(dedupeKey);
+            if (!claim.IsOwner)
             {
-                _processedActions.TryRemove(dedupeKey, out _);
+                // Wait for the prior caller to finish (synchronous if already cached).
+                AdaptiveCardInvokeResponse? prev;
+                try
+                {
+                    prev = await claim.PreviousResponseTask.WaitAsync(ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+
+                if (prev is not null)
+                {
+                    _logger.LogInformation(
+                        "Card action {ActionValue} for question {QuestionId} by actor {Actor} short-circuited by in-memory dedupe; replaying previous response.",
+                        payload.ActionValue,
+                        payload.QuestionId,
+                        actorAad);
+                    return prev;
+                }
+
+                // Prior caller failed and released the slot OR was evicted. Re-claim
+                // and run the pipeline ourselves, but bound the retry count so a
+                // pathological churn cannot loop forever.
+                if (claimAttempt >= maxClaimRetries)
+                {
+                    _logger.LogWarning(
+                        "Card action {ActionValue} for question {QuestionId} by actor {Actor} could not acquire the dedupe slot after {Attempts} attempts; rejecting to break the cycle.",
+                        payload.ActionValue,
+                        payload.QuestionId,
+                        actorAad,
+                        claimAttempt + 1);
+                    return Reject($"Decision for question '{payload.QuestionId}' could not be processed; please retry.");
+                }
+
+                continue;
+            }
+
+            var keepDedupeEntry = false;
+            AdaptiveCardInvokeResponse? terminalResponse = null;
+            try
+            {
+                var outcome = await ProcessHandledAsync(
+                    turnContext,
+                    activity,
+                    payload,
+                    actorAad,
+                    actorDisplayName,
+                    tenantId,
+                    receivedAt,
+                    correlationId,
+                    ct).ConfigureAwait(false);
+                terminalResponse = outcome.Response;
+                keepDedupeEntry = outcome.IsDurable;
+                return terminalResponse;
+            }
+            catch
+            {
+                // Unhandled exception means we never reached a terminal outcome ΓÇö let the
+                // user retry the action by evicting the dedupe entry.
+                throw;
+            }
+            finally
+            {
+                if (keepDedupeEntry && terminalResponse is not null)
+                {
+                    _processedActions.RecordResult(dedupeKey, terminalResponse);
+                }
+                else
+                {
+                    // Either unhandled exception (terminalResponse == null) OR transient
+                    // rejection (keepDedupeEntry == false) — release the slot so a later
+                    // valid submission for the same (QuestionId, UserId) is not blocked.
+                    _processedActions.Remove(dedupeKey);
+                }
             }
         }
     }
 
-    private async Task<AdaptiveCardInvokeResponse> ProcessHandledAsync(
+    /// <summary>
+    /// Internal return shape for <see cref="ProcessHandledAsync"/>. The
+    /// <see cref="IsDurable"/> flag distinguishes outcomes that should be cached in the
+    /// in-memory processed-action set (success + server-state-based rejections) from
+    /// transient/recoverable rejections (question lookup miss, action-value typo) that
+    /// must NOT block subsequent valid submissions for 24 hours. Iter-2 evaluator
+    /// fix #3.
+    /// </summary>
+    private readonly record struct ProcessedHandlerOutcome(AdaptiveCardInvokeResponse Response, bool IsDurable);
+
+    private async Task<ProcessedHandlerOutcome> ProcessHandledAsync(
         ITurnContext turnContext,
         Activity activity,
         CardActionPayload payload,
@@ -288,7 +397,9 @@ public sealed class CardActionHandler : ICardActionHandler
                 correlationId,
                 receivedAt,
                 ct).ConfigureAwait(false);
-            return Reject($"Question '{payload.QuestionId}' was not found.");
+            return new ProcessedHandlerOutcome(
+                Reject($"Question '{payload.QuestionId}' was not found."),
+                IsDurable: false);
         }
 
         var allowed = question.AllowedActions
@@ -310,7 +421,11 @@ public sealed class CardActionHandler : ICardActionHandler
                 correlationId,
                 receivedAt,
                 ct).ConfigureAwait(false);
-            return Reject($"Action '{payload.ActionValue}' is not permitted on this question.");
+            // Iter-2 evaluator fix #3: a typo'd ActionValue must NOT lock out the actor
+            // from later submitting a *valid* ActionValue for the same question.
+            return new ProcessedHandlerOutcome(
+                Reject($"Action '{payload.ActionValue}' is not permitted on this question."),
+                IsDurable: false);
         }
 
         if (!string.Equals(question.Status, AgentQuestionStatuses.Open, StringComparison.Ordinal))
@@ -337,10 +452,14 @@ public sealed class CardActionHandler : ICardActionHandler
             // client can distinguish lifecycle-expired questions from user-resolved ones.
             if (string.Equals(question.Status, AgentQuestionStatuses.Expired, StringComparison.Ordinal))
             {
-                return Reject($"Question '{payload.QuestionId}' has Expired and can no longer accept decisions.");
+                return new ProcessedHandlerOutcome(
+                    Reject($"Question '{payload.QuestionId}' has Expired and can no longer accept decisions."),
+                    IsDurable: true);
             }
 
-            return Reject($"Decision for question '{payload.QuestionId}' has already been recorded.");
+            return new ProcessedHandlerOutcome(
+                Reject($"Decision for question '{payload.QuestionId}' has already been recorded."),
+                IsDurable: true);
         }
 
         // Iter-3 evaluator feedback #3 (re-applied iter-4) ΓÇö between the moment
@@ -369,7 +488,9 @@ public sealed class CardActionHandler : ICardActionHandler
                 correlationId,
                 receivedAt,
                 ct).ConfigureAwait(false);
-            return Reject($"Question '{payload.QuestionId}' has Expired and can no longer accept decisions.");
+            return new ProcessedHandlerOutcome(
+                Reject($"Question '{payload.QuestionId}' has Expired and can no longer accept decisions."),
+                IsDurable: true);
         }
 
         var transitioned = await _questionStore
@@ -397,7 +518,9 @@ public sealed class CardActionHandler : ICardActionHandler
                 correlationId,
                 receivedAt,
                 ct).ConfigureAwait(false);
-            return Reject($"Decision for question '{payload.QuestionId}' has already been recorded.");
+            return new ProcessedHandlerOutcome(
+                Reject($"Decision for question '{payload.QuestionId}' has already been recorded."),
+                IsDurable: true);
         }
 
         // CAS won ΓÇö emit decision, update the card, and write the success audit row.
@@ -531,31 +654,9 @@ public sealed class CardActionHandler : ICardActionHandler
             receivedAt,
             ct).ConfigureAwait(false);
 
-        return Accept($"Recorded {payload.ActionValue} for {payload.QuestionId}.");
-    }
-
-    private static string BuildDedupeKey(string questionId, string actorAad)
-        => $"{questionId}|{actorAad}";
-
-    private void PruneStaleDedupeEntries(DateTimeOffset now)
-    {
-        // Lazy O(N) eviction on each entry ΓÇö the dedupe set is bounded by the rate of
-        // distinct (question, user) pairs within _dedupeRetention. For a realistic
-        // approval workload this stays in the low hundreds of entries even at peak. We
-        // deliberately avoid a background sweep timer because keeping the handler free
-        // of timers makes lifetime reasoning and tests simpler.
-        if (_processedActions.IsEmpty)
-        {
-            return;
-        }
-
-        foreach (var kvp in _processedActions)
-        {
-            if (now - kvp.Value > _dedupeRetention)
-            {
-                _processedActions.TryRemove(kvp.Key, out _);
-            }
-        }
+        return new ProcessedHandlerOutcome(
+            Accept($"Recorded {payload.ActionValue} for {payload.QuestionId}."),
+            IsDurable: true);
     }
 
     private static AdaptiveCardInvokeResponse Reject(string message)
