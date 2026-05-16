@@ -249,11 +249,18 @@ public sealed class SlackInboundAuditRecorderFieldExtractionTests
     [Fact]
     public async Task RecordSuccessAsync_populates_MessageTs_only_for_event_without_thread_and_falls_back_to_channel_id()
     {
-        // Iter 7 evaluator item #2 (extended coverage): a top-level
-        // app_mention NOT inside a thread MUST still record its
-        // MessageTs (so follow-up replies can anchor to it) while
-        // leaving ThreadTs null and falling ConversationId back to
-        // the channel id.
+        // Iter-2 evaluator item 4 (Stage 5.2) STRUCTURAL update: a
+        // top-level app_mention is replied to by SlackAppMentionHandler
+        // by anchoring a NEW thread on event.ts. The audit row's
+        // ThreadTs MUST therefore reflect that anchor (event.ts) so
+        // a downstream operator can find this inbound row when
+        // querying by the thread_ts the bot's reply created --
+        // otherwise top-level @-mentions disappear from thread-scoped
+        // audit queries (story FR-008 "Audit": "every agent/human
+        // exchange is queryable by correlation ID" plus "Persist
+        // ... thread timestamp"). Prior iter (Stage 4.3 iter 7) held
+        // ThreadTs strictly null when event.thread_ts was missing;
+        // Stage 5.2 supersedes that for app_mention specifically.
         InMemorySlackAuditEntryWriter writer = new();
         SlackInboundAuditRecorder recorder = new(
             writer,
@@ -289,14 +296,15 @@ public sealed class SlackInboundAuditRecorderFieldExtractionTests
         entry.CommandText.Should().Be(
             "<@U_BOT> status",
             "the event text MUST flow into CommandText regardless of whether the message is threaded");
-        entry.ThreadTs.Should().BeNull(
-            "this app_mention is NOT in a thread so ThreadTs MUST remain null");
+        entry.ThreadTs.Should().Be(
+            "1700000999.000700",
+            "Stage 5.2 SlackAppMentionHandler anchors a new thread on event.ts when the mention is top-level; ThreadTs MUST mirror that anchor so the audit row is discoverable from the thread the bot will reply into");
         entry.MessageTs.Should().Be(
             "1700000999.000700",
             "MessageTs MUST be populated even for non-threaded events so an outbound reply can anchor to the originating message");
         entry.ConversationId.Should().Be(
-            "C42",
-            "with no thread_ts present the ConversationId MUST fall back to ChannelId so channel-scoped queries still find the row");
+            "1700000999.000700",
+            "Stage 5.2: ConversationId MUST be the new-thread anchor (event.ts) so every audit row tied to this conversation -- inbound mention + outbound reply -- groups under the same id");
     }
 
     [Fact]

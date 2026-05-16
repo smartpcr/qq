@@ -345,4 +345,111 @@ public sealed class SlackInboundPayloadParserTests
 
         payload.Should().Be(SlackCommandPayload.Empty);
     }
+
+    // -----------------------------------------------------------------
+    // Stage 5.2: app_mention payload extraction + bot prefix stripping
+    // -----------------------------------------------------------------
+
+    [Fact]
+    public void ParseEventAppMention_extracts_text_ts_and_thread_ts_from_event_callback()
+    {
+        const string body = """
+            {
+              "type": "event_callback",
+              "event_id": "Ev42",
+              "team_id": "T01TEAM",
+              "event": {
+                "type": "app_mention",
+                "user": "U01USER",
+                "channel": "C01CHAN",
+                "text": "<@U999BOT> ask design persistence layer",
+                "ts": "1700000000.000200",
+                "thread_ts": "1700000000.000100"
+              }
+            }
+            """;
+
+        SlackAppMentionPayload payload = SlackInboundPayloadParser.ParseEventAppMention(body);
+
+        payload.TeamId.Should().Be("T01TEAM");
+        payload.ChannelId.Should().Be("C01CHAN");
+        payload.UserId.Should().Be("U01USER");
+        payload.Text.Should().Be("<@U999BOT> ask design persistence layer");
+        payload.Ts.Should().Be("1700000000.000200");
+        payload.ThreadTs.Should().Be("1700000000.000100");
+        payload.EventSubtype.Should().Be("app_mention");
+    }
+
+    [Fact]
+    public void ParseEventAppMention_returns_null_thread_ts_for_top_level_mention()
+    {
+        const string body = """
+            {
+              "type": "event_callback",
+              "event_id": "Ev43",
+              "team_id": "T01TEAM",
+              "event": {
+                "type": "app_mention",
+                "user": "U01USER",
+                "channel": "C01CHAN",
+                "text": "<@U999BOT> status",
+                "ts": "1700000000.999900"
+              }
+            }
+            """;
+
+        SlackAppMentionPayload payload = SlackInboundPayloadParser.ParseEventAppMention(body);
+
+        payload.Ts.Should().Be("1700000000.999900");
+        payload.ThreadTs.Should().BeNull(
+            "a top-level (non-thread) mention MUST surface thread_ts as null so the handler can anchor a new thread on event.ts");
+    }
+
+    [Fact]
+    public void ParseEventAppMention_returns_empty_for_invalid_json()
+    {
+        SlackInboundPayloadParser.ParseEventAppMention("not-json").Should().Be(SlackAppMentionPayload.Empty);
+    }
+
+    [Fact]
+    public void ParseEventAppMention_returns_empty_when_event_object_missing()
+    {
+        const string body = "{\"type\":\"event_callback\",\"event_id\":\"Ev\",\"team_id\":\"T1\"}";
+
+        SlackInboundPayloadParser.ParseEventAppMention(body).Should().Be(SlackAppMentionPayload.Empty);
+    }
+
+    [Theory]
+    [InlineData("<@U123> ask hello", "ask hello")]
+    [InlineData("<@U123BOT> status", "status")]
+    [InlineData("<@U123|agentbot> approve Q-7", "approve Q-7")]
+    [InlineData("<@WABC> review TASK-9", "review TASK-9")]
+    [InlineData("   <@U123>   ask leading whitespace", "ask leading whitespace")]
+    public void StripBotMentionPrefix_removes_leading_mention_token(string input, string expected)
+    {
+        SlackInboundPayloadParser.StripBotMentionPrefix(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("no mention here", "no mention here")]
+    [InlineData("text with <@U123> in the middle", "text with <@U123> in the middle")]
+    [InlineData("<<@U123> ask", "<<@U123> ask")]
+    public void StripBotMentionPrefix_leaves_text_untouched_when_no_leading_mention(string input, string expected)
+    {
+        SlackInboundPayloadParser.StripBotMentionPrefix(input).Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public void StripBotMentionPrefix_returns_empty_for_blank_input(string? input)
+    {
+        SlackInboundPayloadParser.StripBotMentionPrefix(input).Should().Be(string.Empty);
+    }
+
+    [Fact]
+    public void StripBotMentionPrefix_returns_empty_when_only_mention_token_present()
+    {
+        SlackInboundPayloadParser.StripBotMentionPrefix("<@U123BOT>").Should().Be(string.Empty);
+    }
 }
