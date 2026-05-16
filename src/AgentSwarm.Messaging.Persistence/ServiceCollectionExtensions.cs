@@ -160,6 +160,34 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IHostedService>(sp =>
             new DatabaseInitializer(sp.GetRequiredService<IServiceScopeFactory>(), useMigrations));
 
+        // Stage 4.1 — OutboundQueue:* options + meter singleton +
+        // EF-backed IOutboundQueue replacement. Order matters here:
+        // the options binding and the metrics singleton must be
+        // registered BEFORE the Replace() so the PersistentOutboundQueue
+        // ctor's IOptions<OutboundQueueOptions> + OutboundQueueMetrics
+        // dependencies resolve from the host root provider. The
+        // canonical backpressure counter name and three latency
+        // histogram names live on OutboundQueueMetrics — both this
+        // queue (counter) and the Worker's OutboundQueueProcessor
+        // (histograms) consume the same Meter instance so an OTEL /
+        // Prometheus exporter sees one consistent meter rather than
+        // two competing instances.
+        services.AddOptions<OutboundQueueOptions>()
+            .Configure<IConfiguration>((opts, cfg) =>
+                cfg.GetSection(OutboundQueueOptions.SectionName).Bind(opts));
+        services.TryAddSingleton<OutboundQueueMetrics>();
+        services.TryAddSingleton(TimeProvider.System);
+
+        // Stage 4.1 — durable persistent outbox. Replaces the
+        // Stage 2.6 InMemoryOutboundQueue stub registered by
+        // AddTelegram via TryAddSingleton so production hosts get
+        // the EF-backed durability contract. Same singleton +
+        // IServiceScopeFactory pattern as the other persistent
+        // implementations bridges the singleton consumer
+        // (TelegramMessengerConnector) to the scoped MessagingDbContext
+        // without violating the captive-dependency rule.
+        services.Replace(ServiceDescriptor.Singleton<IOutboundQueue, PersistentOutboundQueue>());
+
         // Iter-3 evaluator item 3 — durable Telegram message_id →
         // CorrelationId reverse index. Registered as a singleton
         // because the implementation uses IServiceScopeFactory to

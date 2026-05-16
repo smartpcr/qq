@@ -43,7 +43,8 @@ public sealed class PendingQuestionPersistenceException : Exception
         long telegramChatId,
         long telegramMessageId,
         string correlationId,
-        Exception innerException)
+        Exception innerException,
+        bool rateLimited = false)
         : base(
             $"Failed to persist pending question '{questionId}' after a successful Telegram send to chat {telegramChatId} (message {telegramMessageId}). The Telegram message has been DELIVERED; do not re-send. Use IPendingQuestionStore.StoreAsync directly to backfill the row.",
             innerException)
@@ -52,6 +53,7 @@ public sealed class PendingQuestionPersistenceException : Exception
         this.TelegramChatId = telegramChatId;
         this.TelegramMessageId = telegramMessageId;
         this.CorrelationId = correlationId;
+        this.RateLimited = rateLimited;
     }
 
     /// <summary>
@@ -77,4 +79,21 @@ public sealed class PendingQuestionPersistenceException : Exception
     /// question, for trace correlation across the recovery path.
     /// </summary>
     public string CorrelationId { get; }
+
+    /// <summary>
+    /// <b>Stage 4.1 iter-2 evaluator item 1.</b>
+    /// <see langword="true"/> when the Telegram send sequence that
+    /// preceded the persistence failure incurred at least one 429
+    /// flood-control retry. Mirrors
+    /// <see cref="SendResult.RateLimited"/>; the Stage 4.1
+    /// <c>OutboundQueueProcessor</c>'s recovery path uses this flag
+    /// to scope <c>telegram.send.first_attempt_latency_ms</c> per
+    /// architecture.md §10.4 — a recovered first-attempt send whose
+    /// underlying wire path waited on retry_after MUST be excluded
+    /// from the SLO histogram (it would have crossed 2 s on the
+    /// retry_after alone) while still contributing to
+    /// <c>telegram.send.all_attempts_latency_ms</c> for capacity
+    /// planning.
+    /// </summary>
+    public bool RateLimited { get; }
 }

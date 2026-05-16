@@ -4,8 +4,11 @@
 // </copyright>
 // -----------------------------------------------------------------------
 
-namespace AgentSwarm.Messaging.Telegram;
-
+// NOTE: usings MUST stay above the file-scoped namespace declaration.
+// Once they are inside `namespace AgentSwarm.Messaging.Telegram;` the
+// `Telegram.Bot` identifier resolves relatively to
+// `AgentSwarm.Messaging.Telegram.Telegram.Bot`, which does not exist
+// — every Telegram.Bot.* using directive then fails CS0234.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -19,6 +22,8 @@ using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Requests;
 using Telegram.Bot.Types.Enums;
+
+namespace AgentSwarm.Messaging.Telegram;
 
 /// <summary>
 /// Stage 3.5 — <see cref="BackgroundService"/> that periodically

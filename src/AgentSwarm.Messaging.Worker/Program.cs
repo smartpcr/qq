@@ -165,6 +165,22 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
         TimeSpan.FromSeconds(staleSeconds));
 });
 
+// Stage 4.1 — durable outbox drainer. Spawns
+// OutboundQueue:ProcessorConcurrency (default 10) independent worker
+// tasks that dequeue from the PersistentOutboundQueue replaced into
+// the container by AddMessagingPersistence above, dispatch through
+// the IMessageSender registered by AddTelegram, and emit the
+// canonical latency histograms
+// (telegram.send.first_attempt_latency_ms,
+//  telegram.send.all_attempts_latency_ms,
+//  telegram.send.queue_dwell_ms) plus the backpressure counter
+// telegram.messages.backpressure_dlq via the singleton
+// OutboundQueueMetrics. The processor must be registered AFTER
+// AddMessagingPersistence (binds OutboundQueueOptions + replaces
+// IOutboundQueue with the persistent impl) and AFTER AddTelegram
+// (registers IMessageSender → TelegramMessageSender).
+builder.Services.AddHostedService<OutboundQueueProcessor>();
+
 var app = builder.Build();
 
 // Routing + endpoint. UseRouting is required when the host uses the

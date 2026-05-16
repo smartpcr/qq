@@ -329,14 +329,14 @@ public class OutboundContractTests
     public async Task OutboundQueue_Mock_DeadLetterAsync_RecordsCall()
     {
         var mock = new Mock<IOutboundQueue>();
-        mock.Setup(q => q.DeadLetterAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+        mock.Setup(q => q.DeadLetterAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         var messageId = Guid.NewGuid();
-        await mock.Object.DeadLetterAsync(messageId, CancellationToken.None);
+        await mock.Object.DeadLetterAsync(messageId, "test:reason", CancellationToken.None);
 
         mock.Verify(
-            q => q.DeadLetterAsync(messageId, It.IsAny<CancellationToken>()),
+            q => q.DeadLetterAsync(messageId, "test:reason", It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
@@ -387,14 +387,22 @@ public class OutboundContractTests
     }
 
     [Fact]
-    public void OutboundQueue_DeadLetterAsync_TakesGuidOnly()
+    public void OutboundQueue_DeadLetterAsync_TakesGuidStringAndCancellationToken()
     {
+        // Stage 4.1 iter-2 evaluator item 5 — the terminal DLQ
+        // transition MUST take a reason string so the audit row's
+        // ErrorDetail column carries the failure category + message
+        // verbatim. The prior single-Guid signature lost that detail
+        // (the dead-letter row landed indistinguishable from any
+        // other DLQ cause).
         var m = typeof(IOutboundQueue).GetMethod(nameof(IOutboundQueue.DeadLetterAsync));
         m.Should().NotBeNull();
         var p = m!.GetParameters();
-        p.Should().HaveCount(2);
+        p.Should().HaveCount(3);
         p[0].ParameterType.Should().Be(typeof(Guid));
-        p[1].ParameterType.Should().Be(typeof(CancellationToken));
+        p[1].ParameterType.Should().Be(typeof(string),
+            "the reason string is persisted to OutboundMessage.ErrorDetail on the terminal transition; without it the audit trail loses the failure cause");
+        p[2].ParameterType.Should().Be(typeof(CancellationToken));
     }
 
     [Fact]
