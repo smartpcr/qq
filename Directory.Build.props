@@ -14,6 +14,18 @@
     <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
     <AnalysisLevel>latest</AnalysisLevel>
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <!--
+      NU1900 fires when NuGet cannot reach the vulnerability audit feed
+      (offline build gate, blocked proxy, transient nuget.org outage).
+      The real vulnerability warnings (NU1901, NU1902, NU1903, NU1904)
+      still escalate to errors via TreatWarningsAsErrors; only the
+      infrastructure level "cannot retrieve audit data" warning is
+      downgraded so a clean compile is not gated on whether the audit
+      feed is reachable from the build environment. The NuGet.config
+      in the repo root further pins auditSources to nuget.org so we
+      never query a feed we cannot authenticate against.
+    -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1900</WarningsNotAsErrors>
   </PropertyGroup>
 
 </Project>

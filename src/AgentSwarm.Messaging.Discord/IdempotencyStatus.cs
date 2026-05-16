@@ -1,4 +1,4 @@
-namespace AgentSwarm.Messaging.Persistence;
+namespace AgentSwarm.Messaging.Discord;
 
 /// <summary>
 /// Lifecycle of a <see cref="DiscordInteractionRecord"/> as it moves through
