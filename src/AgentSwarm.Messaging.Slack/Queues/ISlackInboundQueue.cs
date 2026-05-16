@@ -1,3 +1,9 @@
+// -----------------------------------------------------------------------
+// <copyright file="ISlackInboundQueue.cs" company="Microsoft Corp.">
+//     Copyright (c) Microsoft Corp. All rights reserved.
+// </copyright>
+// -----------------------------------------------------------------------
+
 using AgentSwarm.Messaging.Slack.Transport;
 
 namespace AgentSwarm.Messaging.Slack.Queues;
