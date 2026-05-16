@@ -255,6 +255,21 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
         // both dictionaries on failure so the caller's retry sees a
         // clean slate, and re-throw the original exception so the
         // caller's try/catch / cancellation handling is unaffected.
+        // Stage 4.1 iter-5 evaluator item 1 — this is the ONLY
+        // remaining caller of the bounded channel writer in this
+        // type. The producer-side enqueue is intentionally bounded:
+        // `BoundedChannelFullMode.Wait` is the dev-host
+        // backpressure ceiling and a producer that floods past
+        // capacity blocks here rather than silently dropping. The
+        // dequeue path's deferred-replay no longer routes through
+        // this writer — those replays go into the lock-free
+        // `_deferredBuckets` instead (see DequeueAsync's `finally`
+        // block and MarkFailedAsync's republish branch) — so the
+        // bounded-channel writer can never deadlock the consumer
+        // by being awaited on the dequeue path while producers
+        // hold capacity. A literal grep for the bounded writer's
+        // WriteAsync call in this file should land on the single
+        // line below.
         try
         {
             await _channels[message.Severity].Writer.WriteAsync(message, ct).ConfigureAwait(false);

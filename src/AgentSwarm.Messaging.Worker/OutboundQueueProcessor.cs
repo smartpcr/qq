@@ -120,6 +120,24 @@ public sealed class OutboundQueueProcessor : BackgroundService
         WriteIndented = false,
     };
 
+    /// <summary>
+    /// Upper bound on best-effort bookkeeping writes performed
+    /// while the host's <c>stoppingToken</c> has already cancelled
+    /// (i.e. shutdown is in progress). The catch-all
+    /// <see cref="Exception"/> handler in
+    /// <see cref="ProcessMessageAsync"/> MUST be able to transition
+    /// the outbox row out of <see cref="OutboundMessageStatus.Sending"/>
+    /// even when the shutdown signal arrives between the original
+    /// send failure and the
+    /// <see cref="IOutboundQueue.MarkFailedAsync"/> call — otherwise
+    /// the row stays stuck in <c>Sending</c> until the next recovery
+    /// sweep AND the original exception is silently replaced by an
+    /// <see cref="OperationCanceledException"/> thrown from the
+    /// MarkFailed call itself. We bound the detached bookkeeping so a
+    /// misbehaving queue cannot hold shutdown open indefinitely.
+    /// </summary>
+    private static readonly TimeSpan BookkeepingShutdownTimeout = TimeSpan.FromSeconds(5);
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IOutboundQueue _queue;
     private readonly IMessageSender _sender;
@@ -355,9 +373,45 @@ public sealed class OutboundQueueProcessor : BackgroundService
 
             // Unknown exception — let the queue's retry/dead-letter
             // logic decide based on the row's remaining attempt budget.
-            await _queue
-                .MarkFailedAsync(message.MessageId, ex.Message, ct)
-                .ConfigureAwait(false);
+            //
+            // r0 reviewer item — bookkeeping MUST survive a racing
+            // shutdown. If `ct` is the host's stoppingToken and it
+            // cancelled between the original send failure and this
+            // MarkFailedAsync call, passing `ct` here would cause
+            // MarkFailedAsync to itself throw OperationCanceledException;
+            // that OCE then bubbles out of this catch-all (the inner
+            // OCE-on-shutdown handler above has already been bypassed),
+            // the row stays stuck in Sending until the next recovery
+            // sweep, AND the original root-cause exception (still in
+            // `ex`) is silently dropped from the exception chain even
+            // though it was the actual failure. Detach the bookkeeping
+            // from `ct` via a short-lived, time-bounded token so the
+            // status transition completes even mid-shutdown. The bound
+            // (`BookkeepingShutdownTimeout`) prevents a hung queue from
+            // holding the host's shutdown grace period open forever.
+            using var bookkeepingCts = new CancellationTokenSource(BookkeepingShutdownTimeout);
+            try
+            {
+                await _queue
+                    .MarkFailedAsync(message.MessageId, ex.Message, bookkeepingCts.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception bookkeepingEx)
+            {
+                // Bookkeeping itself failed (timeout, DB down, etc.).
+                // We've already logged the root cause above; surface
+                // the bookkeeping failure with the original error so
+                // operators can correlate, and leave the row in Sending
+                // for the recovery sweep. We deliberately do NOT
+                // re-throw — that would mask the original `ex`, which
+                // is the operationally important failure to triage.
+                _logger.LogError(
+                    bookkeepingEx,
+                    "OutboundQueueProcessor worker {WorkerId} failed to MarkFailed MessageId={MessageId} after unexpected send failure; row left in Sending for recovery sweep. OriginalError={OriginalError}.",
+                    workerId,
+                    message.MessageId,
+                    ex.Message);
+            }
         }
     }
 

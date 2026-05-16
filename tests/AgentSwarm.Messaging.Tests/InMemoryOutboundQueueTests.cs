@@ -255,8 +255,8 @@ public sealed class InMemoryOutboundQueueTests
         //   a) Filling a per-severity bounded channel (capacity = 1)
         //      with one successful enqueue.
         //   b) Calling EnqueueAsync with a pre-cancelled token while
-        //      the channel is full — Channel<T>.Writer.WriteAsync
-        //      observes the cancellation and throws
+        //      the channel is full — the bounded-channel writer's
+        //      async write observes the cancellation and throws
         //      OperationCanceledException.
         //   c) Asserting that a third enqueue with the SAME
         //      idempotency key as (b) succeeds — proving the rollback
@@ -287,7 +287,7 @@ public sealed class InMemoryOutboundQueueTests
 
         Func<Task> act = () => queue.EnqueueAsync(failed, cts.Token);
         await act.Should().ThrowAsync<OperationCanceledException>(
-            "with the channel at capacity and a pre-cancelled token, Channel<T>.Writer.WriteAsync must propagate cancellation");
+            "with the channel at capacity and a pre-cancelled token, the bounded-channel writer's async write must propagate cancellation");
 
         // Invariant: the failed enqueue MUST NOT leave a row behind.
         // The `Enqueued` view reflects `_byMessageId.Values` so if
