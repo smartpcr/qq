@@ -139,13 +139,36 @@ internal static class SlackInboundPayloadParser
     }
 
     /// <summary>
-    /// Parses <paramref name="body"/> as a slash command form payload.
+    /// Parses <paramref name="body"/> as a slash command payload.
     /// </summary>
+    /// <remarks>
+    /// Auto-detects the body encoding so the same entry point works for
+    /// HTTP form bodies (delivered by Slack's slash-command webhook) and
+    /// for the JSON-wrapped Socket Mode <c>slash_commands</c> frame
+    /// payloads (per architecture.md §3.4). A leading <c>{</c> (after
+    /// trimming whitespace) routes through
+    /// <see cref="ParseCommandJson"/>; everything else is treated as
+    /// <c>application/x-www-form-urlencoded</c>.
+    ///
+    /// <para>
+    /// Iter-2 evaluator item 1 fix: previously this method form-decoded
+    /// every body, which silently turned every Socket Mode slash command
+    /// into an empty payload (SocketMode normalizer stores raw JSON in
+    /// <see cref="SlackInboundEnvelope.RawPayload"/>). Downstream handlers
+    /// then saw a missing sub-command and replied with an unhelpful
+    /// "Missing sub-command" error.
+    /// </para>
+    /// </remarks>
     public static SlackCommandPayload ParseCommand(string body)
     {
         if (string.IsNullOrEmpty(body))
         {
             return SlackCommandPayload.Empty;
+        }
+
+        if (LooksLikeJsonObject(body))
+        {
+            return ParseCommandJson(body);
         }
 
         IDictionary<string, StringValues> fields = QueryHelpers.ParseQuery(body);
@@ -160,7 +183,71 @@ internal static class SlackInboundPayloadParser
             Command: command,
             Text: text,
             TriggerId: GetFormValue(fields, "trigger_id"),
+            ResponseUrl: GetFormValue(fields, "response_url"),
             SubCommand: ParseSubCommand(text));
+    }
+
+    /// <summary>
+    /// Parses <paramref name="json"/> as a Socket Mode
+    /// <c>slash_commands</c> envelope payload. The JSON document mirrors
+    /// the HTTP form field set 1:1 but is delivered as a JSON object
+    /// rather than form-encoded text (architecture.md §3.4).
+    /// </summary>
+    /// <remarks>
+    /// Iter-2 evaluator item 1 fix: promoted from a private helper on
+    /// <see cref="SlackSocketModePayloadNormalizer"/> to a public surface
+    /// on the parser so the post-ACK
+    /// <see cref="Pipeline.SlackCommandHandler"/> can decode Socket Mode
+    /// envelopes via the auto-detecting
+    /// <see cref="ParseCommand"/> dispatcher.
+    /// </remarks>
+    public static SlackCommandPayload ParseCommandJson(string json)
+    {
+        if (string.IsNullOrEmpty(json))
+        {
+            return SlackCommandPayload.Empty;
+        }
+
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(json);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return SlackCommandPayload.Empty;
+            }
+
+            string? text = ReadStringProperty(root, "text");
+            return new SlackCommandPayload(
+                TeamId: ReadStringProperty(root, "team_id"),
+                ChannelId: ReadStringProperty(root, "channel_id"),
+                UserId: ReadStringProperty(root, "user_id"),
+                Command: ReadStringProperty(root, "command"),
+                Text: text,
+                TriggerId: ReadStringProperty(root, "trigger_id"),
+                ResponseUrl: ReadStringProperty(root, "response_url"),
+                SubCommand: ParseSubCommand(text));
+        }
+        catch (JsonException)
+        {
+            return SlackCommandPayload.Empty;
+        }
+    }
+
+    private static bool LooksLikeJsonObject(string body)
+    {
+        for (int i = 0; i < body.Length; i++)
+        {
+            char c = body[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            {
+                continue;
+            }
+
+            return c == '{';
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -348,10 +435,57 @@ internal readonly record struct SlackCommandPayload(
     string? Command,
     string? Text,
     string? TriggerId,
+    string? ResponseUrl,
     string? SubCommand)
 {
     public static SlackCommandPayload Empty { get; } =
-        new(null, null, null, null, null, null, null);
+        new(null, null, null, null, null, null, null, null);
+
+    /// <summary>
+    /// Returns the slash-command text with the leading sub-command
+    /// token (and the whitespace that separates it from the
+    /// arguments) removed. Returns <see langword="null"/> when the
+    /// original text is empty.
+    /// </summary>
+    /// <remarks>
+    /// Stage 5.1 helper: command handlers parse the sub-command
+    /// from <see cref="SubCommand"/> and then need the remaining
+    /// arguments verbatim (e.g., the full prompt that follows
+    /// <c>ask</c>). Keeping the slice on the payload struct lets
+    /// every handler share the same trimming rules without
+    /// re-implementing whitespace handling.
+    /// </remarks>
+    public string? ArgumentText
+    {
+        get
+        {
+            string? text = this.Text;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+
+            ReadOnlySpan<char> span = text.AsSpan().TrimStart();
+            if (span.IsEmpty)
+            {
+                return null;
+            }
+
+            int end = 0;
+            while (end < span.Length && !char.IsWhiteSpace(span[end]))
+            {
+                end++;
+            }
+
+            if (end >= span.Length)
+            {
+                return null;
+            }
+
+            ReadOnlySpan<char> rest = span[end..].TrimStart();
+            return rest.IsEmpty ? null : rest.ToString();
+        }
+    }
 }
 
 /// <summary>

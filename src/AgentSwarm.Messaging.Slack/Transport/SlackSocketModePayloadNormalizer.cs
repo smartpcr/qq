@@ -8,7 +8,6 @@ namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
 using System.Globalization;
-using System.Text.Json;
 
 /// <summary>
 /// Converts a Socket Mode <see cref="SlackSocketModeFrame"/> into a
@@ -94,9 +93,12 @@ internal static class SlackSocketModePayloadNormalizer
     private static SlackInboundEnvelope NormalizeCommand(SlackSocketModeFrame frame, DateTimeOffset receivedAt)
     {
         // The slash_commands Socket Mode payload mirrors the HTTP
-        // form fields but is JSON. Parse the JSON directly so the
-        // canonical command field set is populated without re-encoding.
-        SlackCommandPayload payload = ParseCommandJson(frame.Payload);
+        // form fields but is JSON. Iter-2 evaluator item 1 fix: delegate
+        // to the parser's promoted public ParseCommandJson so the parser
+        // owns one canonical command-decode codepath shared by HTTP form
+        // bodies (via auto-detect inside ParseCommand) and Socket Mode
+        // JSON bodies (via this normalizer).
+        SlackCommandPayload payload = SlackInboundPayloadParser.ParseCommandJson(frame.Payload);
 
         string team = payload.TeamId ?? string.Empty;
         string user = payload.UserId ?? string.Empty;
@@ -152,49 +154,6 @@ internal static class SlackSocketModePayloadNormalizer
             RawPayload: frame.Payload,
             TriggerId: NullIfEmpty(payload.TriggerId),
             ReceivedAt: receivedAt);
-    }
-
-    private static SlackCommandPayload ParseCommandJson(string json)
-    {
-        if (string.IsNullOrEmpty(json))
-        {
-            return SlackCommandPayload.Empty;
-        }
-
-        try
-        {
-            using JsonDocument doc = JsonDocument.Parse(json);
-            JsonElement root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object)
-            {
-                return SlackCommandPayload.Empty;
-            }
-
-            string? command = ReadString(root, "command");
-            string? text = ReadString(root, "text");
-            return new SlackCommandPayload(
-                TeamId: ReadString(root, "team_id"),
-                ChannelId: ReadString(root, "channel_id"),
-                UserId: ReadString(root, "user_id"),
-                Command: command,
-                Text: text,
-                TriggerId: ReadString(root, "trigger_id"),
-                SubCommand: SlackInboundPayloadParser.ParseSubCommand(text));
-        }
-        catch (JsonException)
-        {
-            return SlackCommandPayload.Empty;
-        }
-    }
-
-    private static string? ReadString(JsonElement element, string name)
-    {
-        if (!element.TryGetProperty(name, out JsonElement value))
-        {
-            return null;
-        }
-
-        return value.ValueKind == JsonValueKind.String ? value.GetString() : null;
     }
 
     private static string HashFallback(string body)
