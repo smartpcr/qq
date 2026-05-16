@@ -1,3 +1,9 @@
+// -----------------------------------------------------------------------
+// <copyright file="TelegramUserAuthorizationService.cs" company="Microsoft Corp.">
+//     Copyright (c) Microsoft Corp. All rights reserved.
+// </copyright>
+// -----------------------------------------------------------------------
+
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
