@@ -33,7 +33,7 @@ The following capabilities are in scope for this story. Each item maps to a spec
 
 - Discord Gateway WebSocket connection for receiving inbound bot events (slash commands, button clicks, select menu selections, modal submissions).
 - Discord REST API for all outbound message delivery (embeds, components, thread replies, message edits).
-- Gateway Intent declaration: `Guilds`, `GuildMessages`, `MessageContent`, `GuildMessageReactions`.
+- Gateway Intent declaration: `Guilds`, `GuildMessages`, `MessageContent`.
 - Gateway session resumption on reconnect (replay missed events from last sequence number).
 - Automatic reconnection with exponential backoff on Gateway disconnect.
 
@@ -88,7 +88,7 @@ Every agent-originated outbound embed includes:
 
 ### 2.7 Reliability
 
-- **Durable command inbox:** Every inbound interaction is persisted as a `DiscordInteractionRecord` (including full `RawPayload`) before the interaction is acknowledged via `DeferAsync()`. Crash-safe: the `InteractionRecoverySweep` background service re-processes incomplete records on startup and every 60 seconds.
+- **Durable command inbox:** Every inbound interaction is persisted as a `DiscordInteractionRecord` (including full `RawPayload`) before the interaction is acknowledged via `DeferAsync()`. Crash-safe: the `InteractionRecoverySweep` background service re-processes records with `IdempotencyStatus` in `Received`, `Processing`, or `Failed` (where `AttemptCount < MaxRetries`) on startup and every 60 seconds.
 - **Durable outbound outbox:** All outbound messages are persisted in the `OutboundMessage` table before processing. The `OutboundQueueProcessor` dequeues, sends via `DiscordMessageSender`, and marks sent or failed. Failed messages retry with exponential backoff up to `MaxAttempts` (default 5). Exhausted messages are dead-lettered.
 - **Gateway reconnection:** Discord.Net's built-in exponential backoff handles reconnection. Non-recoverable close codes (4004 Authentication Failed, 4014 Disallowed Intents) cause the service to stop rather than retry indefinitely.
 - **Interaction idempotency:** Two-layer deduplication: (1) in-memory `IDeduplicationService` for fast-path suppression within TTL window, (2) UNIQUE constraint on `DiscordInteractionRecord.InteractionId` in the database for cross-restart protection.
@@ -113,7 +113,7 @@ Every agent-originated outbound embed includes:
 
 ### 2.10 Security
 
-- **Role-based access:** Commands are restricted by Discord role. The `GuildBinding.AllowedRoleIds` field specifies which roles can issue commands. `GuildBinding.CommandRestrictions` provides per-subcommand role overrides (e.g., restricting `/agent approve` and `/agent reject` to a senior operator role while allowing `/agent status` for all authorized roles).
+- **Role-based access:** Commands are restricted by Discord role. The `GuildBinding.AllowedRoleIds` field specifies which roles can issue commands. All subcommands -- including `/agent assign` -- are available to all authorized roles by default. `GuildBinding.CommandRestrictions` provides optional per-subcommand role overrides (e.g., restricting `/agent approve` and `/agent reject` to a senior operator role if desired).
 - **Guild ID validation:** Only guilds with registered `GuildBinding` entries are authorized.
 - **Channel ID validation:** Only channels with active bindings accept commands.
 - **Token security:** Bot token stored in Azure Key Vault, DPAPI-protected local storage, or Kubernetes secret. Never logged or included in telemetry.
@@ -150,7 +150,7 @@ The following items are explicitly excluded from this story.
 | Discord webhook-only mode | The story mandates full bot/Gateway interaction. Webhook-only posting (without Gateway) is insufficient for receiving slash commands and component interactions. |
 | Discord voice channels | No requirement for voice-based interaction with agents. |
 | Direct message (DM) bot interactions | The story specifies guild/channel-based interaction. DM support is not required. |
-| Multi-guild federation | The channel model supports configuration for one guild with its channels. Multi-guild routing (cross-guild alert aggregation, guild-to-guild forwarding) is not in scope. Each guild operates independently. |
+| Multi-guild federation | This story targets exactly one Discord guild. The `GuildBinding` data model can structurally hold multiple entries, but all routing logic, startup validation, and testing assume a single guild binding. Multi-guild routing (cross-guild alert aggregation, guild-to-guild forwarding) is out of scope. |
 | Bot presence or activity status | Setting the bot's Discord "Playing" or "Watching" status is not required. |
 | Message reactions as input | Only slash commands, buttons, select menus, and modals are supported interaction types. Reactions are not parsed as commands. |
 | Discord OAuth2 user authorization flows | Authorization uses Discord role membership within the guild, not OAuth2 flows. |
@@ -194,7 +194,7 @@ These are non-negotiable technical and operational boundaries.
 | **REST API rate limits** | Per-route rate limits enforced by Discord. Exceeding limits returns HTTP 429 with `Retry-After`. | Read `X-RateLimit-*` headers proactively. Cooperate with Discord.Net's built-in rate limit handler. Batch low-priority status updates. |
 | **Gateway Intents are mandatory** | Since Discord API v9, privileged intents (`MessageContent`, `GuildMembers`) require approval for bots in 100+ guilds. | Declare required intents at startup. For single-guild deployments (this story's scope), privileged intent approval is automatic. |
 | **Guild commands vs. global commands** | Global commands take up to 1 hour to propagate; guild commands are instant. | Register all commands as guild commands. |
-| **Thread auto-archive** | Discord threads auto-archive after a configurable period (default 24 hours for non-boosted guilds). | Set auto-archive to 24 hours. Accept that long-idle task threads will archive. Operators can unarchive manually. |
+| **Thread auto-archive** | Discord threads auto-archive after a configurable period. | Set auto-archive to 7 days (requires guild boost Level 2 or higher). Accept that long-idle task threads will archive after 7 days. Operators can unarchive manually. |
 
 ### 5.2 Shared Platform Constraints
 
@@ -202,7 +202,7 @@ These are non-negotiable technical and operational boundaries.
 |---|---|---|
 | **.NET 8+ required** | Epic-level mandate | All assemblies target `net8.0`. |
 | **C# implementation** | Epic-level mandate | No polyglot; entire connector is C#. |
-| **`IMessengerConnector` interface conformance** | `AgentSwarm.Messaging.Abstractions` (FR-001) | Discord connector must implement the shared interface, including the `AgentQuestionEnvelope` evolution proposed in architecture.md. |
+| **`IMessengerConnector` interface conformance** | `AgentSwarm.Messaging.Abstractions` (FR-001) | Discord connector implements the original `SendQuestionAsync(AgentQuestion, CancellationToken)` signature from FR-001. The `AgentQuestionEnvelope` wrapper proposed in architecture.md will be adopted in a future iteration once cross-connector alignment is confirmed. |
 | **Shared data models** | Epic-level brief | `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerEvent`, `OutboundMessage` -- all from `AgentSwarm.Messaging.Abstractions`. |
 | **Correlation and traceability** | FR-004 | Every message includes `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`. |
 | **OpenTelemetry integration** | FR-008 | Metrics, traces, and structured logging via OTel. |
@@ -229,7 +229,7 @@ These are non-negotiable technical and operational boundaries.
 | R-3 | **Discord snowflake ID overflow in `long` cast.** Discord snowflake IDs are `ulong` (unsigned 64-bit). The shared `OutboundMessage.ChatId` field is `long` (signed 64-bit). If Discord issues a snowflake ID where the high bit is set (> `long.MaxValue`), the cast produces a negative value. | Low | High | All currently-issued Discord snowflake IDs fit in `long`. Discord's snowflake epoch started in 2015; the high bit will not be set until approximately year 2084. Document the assumption and add a runtime assertion that warns if a negative cast is detected. |
 | R-4 | **Rate limit exhaustion with 100+ agents.** At 100 active agents posting status updates every minute, the bot could generate 100+ REST API calls per minute on a single channel route. Discord's per-route rate limit for channel message sends is typically 5 requests per 5 seconds. | High | High | Low-severity batching (combine multiple status updates into one embed) is the primary mitigation. Architecture.md Section 8.4 specifies batching when queue depth exceeds 50 pending Low-severity messages, reducing calls to approximately 10/minute. Monitor `discord.ratelimit.hits` and tune the batching threshold. |
 | R-5 | **Discord.Net library version churn.** Discord.Net is a community-maintained library. Breaking changes in major versions could require significant refactoring. | Medium | Medium | Pin to a specific Discord.Net major version (currently 3.x). Monitor the Discord.Net GitHub repository for deprecation notices. Isolate Discord.Net usage behind the `DiscordMessageSender` and `DiscordGatewayService` wrappers so that a library migration affects only two classes. |
-| R-6 | **Thread auto-archive causes context loss.** Discord threads auto-archive after 24 hours of inactivity. If a task takes longer than 24 hours with idle periods, the thread archives and operators must manually unarchive to continue the conversation. | Medium | Low | Set auto-archive to the maximum available duration (7 days for Level 2 boosted servers, 3 days for Level 1, 24 hours for unboosted). Accept the limitation and document it for operators. The thread content is preserved; only visibility is affected. |
+| R-6 | **Thread auto-archive causes context loss.** Discord threads auto-archive after the configured duration. If a task takes longer than 7 days with idle periods, the thread archives and operators must manually unarchive to continue the conversation. | Medium | Low | Set auto-archive to 7 days (operator decision). This requires the guild to have boost Level 2 or higher. For unboosted guilds, the maximum is 24 hours and the operator must upgrade or accept shorter archive windows. The thread content is preserved; only visibility is affected. |
 | R-7 | **Single Gateway session limits horizontal scaling.** Discord enforces one Gateway session per bot token (non-sharded). Only one process can hold the Gateway connection, limiting inbound throughput to a single instance. | Low | Medium | For the 100-agent scale target, a single Gateway instance is sufficient (Discord Gateway can handle thousands of events/second). If scale increases, use Discord's sharding mechanism (one shard per 2500 guilds). For this story's single-guild scope, sharding is not needed. |
 
 ### 6.2 Operational Risks
@@ -239,7 +239,7 @@ These are non-negotiable technical and operational boundaries.
 | R-8 | **Bot token compromise.** If the Discord bot token leaks, an attacker can impersonate the bot and issue commands or read messages in authorized channels. | Low | Critical | Store token in Azure Key Vault / Kubernetes secret. Rotate token immediately on suspected compromise via Discord Developer Portal. Audit all bot actions via `IAuditLogger`. Bot token is never logged (enforced by `DiscordOptions` validation). |
 | R-9 | **Guild role misconfiguration.** If `AllowedRoleIds` in `GuildBinding` are set incorrectly, either unauthorized users gain access or legitimate operators are locked out. | Medium | High | Validate `GuildBinding` configuration on startup (check that role IDs exist in the target guild). Provide a `/agent status` self-check that shows the calling user's authorization state. Log all authorization decisions with the specific check that passed or failed. |
 | R-10 | **Dead-letter queue growth without operator awareness.** If outbound messages consistently fail (e.g., channel deleted, permissions revoked), the dead-letter queue grows silently. | Medium | Medium | Emit `discord.send.dead_lettered` counter metric. Set an alert threshold (e.g., > 10 dead-lettered messages in 5 minutes). Include dead-letter count in `/agent status` output. |
-| R-11 | **Interaction recovery sweep creates duplicate processing.** If `InteractionRecoverySweep` re-processes an interaction that was actually completed but whose status update was lost, the command executes twice. | Low | Medium | The `IDeduplicationService` and `ISwarmCommandBus` both enforce idempotency. The sweep checks `IdempotencyStatus` and only re-processes records in `Received` or `Processing` state. The orchestrator is the final idempotency boundary. |
+| R-11 | **Interaction recovery sweep creates duplicate processing.** If `InteractionRecoverySweep` re-processes an interaction that was actually completed but whose status update was lost, the command executes twice. | Low | Medium | The `IDeduplicationService` and `ISwarmCommandBus` both enforce idempotency. The sweep checks `IdempotencyStatus` and only re-processes records in `Received`, `Processing`, or `Failed` state where `AttemptCount < MaxRetries`. The orchestrator is the final idempotency boundary. |
 
 ### 6.3 Integration Risks
 
@@ -247,7 +247,7 @@ These are non-negotiable technical and operational boundaries.
 |---|---|---|---|---|
 | R-12 | **Shared abstraction interface instability.** The `IMessengerConnector`, `IOutboundQueue`, `ISwarmCommandBus`, and other shared interfaces are proposed -- they may change as Telegram, Slack, and Teams connectors are developed in parallel. | High | Medium | Isolate Discord-specific logic behind `DiscordMessengerConnector` (which implements `IMessengerConnector`). If the shared interface changes, only the connector adapter class needs updating. Pin interface versions within a sprint; negotiate changes via the shared `AgentSwarm.Messaging.Abstractions` package. |
 | R-13 | **Shared persistence schema conflicts.** The `OutboundMessage`, `AuditLogEntry`, and `DeadLetterMessage` tables are shared across connectors. Schema migrations from parallel connector stories could conflict. | Medium | Medium | Use EF Core migrations with explicit migration names prefixed by connector (e.g., `Discord_AddGuildBinding`). Coordinate schema changes through the `AgentSwarm.Messaging.Persistence` package. Discord-specific entities (`GuildBinding`, `DiscordInteractionRecord`) use separate tables with a `Discord_` prefix convention. |
-| R-14 | **`AgentQuestionEnvelope` adoption not yet confirmed across all connectors.** Architecture.md proposes evolving `SendQuestionAsync(AgentQuestion)` to `SendQuestionAsync(AgentQuestionEnvelope)`. If other connector stories do not adopt this evolution, the shared interface will have two signatures or require a breaking change. | Medium | Medium | The envelope wraps `AgentQuestion` (accessible via `envelope.Question`), so backward compatibility is achievable via an adapter. Document the proposal in the architecture.md migration note (Section 4.1) and flag for cross-story alignment. |
+| R-14 | **`AgentQuestionEnvelope` adoption deferred.** Architecture.md proposes evolving `SendQuestionAsync(AgentQuestion)` to `SendQuestionAsync(AgentQuestionEnvelope)`. The operator has decided this story implements the original FR-001 signature and adapts internally later. | Medium | Low | The Discord connector implements `SendQuestionAsync(AgentQuestion, CancellationToken)` now. When envelope adoption is confirmed across connectors, an adapter layer will translate. No breaking change risk for this story. |
 
 ---
 
@@ -279,23 +279,25 @@ These are non-negotiable technical and operational boundaries.
 
 | ID | Assumption | Consequence If Wrong |
 |---|---|---|
-| A-1 | The bot operates in a single Discord guild. | Multi-guild routing, cross-guild alert aggregation, and guild discovery would need to be added. The `GuildBinding` model supports multi-guild configuration, but routing logic assumes one guild. |
+| A-1 | This story supports exactly one Discord guild. The `GuildBinding` model can structurally hold multiple entries, but all routing, command registration, startup validation, and test scenarios target a single guild. | If multi-guild support is needed later, routing logic, guild-command registration, and permission validation must be extended to iterate over bindings. |
 | A-2 | Discord.Net 3.x remains stable and maintained. | A library migration to an alternative (e.g., DSharpPlus, Remora.Discord) would require rewriting `DiscordGatewayService` and `DiscordMessageSender`. |
 | A-3 | The shared abstraction interfaces (`IMessengerConnector`, `IOutboundQueue`, etc.) will be defined before or concurrently with this story. | If abstractions are not ready, the Discord connector must define local interfaces and refactor when shared ones land. |
-| A-4 | The Discord bot has the `applications.commands` and `bot` scopes, plus `Send Messages`, `Use Slash Commands`, `Embed Links`, `Create Public Threads`, `Send Messages in Threads`, and `Manage Messages` permissions in the target guild. | Missing permissions cause runtime failures. Startup validation should check guild permissions and log warnings for missing ones. |
+| A-4 | The Discord bot has the `applications.commands` and `bot` scopes, plus `Send Messages`, `Use Slash Commands`, `Embed Links`, `Create Public Threads`, `Send Messages in Threads`, and `Manage Messages` permissions in the target guild. | Missing critical permissions cause the bot to refuse to start (operator decision). Startup validation checks guild permissions and throws a fatal exception if any required permission is absent, preventing operation in a degraded state. |
 | A-5 | The persistence layer (database) supports UNIQUE constraints and is accessible with < 500ms p99 latency for single-row INSERTs. | Higher latency risks breaching the 3-second interaction ACK deadline. |
 | A-6 | The `MessageContent` privileged intent is approved for the bot application in the Discord Developer Portal. | Without this intent, the bot cannot read message content in `GuildMessages` events. For slash-command-only interaction this is not critical, but it limits future extensibility. |
 
 ---
 
-## 9. Open Questions
+## 9. Resolved Design Decisions
 
-| ID | Question | Impact |
+The following questions were raised during iteration 1 and resolved by the operator.
+
+| ID | Question | Resolution |
 |---|---|---|
-| OQ-1 | Should the `/agent assign` command be restricted to a specific operator role, or available to all authorized users? | Affects `CommandRestrictions` configuration in `GuildBinding`. |
-| OQ-2 | What is the desired thread auto-archive duration -- 24 hours, 3 days, or 7 days? This depends on the guild's boost level. | Affects task thread lifecycle and operator experience for long-running tasks. |
-| OQ-3 | Should the bot validate guild permissions on startup and refuse to start if critical permissions are missing, or log warnings and attempt to operate in degraded mode? | Affects startup behavior and failure mode. |
-| OQ-4 | For the `AgentQuestionEnvelope` evolution of `IMessengerConnector.SendQuestionAsync`, should this be adopted as the canonical signature now, or should the Discord connector implement the original `SendQuestionAsync(AgentQuestion)` and adapt internally? | Affects cross-connector interface alignment. Architecture.md proposes the envelope; confirmation from other connector stories is pending. |
+| OQ-1 | Should `/agent assign` be restricted to a specific operator role, or available to all authorized users? | **Available to all authorized roles.** No per-subcommand restriction for `/agent assign`; it follows the standard `GuildBinding.AllowedRoleIds` check. |
+| OQ-2 | What is the desired thread auto-archive duration? | **7 days.** Requires guild boost Level 2 or higher. |
+| OQ-3 | Should the bot validate guild permissions on startup and refuse to start if critical permissions are missing? | **Refuse to start.** The bot throws a fatal exception on startup if any required guild permission is absent. No degraded-mode operation. |
+| OQ-4 | Should this story adopt `AgentQuestionEnvelope` as the canonical `SendQuestionAsync` signature now? | **Use original FR-001 signature (`SendQuestionAsync(AgentQuestion, CancellationToken)`) and adapt to envelope later.** The Discord connector implements the original contract; envelope adoption is deferred until cross-connector alignment is confirmed. |
 
 ---
 
@@ -321,6 +323,6 @@ These are non-negotiable technical and operational boundaries.
 | Document | Relation |
 |---|---|
 | `docs/stories/qq-DISCORD-MESSENGER-SU/architecture.md` | Component design, data model, interfaces, sequence flows. This tech spec defines the problem boundaries; architecture.md defines the solution. |
-| `docs/stories/qq-DISCORD-MESSENGER-SU/implementation-plan.md` | Sprint breakdown and task ordering. (Not yet created -- iter 1.) |
-| `docs/stories/qq-DISCORD-MESSENGER-SU/e2e-scenarios.md` | End-to-end test scenarios and acceptance verification. (Not yet created -- iter 1.) |
+| `docs/stories/qq-DISCORD-MESSENGER-SU/implementation-plan.md` | Sprint breakdown and task ordering. Sibling plan document produced in parallel. |
+| `docs/stories/qq-DISCORD-MESSENGER-SU/e2e-scenarios.md` | End-to-end test scenarios and acceptance verification. Sibling plan document produced in parallel. |
 | `.forge-attachments/agent_swarm_messenger_user_stories.md` | Epic-level brief with shared requirements (FR-001 through FR-008), recommended architecture, solution structure, and data models. |
