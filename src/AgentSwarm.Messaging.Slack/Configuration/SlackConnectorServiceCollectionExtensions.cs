@@ -1,44 +1,66 @@
+// -----------------------------------------------------------------------
+// <copyright file="SlackConnectorServiceCollectionExtensions.cs" company="Microsoft Corp.">
+//     Copyright (c) Microsoft Corp. All rights reserved.
+// </copyright>
+// -----------------------------------------------------------------------
+
 namespace AgentSwarm.Messaging.Slack.Configuration;
 
+using System;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 
 /// <summary>
-/// Service collection extensions that bind the Slack connector options
-/// from <see cref="IConfiguration"/>.
+/// Dependency-injection extensions that register Slack connector services and
+/// bind their strongly-typed configuration. Options are validated at startup
+/// so misconfiguration surfaces eagerly instead of producing runtime failures
+/// when sizing connection pools or computing retry delays.
 /// </summary>
 public static class SlackConnectorServiceCollectionExtensions
 {
     /// <summary>
-    /// Binds <see cref="SlackConnectorOptions"/> from the
-    /// <see cref="SlackConnectorOptions.SectionName"/> configuration
-    /// section using the standard
-    /// <see cref="OptionsConfigurationServiceCollectionExtensions.Configure{TOptions}(IServiceCollection, IConfiguration)"/>
-    /// helper. Idempotent: calling more than once with the same
-    /// configuration is harmless (the last call wins per the options
-    /// pattern).
+    /// Registers Slack connector option bindings against the supplied
+    /// <see cref="IConfiguration"/>. Both <see cref="SlackConnectorOptions"/>
+    /// and <see cref="SlackRetryOptions"/> are bound, validated through any
+    /// data-annotation attributes present on the option types, and additionally
+    /// guarded by inline range checks for numeric properties whose invalid
+    /// values would otherwise silently break runtime behaviour.
     /// </summary>
-    /// <param name="services">The DI container to register the options into.</param>
-    /// <param name="configuration">
-    /// The application configuration root. The
-    /// <see cref="SlackConnectorOptions.SectionName"/> section is read
-    /// from this configuration; the section may be absent, in which
-    /// case the default values on the POCO take effect.
-    /// </param>
+    /// <param name="services">The service collection to register against.</param>
+    /// <param name="configuration">The application configuration root.</param>
     /// <returns>The same <paramref name="services"/> instance for chaining.</returns>
-    /// <exception cref="ArgumentNullException">
-    /// Thrown when <paramref name="services"/> or
-    /// <paramref name="configuration"/> is <c>null</c>.
-    /// </exception>
-    public static IServiceCollection AddSlackConnectorOptions(
+    public static IServiceCollection AddSlackConnector(
         this IServiceCollection services,
         IConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        services.Configure<SlackConnectorOptions>(
-            configuration.GetSection(SlackConnectorOptions.SectionName));
+        var connectorSection = configuration.GetSection(SlackConnectorOptions.SectionName);
+        var retrySection = configuration.GetSection(SlackRetryOptions.SectionName);
+
+        services
+            .AddOptions<SlackConnectorOptions>()
+            .Bind(connectorSection)
+            .ValidateDataAnnotations()
+            .Validate(
+                opts => opts.MaxWorkspaces > 0,
+                $"{nameof(SlackConnectorOptions)}.{nameof(SlackConnectorOptions.MaxWorkspaces)} must be greater than zero.")
+            .ValidateOnStart();
+
+        services
+            .AddOptions<SlackRetryOptions>()
+            .Bind(retrySection)
+            .ValidateDataAnnotations()
+            .Validate(
+                opts => opts.MaxAttempts > 0,
+                $"{nameof(SlackRetryOptions)}.{nameof(SlackRetryOptions.MaxAttempts)} must be greater than zero.")
+            .Validate(
+                opts => opts.InitialDelayMilliseconds >= 0,
+                $"{nameof(SlackRetryOptions)}.{nameof(SlackRetryOptions.InitialDelayMilliseconds)} must be non-negative.")
+            .ValidateOnStart();
+
         return services;
     }
 }
