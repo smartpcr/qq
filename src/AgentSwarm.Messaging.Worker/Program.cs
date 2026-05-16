@@ -7,7 +7,7 @@ namespace AgentSwarm.Messaging.Worker;
 /// signature middleware, queues, controllers, ...) is registered by later
 /// stages of the implementation plan.
 /// </summary>
-public static class Program
+public class Program
 {
     public static void Main(string[] args)
     {
