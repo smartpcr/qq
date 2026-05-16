@@ -53,13 +53,19 @@ public sealed class SlackTestDbContext : DbContext
     public DbSet<SlackAuditEntry> AuditEntries => Set<SlackAuditEntry>();
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Stage 2.3: delegates to
+    /// <see cref="SlackModelBuilderExtensions.AddSlackEntities(ModelBuilder)"/>
+    /// so the test context exercises the same auto-discovery hook
+    /// (<see cref="ModelBuilderExtensions.ApplyConfigurationsFromAssembly(ModelBuilder, System.Reflection.Assembly, System.Func{System.Type, bool}?)"/>)
+    /// the upstream <c>MessagingDbContext</c> will invoke in production.
+    /// New <c>IEntityTypeConfiguration</c> implementations added to the
+    /// Slack assembly are registered automatically.
+    /// </remarks>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         ArgumentNullException.ThrowIfNull(modelBuilder);
 
-        modelBuilder.ApplyConfiguration(new SlackWorkspaceConfigConfiguration());
-        modelBuilder.ApplyConfiguration(new SlackThreadMappingConfiguration());
-        modelBuilder.ApplyConfiguration(new SlackInboundRequestRecordConfiguration());
-        modelBuilder.ApplyConfiguration(new SlackAuditEntryConfiguration());
+        modelBuilder.AddSlackEntities();
     }
 }
