@@ -63,14 +63,86 @@ public sealed record OutboundMessage
     /// <summary>Target Telegram chat.</summary>
     public required long ChatId { get; init; }
 
-    /// <summary>Serialized MessengerMessage or AgentQuestion payload.</summary>
+    /// <summary>
+    /// Outbox payload whose semantics depend on <see cref="SourceType"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Per architecture.md §3.1:
+    /// <list type="bullet">
+    /// <item><description>
+    /// <see cref="OutboundSourceType.CommandAck"/>,
+    /// <see cref="OutboundSourceType.StatusUpdate"/>, and
+    /// <see cref="OutboundSourceType.Alert"/>: pre-rendered Telegram
+    /// message content (MarkdownV2 text) ready for
+    /// <c>IMessageSender.SendTextAsync</c>. Rendering is performed by
+    /// <c>TelegramMessengerConnector</c> at enqueue time so the
+    /// outbound-queue worker stays agnostic of Telegram formatting
+    /// rules.
+    /// </description></item>
+    /// <item><description>
+    /// <see cref="OutboundSourceType.Question"/>: a human-readable
+    /// <i>preview</i> of the question (title, severity, body summary)
+    /// stored only for debugging, dead-letter inspection, and replay
+    /// diagnostics — <b>not</b> the actual send content. For questions,
+    /// the real Telegram render (inline keyboard buttons, MarkdownV2
+    /// body, default-action annotation, <c>IDistributedCache</c>
+    /// <c>HumanAction</c> writes) happens at send time inside
+    /// <c>TelegramMessageSender.SendQuestionAsync</c>, reading from
+    /// <see cref="SourceEnvelopeJson"/>. This split keeps question
+    /// rendering side-effects (cache writes, inline keyboard layout)
+    /// out of the enqueue path.
+    /// </description></item>
+    /// </list>
+    /// </para>
+    /// </remarks>
     public required string Payload { get; init; }
 
     /// <summary>
-    /// Full serialized <see cref="AgentQuestionEnvelope"/> JSON for question-type messages.
-    /// Preserved for recovery/backfill so the connector can reconstruct the original envelope
-    /// without re-querying the source. Null for non-question source types.
+    /// Serialized original source envelope, preserved verbatim for recovery,
+    /// dead-letter replay, and (for questions) <c>QuestionRecoverySweep</c>
+    /// backfill of <c>PendingQuestionRecord</c> fields.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Per architecture.md §3.1, this field is populated for two
+    /// <see cref="OutboundSourceType"/> values and null for the other two:
+    /// <list type="bullet">
+    /// <item><description>
+    /// <see cref="OutboundSourceType.Question"/>: full
+    /// <see cref="AgentQuestionEnvelope"/> JSON. Read by
+    /// <c>TelegramMessageSender.SendQuestionAsync</c> to render the inline
+    /// keyboard / MarkdownV2 text at send time, and by
+    /// <c>QuestionRecoverySweep</c> to reconstruct
+    /// <c>PendingQuestionRecord</c> after a crash between
+    /// <c>MarkSentAsync</c> and store persistence (architecture.md §3.1
+    /// Gap B).
+    /// </description></item>
+    /// <item><description>
+    /// <see cref="OutboundSourceType.Alert"/>: full <c>AgentAlertEvent</c>
+    /// JSON (or, at the <c>IMessengerConnector</c> boundary where the
+    /// raw <c>SwarmEvent</c> type has already been projected to
+    /// <see cref="MessengerMessage"/>, the serialized
+    /// <see cref="MessengerMessage"/> alert payload). Preserved so that
+    /// dead-letter replay and audit can reconstruct the original alert
+    /// without re-querying the swarm event source.
+    /// </description></item>
+    /// <item><description>
+    /// <see cref="OutboundSourceType.StatusUpdate"/> and
+    /// <see cref="OutboundSourceType.CommandAck"/>: always <c>null</c>.
+    /// These message types are self-describing through
+    /// <see cref="Payload"/> and have no upstream envelope to preserve.
+    /// </description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// When the outbound message is dead-lettered, the contents of this
+    /// field are copied verbatim to
+    /// <c>DeadLetterMessage.SourceEnvelopeJson</c> (distinct from
+    /// <c>DeadLetterMessage.Payload</c>, which holds the rendered
+    /// Telegram content).
+    /// </para>
+    /// </remarks>
     public string? SourceEnvelopeJson { get; init; }
 
     public required MessageSeverity Severity { get; init; }

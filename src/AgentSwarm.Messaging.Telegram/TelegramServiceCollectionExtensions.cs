@@ -115,6 +115,32 @@ public static class TelegramServiceCollectionExtensions
         // TimeProvider.System is the production default; tests register a
         // FakeTimeProvider via TryAddSingleton-replacement before AddTelegram.
         services.TryAddSingleton(TimeProvider.System);
+
+        // Stage 2.6: unbounded in-process bridge channel between the
+        // inbound pipeline (writer) and the IMessengerConnector.ReceiveAsync
+        // drain (reader). The backing channel is constructed via
+        // Channel.CreateUnbounded<MessengerEvent> (see
+        // ProcessedMessengerEventChannel.ctor) so every processed update
+        // reaches the connector drain losslessly — the Stage 2.6
+        // "burst from 100+ agents without message loss" SLO forbids any
+        // bounded / fast-drop shape on this hop, and unlike the
+        // Webhook/InboundUpdateChannel there is no durable InboundUpdate
+        // backstop row here for replay. Registered as a singleton so
+        // the producer and consumer share ONE in-process buffer, and
+        // registered BEFORE the pipeline so the pipeline's
+        // [ActivatorUtilitiesConstructor] overload can resolve it as
+        // a constructor argument.
+        services.TryAddSingleton<ProcessedMessengerEventChannel>();
+
+        // Stage 2.6: stub IOutboundQueue so TelegramMessengerConnector's
+        // dependency is satisfiable before Stage 4.1 ships the durable
+        // persistent queue. TryAddSingleton — the Stage 4.1 production
+        // registration (AddSingleton<IOutboundQueue, PersistentOutboundQueue>)
+        // wins by last-wins semantics. Mirrors the existing
+        // InMemoryDeduplicationService / InMemoryOutboundMessageIdIndex /
+        // InMemoryOutboundDeadLetterStore replacement pattern.
+        services.TryAddSingleton<IOutboundQueue, InMemoryOutboundQueue>();
+
         services.AddSingleton<ITelegramUpdatePipeline, TelegramUpdatePipeline>();
 
         // Stage 2.5: long-polling receiver (development mode).
@@ -162,6 +188,17 @@ public static class TelegramServiceCollectionExtensions
         // Replace pattern as the msg-id index.
         services.TryAddSingleton<IOutboundDeadLetterStore, InMemoryOutboundDeadLetterStore>();
         services.TryAddSingleton<IMessageSender, TelegramMessageSender>();
+
+        // Stage 2.6: the connector is the platform-agnostic facade the
+        // agent swarm uses to send messages / questions and to drain
+        // processed inbound events. Singleton lifetime — the type is
+        // stateless beyond its singleton dependencies (IOutboundQueue,
+        // ProcessedMessengerEventChannel, TimeProvider, ILogger). Concrete
+        // type is also registered so tests / diagnostics can resolve the
+        // implementation without going through the interface.
+        services.TryAddSingleton<TelegramMessengerConnector>();
+        services.TryAddSingleton<IMessengerConnector>(sp =>
+            sp.GetRequiredService<TelegramMessengerConnector>());
 
         var pollingSnapshot = configuration
             .GetSection(TelegramOptions.SectionName)
