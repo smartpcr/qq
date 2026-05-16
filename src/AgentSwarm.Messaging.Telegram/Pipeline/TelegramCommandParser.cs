@@ -54,6 +54,23 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 /// on the head and leave any later <c>@</c>-prefixed tokens
 /// (operator aliases, mentions) intact in the arguments list.
 /// </para>
+/// <para>
+/// <b>Nullable input.</b> The <paramref name="messageText"/> parameter on
+/// <see cref="Parse"/> is declared <see cref="string"/>? deliberately:
+/// Telegram <c>Update.Message.Text</c> is nullable on the wire (a
+/// caption-only photo, a sticker, a service message, or a join/leave
+/// notification all surface with no <c>text</c> field), so callers
+/// pulling the field straight off the deserialised payload must be
+/// able to hand it through without a <c>!</c> suppression. The method
+/// normalises null to an "empty / not a command" rejection via the
+/// same <see cref="string.IsNullOrWhiteSpace"/> gate used for empty
+/// strings. The interface declaration in
+/// <c>AgentSwarm.Messaging.Abstractions.ICommandParser</c> should be
+/// updated to a nullable parameter to match this contract; until
+/// then the compiler may surface CS8767 (nullability of parameter
+/// doesn't match the implicitly implemented interface member), which
+/// is the intended prompt for that paired interface change.
+/// </para>
 /// </remarks>
 internal sealed class TelegramCommandParser : ICommandParser
 {
@@ -75,7 +92,7 @@ internal sealed class TelegramCommandParser : ICommandParser
             [TelegramCommands.Ask] = "/ask requires a task description. Usage: /ask <task description>.",
         };
 
-    public ParsedCommand Parse(string messageText)
+    public ParsedCommand Parse(string? messageText)
     {
         if (string.IsNullOrWhiteSpace(messageText))
         {
