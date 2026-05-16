@@ -32,34 +32,36 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// comparing against the stored value.
 /// </para>
 /// <para>
-/// <b>Server-side row cap (reviewer feedback)</b>: every query applies a configurable
-/// hard ceiling (<see cref="MaxRows"/>, default <see cref="DefaultMaxRows"/>) before
-/// <c>ToListAsync</c>. The cap is a <b>safety guard</b>, not a pagination surface:
-/// when a query matches more rows than the cap the service throws
-/// <see cref="InvalidOperationException"/> rather than silently truncating the result
-/// set. Silent truncation would be catastrophic for compliance review — a reviewer
-/// could miss critical entries believing they had the full picture. The interface
-/// (per its remarks) defers pagination, free-text search, and bulk export to a future
-/// stage; the ceiling exists so a broad date range or a high-volume actor query
-/// cannot accidentally OOM the process while that work is pending. Hosts that need a
-/// larger ceiling (e.g. an archival export job) construct the service via the
-/// two-arg constructor.
+/// <b>Server-side safety cap (reviewer feedback).</b> The <see cref="IAuditLogQueryService"/>
+/// contract defers pagination, free-text search, and bulk export to a future stage —
+/// but a compliance audit table grows without bound, so leaving the three queries
+/// unbounded would let a broad date window or a high-volume actor query materialize
+/// millions of rows and OOM the host. To make that deferral safe every query method
+/// here applies a configurable hard ceiling (<see cref="MaxRows"/>, default
+/// <see cref="DefaultMaxRows"/>) before <c>ToListAsync</c> using a
+/// <c>Take(MaxRows + 1)</c> <i>overflow canary</i>. If the canary row materializes
+/// the service throws <see cref="InvalidOperationException"/> rather than silently
+/// truncating: silent truncation would be catastrophic for compliance review because
+/// the caller would believe they had the full picture while a critical entry was
+/// hidden. Hosts that legitimately need a larger ceiling (for example an archival
+/// export job) construct the service via the two-argument constructor with an
+/// explicit <c>maxRows</c> value.
 /// </para>
 /// </remarks>
 public sealed class SqlAuditLogQueryService : IAuditLogQueryService
 {
     /// <summary>
-    /// Default ceiling on rows materialized by a single query. The figure (10,000)
+    /// Default ceiling on rows materialized by a single query (10,000). The figure
     /// balances two competing concerns:
     /// <list type="bullet">
     ///   <item><description>An <see cref="AuditEntry"/> projection is on the order of
-    ///   1–2&#160;KB once strings settle, so 10,000 rows fits in ~10–20&#160;MB —
-    ///   comfortably within a typical compliance-review session's working set.</description></item>
-    ///   <item><description>A single user, agent, or correlation ID legitimately
-    ///   producing more than 10,000 audit entries inside one query window is almost
-    ///   certainly a sign the reviewer wants a narrower filter (smaller date range,
-    ///   specific correlation ID). Throwing surfaces that signal explicitly rather
-    ///   than letting the host slowly fall over.</description></item>
+    ///   1–2&#160;KB once strings settle, so 10,000 rows fits in roughly
+    ///   10–20&#160;MB — comfortably inside a typical compliance-review session's
+    ///   working set.</description></item>
+    ///   <item><description>A single actor, correlation ID, or sensibly-scoped date
+    ///   window producing more than 10,000 audit entries almost always means the
+    ///   reviewer wants a narrower filter. Throwing surfaces that signal explicitly
+    ///   instead of letting the host slowly fall over.</description></item>
     /// </list>
     /// </summary>
     public const int DefaultMaxRows = 10_000;
@@ -68,34 +70,38 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
     private readonly int _maxRows;
 
     /// <summary>
-    /// Construct the query service with the DI-bound EF context factory and the
-    /// default row cap (<see cref="DefaultMaxRows"/>). This is the parameter-less
-    /// constructor wired by <c>AddSqlAuditLogger</c> in
-    /// <c>EntityFrameworkCoreServiceCollectionExtensions</c>; preserving its
-    /// signature keeps the existing DI registration
-    /// (<c>TryAddSingleton&lt;SqlAuditLogQueryService&gt;()</c>) and the existing
-    /// test fixture wiring unchanged.
+    /// DI-friendly constructor that uses <see cref="DefaultMaxRows"/> as the safety
+    /// cap. This is the signature wired by
+    /// <c>EntityFrameworkCoreServiceCollectionExtensions.AddSqlAuditLogger</c>
+    /// (<c>TryAddSingleton&lt;SqlAuditLogQueryService&gt;()</c>); preserving it keeps
+    /// the existing registration and the existing
+    /// <c>AuditLogStoreFixture</c> test wiring unchanged.
     /// </summary>
     /// <param name="contextFactory">EF Core context factory bound by DI.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="contextFactory"/> is null.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="contextFactory"/> is <see langword="null"/>.</exception>
     public SqlAuditLogQueryService(IDbContextFactory<AuditLogDbContext> contextFactory)
         : this(contextFactory, DefaultMaxRows)
     {
     }
 
     /// <summary>
-    /// Construct the query service with an explicit row cap. Hosts that need to raise
-    /// the ceiling for a specific scenario (e.g. an archival export job that must
-    /// materialize a larger window) register a custom factory using this overload.
+    /// Explicit-cap constructor. Use this overload to register the service with a
+    /// non-default ceiling (for example an archival export host that intentionally
+    /// materializes a larger window).
     /// </summary>
     /// <param name="contextFactory">EF Core context factory bound by DI.</param>
-    /// <param name="maxRows">Strictly positive ceiling on rows returned by any single
-    /// query. When a query matches more than this many rows the service throws
-    /// <see cref="InvalidOperationException"/> rather than truncate. Capped below
-    /// <see cref="int.MaxValue"/> so the <c>maxRows + 1</c> overflow canary never
-    /// itself overflows.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="contextFactory"/> is null.</exception>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxRows"/> is less than or equal to zero, or equals <see cref="int.MaxValue"/>.</exception>
+    /// <param name="maxRows">
+    /// Strictly positive ceiling on rows returned by any single query. When a query
+    /// matches more than this many rows the service throws
+    /// <see cref="InvalidOperationException"/> rather than truncate. Must be strictly
+    /// less than <see cref="int.MaxValue"/> so the <c>maxRows + 1</c> overflow canary
+    /// applied internally cannot wrap to a negative <c>Take</c> argument.
+    /// </param>
+    /// <exception cref="ArgumentNullException"><paramref name="contextFactory"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="maxRows"/> is less than or equal to zero, or equals
+    /// <see cref="int.MaxValue"/>.
+    /// </exception>
     public SqlAuditLogQueryService(
         IDbContextFactory<AuditLogDbContext> contextFactory,
         int maxRows)
@@ -111,7 +117,8 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
         }
 
         // Reject int.MaxValue so the canary expression `_maxRows + 1` (used below in
-        // every query method) cannot silently overflow into a negative Take() argument.
+        // every query method) cannot silently overflow into a negative Take argument
+        // and degrade into an unbounded materialization.
         if (maxRows == int.MaxValue)
         {
             throw new ArgumentOutOfRangeException(
@@ -129,6 +136,12 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
     public int MaxRows => _maxRows;
 
     /// <inheritdoc />
+    /// <exception cref="ArgumentException"><paramref name="toUtc"/> is less than or equal to <paramref name="fromUtc"/>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The query matched more than <see cref="MaxRows"/> rows. The service refuses to
+    /// return a silently-truncated result set; narrow the date window or filter by
+    /// correlation ID instead.
+    /// </exception>
     public async Task<IReadOnlyList<AuditEntry>> GetByDateRangeAsync(
         DateTimeOffset fromUtc,
         DateTimeOffset toUtc,
@@ -166,6 +179,12 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
     }
 
     /// <inheritdoc />
+    /// <exception cref="ArgumentException"><paramref name="actorId"/> is null, empty, or whitespace.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The query matched more than <see cref="MaxRows"/> rows. The service refuses to
+    /// return a silently-truncated result set; intersect the actor filter with a
+    /// bounded date window or filter by correlation ID instead.
+    /// </exception>
     public async Task<IReadOnlyList<AuditEntry>> GetByActorAsync(
         string actorId,
         CancellationToken cancellationToken)
@@ -197,6 +216,12 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
     }
 
     /// <inheritdoc />
+    /// <exception cref="ArgumentException"><paramref name="correlationId"/> is null, empty, or whitespace.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The query matched more than <see cref="MaxRows"/> rows. A single end-to-end
+    /// trace should not produce that many audit entries; this almost always indicates
+    /// a correlation-ID reuse bug in an upstream producer.
+    /// </exception>
     public async Task<IReadOnlyList<AuditEntry>> GetByCorrelationIdAsync(
         string correlationId,
         CancellationToken cancellationToken)
@@ -219,9 +244,11 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        // A correlation ID is the narrowest possible filter (one task's lifecycle) so
-        // overflow here almost always means an upstream bug is reusing a correlation
-        // ID across unrelated tasks. The exception message says so explicitly.
+        // A correlation ID is the narrowest possible filter (one task's lifecycle),
+        // so overflow here almost always means an upstream producer is reusing a
+        // correlation ID across unrelated tasks. The remediation message calls that
+        // out directly rather than suggesting a date-window workaround that would
+        // mask the underlying bug.
         ThrowIfCapExceeded(
             entities.Count,
             queryDescription: $"GetByCorrelationIdAsync(correlationId='{correlationId}')",
@@ -237,11 +264,11 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
             throw new InvalidOperationException(
                 $"{queryDescription} matched more than the configured safety cap of {_maxRows} rows " +
                 $"(materialized {materializedCount} rows including the overflow canary). The audit " +
-                $"query service refuses to return a partial / silently-truncated result set because " +
-                $"compliance review depends on completeness. Pagination is deferred on " +
-                $"IAuditLogQueryService — to proceed, {remediation}. Hosts that genuinely need a " +
-                $"larger ceiling can construct {nameof(SqlAuditLogQueryService)} via its two-arg " +
-                $"constructor with an explicit maxRows value.");
+                $"query service refuses to return a partially-truncated result set because compliance " +
+                $"review depends on completeness. Pagination is deferred on IAuditLogQueryService — to " +
+                $"proceed, {remediation}. Hosts that genuinely need a larger ceiling can construct " +
+                $"{nameof(SqlAuditLogQueryService)} via its two-argument constructor with an explicit " +
+                $"maxRows value.");
         }
     }
 
