@@ -66,9 +66,15 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 /// <b>State-machine.</b> The record-type contract uses
 /// <c>init</c>-only properties so each transition produces a new
 /// <see cref="OutboundMessage"/> via <c>with</c> expression and
-/// replaces the dictionary entry atomically. Concurrent
-/// dequeue+mark from multiple workers is safe via
-/// <see cref="ConcurrentDictionary{TKey,TValue}.TryUpdate"/>.
+/// replaces the dictionary entry atomically. All transitions
+/// (<see cref="DequeueAsync"/>'s Pending→Sending claim,
+/// <see cref="MarkSentAsync"/>, <see cref="MarkFailedAsync"/>, and
+/// <see cref="DeadLetterAsync"/>) use a CAS retry loop on
+/// <see cref="ConcurrentDictionary{TKey,TValue}.TryUpdate"/>, so
+/// concurrent mutation of the same record by another worker (or by
+/// the dequeue claim racing with a mark call) cannot silently lose
+/// a transition — the loop re-snapshots the current record and
+/// re-applies the transition against the fresh comparand.
 /// </para>
 /// </remarks>
 internal sealed class InMemoryOutboundQueue : IOutboundQueue
@@ -164,23 +170,54 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
 
     public Task MarkSentAsync(Guid messageId, long telegramMessageId, CancellationToken ct)
     {
-        if (_byMessageId.TryGetValue(messageId, out var current))
+        // CAS loop: re-snapshot `current` and re-apply the Sending → Sent
+        // transition until either TryUpdate succeeds (the comparand still
+        // matched, so our update landed) or the record disappears from
+        // the dictionary (no-op exit). The previous TryGetValue +
+        // single-shot TryUpdate silently swallowed a failed CAS, so a
+        // concurrent state change between the two calls would drop the
+        // Sent transition on the floor and leave the message stuck in
+        // Sending forever. The persistent Stage 4.1 queue gets the same
+        // safety from a single UPDATE ... WHERE Status = 'Sending'
+        // statement; here we emulate it with the same CAS-retry shape
+        // used by DequeueAsync above.
+        while (true)
         {
+            if (!_byMessageId.TryGetValue(messageId, out var current))
+            {
+                return Task.CompletedTask;
+            }
+
             var sent = current with
             {
                 Status = OutboundMessageStatus.Sent,
                 SentAt = _timeProvider.GetUtcNow(),
                 TelegramMessageId = telegramMessageId,
             };
-            _byMessageId.TryUpdate(messageId, sent, current);
+
+            if (_byMessageId.TryUpdate(messageId, sent, current))
+            {
+                return Task.CompletedTask;
+            }
         }
-        return Task.CompletedTask;
     }
 
     public Task MarkFailedAsync(Guid messageId, string error, CancellationToken ct)
     {
-        if (_byMessageId.TryGetValue(messageId, out var current))
+        // CAS loop, same rationale as MarkSentAsync. Re-snapshotting
+        // `current` on each iteration matters here because the retry
+        // counter and backoff are derived from `current.AttemptCount`
+        // — if a concurrent transition won the CAS, the next iteration
+        // must compute `nextAttempt` from the new attempt count rather
+        // than from a stale snapshot, otherwise the backoff schedule
+        // would be wrong.
+        while (true)
         {
+            if (!_byMessageId.TryGetValue(messageId, out var current))
+            {
+                return Task.CompletedTask;
+            }
+
             var nextAttempt = current.AttemptCount + 1;
             var hasBudgetLeft = nextAttempt < current.MaxAttempts;
             var failed = current with
@@ -194,18 +231,33 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
                     ? _timeProvider.GetUtcNow().AddSeconds(Math.Min(60, 1 << Math.Min(nextAttempt, 6)))
                     : null,
             };
-            _byMessageId.TryUpdate(messageId, failed, current);
+
+            if (_byMessageId.TryUpdate(messageId, failed, current))
+            {
+                return Task.CompletedTask;
+            }
         }
-        return Task.CompletedTask;
     }
 
     public Task DeadLetterAsync(Guid messageId, CancellationToken ct)
     {
-        if (_byMessageId.TryGetValue(messageId, out var current))
+        // CAS loop, same rationale as MarkSentAsync — a dropped CAS
+        // here would leave the record in its prior status (typically
+        // Sending or Failed) instead of DeadLettered, and no caller
+        // would ever retry the transition.
+        while (true)
         {
+            if (!_byMessageId.TryGetValue(messageId, out var current))
+            {
+                return Task.CompletedTask;
+            }
+
             var dead = current with { Status = OutboundMessageStatus.DeadLettered };
-            _byMessageId.TryUpdate(messageId, dead, current);
+
+            if (_byMessageId.TryUpdate(messageId, dead, current))
+            {
+                return Task.CompletedTask;
+            }
         }
-        return Task.CompletedTask;
     }
 }

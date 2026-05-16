@@ -63,7 +63,39 @@ public sealed record OutboundMessage
     /// <summary>Target Telegram chat.</summary>
     public required long ChatId { get; init; }
 
-    /// <summary>Serialized MessengerMessage or AgentQuestion payload.</summary>
+    /// <summary>
+    /// Outbox payload whose semantics depend on <see cref="SourceType"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Per architecture.md §3.1:
+    /// <list type="bullet">
+    /// <item><description>
+    /// <see cref="OutboundSourceType.CommandAck"/>,
+    /// <see cref="OutboundSourceType.StatusUpdate"/>, and
+    /// <see cref="OutboundSourceType.Alert"/>: pre-rendered Telegram
+    /// message content (MarkdownV2 text) ready for
+    /// <c>IMessageSender.SendTextAsync</c>. Rendering is performed by
+    /// <c>TelegramMessengerConnector</c> at enqueue time so the
+    /// outbound-queue worker stays agnostic of Telegram formatting
+    /// rules.
+    /// </description></item>
+    /// <item><description>
+    /// <see cref="OutboundSourceType.Question"/>: a human-readable
+    /// <i>preview</i> of the question (title, severity, body summary)
+    /// stored only for debugging, dead-letter inspection, and replay
+    /// diagnostics — <b>not</b> the actual send content. For questions,
+    /// the real Telegram render (inline keyboard buttons, MarkdownV2
+    /// body, default-action annotation, <c>IDistributedCache</c>
+    /// <c>HumanAction</c> writes) happens at send time inside
+    /// <c>TelegramMessageSender.SendQuestionAsync</c>, reading from
+    /// <see cref="SourceEnvelopeJson"/>. This split keeps question
+    /// rendering side-effects (cache writes, inline keyboard layout)
+    /// out of the enqueue path.
+    /// </description></item>
+    /// </list>
+    /// </para>
+    /// </remarks>
     public required string Payload { get; init; }
 
     /// <summary>
