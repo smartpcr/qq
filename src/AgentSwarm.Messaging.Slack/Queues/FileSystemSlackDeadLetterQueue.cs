@@ -293,7 +293,9 @@ internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, ID
                     CorrelationId: out_.CorrelationId,
                     MessageType: out_.MessageType.ToString(),
                     BlockKitPayload: out_.BlockKitPayload,
-                    ThreadTs: out_.ThreadTs);
+                    ThreadTs: out_.ThreadTs,
+                    MessageTs: out_.MessageTs,
+                    ViewId: out_.ViewId);
                 break;
 
             default:
@@ -388,7 +390,11 @@ internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, ID
             CorrelationId: outbound.CorrelationId,
             MessageType: kind,
             BlockKitPayload: outbound.BlockKitPayload,
-            ThreadTs: outbound.ThreadTs);
+            ThreadTs: outbound.ThreadTs)
+        {
+            MessageTs = outbound.MessageTs,
+            ViewId = outbound.ViewId,
+        };
     }
 }
 
@@ -422,13 +428,21 @@ internal sealed record FileSystemSlackInboundPayload(
     string? TriggerId,
     DateTimeOffset ReceivedAt);
 
-/// <summary>Persisted shape of <see cref="SlackOutboundEnvelope"/>.</summary>
+/// <summary>
+/// Persisted shape of <see cref="SlackOutboundEnvelope"/>. Stage 6.3
+/// iter 2 added the optional <see cref="MessageTs"/> / <see cref="ViewId"/>
+/// fields so dead-lettered chat.update / views.update envelopes can be
+/// rehydrated with their target references intact for operator-driven
+/// replay.
+/// </summary>
 internal sealed record FileSystemSlackOutboundPayload(
     string TaskId,
     string CorrelationId,
     string MessageType,
     string BlockKitPayload,
-    string? ThreadTs);
+    string? ThreadTs,
+    string? MessageTs = null,
+    string? ViewId = null);
 
 /// <summary>
 /// DI extensions for <see cref="FileSystemSlackDeadLetterQueue"/>.
