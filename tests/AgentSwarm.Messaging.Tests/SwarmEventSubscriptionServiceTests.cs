@@ -59,8 +59,7 @@ public class SwarmEventSubscriptionServiceTests
         };
         bus.Publish("t-1", ev);
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1");
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Questions.Should().ContainSingle();
         var sent = connector.Questions[0];
@@ -88,8 +87,7 @@ public class SwarmEventSubscriptionServiceTests
             Envelope = envelope,
         });
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1");
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Questions.Should().ContainSingle();
         connector.Questions[0].RoutingMetadata[TelegramMessengerConnector.TelegramChatIdMetadataKey]
@@ -137,8 +135,7 @@ public class SwarmEventSubscriptionServiceTests
             Timestamp = DateTimeOffset.UtcNow,
         });
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1");
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Messages.Should().ContainSingle();
         var sent = connector.Messages[0];
@@ -187,8 +184,7 @@ public class SwarmEventSubscriptionServiceTests
             Timestamp = DateTimeOffset.UtcNow,
         });
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1");
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Messages.Should().ContainSingle();
         connector.Messages[0].Metadata[TelegramMessengerConnector.TelegramChatIdMetadataKey]
@@ -219,8 +215,7 @@ public class SwarmEventSubscriptionServiceTests
             Timestamp = DateTimeOffset.UtcNow,
         });
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1");
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Messages.Should().BeEmpty();
     }
@@ -251,8 +246,7 @@ public class SwarmEventSubscriptionServiceTests
             StatusText = "Compilation 50% complete",
         });
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1");
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Messages.Should().HaveCount(2);
         connector.Messages.Should().AllSatisfy(m => m.Severity.Should().Be(MessageSeverity.Normal));
@@ -296,8 +290,7 @@ public class SwarmEventSubscriptionServiceTests
             StatusText = "started",
         });
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1");
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Messages.Should().ContainSingle();
         connector.Messages[0].Metadata[TelegramMessengerConnector.TelegramChatIdMetadataKey]
@@ -331,8 +324,9 @@ public class SwarmEventSubscriptionServiceTests
             StatusText = "after-reconnect",
         });
 
-        await bus.WaitForConsumptionAsync("t-1");
-        await RunAndCancelAsync(service, "t-1", warmupMs: 200);
+        // The default 2 s consumption timeout absorbs the (≤50 ms) backoff
+        // and the second-subscribe drain. No fixed warmup is needed.
+        await RunAndCancelAsync(service, bus, "t-1");
 
         connector.Messages.Should().NotBeEmpty(
             "the second subscribe iteration must successfully drain the published status event");
@@ -370,16 +364,33 @@ public class SwarmEventSubscriptionServiceTests
         };
     }
 
+    /// <summary>
+    /// Starts the tenant loop, then deterministically blocks until the bus
+    /// reports that every already-published event has been consumed by the
+    /// running subscription, then cancels and awaits a clean shutdown.
+    ///
+    /// The consumer MUST be started before the consumption barrier — calling
+    /// <see cref="FakeSwarmCommandBus.WaitForConsumptionAsync"/> with no
+    /// running subscriber would spin for the full timeout and synchronise
+    /// nothing.
+    /// </summary>
     private static async Task RunAndCancelAsync(
         SwarmEventSubscriptionService service,
+        FakeSwarmCommandBus bus,
         string tenantId,
-        int warmupMs = 100)
+        int waitTimeoutMs = 2000)
     {
         using var cts = new CancellationTokenSource();
         var loop = service.RunTenantLoopAsync(tenantId, cts.Token);
-        await Task.Delay(warmupMs);
-        cts.Cancel();
-        await loop;
+        try
+        {
+            await bus.WaitForConsumptionAsync(tenantId, waitTimeoutMs);
+        }
+        finally
+        {
+            cts.Cancel();
+            await loop;
+        }
     }
 
     private static AgentQuestionEnvelope BuildEnvelope(
@@ -456,6 +467,13 @@ public class SwarmEventSubscriptionServiceTests
             lock (_lock) { _publishedCounts[tenantId]++; }
         }
 
+        /// <summary>
+        /// Blocks until the running subscription has consumed every event
+        /// already published for <paramref name="tenantId"/>. Callers MUST
+        /// ensure a subscriber is running before invoking this — with no
+        /// consumer this would spin for the full timeout and synchronise
+        /// nothing.
+        /// </summary>
         public async Task WaitForConsumptionAsync(string tenantId, int timeoutMs = 2000)
         {
             var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
