@@ -35,8 +35,20 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// active working set so it does not regress as the audit table grows.</description></item>
 /// </list>
 /// <para>
-/// Filtered-index syntax differs by provider; the <c>HasFilter</c> calls below use
-/// quoted-identifier syntax which both SQL Server and SQLite accept.
+/// <b>Provider note on filtered-index syntax</b>: the <c>HasFilter</c> expressions
+/// below are written for SQL Server (the production target) using ANSI quoted
+/// identifiers — <c>"Status" = 'Open'</c>. SQLite parses the same expression without
+/// error because EF Core's SQLite provider supports partial indexes and SQLite
+/// itself accepts double-quoted identifiers as a backwards-compat fallback. However,
+/// SQLite's well-known double-quote quirk (an unrecognised quoted token silently
+/// falls back to a string literal) means this filter is fragile under SQLite if the
+/// column is ever renamed: the index would compile but match zero rows, silently
+/// disabling the filter rather than producing an error. The CI suite uses SQLite
+/// in-memory and exercises functional correctness only — it does not assert query
+/// plans or selectivity, so filtered-index behaviour is effectively validated only
+/// on the SQL Server production deployment. Future maintainers changing the
+/// <c>Status</c> column or the filter expression should re-verify against SQL
+/// Server and not assume the SQLite test pass implies the filter is exercised.
 /// </para>
 /// </remarks>
 public class TeamsLifecycleDbContext : DbContext
@@ -129,6 +141,17 @@ public class TeamsLifecycleDbContext : DbContext
         builder.Property(e => e.Status).HasMaxLength(16).IsRequired();
         builder.Property(e => e.CreatedAt).IsRequired();
         builder.Property(e => e.ResolvedAt);
+
+        // Filtered indexes target SQL Server (the production database). The HasFilter
+        // expression uses ANSI quoted identifiers ("Status" = 'Open'), which SQL
+        // Server treats as a true partial index. SQLite parses the same expression
+        // without error (and EF Core's SQLite provider does emit CREATE INDEX ...
+        // WHERE), but SQLite's double-quote quirk means a renamed column would
+        // silently fall back to a string literal and the index would match zero
+        // rows. The CI suite uses SQLite in-memory and asserts only functional
+        // correctness — it does not validate query plans or selectivity, so the
+        // filtered-index behaviour is effectively exercised only against SQL Server
+        // in production. See the class-level <remarks> for the full rationale.
 
         // Open-by-conversation lookup (Stage 3.2 bare approve/reject disambiguation).
         builder.HasIndex(e => new { e.ConversationId, e.Status })
