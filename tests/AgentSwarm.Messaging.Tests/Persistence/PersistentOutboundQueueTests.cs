@@ -449,6 +449,53 @@ public class PersistentOutboundQueueTests : IDisposable
         all.Select(m => m.IdempotencyKey).Should().BeEquivalentTo(msgs.Select(m => m.IdempotencyKey));
     }
 
+    [Fact]
+    public async Task DequeueAsync_InterleavedTwoQueueInstances_NeverDoubleClaim()
+    {
+        // Multi-instance race-safety: two PersistentOutboundQueue instances
+        // sharing the same SQLite store (i.e. two dispatchers in the same
+        // process) interleave DequeueAsync calls without ever returning
+        // the same row twice. SQLite serialises the conditional UPDATE
+        // statements at the storage layer, so this models the realistic
+        // single-process / multi-dispatcher topology. Across rowCount * 2
+        // alternating calls, every claim resolves to a unique MessageId
+        // and the surplus calls return null.
+        var queueA = new PersistentOutboundQueue(_harness.Factory, _clock);
+        var queueB = new PersistentOutboundQueue(_harness.Factory, _clock);
+
+        const int rowCount = 10;
+        var msgs = Enumerable.Range(0, rowCount)
+            .Select(i => NewMessage($"k-multi-{i:D2}", MessageSeverity.Normal))
+            .ToList();
+        foreach (var m in msgs)
+        {
+            await _queue.EnqueueAsync(m, CancellationToken.None);
+        }
+
+        var claimed = new List<OutboundMessage>(rowCount);
+        var nullObservations = 0;
+        for (var i = 0; i < rowCount * 2; i++)
+        {
+            var queue = (i % 2 == 0) ? queueA : queueB;
+            var result = await queue.DequeueAsync(CancellationToken.None);
+            if (result is null)
+            {
+                nullObservations++;
+            }
+            else
+            {
+                claimed.Add(result);
+            }
+        }
+
+        claimed.Should().HaveCount(rowCount,
+            "every enqueued row must be claimed exactly once across both queue instances");
+        claimed.Select(m => m.MessageId).Should().OnlyHaveUniqueItems(
+            "no MessageId can surface on both queues");
+        nullObservations.Should().Be(rowCount,
+            "surplus dispatcher calls must observe an empty queue rather than re-claiming a leased row");
+    }
+
     private OutboundMessage NewMessage(
         string idempotencyKey,
         MessageSeverity severity,
