@@ -70,6 +70,20 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
     public const string MessengerName = "slack";
 
     /// <summary>
+    /// Separator placed between the escalate modal's pinned verdict
+    /// (<see cref="DefaultSlackMessageRenderer.EscalateActionValue"/>)
+    /// and the operator's chosen severity tier when composing
+    /// <see cref="HumanDecisionEvent.ActionValue"/>. Stage 6.1
+    /// evaluator item 2: severity propagates through this namespacing
+    /// (e.g., <c>"escalate:critical"</c>) because
+    /// <see cref="HumanDecisionEvent"/> has no Metadata slot.
+    /// Downstream consumers can route the verdict via
+    /// <c>StartsWith("escalate")</c> and the urgency via
+    /// <c>Split(':')[1]</c>.
+    /// </summary>
+    public const string EscalateSeveritySeparator = ":";
+
+    /// <summary>
     /// Allow-list of Slack modal <c>callback_id</c> values that
     /// Stage 5.3 owns. View submissions with any other
     /// <c>callback_id</c> are ignored so an unrelated workspace modal
@@ -311,17 +325,17 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
 
         // Pinned ActionValue (from a comment modal opened by a
         // RequiresComment button click, or from the escalate modal
-        // which has no static_select) wins over any in-view select;
-        // when the modal was opened from /agent review the verdict
-        // comes from the static_select in view.state.values. The
-        // FirstStaticSelectValueFallback (raw "value" property on
-        // any action, including plain_text_input) is intentionally
-        // NOT used here -- letting a text input's value leak into
-        // ActionValue produces malformed escalation decisions. Modals
-        // MUST either supply a static_select (review) or pin
-        // actionValue in private_metadata (comment, escalate);
-        // anything else is discarded by the missing-verdict guard
-        // below.
+        // whose verdict is the literal "escalate") wins over any
+        // in-view select; when the modal was opened from /agent review
+        // the verdict comes from the static_select in
+        // view.state.values. The FirstStaticSelectValueFallback (raw
+        // "value" property on any action, including plain_text_input)
+        // is intentionally NOT used here -- letting a text input's
+        // value leak into ActionValue produces malformed escalation
+        // decisions. Modals MUST either supply a static_select
+        // (review) or pin actionValue in private_metadata (comment,
+        // escalate); anything else is discarded by the
+        // missing-verdict guard below.
         string? actionValue = metadata.ActionValue
             ?? detail.View.FirstStaticSelectValue;
         if (string.IsNullOrEmpty(actionValue))
@@ -332,6 +346,29 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
                 detail.View.Id,
                 questionId);
             return;
+        }
+
+        // Stage 6.1 evaluator item 2: propagate the escalate modal's
+        // severity static_select into the typed HumanDecisionEvent by
+        // namespacing the verdict as "escalate:<severity>" (e.g.,
+        // "escalate:critical"). HumanDecisionEvent has no Metadata
+        // slot (architecture.md §3.6.3 pins eight fields), so we
+        // encode the urgency tier into ActionValue itself; downstream
+        // consumers can route on the bare verdict via
+        // StartsWith("escalate") and on the urgency via the suffix.
+        // The composition only fires for the escalate callback so
+        // /agent review's verdict ("approve" / "request-changes" /
+        // "reject") is never wrapped. The pinned base value
+        // ("escalate", from private_metadata.actionValue) is the
+        // source of truth for the verdict half; FirstStaticSelectValue
+        // is the user's severity choice. When the user submits without
+        // touching the select Slack still echoes the initial_option
+        // (Warning), so production submissions always carry severity.
+        if (string.Equals(detail.View.CallbackId, DefaultSlackMessageRenderer.EscalateCallbackId, StringComparison.Ordinal)
+            && !string.IsNullOrEmpty(detail.View.FirstStaticSelectValue)
+            && !actionValue!.Contains(EscalateSeveritySeparator, StringComparison.Ordinal))
+        {
+            actionValue = string.Concat(actionValue, EscalateSeveritySeparator, detail.View.FirstStaticSelectValue);
         }
 
         string? comment = detail.View.FirstPlainTextInputValue;
