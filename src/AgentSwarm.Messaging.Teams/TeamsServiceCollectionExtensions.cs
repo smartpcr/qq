@@ -1,10 +1,12 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Extensions;
 using AgentSwarm.Messaging.Teams.Lifecycle;
 using AgentSwarm.Messaging.Teams.Outbox;
+using AgentSwarm.Messaging.Teams.Security;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -123,6 +125,17 @@ public static class TeamsServiceCollectionExtensions
         // uses RemoveAll + TryAdd so the second invocation is a no-op for callers that
         // already wired the security graph explicitly.
         services.AddTeamsSecurity();
+
+        // Stage 5.2 — every host that wires the Teams connector inherits a working
+        // IAuditLogger registration. The default is NoOpAuditLogger so hosts that have
+        // not (yet) called AddSqlAuditLogger() can still construct the connector,
+        // CardActionHandler, TeamsProactiveNotifier, and TenantValidationMiddleware
+        // (all of which require IAuditLogger). Hosts that want durable persistence call
+        // AddSqlAuditLogger() AFTER this helper; the SQL helper uses RemoveAll+AddSingleton
+        // to unconditionally replace the no-op stub with the production logger. The
+        // TryAddSingleton here means an explicit IAuditLogger registration the host wired
+        // BEFORE this helper is preserved untouched.
+        services.TryAddSingleton<IAuditLogger, NoOpAuditLogger>();
 
         // Stage 5.1 iter-4 evaluator feedback item 2 — TimeProvider MUST be in the DI graph
         // so the constructor-with-TimeProvider+InstallationStateGate overload of
@@ -388,7 +401,8 @@ public static class TeamsServiceCollectionExtensions
             agentQuestionStore: sp.GetRequiredService<IAgentQuestionStore>(),
             logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsProactiveNotifier>>(),
             timeProvider: sp.GetRequiredService<TimeProvider>(),
-            installationStateGate: sp.GetRequiredService<InstallationStateGate>()));
+            installationStateGate: sp.GetRequiredService<InstallationStateGate>(),
+            auditLogger: sp.GetRequiredService<IAuditLogger>()));
         services.TryAddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<TeamsProactiveNotifier>());
 
         return services;

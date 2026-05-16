@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using Microsoft.Bot.Builder;
@@ -143,6 +144,79 @@ public sealed class ApproveCommandHandlerTests
         Assert.Empty(store.StatusTransitionCalls);
         Assert.Empty(publisher.Published);
         Assert.Single(adapter.Sent);
+    }
+
+    [Fact]
+    public async Task Explicit_UnknownQuestionId_StampsRejectedOutcomeOnContext()
+    {
+        // Stage 5.2 iter-4 (eval iter-2 item 7) — `ApproveRejectCommandExecutor`
+        // returns NORMALLY (no exception) on handled command-level failures such
+        // as "question not found". Without an explicit outcome signal the
+        // activity handler's post-dispatch CommandReceived audit would record
+        // `Outcome = "Success"`, which is wrong from the user/compliance
+        // perspective — the command was rejected, not successful.
+        //
+        // The iter-4 fix introduces `CommandContext.Outcome` (mutable string)
+        // that handlers populate on every rejection branch. The activity handler
+        // prefers `context.Outcome` when set; otherwise it defaults to the
+        // exception-based Success/Failed split.
+        //
+        // This test pins the rejection-branch contract: the explicit-unknown-id
+        // branch stamps `AuditOutcomes.Rejected` on the context so the audit
+        // row records the truthful outcome.
+        var store = new InMemoryAgentQuestionStore();
+        var publisher = new RecordingInboundEventPublisher();
+        var handler = BuildHandler(store, publisher);
+        var (turn, _) = BuildTurnContext();
+        var context = BuildContext("q-missing", turn);
+        Assert.Null(context.Outcome);
+
+        await handler.HandleAsync(context, CancellationToken.None);
+
+        Assert.Equal(AuditOutcomes.Rejected, context.Outcome);
+    }
+
+    [Fact]
+    public async Task Approve_NotInAllowedActions_StampsRejectedOutcomeOnContext()
+    {
+        // Stage 5.2 iter-4 (eval iter-2 item 7) — companion to the unknown-id
+        // rejection: the "action not in AllowedActions" branch must ALSO stamp
+        // `AuditOutcomes.Rejected` because we return without throwing yet the
+        // command was rejected at the AllowedActions validation layer.
+        var store = new InMemoryAgentQuestionStore();
+        store.Seed(BuildOpenQuestion(
+            "q-approve-only",
+            allowedActions: new[]
+            {
+                new HumanAction("approve", "Approve", "approve", RequiresComment: false),
+            }));
+        var publisher = new RecordingInboundEventPublisher();
+        // Construct a reject handler so `actionValue` is "reject" but the only
+        // allowed action is "approve" — exercises the MatchAction-returns-null
+        // branch in `ApproveRejectCommandExecutor`.
+        var rejectHandler = new RejectCommandHandler(
+            store,
+            publisher,
+            new AdaptiveCardBuilder(),
+            NullLogger<RejectCommandHandler>.Instance);
+        var (turn, _) = BuildTurnContext();
+        var context = new CommandContext
+        {
+            NormalizedText = "reject q-approve-only",
+            ResolvedIdentity = new UserIdentity("user-internal-1", "aad-obj-1", "Test", "Operator"),
+            CorrelationId = "corr-1",
+            TurnContext = turn,
+            ConversationId = ConversationId,
+            ActivityId = "activity-1",
+            CommandArguments = "q-approve-only",
+        };
+        Assert.Null(context.Outcome);
+
+        await rejectHandler.HandleAsync(context, CancellationToken.None);
+
+        Assert.Empty(store.StatusTransitionCalls);
+        Assert.Empty(publisher.Published);
+        Assert.Equal(AuditOutcomes.Rejected, context.Outcome);
     }
 
     [Fact]

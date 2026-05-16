@@ -61,8 +61,36 @@ public sealed class AskCommandHandler : ICommandHandler
             ? Guid.NewGuid().ToString()
             : context.CorrelationId!;
 
+        // Stage 5.2 step 3 (iter-4 → iter-6 evolution) — stamp a SEPARATELY-MINTED
+        // task tracking identifier onto the CommandContext so the activity handler's
+        // post-dispatch CommandReceived audit (tech-spec.md §4.3) records a TaskId
+        // that is semantically a task reference, not just a re-use of the correlation
+        // ID. Iter-1/2 set `context.TaskId = correlationId` which the iter-2 evaluator
+        // (item 6) correctly flagged as wrong — a correlation ID is the cross-cutting
+        // trace identifier, not the agent-task work-item identifier; conflating them
+        // defeats the audit table's TaskId column.
+        //
+        // The `task_` prefix marks the namespace explicitly so downstream log
+        // aggregation can distinguish task-tracking IDs from correlation IDs at a
+        // glance. The value is propagated to the orchestrator through TWO channels
+        // that BOTH carry the same identifier (iter-6 / eval iter-3 item 1):
+        //   1. `ParsedCommand.TaskId` on the published `CommandEvent.Payload` — the
+        //      orchestrator reads this off the event envelope and adopts it as the
+        //      persistent agent-task work-item ID. This is the contractual binding
+        //      the audit row's TaskId column references.
+        //   2. The structured logger field below — visible to operators / log
+        //      aggregation for forensic correlation without subscribing to the
+        //      orchestrator's event stream.
+        //
+        // AgentId remains null on this path because `agent ask` does NOT pre-select
+        // an agent — the orchestrator routes the task to one based on its scheduling
+        // policy.
+        var taskId = $"task_{Guid.NewGuid():N}";
+        context.TaskId = taskId;
+
         _logger.LogInformation(
-            "AskCommandHandler accepted task (correlation {CorrelationId}, user {UserId}, prompt length {PromptLength}).",
+            "AskCommandHandler accepted task (taskId {TaskId}, correlation {CorrelationId}, user {UserId}, prompt length {PromptLength}).",
+            taskId,
             correlationId,
             context.ResolvedIdentity?.InternalUserId ?? "(unmapped)",
             prompt.Length);

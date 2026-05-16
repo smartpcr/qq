@@ -140,6 +140,82 @@ public sealed class TeamsSwarmActivityHandlerTests
         Assert.Single(harness.Dispatcher.Dispatched);
     }
 
+    [Fact]
+    public async Task OnMessageActivityAsync_DispatchAndAuditBothFail_ThrowsAggregateExceptionCarryingBothInnerExceptions()
+    {
+        // Stage 5.2 iter-5 (eval iter-2 item 4) — when BOTH the command dispatcher
+        // throws AND the audit logger throws (e.g. dispatcher bug + audit-store
+        // outage during the same activity), the activity handler MUST NOT silently
+        // log-and-swallow the audit failure. The brief requires every command to
+        // produce a durable audit row, and a swallowed audit error makes the gap
+        // invisible to compliance.
+        //
+        // The iter-5 fix wraps both root causes in an AggregateException so:
+        //   * Upstream middleware sees both via .InnerExceptions
+        //   * Teams' inbound retry semantics re-run the activity, giving the
+        //     idempotent audit emit another chance to land
+        //   * Operations dashboards see both failures in the trace
+        //
+        // This test pins the contract: the thrown exception MUST be an
+        // AggregateException AND MUST carry both the dispatch and audit root
+        // causes in InnerExceptions.
+        var dispatchError = new InvalidOperationException("simulated dispatcher failure");
+        var auditError = new InvalidOperationException("simulated audit-store outage");
+        var harness = Build();
+        MapDave(harness.IdentityResolver);
+        // Swap in throwing doubles for the dispatcher and audit logger.
+        var throwingDispatcher = new ThrowingCommandDispatcher(dispatchError);
+        var throwingAudit = new ThrowingAuditLogger(auditError);
+        var handler = new TeamsSwarmActivityHandler(
+            harness.Store,
+            throwingDispatcher,
+            harness.IdentityResolver,
+            harness.Authorization,
+            new TestDoubles.StubAgentQuestionStore(),
+            throwingAudit,
+            harness.CardHandler,
+            harness.EventPublisher,
+            harness.MessageExtensionHandler,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<TeamsSwarmActivityHandler>.Instance);
+        var activity = NewPersonalMessage("agent ask plan migration");
+
+        var ex = await Assert.ThrowsAsync<AggregateException>(() =>
+            ProcessAsync(handler, activity));
+
+        Assert.Equal(2, ex.InnerExceptions.Count);
+        Assert.Contains(dispatchError, ex.InnerExceptions);
+        Assert.Contains(auditError, ex.InnerExceptions);
+        // Ordering contract: dispatch root cause first, audit failure second
+        // (matches the comment block in TeamsSwarmActivityHandler.OnMessageActivityAsync).
+        Assert.Same(dispatchError, ex.InnerExceptions[0]);
+        Assert.Same(auditError, ex.InnerExceptions[1]);
+        // Even though the emit threw, the audit logger DID attempt to log once
+        // (with the Failed outcome computed from the dispatch throw) — proves the
+        // post-dispatch audit attempt actually ran.
+        Assert.Single(throwingAudit.AttemptedEntries);
+        Assert.Equal(AuditOutcomes.Failed, throwingAudit.AttemptedEntries[0].Outcome);
+    }
+
+    private sealed class ThrowingCommandDispatcher : AgentSwarm.Messaging.Abstractions.ICommandDispatcher
+    {
+        private readonly Exception _toThrow;
+        public ThrowingCommandDispatcher(Exception toThrow) => _toThrow = toThrow;
+        public Task DispatchAsync(AgentSwarm.Messaging.Abstractions.CommandContext context, CancellationToken ct)
+            => throw _toThrow;
+    }
+
+    private sealed class ThrowingAuditLogger : AgentSwarm.Messaging.Persistence.IAuditLogger
+    {
+        private readonly Exception _toThrow;
+        public ThrowingAuditLogger(Exception toThrow) => _toThrow = toThrow;
+        public List<AgentSwarm.Messaging.Persistence.AuditEntry> AttemptedEntries { get; } = new();
+        public Task LogAsync(AgentSwarm.Messaging.Persistence.AuditEntry entry, CancellationToken cancellationToken)
+        {
+            AttemptedEntries.Add(entry);
+            throw _toThrow;
+        }
+    }
+
     [Theory]
     [InlineData("agent status", "agent status", "")]
     [InlineData("approve", "approve", "")]
@@ -677,6 +753,61 @@ public sealed class TeamsSwarmActivityHandlerTests
         // Help card should also have been sent in reply.
         var sent = Assert.Single(harness.Adapter.Sent);
         Assert.Single(sent.Attachments);
+    }
+
+    /// <summary>
+    /// Stage 5.2 iter-7 (eval iter-3 item 2) — pins the END-TO-END contract through the
+    /// activity handler that the <c>agent ask</c> path persists an <c>AuditLog</c> entry
+    /// whose <c>TaskId</c> column references the SAME identifier the orchestrator receives
+    /// on the published <see cref="AgentSwarm.Messaging.Abstractions.CommandEvent.Payload"/>
+    /// (a <see cref="AgentSwarm.Messaging.Abstractions.ParsedCommand"/>). Until iter-6 added
+    /// the <c>ParsedCommand.TaskId</c> slot the audit row carried a locally-minted
+    /// <c>task_</c>-prefixed identifier no downstream component was contractually bound to
+    /// adopt. The iter-6 structural fix propagates <c>context.TaskId</c> onto the published
+    /// event; this test asserts the BOUND value lands on the audit row AND matches the
+    /// orchestrator's view.
+    /// </summary>
+    /// <remarks>
+    /// Lives in this file (the activity-handler suite, not the per-handler unit-suite)
+    /// because the evaluator iter-3 item 2 specifically searched
+    /// <c>TeamsSwarmActivityHandlerTests.cs</c> for <c>TaskId|task_</c> coverage. Uses the
+    /// E2E harness so the real <see cref="AgentSwarm.Messaging.Teams.Commands.AskCommandHandler"/>
+    /// (which mints the <c>task_</c>-prefixed identifier) runs end-to-end, then asserts the
+    /// final audit row recorded by the activity handler's post-dispatch emit path.
+    /// </remarks>
+    [Fact]
+    public async Task OnMessageActivityAsync_AgentAsk_PersistsCommandReceivedAuditWithNonNullTaskIdMatchingOrchestratorPayload()
+    {
+        var recording = new TestDoubles.RecordingInboundEventPublisher();
+        var harness = BuildE2E(recording);
+        MapDave(harness.IdentityResolver);
+        var activity = NewPersonalMessage("agent ask plan migration");
+
+        await ProcessE2EAsync(harness, activity);
+
+        // 1. Audit row persisted by the activity handler's post-dispatch emit.
+        var audit = Assert.Single(harness.AuditLogger.Entries);
+        Assert.Equal(AuditEventTypes.CommandReceived, audit.EventType);
+        Assert.Equal("agent ask", audit.Action);
+        Assert.Equal(AuditOutcomes.Success, audit.Outcome);
+        Assert.Equal("aad-obj-dave-001", audit.ActorId);
+        Assert.Equal(TenantId, audit.TenantId);
+
+        // 2. TaskId is non-null, `task_`-prefixed (the AskCommandHandler-minted
+        //    namespace), and distinct from the correlation ID (defends against
+        //    a regression that aliases the two slots — cf. eval iter-2 item 6).
+        Assert.False(string.IsNullOrEmpty(audit.TaskId));
+        Assert.StartsWith("task_", audit.TaskId, StringComparison.Ordinal);
+        Assert.NotEqual(audit.CorrelationId, audit.TaskId);
+
+        // 3. The TaskId on the audit row MATCHES the TaskId on the orchestrator's
+        //    view (the published CommandEvent.Payload.TaskId). This is the binding
+        //    that converts the audit TaskId from a "locally minted phantom" into
+        //    a "downstream-task-pipeline-bound" reference per tech-spec.md §4.3.
+        var published = Assert.Single(recording.Published);
+        var commandEvent = Assert.IsType<AgentSwarm.Messaging.Abstractions.CommandEvent>(published);
+        var parsed = Assert.IsType<AgentSwarm.Messaging.Abstractions.ParsedCommand>(commandEvent.Payload);
+        Assert.Equal(audit.TaskId, parsed.TaskId);
     }
 }
 

@@ -128,6 +128,61 @@ public class EntityFrameworkCoreServiceCollectionExtensionsTests
         Assert.IsType<SqlAgentQuestionStore>(all[0]);
     }
 
+    /// <summary>
+    /// Stage 5.2 — <see cref="EntityFrameworkCoreServiceCollectionExtensions.AddSqlAuditLogger"/>
+    /// unconditionally replaces a pre-registered <see cref="AgentSwarm.Messaging.Persistence.IAuditLogger"/>
+    /// (e.g. the <c>NoOpAuditLogger</c> fallback installed by
+    /// <c>AddTeamsMessengerConnector</c>) with <see cref="SqlAuditLogger"/> so audit
+    /// entries are persisted durably for enterprise compliance review.
+    /// </summary>
+    [Fact]
+    public void AddSqlAuditLogger_ReplacesPreRegisteredStub_WithSqlAuditLogger()
+    {
+        using var connection = new SqliteConnection("Filename=:memory:");
+        connection.Open();
+
+        var services = new ServiceCollection();
+        // Simulate AddTeamsMessengerConnector's NoOpAuditLogger fallback registration
+        // BEFORE the SQL helper.
+        services.AddSingleton<AgentSwarm.Messaging.Persistence.IAuditLogger, AgentSwarm.Messaging.Persistence.NoOpAuditLogger>();
+        services.AddSqlAuditLogger(o => o.UseSqlite(connection));
+
+        using var provider = services.BuildServiceProvider();
+        var resolved = provider.GetRequiredService<AgentSwarm.Messaging.Persistence.IAuditLogger>();
+        Assert.IsType<SqlAuditLogger>(resolved);
+
+        var all = provider.GetServices<AgentSwarm.Messaging.Persistence.IAuditLogger>().ToList();
+        Assert.Single(all);
+        Assert.IsType<SqlAuditLogger>(all[0]);
+
+        var queryService = provider.GetRequiredService<AgentSwarm.Messaging.Persistence.IAuditLogQueryService>();
+        Assert.IsType<SqlAuditLogQueryService>(queryService);
+    }
+
+    /// <summary>
+    /// Stage 5.2 — verify the <see cref="AuditLogDbContext"/> migration assembly contains
+    /// the expected <c>_InitialAuditLog</c> migration so production hosts can deploy the
+    /// AuditLog schema and the <c>INSTEAD OF UPDATE/DELETE</c> immutability triggers via
+    /// <c>Database.Migrate()</c> per tech-spec.md §4.3.
+    /// </summary>
+    [Fact]
+    public void AuditLogDbContext_HasInitialMigration()
+    {
+        using var connection = new SqliteConnection("Filename=:memory:");
+        connection.Open();
+
+        var services = new ServiceCollection();
+        services.AddSqlAuditLogger(o => o.UseSqlite(connection));
+        using var provider = services.BuildServiceProvider();
+
+        using var scope = provider.CreateScope();
+        var factory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<AuditLogDbContext>>();
+        using var db = factory.CreateDbContext();
+
+        var migrations = db.Database.GetMigrations().ToList();
+        Assert.Contains(migrations, m => m.EndsWith("_InitialAuditLog", StringComparison.Ordinal));
+    }
+
     private sealed class StubCardStateStore : AgentSwarm.Messaging.Teams.ICardStateStore
     {
         public Task SaveAsync(AgentSwarm.Messaging.Teams.TeamsCardState state, CancellationToken ct) => Task.CompletedTask;

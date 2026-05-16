@@ -56,7 +56,7 @@
             {
               "name": "instruction",
               "title": "Instruction",
-              "description": "Task or message to forward to the AgentSwarm orchestrator. Optional when forwarding a message; required when invoked from the command box.",
+              "description": "Task or message to forward to the AgentSwarm orchestrator. Optional when forwarding; required from command box.",
               "inputType": "text"
             }
           ]

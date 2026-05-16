@@ -138,7 +138,17 @@ public sealed class CommandDispatcher : ICommandDispatcher
         }
 
         var (handler, arguments) = match.Value;
-        var routed = context with { CommandArguments = arguments };
+
+        // Stage 5.2 iter-7 — mutate the SAME context instance the activity handler
+        // already holds, rather than `context with { CommandArguments = arguments }`
+        // cloning a throwaway record. The prior clone broke the
+        // `AgentId`/`TaskId`/`Outcome` mutable-handler-output contract: any handler
+        // stamp on the cloned record was discarded when control returned to the
+        // activity handler, silently nulling those fields in the persisted
+        // `CommandReceived` audit row (tech-spec.md §4.3). Mutating the original
+        // is sound because `CommandArguments` is now declared `set` (not `init`)
+        // and the dispatcher is the only producer of that field.
+        context.CommandArguments = arguments;
 
         _logger.LogInformation(
             "Dispatching command '{CommandName}' to handler '{HandlerType}' (correlation {CorrelationId}, args length {ArgsLength}).",
@@ -147,7 +157,7 @@ public sealed class CommandDispatcher : ICommandDispatcher
             context.CorrelationId,
             arguments.Length);
 
-        await handler.HandleAsync(routed, ct).ConfigureAwait(false);
+        await handler.HandleAsync(context, ct).ConfigureAwait(false);
     }
 
     private (ICommandHandler Handler, string Arguments)? MatchHandler(string trimmed)

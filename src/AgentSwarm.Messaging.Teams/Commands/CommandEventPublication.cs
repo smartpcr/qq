@@ -36,7 +36,16 @@ internal static class CommandEventPublication
             ActivityId = context.ActivityId,
             Source = ResolveEventSource(context),
             Timestamp = DateTimeOffset.UtcNow,
-            Payload = new ParsedCommand(commandVerb, body, correlationId),
+            // Stage 5.2 iter-6 (eval iter-3 item 1) — propagate the handler-minted task
+            // identifier to the orchestrator through ParsedCommand.TaskId so the audit
+            // row's TaskId column references an ID the downstream task pipeline is
+            // contractually bound to adopt (per tech-spec.md §4.3). When the handler did
+            // not stamp context.TaskId (status/approve/reject/escalate/pause/resume),
+            // the field stays null.
+            Payload = new ParsedCommand(commandVerb, body, correlationId)
+            {
+                TaskId = context.TaskId,
+            },
         };
 
         return publisher.PublishAsync(commandEvent, ct);

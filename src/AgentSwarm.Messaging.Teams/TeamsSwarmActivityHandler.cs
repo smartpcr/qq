@@ -249,23 +249,26 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             }
         }
 
-        // (3.5) Authorized inbound — emit the `CommandReceived` audit BEFORE persisting
-        // the reference and dispatching. Persisting an immutable audit record on every
-        // authorized inbound (both canonical commands and unrecognised free text) satisfies
-        // the story's "Persist immutable audit trail suitable for enterprise review"
-        // requirement and the attachment's e2e mandate. For non-canonical text, the
-        // commandVerb is empty so the audit `Action` records "(text)" — distinguishing the
-        // shape from a real command without inventing a new AuditEventType (the canonical
-        // set is fixed at seven per tech-spec §4.3).
-        await LogCommandReceivedAsync(
-            correlationId: correlationId,
-            tenantId: tenantId,
-            actorId: aadObjectId,
-            commandVerb: isCanonical ? commandVerb : "(text)",
-            isCanonicalVerb: isCanonical,
-            conversationId: activity?.Conversation?.Id,
-            normalizedText: normalizedText,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+        // (3.5) Authorized inbound — defer audit emission to AFTER dispatch so the
+        // CommandReceived audit row (per tech-spec.md §4.3) carries the actual
+        // outcome (Success / Failed) AND the AgentId / TaskId that the matched
+        // command handler resolved or created (e.g. ApproveRejectCommandExecutor
+        // stamps the resolved question's AgentId/TaskId onto context.AgentId/TaskId;
+        // AskCommandHandler stamps the new task tracking ID). The earlier
+        // pre-dispatch emit hardcoded outcome=Success and AgentId/TaskId=null —
+        // both of those were violations of §4.3 (the schema requires per-event
+        // outcome and per-event task/agent association whenever they apply).
+        //
+        // Persist/refresh the conversation reference BEFORE dispatch (formerly
+        // step 4) so that downstream handlers that rely on
+        // ConversationReferenceStore inside their dispatch path still see the
+        // refresh — the reference write is a side effect of "the user spoke",
+        // not of "the command succeeded".
+        //
+        // For non-canonical text, the commandVerb is empty so the audit `Action`
+        // records "(text)" — distinguishing the shape from a real command without
+        // inventing a new AuditEventType (the canonical set is fixed at seven per
+        // tech-spec §4.3).
 
         // (4) Persist/refresh the conversation reference AFTER successful identity + RBAC.
         // This satisfies e2e-scenarios.md §Conversation Reference Persistence and the
@@ -296,7 +299,93 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             ActivityId = activity?.Id,
         };
 
-        await _commandDispatcher.DispatchAsync(context, cancellationToken).ConfigureAwait(false);
+        // Stage 5.2 step 3 — try/catch+finally so EVERY dispatch produces exactly
+        // one CommandReceived audit row. Outcome is "Success" when DispatchAsync
+        // returns normally and "Failed" when it throws; the exception still
+        // propagates so the outer middleware sees the same error shape as before.
+        // AgentId / TaskId are read from `context` in the finally — the matched
+        // command handler may have stamped them on the context instance during
+        // dispatch.
+        // Stage 5.2 iter-3 — replace the prior try/catch+finally with an explicit
+        // capture/rethrow so that:
+        //   (a) the audit emit is OUTSIDE finally (a throw from a finally would
+        //       replace the dispatch exception, hiding the real failure cause from
+        //       Teams' inbound retry layer); and
+        //   (b) audit failures STILL propagate (per iter-1 evaluator item 7 — every
+        //       outbound notification MUST land a durable audit row; same applies
+        //       to inbound CommandReceived).
+        // Stage 5.2 iter-5 (eval iter-2 item 4) — when BOTH dispatch AND audit fail,
+        // the prior iter-3 design logged-and-swallowed the audit error so only the
+        // dispatch error surfaced. That suppressed the audit failure, which the
+        // workstream's compliance contract ("every command emits an audit entry")
+        // forbids. The fix: surface both via AggregateException so the dispatch
+        // root cause and the audit-store outage are visible to upstream middleware
+        // (and to Teams' inbound retry, which will re-run the activity and give
+        // the idempotent audit row another chance to land).
+        // Branch summary:
+        //   * dispatch OK,    audit OK    → no exception (Success audit row landed).
+        //   * dispatch fails, audit OK    → dispatch exception re-thrown with original
+        //                                   stack via ExceptionDispatchInfo.Throw().
+        //   * dispatch OK,    audit fails → audit exception propagates uncaught (the
+        //                                   `when` filter is false). Teams retries the
+        //                                   activity; the idempotent emit eventually lands.
+        //   * dispatch fails, audit fails → AggregateException(dispatch, audit) thrown.
+        //                                   Both root causes carried in InnerExceptions.
+        var commandOutcome = AuditOutcomes.Success;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? capturedDispatchFailure = null;
+        try
+        {
+            await _commandDispatcher.DispatchAsync(context, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            commandOutcome = AuditOutcomes.Failed;
+            capturedDispatchFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+        }
+
+        try
+        {
+            await LogCommandReceivedAsync(
+                correlationId: correlationId,
+                tenantId: tenantId,
+                actorId: aadObjectId,
+                commandVerb: isCanonical ? commandVerb : "(text)",
+                isCanonicalVerb: isCanonical,
+                conversationId: activity?.Conversation?.Id,
+                normalizedText: normalizedText,
+                agentId: context.AgentId,
+                taskId: context.TaskId,
+                // Stage 5.2 iter-4 (eval item 7) — handlers may signal a non-Success
+                // outcome (Rejected) for handled command-level failures that return
+                // normally instead of throwing. context.Outcome wins when set; the
+                // Failed-on-throw / Success-on-clean-return defaults from
+                // `commandOutcome` apply only when the handler did NOT declare one.
+                outcome: context.Outcome ?? commandOutcome,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception auditEx) when (capturedDispatchFailure is not null)
+        {
+            // Both dispatch AND audit failed. Iter-5 fix (eval iter-2 item 4): do
+            // NOT swallow the audit error — the brief requires every command to
+            // produce a durable audit row, and a silently-logged audit failure
+            // makes the gap invisible. Surface both via AggregateException so:
+            //   * The dispatch root cause is preserved (Inner[0]).
+            //   * The audit failure is surfaced (Inner[1]) so the missing
+            //     CommandReceived row is visible at the failure boundary.
+            //   * Teams' inbound retry sees a failure and re-runs the activity,
+            //     giving the idempotent audit emit another chance to land.
+            // Also log loudly so operations see both root causes in the trace.
+            _logger.LogError(
+                auditEx,
+                "CommandReceived audit emit failed AFTER dispatch failure (correlation {CorrelationId}); surfacing AggregateException carrying BOTH root causes.",
+                correlationId);
+            throw new AggregateException(
+                $"Command dispatch failed AND CommandReceived audit-row persistence failed (correlation {correlationId}). Both root causes are carried in InnerExceptions; Teams should retry the activity so the idempotent audit row can eventually land.",
+                capturedDispatchFailure.SourceException,
+                auditEx);
+        }
+
+        capturedDispatchFailure?.Throw();
     }
 
     /// <summary>
@@ -913,6 +1002,9 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         bool isCanonicalVerb,
         string? conversationId,
         string normalizedText,
+        string? agentId,
+        string? taskId,
+        string outcome,
         CancellationToken cancellationToken)
     {
         // Per `e2e-scenarios.md` §Compliance — Immutable Audit Trail, scenario
@@ -924,6 +1016,15 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         //   PayloadJson  = {"body":"<remainder after the verb>"} for canonical commands;
         //                  {"body":"<full normalized text>"} for non-canonical input so
         //                  the audit record captures what the user actually typed.
+        //   AgentId      = stamped by the command handler onto CommandContext.AgentId
+        //                  AFTER the agent target has been resolved (approve/reject) or
+        //                  null when no agent is associated yet (`agent ask` before
+        //                  routing).
+        //   TaskId       = stamped by the command handler onto CommandContext.TaskId
+        //                  after the task has been created / resolved.
+        //   Outcome      = "Success" when DispatchAsync returned without throwing;
+        //                  "Failed" when the dispatch threw (the exception still
+        //                  propagates — the audit emission lives in `finally`).
         // The earlier implementation-specific shape ({command, normalizedText}) did not
         // conform to the enterprise-reviewable audit contract — corrected here so the
         // `SqlAuditLogger` (Stage 5.2) and downstream compliance tooling can rely on the
@@ -941,8 +1042,19 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             action: commandVerb,
             conversationId: conversationId,
             payloadJson: payload,
-            outcome: AuditOutcomes.Success);
+            outcome: outcome,
+            agentId: agentId,
+            taskId: taskId);
 
+        // Stage 5.2 — CommandReceived audit emission MUST be durable. Per the
+        // workstream's compliance contract ("Persist immutable audit trail suitable
+        // for enterprise review") and the iter-1 evaluator feedback item 7 (which
+        // rejected silent loss of audit rows even with a logged warning), audit
+        // failures propagate. Teams' inbound retry semantics on activity-handler
+        // exceptions cover the retry path — a transient audit-store outage drops
+        // the activity for re-delivery, at which point the same correlationId
+        // produces an idempotent audit row. Swallowing here would leave commands
+        // executed with no durable audit record, violating §4.3.
         await _auditLogger.LogAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1060,7 +1172,9 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
         string action,
         string? conversationId,
         string payloadJson,
-        string outcome)
+        string outcome,
+        string? agentId = null,
+        string? taskId = null)
     {
         var timestamp = DateTimeOffset.UtcNow;
         var checksum = AuditEntry.ComputeChecksum(
@@ -1070,8 +1184,8 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             actorId: actorId,
             actorType: AuditActorTypes.User,
             tenantId: tenantId,
-            agentId: null,
-            taskId: null,
+            agentId: agentId,
+            taskId: taskId,
             conversationId: conversationId,
             action: action,
             payloadJson: payloadJson,
@@ -1085,8 +1199,8 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             ActorId = actorId,
             ActorType = AuditActorTypes.User,
             TenantId = tenantId,
-            AgentId = null,
-            TaskId = null,
+            AgentId = agentId,
+            TaskId = taskId,
             ConversationId = conversationId,
             Action = action,
             PayloadJson = payloadJson,
