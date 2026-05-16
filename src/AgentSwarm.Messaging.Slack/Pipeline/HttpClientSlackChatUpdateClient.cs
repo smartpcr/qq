@@ -17,6 +17,7 @@ using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Entities;
 using AgentSwarm.Messaging.Slack.Security;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 /// <summary>
 /// Default <see cref="ISlackChatUpdateClient"/> implementation: resolves
@@ -36,6 +37,20 @@ using Microsoft.Extensions.Logging;
 /// the surrounding decision-publish flow.
 /// </para>
 /// <para>
+/// Unlike <see cref="Transport.HttpClientSlackViewsOpenClient"/>, this
+/// client is invoked on the async handler path AFTER the Slack
+/// interaction ACK has already flushed, so it is NOT bound by Slack's
+/// 3-second ACK budget. The default per-request timeout therefore
+/// targets a steady-state outbound-API budget (10 s) rather than the
+/// ACK budget; an earlier 3 s default caused spurious
+/// <see cref="SlackChatUpdateResult.NetworkFailure(string)"/>
+/// dead-letters under normal cross-region latency and TLS handshake
+/// jitter. Hosts that need a different value should bind
+/// <see cref="SlackChatUpdateOptions"/> via
+/// <c>services.Configure&lt;SlackChatUpdateOptions&gt;(...)</c>; the
+/// value is consumed once at construction.
+/// </para>
+/// <para>
 /// Stage 6.4's <c>SlackDirectApiClient</c> is expected to supersede
 /// this implementation (sharing rate-limit state with the outbound
 /// dispatcher); until then this client is what runs in production.
@@ -49,7 +64,14 @@ internal sealed class HttpClientSlackChatUpdateClient : ISlackChatUpdateClient
     /// <summary>Named <see cref="HttpClient"/> for resilience-handler layering.</summary>
     public const string HttpClientName = "slack-chat-update";
 
-    private static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(3);
+    /// <summary>
+    /// Fallback per-request timeout applied when the host has not
+    /// configured <see cref="SlackChatUpdateOptions.RequestTimeoutMilliseconds"/>
+    /// (or has set it to a non-positive value). Deliberately well
+    /// above the 3 s Slack-ACK budget because this client runs on
+    /// the post-ACK async path.
+    /// </summary>
+    internal static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(10);
 
     private readonly IHttpClientFactory httpClientFactory;
     private readonly ISlackWorkspaceConfigStore workspaceStore;
@@ -57,16 +79,36 @@ internal sealed class HttpClientSlackChatUpdateClient : ISlackChatUpdateClient
     private readonly ILogger<HttpClientSlackChatUpdateClient> logger;
     private readonly TimeSpan requestTimeout;
 
+    /// <summary>
+    /// DI-resolvable constructor. Reads the per-request timeout from
+    /// <paramref name="options"/>; if no <see cref="SlackChatUpdateOptions"/>
+    /// has been configured the built-in <see cref="DefaultRequestTimeout"/>
+    /// is used.
+    /// </summary>
     public HttpClientSlackChatUpdateClient(
         IHttpClientFactory httpClientFactory,
         ISlackWorkspaceConfigStore workspaceStore,
         ISecretProvider secretProvider,
-        ILogger<HttpClientSlackChatUpdateClient> logger)
-        : this(httpClientFactory, workspaceStore, secretProvider, logger, DefaultRequestTimeout)
+        ILogger<HttpClientSlackChatUpdateClient> logger,
+        IOptions<SlackChatUpdateOptions>? options = null)
+        : this(
+            httpClientFactory,
+            workspaceStore,
+            secretProvider,
+            logger,
+            ResolveTimeout(options?.Value))
     {
     }
 
-    public HttpClientSlackChatUpdateClient(
+    /// <summary>
+    /// Test-friendly constructor that lets a unit test override the
+    /// request timeout directly. Marked <c>internal</c> so the DI
+    /// container's public-constructor scan picks the
+    /// <see cref="IOptions{TOptions}"/>-based overload above; the
+    /// Tests assembly reaches it through
+    /// <c>[InternalsVisibleTo("AgentSwarm.Messaging.Slack.Tests")]</c>.
+    /// </summary>
+    internal HttpClientSlackChatUpdateClient(
         IHttpClientFactory httpClientFactory,
         ISlackWorkspaceConfigStore workspaceStore,
         ISecretProvider secretProvider,
@@ -246,4 +288,47 @@ internal sealed class HttpClientSlackChatUpdateClient : ISlackChatUpdateClient
             httpResponse?.Dispose();
         }
     }
+
+    private static TimeSpan ResolveTimeout(SlackChatUpdateOptions? options)
+    {
+        int milliseconds = options?.RequestTimeoutMilliseconds ?? 0;
+        return milliseconds > 0
+            ? TimeSpan.FromMilliseconds(milliseconds)
+            : DefaultRequestTimeout;
+    }
+}
+
+/// <summary>
+/// Tunables for <see cref="HttpClientSlackChatUpdateClient"/>. Bound
+/// from <c>Slack:ChatUpdate</c> in configuration via
+/// <c>services.Configure&lt;SlackChatUpdateOptions&gt;(...)</c>.
+/// </summary>
+/// <remarks>
+/// Resolution is opportunistic: the
+/// <see cref="HttpClientSlackChatUpdateClient"/> constructor accepts
+/// an optional <see cref="IOptions{TOptions}"/> and falls back to
+/// <see cref="HttpClientSlackChatUpdateClient.DefaultRequestTimeout"/>
+/// when the host has not bound the section, so adding this options
+/// type does not require a corresponding DI-wiring change in the
+/// composition root.
+/// </remarks>
+public sealed class SlackChatUpdateOptions
+{
+    /// <summary>
+    /// Configuration section name (<c>"Slack:ChatUpdate"</c>) the
+    /// options are bound from.
+    /// </summary>
+    public const string SectionName = "Slack:ChatUpdate";
+
+    /// <summary>
+    /// Per-request timeout for the <c>chat.update</c> POST, in
+    /// milliseconds. Values &lt;= 0 fall back to the built-in
+    /// default of 10 000 ms. The default is intentionally generous
+    /// because <c>chat.update</c> runs on the async handler path
+    /// AFTER the Slack ACK has flushed, so the request is NOT bound
+    /// by Slack's 3-second ACK budget; an earlier 3 s value
+    /// produced spurious dead-letters under normal cross-region
+    /// latency and TLS handshake jitter.
+    /// </summary>
+    public int RequestTimeoutMilliseconds { get; set; } = 10_000;
 }
