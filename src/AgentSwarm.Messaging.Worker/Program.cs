@@ -1,3 +1,5 @@
+using AgentSwarm.Messaging.Slack.Configuration;
+
 namespace AgentSwarm.Messaging.Worker;
 
 /// <summary>
@@ -27,6 +29,7 @@ public class Program
     {
         WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
         builder.Services.AddRouting();
+        builder.Services.AddSlackConnectorOptions(builder.Configuration);
         return builder.Build();
     }
 }
