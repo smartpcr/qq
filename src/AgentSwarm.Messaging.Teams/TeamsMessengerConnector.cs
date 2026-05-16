@@ -66,6 +66,20 @@ namespace AgentSwarm.Messaging.Teams;
 /// in-memory and Stage 4.1 SQL) are expected to implement both interfaces and register
 /// the same singleton under both service types.
 /// </para>
+/// <para>
+/// <b>Clock injection:</b> all timestamps stamped onto persisted rows
+/// (<see cref="TeamsCardState.CreatedAt"/>, <see cref="TeamsCardState.UpdatedAt"/>) and
+/// onto in-memory <see cref="HumanDecisionEvent"/> placeholders flow through an injected
+/// <see cref="TimeProvider"/>. The DI-friendly public constructor defaults to
+/// <see cref="TimeProvider.System"/>; a second public overload accepts a deterministic
+/// provider so unit tests can advance the clock without wall-clock flakiness. This
+/// mirrors the pattern already used by <see cref="Cards.AdaptiveCardBuilder"/>,
+/// <see cref="Cards.CardActionHandler"/>, and
+/// <see cref="Lifecycle.QuestionExpiryProcessor"/> and keeps the connector's
+/// store-bound timestamps consistent with the rest of the lifecycle code so
+/// cross-component ordering (card state row vs. dedupe cache vs. expiry sweep) stays
+/// deterministic under a fake clock.
+/// </para>
 /// </remarks>
 public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardManager
 {
@@ -78,6 +92,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
     private readonly IAdaptiveCardRenderer _cardRenderer;
     private readonly IInboundEventReader _inboundEventReader;
     private readonly ILogger<TeamsMessengerConnector> _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Construct the connector with the dependencies required by
@@ -88,7 +103,8 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
     /// rendering, and an <see cref="ILogger{T}"/> for operational logging. Every
     /// parameter is null-guarded so DI mis-registration fails loudly at startup rather
     /// than producing a <see cref="NullReferenceException"/> deep inside an outbound
-    /// delivery.
+    /// delivery. The clock defaults to <see cref="TimeProvider.System"/>; unit tests
+    /// resolve the second public overload to inject a deterministic provider.
     /// </summary>
     public TeamsMessengerConnector(
         CloudAdapter adapter,
@@ -100,6 +116,43 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         IAdaptiveCardRenderer cardRenderer,
         IInboundEventReader inboundEventReader,
         ILogger<TeamsMessengerConnector> logger)
+        : this(
+            adapter,
+            options,
+            conversationReferenceStore,
+            conversationReferenceRouter,
+            agentQuestionStore,
+            cardStateStore,
+            cardRenderer,
+            inboundEventReader,
+            logger,
+            TimeProvider.System)
+    {
+    }
+
+    /// <summary>
+    /// Test-friendly constructor that accepts a deterministic <see cref="TimeProvider"/>
+    /// so unit tests can verify the exact values stamped onto
+    /// <see cref="TeamsCardState.CreatedAt"/> / <see cref="TeamsCardState.UpdatedAt"/>
+    /// (including the stale-activity fallback in
+    /// <see cref="UpdateCardAsync(string, CardUpdateAction, CancellationToken)"/>) and
+    /// onto <see cref="HumanDecisionEvent.ReceivedAt"/> placeholders without wall-clock
+    /// flakiness. Production DI resolves the 9-arg constructor, which delegates here
+    /// with <see cref="TimeProvider.System"/>; this overload is public (matching the
+    /// pattern used by <see cref="Lifecycle.QuestionExpiryProcessor"/>) so tests in
+    /// other assemblies do not need <c>InternalsVisibleTo</c>.
+    /// </summary>
+    public TeamsMessengerConnector(
+        CloudAdapter adapter,
+        TeamsMessagingOptions options,
+        IConversationReferenceStore conversationReferenceStore,
+        IConversationReferenceRouter conversationReferenceRouter,
+        IAgentQuestionStore agentQuestionStore,
+        ICardStateStore cardStateStore,
+        IAdaptiveCardRenderer cardRenderer,
+        IInboundEventReader inboundEventReader,
+        ILogger<TeamsMessengerConnector> logger,
+        TimeProvider timeProvider)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _options = options ?? throw new ArgumentNullException(nameof(options));
@@ -110,6 +163,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         _cardRenderer = cardRenderer ?? throw new ArgumentNullException(nameof(cardRenderer));
         _inboundEventReader = inboundEventReader ?? throw new ArgumentNullException(nameof(inboundEventReader));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
 
     /// <inheritdoc />
@@ -272,7 +326,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             .UpdateConversationIdAsync(question.QuestionId, deliveredConversationId!, ct)
             .ConfigureAwait(false);
 
-        var now = DateTimeOffset.UtcNow;
+        var now = _timeProvider.GetUtcNow();
         var cardState = new TeamsCardState
         {
             QuestionId = question.QuestionId,
@@ -375,11 +429,16 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
 
                 if (staleActivityFallbackTriggered && !string.IsNullOrWhiteSpace(newActivityId))
                 {
+                    // Use the injected TimeProvider (not DateTimeOffset.UtcNow) so the
+                    // refreshed row's UpdatedAt stays in sync with the rest of the
+                    // lifecycle code (AdaptiveCardBuilder, CardActionHandler,
+                    // QuestionExpiryProcessor) and remains deterministic under a fake
+                    // clock in unit tests.
                     var refreshed = state with
                     {
                         ActivityId = newActivityId!,
                         Status = nextStatus,
-                        UpdatedAt = DateTimeOffset.UtcNow,
+                        UpdatedAt = _timeProvider.GetUtcNow(),
                     };
                     await _cardStateStore.SaveAsync(refreshed, innerCt).ConfigureAwait(false);
                     return;
@@ -463,7 +522,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         };
     }
 
-    private static HumanDecisionEvent BuildPlaceholderDecision(string questionId, string actionValue)
+    private HumanDecisionEvent BuildPlaceholderDecision(string questionId, string actionValue)
         => new(
             QuestionId: questionId,
             ActionValue: actionValue,
@@ -471,7 +530,7 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             Messenger: "Teams",
             ExternalUserId: "system",
             ExternalMessageId: string.Empty,
-            ReceivedAt: DateTimeOffset.UtcNow,
+            ReceivedAt: _timeProvider.GetUtcNow(),
             CorrelationId: questionId);
 
     private static ConversationReference DeserializeReferenceFromJson(string referenceJson, string questionId)
