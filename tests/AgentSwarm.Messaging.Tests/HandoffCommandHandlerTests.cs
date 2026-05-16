@@ -191,6 +191,50 @@ public class HandoffCommandHandlerTests
         upserted.AssignedBy.Should().Be("@operator-1", "the source operator initiated the handoff");
     }
 
+    [Fact]
+    public async Task AuditDetails_AreValidJson_AndEscapeQuotesAndBackslashesInIdentifiers()
+    {
+        // iter-3 evaluator item 5: hand-built JSON in the prior
+        // implementation produced invalid JSON when the task id or
+        // alias contained quotes or backslashes. Switching to
+        // System.Text.Json guarantees the persisted Details column
+        // round-trips for arbitrary identifier shapes.
+        var (handler, oversight, registry, queue, audit, _) = Build();
+        var trickyTaskId = "TASK-\"weird\"\\path";
+        var trickyAlias = "@op\"er\\ator-2";
+
+        var existing = ExistingOwnedByOperator1() with { TaskId = trickyTaskId };
+        oversight.Setup(o => o.GetByTaskIdAsync(trickyTaskId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(existing);
+        registry.Setup(r => r.GetByAliasAsync(trickyAlias, "t-acme", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Operator2Binding() with { OperatorAlias = trickyAlias });
+
+        oversight.Setup(o => o.UpsertAsync(It.IsAny<TaskOversight>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        queue.Setup(q => q.EnqueueAsync(It.IsAny<OutboundMessage>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        AuditEntry? captured = null;
+        audit.Setup(a => a.LogAsync(It.IsAny<AuditEntry>(), It.IsAny<CancellationToken>()))
+            .Callback<AuditEntry, CancellationToken>((e, _) => captured = e)
+            .Returns(Task.CompletedTask);
+
+        var result = await handler.HandleAsync(
+            TestCommands.Build("handoff", trickyTaskId, trickyAlias),
+            Operator1(),
+            default);
+
+        result.Success.Should().BeTrue();
+        captured.Should().NotBeNull();
+        captured!.Details.Should().NotBeNullOrEmpty();
+
+        // Must be valid JSON — parsing throws JsonException otherwise.
+        using var doc = System.Text.Json.JsonDocument.Parse(captured.Details!);
+        var root = doc.RootElement;
+        root.GetProperty("taskId").GetString().Should().Be(trickyTaskId);
+        root.GetProperty("targetAlias").GetString().Should().Be(trickyAlias);
+    }
+
     private static (
         HandoffCommandHandler handler,
         Mock<ITaskOversightRepository> oversight,

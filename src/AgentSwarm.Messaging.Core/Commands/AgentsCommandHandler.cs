@@ -1,3 +1,9 @@
+// -----------------------------------------------------------------------
+// <copyright file="AgentsCommandHandler.cs" company="Microsoft Corp.">
+//     Copyright (c) Microsoft Corp. All rights reserved.
+// </copyright>
+// -----------------------------------------------------------------------
+
 namespace AgentSwarm.Messaging.Core.Commands;
 
 using System.Globalization;
@@ -15,7 +21,7 @@ using Microsoft.Extensions.Logging;
 /// <para>
 /// <b>Multi-workspace disambiguation is the pipeline's responsibility</b>
 /// (per <c>TelegramUpdatePipeline.ExecuteAsync</c>'s resolve-operator
-/// stage and the iter-2 evaluator pins on items 1–3). When an operator
+/// stage and the iter-2 evaluator pins on items 1ΓÇô3). When an operator
 /// has more than one <c>OperatorBinding</c> AND types <c>/agents</c>
 /// with NO argument, the pipeline emits the workspace-selection prompt
 /// using the durable
@@ -31,7 +37,7 @@ using Microsoft.Extensions.Logging;
 /// <b>Authorization scope for explicit workspace args.</b> When the
 /// operator supplies <c>/agents WORKSPACE</c>, the handler verifies the
 /// operator actually has a binding in that workspace via
-/// <see cref="IOperatorRegistry.GetAllBindingsAsync"/> — otherwise a
+/// <see cref="IOperatorRegistry.GetAllBindingsAsync"/> ΓÇö otherwise a
 /// hostile actor with one binding could enumerate any workspace's
 /// agent roster by typing <c>/agents OTHER-WORKSPACE</c>.
 /// </para>
@@ -39,7 +45,7 @@ using Microsoft.Extensions.Logging;
 public sealed class AgentsCommandHandler : ICommandHandler
 {
     public const string UnauthorizedWorkspaceTemplate =
-        "❌ You do not have access to workspace {0}.";
+        "Γ¥î You do not have access to workspace {0}.";
 
     public const string EmptyRosterTemplate =
         "Workspace {0} has no active agents.";
@@ -83,7 +89,7 @@ public sealed class AgentsCommandHandler : ICommandHandler
         }
 
         // Operator explicitly named a workspace. Verify they have access
-        // to it via GetAllBindingsAsync — refusing to enumerate workspaces
+        // to it via GetAllBindingsAsync ΓÇö refusing to enumerate workspaces
         // the operator is not bound to.
         var operatorBindings = await _registry
             .GetAllBindingsAsync(@operator.TelegramUserId, ct)
@@ -148,7 +154,7 @@ public sealed class AgentsCommandHandler : ICommandHandler
         sb.Append(CultureInfo.InvariantCulture, $"Agents in workspace {workspaceId} ({agents.Count}):");
         foreach (var agent in agents)
         {
-            sb.Append(CultureInfo.InvariantCulture, $"\n• {agent.AgentId} [{agent.Role}] — {agent.State}");
+            sb.Append(CultureInfo.InvariantCulture, $"\nΓÇó {agent.AgentId} [{agent.Role}] ΓÇö {agent.State}");
             if (!string.IsNullOrWhiteSpace(agent.CurrentTaskId))
             {
                 sb.Append(CultureInfo.InvariantCulture, $" (task {agent.CurrentTaskId})");
