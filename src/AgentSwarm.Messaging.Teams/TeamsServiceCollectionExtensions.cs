@@ -272,4 +272,48 @@ public static class TeamsServiceCollectionExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Register the Stage 4.2 <see cref="TeamsProactiveNotifier"/> as a singleton under
+    /// both the concrete type and <see cref="IProactiveNotifier"/>. Intended for hosts
+    /// that need to drive agent-originated proactive deliveries (the Phase 6 outbox
+    /// engine, the orchestrator's "ask a question" trigger, etc.) without going through
+    /// an inbound activity.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The notifier shares its <c>CloudAdapter</c>,
+    /// <see cref="IConversationReferenceStore"/>, <see cref="ICardStateStore"/>,
+    /// <see cref="IAgentQuestionStore"/>, and <see cref="Cards.IAdaptiveCardRenderer"/>
+    /// dependencies with <see cref="TeamsMessengerConnector"/>; this helper therefore
+    /// composes <see cref="AddTeamsMessengerConnector"/> first so the shared
+    /// <see cref="Cards.IAdaptiveCardRenderer"/> registration is in place.
+    /// Persistence-store registration is NOT included for the same reason as
+    /// <see cref="AddTeamsCardLifecycle"/>: SQL-backed stores live in the EF Core
+    /// extension package and are composed by the host BEFORE this helper.
+    /// </para>
+    /// <para>
+    /// <b>Idempotent</b> — every registration uses <c>TryAdd*</c> variants so calling
+    /// this helper multiple times leaves the descriptor count unchanged, and explicit
+    /// pre-registrations of either service type are preserved.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddTeamsProactiveNotifier(this IServiceCollection services)
+    {
+        if (services is null)
+        {
+            throw new ArgumentNullException(nameof(services));
+        }
+
+        // Compose the shared dependency graph: CloudAdapter + IConversationReferenceStore
+        // + IAdaptiveCardRenderer are all populated by AddTeamsMessengerConnector. Hosts
+        // that compose AddTeamsProactiveNotifier without the connector would have to
+        // register every dependency manually; cross-wiring keeps the DI graph consistent.
+        services.AddTeamsMessengerConnector();
+
+        services.TryAddSingleton<TeamsProactiveNotifier>();
+        services.TryAddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<TeamsProactiveNotifier>());
+
+        return services;
+    }
 }
