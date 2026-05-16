@@ -87,19 +87,25 @@ using Microsoft.Extensions.Logging;
 /// enqueues without relying on wall-clock races.
 /// </para>
 /// <para>
-/// <b>Cancellation propagation</b>. The single-arg
-/// <see cref="EnqueueAsync(SlackOutboundEnvelope)"/> overload exists
-/// to satisfy the <see cref="ISlackOutboundQueue"/> contract; it
-/// delegates to the
-/// <see cref="EnqueueAsync(SlackOutboundEnvelope, CancellationToken)"/>
-/// overload with <see cref="CancellationToken.None"/>. Hosts /
-/// connector producers that hold a stopping token should call the
-/// CT overload so that a stuck file-system I/O operation holding the
-/// internal write gate cannot block subsequent producers indefinitely
-/// -- the gate, the journal write, and the in-memory channel write
-/// all honour the supplied token. This mirrors
-/// <see cref="AcknowledgeAsync"/>, which already forwards its token
-/// to <c>writeGate.WaitAsync(ct)</c>.
+/// <b>Cancellation escape hatch</b>. The single-slot
+/// <c>writeGate</c> serialises journal writes. Without an escape
+/// hatch, a stuck I/O operation (full disk, dropped network share,
+/// hung file handle) would block every subsequent
+/// <see cref="EnqueueAsync(SlackOutboundEnvelope)"/> call
+/// indefinitely. Two complementary mechanisms address this:
+/// (1) the queue holds a <see cref="CancellationTokenSource"/>
+/// (<c>lifetimeCts</c>) that <see cref="Dispose"/> cancels, and the
+/// linked token is passed to every <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/>
+/// call, so disposing the queue (during host shutdown) wakes any
+/// gate-waiter; (2) callers holding a concrete reference may use
+/// the <see cref="EnqueueAsync(SlackOutboundEnvelope, CancellationToken)"/>
+/// overload to supply a per-call token (e.g. a host stopping
+/// token). The <see cref="ISlackOutboundQueue"/> interface
+/// intentionally omits a per-call cancellation token (Stage 1.3
+/// contract: producers have handed off ownership and cannot retract
+/// a queued send); the overload satisfies that contract's
+/// "implementations that require per-call cancellation expose it on
+/// their concrete type" guidance.
 /// </para>
 /// </remarks>
 internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutboundQueue, IDisposable
@@ -118,6 +124,13 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
     private readonly Channel<SlackOutboundEnvelope> backing;
     private readonly ConcurrentDictionary<Guid, string> inFlightFilePaths;
     private readonly SemaphoreSlim writeGate = new(1, 1);
+
+    // Cancelled by Dispose so a stuck I/O operation cannot wedge the
+    // writeGate past the queue's lifetime. Every WaitAsync below uses
+    // a token linked to this source -- giving the interface-shaped
+    // EnqueueAsync(envelope) overload (which carries no per-call CT
+    // by Stage 1.3 contract) at least a shutdown-time escape hatch.
+    private readonly CancellationTokenSource lifetimeCts = new();
     private bool disposed;
 
     /// <summary>
@@ -187,44 +200,34 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
 
     /// <inheritdoc />
     /// <remarks>
-    /// Interface-contract shim. The
-    /// <see cref="ISlackOutboundQueue.EnqueueAsync(SlackOutboundEnvelope)"/>
-    /// signature does not carry a cancellation token, so this entry
-    /// point delegates to the CT-aware overload with
-    /// <see cref="CancellationToken.None"/>. Producers that hold a
-    /// stopping token (hosted services, connector shutdown paths)
-    /// should call
+    /// Contract-shaped overload required by <see cref="ISlackOutboundQueue"/>
+    /// -- the Stage 1.3 brief intentionally omits a per-call
+    /// cancellation token on the interface so producers cannot
+    /// retract a queued send. Delegates to the concrete-typed
     /// <see cref="EnqueueAsync(SlackOutboundEnvelope, CancellationToken)"/>
-    /// directly so a stuck I/O operation holding the write gate
-    /// cannot block them indefinitely.
+    /// overload with <see cref="CancellationToken.None"/>, which
+    /// still links to <c>lifetimeCts</c> internally so a stuck I/O
+    /// operation cannot pin the write gate past <see cref="Dispose"/>.
     /// </remarks>
-    public ValueTask EnqueueAsync(SlackOutboundEnvelope envelope)
-        => this.EnqueueAsync(envelope, CancellationToken.None);
+    public ValueTask EnqueueAsync(SlackOutboundEnvelope envelope) =>
+        this.EnqueueAsync(envelope, CancellationToken.None);
 
     /// <summary>
-    /// Cancellation-aware overload of <see cref="EnqueueAsync(SlackOutboundEnvelope)"/>.
+    /// Concrete-typed overload that lets callers supply a per-call
+    /// <see cref="CancellationToken"/> (e.g. a host stopping token)
+    /// to abort an in-flight enqueue. Exposed only on the concrete
+    /// type per the <see cref="ISlackOutboundQueue"/> contract
+    /// guidance ("implementations that require per-call cancellation
+    /// expose it on their concrete type, not on this interface").
+    /// The supplied token is linked with the queue's lifetime token
+    /// so disposing the queue also wakes the wait regardless of what
+    /// the caller passed -- this is the cancellation escape hatch
+    /// the contract-shaped overload relies on.
     /// </summary>
-    /// <param name="envelope">The envelope to persist and publish.</param>
-    /// <param name="ct">
-    /// Caller-supplied token. Honoured at three points:
-    /// (1) acquiring the internal write gate -- so a stuck I/O
-    /// operation holding the gate does NOT block subsequent producers
-    /// indefinitely (the symmetric concern that <see cref="AcknowledgeAsync"/>
-    /// already addresses by forwarding <c>ct</c> to
-    /// <c>writeGate.WaitAsync(ct)</c>); (2) the journal file write /
-    /// flush, so cancellation pre-empts a slow disk; (3) the
-    /// in-memory channel publish, for symmetry. On
-    /// <see cref="OperationCanceledException"/> any partial
-    /// <c>.tmp</c> file is best-effort deleted and the exception
-    /// propagates unwrapped so callers can distinguish cancellation
-    /// from a genuine persistence failure (which surfaces as
-    /// <see cref="SlackOutboundQueuePersistenceException"/>).
-    /// </param>
     public async ValueTask EnqueueAsync(SlackOutboundEnvelope envelope, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(envelope);
         this.ThrowIfDisposed();
-        ct.ThrowIfCancellationRequested();
 
         // Sortable filename so directory enumeration yields FIFO order
         // on replay. The leading sortable UTC tick prefix preserves
@@ -244,18 +247,22 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
         FileSystemSlackOutboundRecord record = ToRecord(envelope);
         string json = JsonSerializer.Serialize(record, JsonOptions);
 
-        // Forward the token to WaitAsync so a stuck I/O operation
-        // holding the gate cannot block this producer indefinitely.
-        // Matches the AcknowledgeAsync path which already does
-        // writeGate.WaitAsync(ct).
-        await this.writeGate.WaitAsync(ct).ConfigureAwait(false);
-        string tempPath = filePath + ".tmp";
+        // Link the caller's token with the queue's lifetime token so
+        // both shutdown (Dispose -> lifetimeCts.Cancel) and per-call
+        // cancellation wake a stuck gate-waiter. The linked source is
+        // cheap; we always create it so the code path is uniform
+        // regardless of whether `ct` is None.
+        using CancellationTokenSource linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(this.lifetimeCts.Token, ct);
+
+        await this.writeGate.WaitAsync(linkedCts.Token).ConfigureAwait(false);
         try
         {
             // Write to a temp file then atomically rename so a crash
             // mid-write does not leave a partial JSON line that the
             // replay parser would have to skip. File.Move with
             // overwrite=false is atomic on the same volume.
+            string tempPath = filePath + ".tmp";
             await using (FileStream stream = new(
                 tempPath,
                 FileMode.Create,
@@ -265,25 +272,19 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
                 useAsync: true))
             {
                 byte[] bytes = Encoding.UTF8.GetBytes(json);
-                await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
-                await stream.FlushAsync(ct).ConfigureAwait(false);
+                await stream.WriteAsync(bytes, linkedCts.Token).ConfigureAwait(false);
+                await stream.FlushAsync(linkedCts.Token).ConfigureAwait(false);
             }
 
             File.Move(tempPath, filePath, overwrite: false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (linkedCts.Token.IsCancellationRequested)
         {
-            // Cancellation is a first-class outcome distinct from a
-            // persistence failure -- propagate unwrapped so the
-            // producer can react (typically: stop accepting new work
-            // because the host is shutting down) without triggering
-            // the operator-facing CRITICAL log path that
-            // SlackOutboundQueuePersistenceException implies. The
-            // *.tmp orphan does not affect replay because
-            // ReplayUnacknowledgedFromDisk enumerates with the
-            // "*.json" mask, but we still best-effort delete it to
-            // keep the pending directory tidy.
-            TryDeleteIfExists(tempPath);
+            // Cancellation is a first-class outcome -- do NOT wrap it
+            // in SlackOutboundQueuePersistenceException (that exception
+            // is reserved for genuine durability failures that the
+            // producer must surface upstream). Propagate so the caller
+            // sees the OCE and the channel publish below is skipped.
             throw;
         }
         catch (Exception ex)
@@ -294,10 +295,6 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
                 envelope.TaskId,
                 envelope.CorrelationId,
                 filePath);
-
-            // Best-effort cleanup of the temp file so a retry by the
-            // producer does not collide with leftover state.
-            TryDeleteIfExists(tempPath);
 
             // Re-throw so the producer (SlackConnector) sees the
             // failure and can surface it upstream. We do NOT silently
@@ -312,14 +309,9 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
         }
 
         // Only publish to the in-memory channel AFTER the durable
-        // journal write succeeds. The token is forwarded for symmetry;
-        // on an unbounded channel WriteAsync normally completes
-        // synchronously, but a cancelled token will still short-circuit
-        // it. If cancellation lands between the file write and the
-        // channel write, the journal entry remains on disk and will
-        // replay on next start -- the at-least-once contract holds.
+        // journal write succeeds.
         this.inFlightFilePaths[envelope.EnvelopeId] = filePath;
-        await this.backing.Writer.WriteAsync(envelope, ct).ConfigureAwait(false);
+        await this.backing.Writer.WriteAsync(envelope, linkedCts.Token).ConfigureAwait(false);
 
         this.logger.LogDebug(
             "FileSystemSlackOutboundQueue enqueued envelope task_id={TaskId} correlation_id={CorrelationId} envelope_id={EnvelopeId} file={FilePath}.",
@@ -349,7 +341,13 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
             return;
         }
 
-        await this.writeGate.WaitAsync(ct).ConfigureAwait(false);
+        // Same linkage rationale as EnqueueAsync: dispose-time
+        // cancellation must also unblock a gate-waiter on the ack
+        // path even when the caller's token is None.
+        using CancellationTokenSource linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(this.lifetimeCts.Token, ct);
+
+        await this.writeGate.WaitAsync(linkedCts.Token).ConfigureAwait(false);
         try
         {
             if (File.Exists(filePath))
@@ -389,25 +387,22 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
 
         this.disposed = true;
         this.backing.Writer.TryComplete();
-        this.writeGate.Dispose();
-    }
 
-    private static void TryDeleteIfExists(string path)
-    {
+        // Cancel BEFORE disposing the gate / CTS so any pending
+        // WaitAsync(linkedCts.Token) callers wake with an
+        // OperationCanceledException rather than racing into an
+        // ObjectDisposedException from the underlying SemaphoreSlim.
         try
         {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
+            this.lifetimeCts.Cancel();
         }
-        catch
+        catch (ObjectDisposedException)
         {
-            // Best-effort cleanup of an interrupted journal write. The
-            // replay path enumerates with the "*.json" mask, so a
-            // surviving "*.tmp" orphan is benign; operator triage can
-            // pick it up out-of-band.
+            // Already disposed by a concurrent Dispose race -- ignore.
         }
+
+        this.writeGate.Dispose();
+        this.lifetimeCts.Dispose();
     }
 
     private void ThrowIfDisposed()
@@ -555,19 +550,14 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
 
 /// <summary>
 /// Raised when the file-system journal write inside
-/// <see cref="FileSystemSlackOutboundQueue.EnqueueAsync(SlackOutboundEnvelope, CancellationToken)"/>
-/// fails. The wrapped IO exception (typically full disk, permission
-/// denied, network share dropped) is preserved on
+/// <see cref="FileSystemSlackOutboundQueue.EnqueueAsync(SlackOutboundEnvelope)"/> fails.
+/// The wrapped IO exception (typically full disk, permission denied,
+/// network share dropped) is preserved on
 /// <see cref="Exception.InnerException"/> so operators can triage.
 /// Propagating instead of swallowing preserves the FR-005 / FR-007
 /// zero-message-loss guarantee: the producer (SlackConnector) sees
 /// the failure and can surface it upstream rather than the channel
 /// silently buffering a message that has no durable backing.
-/// <see cref="OperationCanceledException"/> is intentionally NOT
-/// wrapped by this type -- cancellation is a first-class outcome and
-/// the producer needs to distinguish it from a genuine persistence
-/// failure (an operator-facing CRITICAL log line vs an expected
-/// shutdown signal).
 /// </summary>
 [Serializable]
 internal sealed class SlackOutboundQueuePersistenceException : Exception
