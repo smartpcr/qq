@@ -1,6 +1,8 @@
 using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Persistence;
+using AgentSwarm.Messaging.Slack.Pipeline;
+using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.EntityFrameworkCore;
@@ -161,6 +163,57 @@ public class Program
         // trigger_id.
         builder.Services
             .AddSlackFastPathDurableIdempotency<SlackPersistenceDbContext>();
+
+        // Stage 4.3 iter 6 evaluator item #2: opt the Worker into the
+        // disk-backed dead-letter queue BEFORE the ingestor wires its
+        // own TryAdd<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>
+        // default. The in-memory default loses every exhausted-retry
+        // envelope on a process restart, which contradicts the story's
+        // FR-005 / FR-007 zero-loss requirement and the operator
+        // attachment's "Reliability" cell. The directory is configurable
+        // via Slack:Inbound:DeadLetterQueueDirectory and defaults to a
+        // relative "data/slack-dead-letter" path so the wiring is never
+        // accidentally skipped.
+        string dlqDir = builder.Configuration["Slack:Inbound:DeadLetterQueueDirectory"]
+            ?? "data/slack-dead-letter";
+        if (!string.IsNullOrWhiteSpace(dlqDir))
+        {
+            builder.Services.AddFileSystemSlackDeadLetterQueue(dlqDir);
+        }
+
+        // Stage 4.3 (workstream:
+        // ws-qq-slack-messenger-supp-phase-inbound-transport-stage-inbound-ingestor-and-deduplication):
+        // register the SlackInboundIngestor BackgroundService and the
+        // full processing pipeline (EF-backed idempotency guard,
+        // envelope authorizer, retry policy, in-memory DLQ,
+        // routing-by-source-type, audit recorder). Without this call
+        // envelopes pushed onto ISlackInboundQueue by Stage 4.1 /
+        // 4.2 transports would accumulate forever -- the BackgroundService
+        // is the dedicated drainer required by Stage 4.3 of
+        // implementation-plan.md. Must follow
+        // AddSlackFastPathDurableIdempotency so the guard's EF
+        // SlackInboundRequestRecord wiring is already in DI.
+        builder.Services
+            .AddSlackInboundIngestor<SlackPersistenceDbContext>();
+
+        // Stage 4.3 iter 6 evaluator item #2 (STRUCTURAL fix):
+        // AddSlackInboundIngestor INTENTIONALLY no longer registers
+        // no-op handler defaults. A production host that resolved
+        // ISlackCommandHandler / ISlackAppMentionHandler /
+        // ISlackInteractionHandler against the silent-completion
+        // stubs would ack-and-drop every Slack request -- a real
+        // no-message-loss bug. Until Stage 5.1/5.2/5.3 ship the real
+        // handlers, the Worker explicitly opts into the development
+        // stand-ins so the ingestor remains resolvable AND any
+        // operator reading this file SEES the explicit opt-in (and
+        // knows to remove it before going to production).
+        //
+        // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this call
+        // with the real handler registrations (Stage 5.1 command
+        // dispatcher, Stage 5.2 @mention dispatcher, Stage 5.3
+        // interaction -> HumanDecisionEvent dispatcher). The
+        // production Worker must NOT ship the no-op stubs.
+        builder.Services.AddSlackInboundDevelopmentHandlerStubs();
 
         // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the
         // durable file-system dead-letter sink for post-ACK enqueue
