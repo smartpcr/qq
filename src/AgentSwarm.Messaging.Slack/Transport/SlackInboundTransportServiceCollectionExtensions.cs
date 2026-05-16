@@ -8,6 +8,7 @@ namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
 using System.Collections.Generic;
+using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Queues;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
@@ -75,7 +76,9 @@ public static class SlackInboundTransportServiceCollectionExtensions
         // production host registers a durable sink BEFORE this call.
         services.TryAddSingleton<InMemorySlackInboundEnqueueDeadLetterSink>();
         services.TryAddSingleton<ISlackInboundEnqueueDeadLetterSink>(sp =>
-            sp.GetRequiredService<InMemorySlackInboundEnqueueDeadLetterSink>());        // Default modal fast-path handler is a real implementation that
+            sp.GetRequiredService<InMemorySlackInboundEnqueueDeadLetterSink>());
+
+        // Default modal fast-path handler is a real implementation that
         // runs idempotency + views.open synchronously inside the HTTP
         // request lifetime (architecture.md §5.3, tech-spec.md §5.2).
         // Iter-3 (evaluator items 2 + 3) introduces the
@@ -104,6 +107,15 @@ public static class SlackInboundTransportServiceCollectionExtensions
         services.TryAddSingleton<ISlackViewsOpenClient, HttpClientSlackViewsOpenClient>();
 
         services.TryAddSingleton<ISlackModalFastPathHandler, DefaultSlackModalFastPathHandler>();
+
+        // Register a NO-OP ISlackInteractionFastPathHandler so the
+        // SlackInteractionsController can always resolve a fast-path
+        // even when the host has not opted into the Stage 5.3
+        // interaction dispatcher. Hosts that DO call
+        // AddSlackInteractionDispatcher swap this NoOp out for the
+        // real DefaultSlackInteractionFastPathHandler via
+        // RemoveAll<>+AddSingleton<>.
+        services.TryAddSingleton<ISlackInteractionFastPathHandler, NoOpSlackInteractionFastPathHandler>();
 
         return services;
     }
