@@ -25,6 +25,9 @@ internal static class SecurityTestDoubles
     {
         public List<(string OutboxEntryId, string Error)> DeadLettered { get; } = new();
         public List<OutboxEntry> Enqueued { get; } = new();
+        public List<(string OutboxEntryId, OutboxDeliveryReceipt Receipt)> Acknowledged { get; } = new();
+        public List<(string OutboxEntryId, OutboxDeliveryReceipt Receipt)> ReceiptsRecorded { get; } = new();
+        public List<(string OutboxEntryId, DateTimeOffset NextRetryAt, string Error)> Rescheduled { get; } = new();
         public Exception? DeadLetterThrow { get; set; }
 
         public Task EnqueueAsync(OutboxEntry entry, CancellationToken ct)
@@ -36,8 +39,23 @@ internal static class SecurityTestDoubles
         public Task<IReadOnlyList<OutboxEntry>> DequeueAsync(int batchSize, CancellationToken ct)
             => Task.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
 
-        public Task AcknowledgeAsync(string outboxEntryId, CancellationToken ct)
-            => Task.CompletedTask;
+        public Task AcknowledgeAsync(string outboxEntryId, OutboxDeliveryReceipt receipt, CancellationToken ct)
+        {
+            Acknowledged.Add((outboxEntryId, receipt));
+            return Task.CompletedTask;
+        }
+
+        public Task RecordSendReceiptAsync(string outboxEntryId, OutboxDeliveryReceipt receipt, CancellationToken ct)
+        {
+            ReceiptsRecorded.Add((outboxEntryId, receipt));
+            return Task.CompletedTask;
+        }
+
+        public Task RescheduleAsync(string outboxEntryId, DateTimeOffset nextRetryAt, string error, CancellationToken ct)
+        {
+            Rescheduled.Add((outboxEntryId, nextRetryAt, error));
+            return Task.CompletedTask;
+        }
 
         public Task DeadLetterAsync(string outboxEntryId, string error, CancellationToken ct)
         {

@@ -50,14 +50,29 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// <see cref="TeamsMessengerConnector"/> singleton → the keyed
     /// <see cref="IMessengerConnector"/> registration under
     /// <see cref="TeamsServiceCollectionExtensions.MessengerKey"/>. Once an inner is
-    /// captured, the decorator installs the outbox-backed wrapper under both the
-    /// unkeyed <see cref="IMessengerConnector"/> contract AND the keyed
-    /// <see cref="TeamsServiceCollectionExtensions.MessengerKey"/> alias (if the keyed
-    /// registration was present originally), so callers using either
-    /// <see cref="ServiceProviderServiceExtensions.GetRequiredService{T}(IServiceProvider)"/>
-    /// or
-    /// <see cref="Microsoft.Extensions.DependencyInjection.ServiceProviderKeyedServiceExtensions.GetRequiredKeyedService{T}(IServiceProvider, object?)"/>
-    /// always go through the outbox.
+    /// captured, the decorator installs the outbox-backed wrapper under the unkeyed
+    /// <see cref="IMessengerConnector"/> contract. The keyed alias under
+    /// <see cref="TeamsServiceCollectionExtensions.MessengerKey"/> is rebound to the
+    /// wrapper <b>only when the host originally registered a keyed descriptor</b> — when
+    /// the host registered only the concrete <see cref="TeamsMessengerConnector"/>
+    /// singleton (without ever asking for the keyed alias), no synthetic keyed alias is
+    /// introduced. This preserves the host's wiring shape and matches the iter-5
+    /// evaluator critique #3.
+    /// </para>
+    /// <para>
+    /// <b>Cycle safety (iter-6 fix for critique #2).</b> When an unkeyed
+    /// <see cref="IMessengerConnector"/> descriptor is a factory (e.g.
+    /// <c>sp =&gt; sp.GetRequiredKeyedService&lt;IMessengerConnector&gt;(MessengerKey)</c>)
+    /// that aliases back to the keyed registration, naively capturing the inner via the
+    /// unkeyed factory after the keyed rebind would create a self-referential resolution
+    /// path: <c>Inner.factory → unkeyed.factory → keyed alias → wrapper → wrapper needs
+    /// Inner → loop</c>. To prevent this, when both an unkeyed FACTORY descriptor and a
+    /// keyed descriptor are present, the decorator captures the inner directly from the
+    /// keyed descriptor (which is snapshotted before rebind) and discards the unkeyed
+    /// alias factory. Unkeyed descriptors backed by an
+    /// <see cref="ServiceDescriptor.ImplementationInstance"/> or
+    /// <see cref="ServiceDescriptor.ImplementationType"/> are not at risk and continue to
+    /// take precedence.
     /// </para>
     /// <para>
     /// <b>Idempotent.</b> Calling this method more than once is a no-op for the inner
@@ -73,6 +88,24 @@ public static class TeamsOutboxServiceCollectionExtensions
         Action<OutboxOptions>? configure = null)
     {
         ArgumentNullException.ThrowIfNull(services);
+
+        // Fail fast — symmetric with the IProactiveNotifier / IMessengerConnector
+        // checks inside DecorateProactiveNotifier / DecorateMessengerConnector. The
+        // dispatcher and the outbox-backed decorators resolve IMessageOutbox via
+        // GetRequiredService at request time; without this guard the host gets a
+        // hostile InvalidOperationException at the FIRST send attempt with no hint
+        // that the real fix is "call AddSqlMessageOutbox before AddTeamsOutboxEngine".
+        // We deliberately run this check BEFORE any service-collection mutation so a
+        // misconfigured container is left in its original state.
+        if (!services.Any(d => d.ServiceType == typeof(IMessageOutbox)))
+        {
+            throw new InvalidOperationException(
+                "AddTeamsOutboxEngine requires an IMessageOutbox registration. Call " +
+                "services.AddSqlMessageOutbox(...) (the canonical Teams EF Core wiring) " +
+                "or register your own IMessageOutbox implementation BEFORE invoking " +
+                "AddTeamsOutboxEngine. Without IMessageOutbox the outbox-backed " +
+                "decorators have nothing to enqueue against.");
+        }
 
         // OutboxOptions singleton — replace any prior registration so the host's
         // configure callback is honoured (TryAddSingleton would silently keep an
@@ -185,11 +218,36 @@ public static class TeamsOutboxServiceCollectionExtensions
 
         if (unkeyed is not null)
         {
-            // Legacy / manual wiring path — host added an explicit unkeyed registration.
-            // Capture the descriptor's factory/instance/type so the inner adapter can
-            // forward to it without going through the now-decorated unkeyed contract.
-            services.Remove(unkeyed);
-            RegisterInnerMessengerAdapterFromDescriptor(services, unkeyed);
+            // Cycle-safety pre-check for critique #2: if the unkeyed descriptor is a
+            // FACTORY (not a captured instance and not a concrete type) AND a keyed
+            // descriptor exists for the same service, the factory may alias back to
+            // the keyed resolution path (a common host pattern is
+            // `sp => sp.GetRequiredKeyedService<IMessengerConnector>(MessengerKey)`).
+            // After the keyed rebind below points the keyed alias at the wrapper, the
+            // inner adapter executing that factory would resolve back to the wrapper,
+            // and the wrapper depends on the inner, producing a stack overflow at
+            // first resolution. Materialise the inner from the keyed descriptor's
+            // snapshot instead and remove the unkeyed alias entirely.
+            var unkeyedIsAliasFactory = unkeyed.ImplementationInstance is null
+                                        && unkeyed.ImplementationType is null
+                                        && unkeyed.ImplementationFactory is not null;
+            if (unkeyedIsAliasFactory && keyedTeams is not null)
+            {
+                services.Remove(unkeyed);
+                services.Remove(keyedTeams);
+                services.AddSingleton<IInnerTeamsMessengerConnector>(
+                    BuildInnerFromKeyedDescriptor(keyedTeams));
+            }
+            else
+            {
+                // Legacy / manual wiring path — host added an explicit unkeyed
+                // registration (instance, concrete type, or a factory with no keyed
+                // sibling to cycle into). Capture the descriptor's factory/instance/
+                // type so the inner adapter can forward to it without going through
+                // the now-decorated unkeyed contract.
+                services.Remove(unkeyed);
+                RegisterInnerMessengerAdapterFromDescriptor(services, unkeyed);
+            }
         }
         else if (concreteTeams is not null)
         {
@@ -220,13 +278,12 @@ public static class TeamsOutboxServiceCollectionExtensions
             sp.GetRequiredService<ILogger<OutboxBackedMessengerConnector>>(),
             sp.GetService<TimeProvider>()));
 
-        // Rebind the keyed "teams" alias (if it existed in the original graph) to the
-        // wrapper so GetRequiredKeyedService<IMessengerConnector>("teams") also goes
-        // through the outbox. Without this step the keyed alias still resolves to the
-        // pre-decoration TeamsMessengerConnector and the canonical Teams composition
-        // silently bypasses the outbox for keyed-resolution callers — the iter-1
-        // evaluator critique.
-        var hadKeyedAlias = keyedTeams is not null || concreteTeams is not null;
+        // Rebind the keyed "teams" alias to the wrapper ONLY when the host originally
+        // registered a keyed alias (critique #3). The concrete TeamsMessengerConnector
+        // singleton on its own does NOT imply the host opted into the keyed contract,
+        // so we must not synthesise one — that would silently change the host's wiring
+        // shape and violate the documented contract on AddTeamsOutboxEngine.
+        var hadKeyedAlias = keyedTeams is not null;
         var staleKeyed = services.Where(IsKeyedTeamsMessengerConnector).ToList();
         foreach (var d in staleKeyed)
         {

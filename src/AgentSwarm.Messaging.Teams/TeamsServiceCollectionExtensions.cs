@@ -5,6 +5,7 @@ using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Extensions;
 using AgentSwarm.Messaging.Teams.Lifecycle;
 using AgentSwarm.Messaging.Teams.Outbox;
+using AgentSwarm.Messaging.Teams.Security;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
