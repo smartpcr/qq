@@ -32,18 +32,18 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// comparing against the stored value.
 /// </para>
 /// <para>
-/// <b>Server-side row cap (iter-3 reviewer feedback)</b>: every query applies a
-/// configurable hard ceiling (<see cref="MaxRows"/>, default <see cref="DefaultMaxRows"/>)
-/// before <c>ToListAsync</c>. The cap is a <b>safety guard</b>, not a pagination
-/// surface: when a query matches more rows than the cap the service throws
+/// <b>Server-side row cap (reviewer feedback)</b>: every query applies a configurable
+/// hard ceiling (<see cref="MaxRows"/>, default <see cref="DefaultMaxRows"/>) before
+/// <c>ToListAsync</c>. The cap is a <b>safety guard</b>, not a pagination surface:
+/// when a query matches more rows than the cap the service throws
 /// <see cref="InvalidOperationException"/> rather than silently truncating the result
 /// set. Silent truncation would be catastrophic for compliance review — a reviewer
-/// could miss the critical entries believing they had the full picture. The
-/// interface (per its remarks) defers pagination, free-text search, and bulk export
-/// to a future stage; the ceiling exists so a broad date range or a high-volume
-/// actor query cannot accidentally OOM the process while that work is pending. Hosts
-/// that need a larger ceiling (e.g. an archival export job) construct the service
-/// via the two-arg constructor.
+/// could miss critical entries believing they had the full picture. The interface
+/// (per its remarks) defers pagination, free-text search, and bulk export to a future
+/// stage; the ceiling exists so a broad date range or a high-volume actor query
+/// cannot accidentally OOM the process while that work is pending. Hosts that need a
+/// larger ceiling (e.g. an archival export job) construct the service via the
+/// two-arg constructor.
 /// </para>
 /// </remarks>
 public sealed class SqlAuditLogQueryService : IAuditLogQueryService
@@ -69,11 +69,14 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
 
     /// <summary>
     /// Construct the query service with the DI-bound EF context factory and the
-    /// default row cap (<see cref="DefaultMaxRows"/>). This is the constructor wired
-    /// by <c>AddSqlAuditLogger</c> in
-    /// <c>EntityFrameworkCoreServiceCollectionExtensions</c>.
+    /// default row cap (<see cref="DefaultMaxRows"/>). This is the parameter-less
+    /// constructor wired by <c>AddSqlAuditLogger</c> in
+    /// <c>EntityFrameworkCoreServiceCollectionExtensions</c>; preserving its
+    /// signature keeps the existing DI registration
+    /// (<c>TryAddSingleton&lt;SqlAuditLogQueryService&gt;()</c>) unchanged.
     /// </summary>
     /// <param name="contextFactory">EF Core context factory bound by DI.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="contextFactory"/> is null.</exception>
     public SqlAuditLogQueryService(IDbContextFactory<AuditLogDbContext> contextFactory)
         : this(contextFactory, DefaultMaxRows)
     {
@@ -129,9 +132,9 @@ public sealed class SqlAuditLogQueryService : IAuditLogQueryService
             .CreateDbContextAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        // Take MaxRows + 1 so overflow is detected without materializing the full
-        // unbounded result set. The +1 row is the canary; if it shows up, the query
-        // matched too much and we fail-fast instead of silently truncating.
+        // Take MaxRows + 1 so overflow is detectable without materializing the full
+        // unbounded result set. The +1 row is the overflow canary: if it shows up,
+        // the query matched too much and we fail-fast instead of silently truncating.
         var entities = await ctx.AuditLog
             .AsNoTracking()
             .Where(e => e.Timestamp >= fromUtc && e.Timestamp < toUtc)
