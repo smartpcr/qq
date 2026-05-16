@@ -209,6 +209,30 @@ internal readonly record struct SlackInboundEnvelopeAuditFields(
         string? threadTs = ReadStringProperty(evt, "thread_ts");
         string? messageTs = ReadStringProperty(evt, "ts");
 
+        // Iter-2 evaluator item 4 (Stage 5.2): for app_mention events
+        // the SlackAppMentionHandler always replies in a Slack thread
+        // (using event.thread_ts when the mention was inside an
+        // existing thread, otherwise using event.ts as the anchor of
+        // a new thread Slack auto-creates on the first reply). The
+        // audit row's ThreadTs MUST therefore reflect the SAME anchor
+        // value the handler picks so a downstream operator querying
+        // by thread_ts can locate the inbound row that triggered the
+        // thread -- otherwise top-level @-mentions vanish from
+        // thread-scoped audit queries because their thread_ts column
+        // is null and ConversationId falls all the way back to the
+        // channel id (story FR-008 "Audit": "every agent/human
+        // exchange is queryable by correlation ID" plus "Persist
+        // ... thread timestamp"). For non-app_mention events we keep
+        // the strict thread_ts-only semantic because we have no
+        // reply contract that would create a thread from a message
+        // event.
+        if (string.IsNullOrEmpty(threadTs)
+            && string.Equals(subtype, "app_mention", StringComparison.Ordinal)
+            && !string.IsNullOrEmpty(messageTs))
+        {
+            threadTs = messageTs;
+        }
+
         return new SlackInboundEnvelopeAuditFields(
             CommandText: commandText,
             ThreadTs: threadTs,

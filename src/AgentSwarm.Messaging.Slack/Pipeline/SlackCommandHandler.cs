@@ -173,12 +173,47 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     }
 
     /// <inheritdoc />
-    public async Task HandleAsync(SlackInboundEnvelope envelope, CancellationToken ct)
+    public Task HandleAsync(SlackInboundEnvelope envelope, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(envelope);
         ct.ThrowIfCancellationRequested();
 
         SlackCommandPayload payload = SlackInboundPayloadParser.ParseCommand(envelope.RawPayload);
+        return this.DispatchAsync(envelope, payload, this.ephemeralResponder, ct);
+    }
+
+    /// <summary>
+    /// Dispatches a previously-parsed <see cref="SlackCommandPayload"/>
+    /// using the supplied <paramref name="responder"/>. Exposed
+    /// <see langword="internal"/> so the Stage 5.2
+    /// <see cref="SlackAppMentionHandler"/> can reuse the same
+    /// sub-command switch, error messages, and orchestrator call shape
+    /// while substituting a threaded-reply responder for the default
+    /// ephemeral <c>response_url</c> responder.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the unified dispatch surface required by Stage 5.2
+    /// implementation step 4 ("Delegate parsed commands to the same
+    /// <see cref="SlackCommandHandler"/> dispatch logic to ensure
+    /// unified processing"). Callers that arrive from the app-mention
+    /// path pass a synthesised payload (no <c>response_url</c>,
+    /// no <c>trigger_id</c>) plus a custom responder that posts the
+    /// reply as a threaded <c>chat.postMessage</c> instead of
+    /// <c>response_url</c> POST. Errors, missing arguments, and the
+    /// review / escalate fall-back hint all flow through that same
+    /// responder so the user sees them as threaded replies.
+    /// </para>
+    /// </remarks>
+    internal async Task DispatchAsync(
+        SlackInboundEnvelope envelope,
+        SlackCommandPayload payload,
+        ISlackEphemeralResponder responder,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        ArgumentNullException.ThrowIfNull(responder);
+        ct.ThrowIfCancellationRequested();
 
         // Dispatching strictly on the parsed sub-command keeps the
         // pipeline source-of-truth on the brief-mandated tokens; the
@@ -197,6 +232,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 envelope.TeamId,
                 envelope.UserId);
             await this.SendUsageErrorAsync(
+                responder,
                 payload.ResponseUrl,
                 "Missing sub-command.",
                 ct).ConfigureAwait(false);
@@ -206,17 +242,18 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
         switch (subCommand)
         {
             case AskSubCommand:
-                await this.HandleAskAsync(envelope, payload, correlationId, ct).ConfigureAwait(false);
+                await this.HandleAskAsync(envelope, payload, responder, correlationId, ct).ConfigureAwait(false);
                 return;
 
             case StatusSubCommand:
-                await this.HandleStatusAsync(envelope, payload, correlationId, ct).ConfigureAwait(false);
+                await this.HandleStatusAsync(envelope, payload, responder, correlationId, ct).ConfigureAwait(false);
                 return;
 
             case ApproveSubCommand:
                 await this.HandleDecisionAsync(
                     envelope,
                     payload,
+                    responder,
                     correlationId,
                     ApproveActionValue,
                     "approve",
@@ -227,6 +264,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 await this.HandleDecisionAsync(
                     envelope,
                     payload,
+                    responder,
                     correlationId,
                     RejectActionValue,
                     "reject",
@@ -234,11 +272,11 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 return;
 
             case ReviewSubCommand:
-                await this.HandleModalAsync(envelope, payload, subCommand, correlationId, ct).ConfigureAwait(false);
+                await this.HandleModalAsync(envelope, payload, responder, subCommand, correlationId, ct).ConfigureAwait(false);
                 return;
 
             case EscalateSubCommand:
-                await this.HandleModalAsync(envelope, payload, subCommand, correlationId, ct).ConfigureAwait(false);
+                await this.HandleModalAsync(envelope, payload, responder, subCommand, correlationId, ct).ConfigureAwait(false);
                 return;
 
             default:
@@ -249,6 +287,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                     envelope.TeamId,
                     envelope.UserId);
                 await this.SendUsageErrorAsync(
+                    responder,
                     payload.ResponseUrl,
                     $"Unknown sub-command `{subCommand}`.",
                     ct).ConfigureAwait(false);
@@ -299,6 +338,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     private async Task HandleAskAsync(
         SlackInboundEnvelope envelope,
         SlackCommandPayload payload,
+        ISlackEphemeralResponder responder,
         string correlationId,
         CancellationToken ct)
     {
@@ -311,6 +351,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 envelope.TeamId,
                 envelope.UserId);
             await this.SendUsageErrorAsync(
+                responder,
                 payload.ResponseUrl,
                 "`/agent ask` requires a prompt (e.g., `/agent ask generate implementation plan`).",
                 ct).ConfigureAwait(false);
@@ -346,7 +387,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             ? $"Task `{result.TaskId}` created. The agent will reply in this thread."
             : result.Acknowledgement;
 
-        await this.ephemeralResponder
+        await responder
             .SendEphemeralAsync(payload.ResponseUrl, ack, ct)
             .ConfigureAwait(false);
     }
@@ -354,6 +395,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     private async Task HandleStatusAsync(
         SlackInboundEnvelope envelope,
         SlackCommandPayload payload,
+        ISlackEphemeralResponder responder,
         string correlationId,
         CancellationToken ct)
     {
@@ -376,7 +418,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             envelope.UserId);
 
         string body = RenderStatusBody(result);
-        await this.ephemeralResponder
+        await responder
             .SendEphemeralAsync(payload.ResponseUrl, body, ct)
             .ConfigureAwait(false);
     }
@@ -416,6 +458,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     private async Task HandleDecisionAsync(
         SlackInboundEnvelope envelope,
         SlackCommandPayload payload,
+        ISlackEphemeralResponder responder,
         string correlationId,
         string actionValue,
         string verb,
@@ -431,6 +474,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 envelope.TeamId,
                 envelope.UserId);
             await this.SendUsageErrorAsync(
+                responder,
                 payload.ResponseUrl,
                 $"`/agent {verb}` requires a question-id (e.g., `/agent {verb} Q-123`).",
                 ct).ConfigureAwait(false);
@@ -464,7 +508,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             envelope.TeamId,
             envelope.UserId);
 
-        await this.ephemeralResponder
+        await responder
             .SendEphemeralAsync(
                 payload.ResponseUrl,
                 $"Decision recorded: `{verb}` on question `{questionId}`.",
@@ -475,6 +519,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     private async Task HandleModalAsync(
         SlackInboundEnvelope envelope,
         SlackCommandPayload payload,
+        ISlackEphemeralResponder responder,
         string subCommand,
         string correlationId,
         CancellationToken ct)
@@ -495,7 +540,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 envelope.IdempotencyKey,
                 envelope.TeamId,
                 envelope.UserId);
-            await this.ephemeralResponder
+            await responder
                 .SendEphemeralAsync(
                     payload.ResponseUrl,
                     $"Cannot open the `{subCommand}` modal: the Slack trigger_id is missing. Re-run `/agent {subCommand}` from Slack.",
@@ -514,6 +559,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 envelope.TeamId,
                 envelope.UserId);
             await this.SendUsageErrorAsync(
+                responder,
                 payload.ResponseUrl,
                 $"`/agent {subCommand}` requires a task-id (e.g., `/agent {subCommand} TASK-42`).",
                 ct).ConfigureAwait(false);
@@ -558,7 +604,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
                 envelope.IdempotencyKey,
                 envelope.TeamId,
                 envelope.UserId);
-            await this.ephemeralResponder
+            await responder
                 .SendEphemeralAsync(
                     payload.ResponseUrl,
                     $"Could not build the `{subCommand}` modal payload: {ex.Message}.",
@@ -601,13 +647,13 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             envelope.UserId,
             envelope.TriggerId);
 
-        await this.ephemeralResponder
+        await responder
             .SendEphemeralAsync(payload.ResponseUrl, userMessage, ct)
             .ConfigureAwait(false);
     }
 
-    private Task SendUsageErrorAsync(string? responseUrl, string leadingDetail, CancellationToken ct)
-        => this.ephemeralResponder.SendEphemeralAsync(
+    private Task SendUsageErrorAsync(ISlackEphemeralResponder responder, string? responseUrl, string leadingDetail, CancellationToken ct)
+        => responder.SendEphemeralAsync(
             responseUrl,
             BuildUsageMessage(leadingDetail),
             ct);

@@ -8,6 +8,7 @@ namespace AgentSwarm.Messaging.Slack.Tests.Pipeline;
 
 using System;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
@@ -34,6 +35,43 @@ using Xunit;
 public sealed class SlackCommandDispatchServiceCollectionExtensionsTests
 {
     [Fact]
+    public void AddSlackInboundTransport_registers_HttpClientSlackThreadedReplyPoster_as_default_threaded_reply_poster()
+    {
+        // Iter-2 evaluator item 1 (Stage 5.2) STRUCTURAL fix: the
+        // Worker host calls AddSlackInboundTransport then
+        // AddSlackCommandDispatcher; the transport extension MUST
+        // register the production HTTP-backed threaded reply poster
+        // (via TryAddSingleton, alongside HttpClientSlackViewsOpenClient)
+        // so the dispatcher's TryAdd NoOp default loses the race and
+        // app_mention replies actually post to Slack. Asserting on the
+        // descriptor (rather than resolving the service) keeps this
+        // test focused on the wiring contract without needing the full
+        // workspace-store / secret-provider DI graph.
+        ServiceCollection services = new();
+        services.AddSlackInboundTransport();
+
+        ServiceDescriptor descriptor = services
+            .Single(d => d.ServiceType == typeof(ISlackThreadedReplyPoster));
+        descriptor.ImplementationType.Should().Be(
+            typeof(HttpClientSlackThreadedReplyPoster),
+            "AddSlackInboundTransport MUST register the real HTTP chat.postMessage poster so a Worker host that wires the transport gets the production binding -- the dispatcher's TryAdd NoOp is a unit-test fall-back only");
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+    }
+
+    [Fact]
+    public void AddSlackInboundTransport_registers_named_HttpClient_for_chat_postMessage()
+    {
+        ServiceCollection services = new();
+        services.AddSlackInboundTransport();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        IHttpClientFactory factory = provider.GetRequiredService<IHttpClientFactory>();
+        HttpClient client = factory.CreateClient(HttpClientSlackThreadedReplyPoster.HttpClientName);
+        client.Should().NotBeNull(
+            "the typed HttpClient registration named chat-postmessage MUST exist so hosts can layer resilience handlers on it without subclassing the client");
+    }
+
+    [Fact]
     public void AddSlackCommandDispatcher_registers_SlackCommandHandler_as_ISlackCommandHandler()
     {
         ServiceCollection services = BuildBaseServices();
@@ -44,6 +82,74 @@ public sealed class SlackCommandDispatchServiceCollectionExtensionsTests
         using ServiceProvider provider = services.BuildServiceProvider();
         ISlackCommandHandler resolved = provider.GetRequiredService<ISlackCommandHandler>();
         resolved.Should().BeOfType<SlackCommandHandler>();
+    }
+
+    [Fact]
+    public void AddSlackCommandDispatcher_registers_SlackAppMentionHandler_as_ISlackAppMentionHandler()
+    {
+        // Stage 5.2: the same composition extension that wires Stage
+        // 5.1's slash-command dispatcher also wires the app-mention
+        // handler. A host that calls AddSlackCommandDispatcher MUST
+        // get both real handlers; the AddSlackInboundDevelopmentHandlerStubs
+        // TryAdd path then becomes a no-op for these two bindings.
+        ServiceCollection services = BuildBaseServices();
+        services.AddSingleton<IAgentTaskService, RecordingTaskService>();
+
+        services.AddSlackCommandDispatcher();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        ISlackAppMentionHandler resolved = provider.GetRequiredService<ISlackAppMentionHandler>();
+        resolved.Should().BeOfType<SlackAppMentionHandler>();
+    }
+
+    [Fact]
+    public void AddSlackCommandDispatcher_replaces_NoOp_app_mention_handler_registered_by_dev_stubs()
+    {
+        ServiceCollection services = BuildBaseServices();
+        services.AddSingleton<IAgentTaskService, RecordingTaskService>();
+
+        // Simulate the dev-stub registration order (NoOp first, real
+        // dispatcher second).
+        services.AddSingleton<ISlackAppMentionHandler, NoOpSlackAppMentionHandler>();
+        services.AddSlackCommandDispatcher();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        ISlackAppMentionHandler resolved = provider.GetRequiredService<ISlackAppMentionHandler>();
+        resolved.Should().BeOfType<SlackAppMentionHandler>(
+            "AddSlackCommandDispatcher MUST win over a prior NoOp app-mention registration so production traffic never silently lands on the stub");
+    }
+
+    [Fact]
+    public void AddSlackCommandDispatcher_registers_NoOp_threaded_reply_poster_as_default()
+    {
+        // Stage 5.2: the dispatcher registers a TryAdd default for
+        // ISlackThreadedReplyPoster so the handler can resolve. Stage
+        // 6.x will swap in the real HTTP implementation; a host that
+        // registers a production poster BEFORE calling this extension
+        // wins (TryAdd contract).
+        ServiceCollection services = BuildBaseServices();
+        services.AddSingleton<IAgentTaskService, RecordingTaskService>();
+
+        services.AddSlackCommandDispatcher();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        ISlackThreadedReplyPoster resolved = provider.GetRequiredService<ISlackThreadedReplyPoster>();
+        resolved.Should().BeOfType<NoOpSlackThreadedReplyPoster>();
+    }
+
+    [Fact]
+    public void AddSlackCommandDispatcher_honours_preregistered_threaded_reply_poster()
+    {
+        ServiceCollection services = BuildBaseServices();
+        services.AddSingleton<IAgentTaskService, RecordingTaskService>();
+        services.AddSingleton<ISlackThreadedReplyPoster, StubThreadedReplyPoster>();
+
+        services.AddSlackCommandDispatcher();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+        provider.GetRequiredService<ISlackThreadedReplyPoster>()
+            .Should().BeOfType<StubThreadedReplyPoster>(
+                "TryAdd MUST honour a host-supplied poster registered before the extension call");
     }
 
     [Fact]
@@ -157,6 +263,12 @@ public sealed class SlackCommandDispatchServiceCollectionExtensionsTests
     {
         public Task<SlackViewsOpenResult> OpenAsync(SlackViewsOpenRequest request, CancellationToken ct)
             => Task.FromResult(SlackViewsOpenResult.Success());
+    }
+
+    private sealed class StubThreadedReplyPoster : ISlackThreadedReplyPoster
+    {
+        public Task PostAsync(SlackThreadedReplyRequest request, CancellationToken ct)
+            => Task.CompletedTask;
     }
 
     private sealed class RecordingTaskService : IAgentTaskService
