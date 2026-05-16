@@ -446,7 +446,22 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
 
         var observedAttemptCount = current.AttemptCount;
         var nextAttempt = observedAttemptCount + 1;
-        var hasBudgetLeft = nextAttempt < current.MaxAttempts;
+
+        // Budget = min(per-message MaxAttempts, global
+        // RetryPolicy.MaxAttempts). This mirrors the processor's
+        // pre-emption check (`Math.Min(message.MaxAttempts,
+        // _retryPolicy.MaxAttempts)` in
+        // OutboundQueueProcessor.HandleSendFailedAsync /
+        // catch-all branch) so a caller that bypasses the processor
+        // — the documented "defensive branch" path acknowledged
+        // below — still gets the same effective retry ceiling. If
+        // we only honored the per-row cap here, a row enqueued with
+        // a higher per-message MaxAttempts than RetryPolicy.MaxAttempts
+        // could loop past the global policy limit when driven by a
+        // direct caller, defeating the host-level cap that operators
+        // tune via `RetryPolicy:MaxAttempts` in appsettings.
+        var effectiveMaxAttempts = Math.Min(current.MaxAttempts, _retryPolicy.MaxAttempts);
+        var hasBudgetLeft = nextAttempt < effectiveMaxAttempts;
         var truncated = error.Length > 2048 ? error.Substring(0, 2048) : error;
 
         // Backoff: Stage 4.2 RetryPolicy. The processor's pre-emptive
