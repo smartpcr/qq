@@ -1,0 +1,64 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{7A670F37-1823-4A6F-B721-50D6DB2D35A2}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Abstractions", "src\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj", "{43113738-F066-457B-8AE5-A610E430C374}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Core", "src\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj", "{83CBE79B-6575-4770-8E04-D5DFFDCD8108}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Discord", "src\AgentSwarm.Messaging.Discord\AgentSwarm.Messaging.Discord.csproj", "{C7462C15-6177-4AE5-AA8E-EC0AE2DB73AA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Persistence", "src\AgentSwarm.Messaging.Persistence\AgentSwarm.Messaging.Persistence.csproj", "{14128F92-E4CF-4E95-9ED3-9D8DF4E8E4DC}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Worker", "src\AgentSwarm.Messaging.Worker\AgentSwarm.Messaging.Worker.csproj", "{8112D68F-01E9-4815-A770-9C3DC86DCF1B}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{CE5A8A84-B7E0-46DF-B592-139A5E0DBCC4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentSwarm.Messaging.Tests", "tests\AgentSwarm.Messaging.Tests\AgentSwarm.Messaging.Tests.csproj", "{8C7E0AB4-654E-4947-A390-2B984FF9125A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{43113738-F066-457B-8AE5-A610E430C374}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{43113738-F066-457B-8AE5-A610E430C374}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{43113738-F066-457B-8AE5-A610E430C374}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{43113738-F066-457B-8AE5-A610E430C374}.Release|Any CPU.Build.0 = Release|Any CPU
+		{83CBE79B-6575-4770-8E04-D5DFFDCD8108}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{83CBE79B-6575-4770-8E04-D5DFFDCD8108}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{83CBE79B-6575-4770-8E04-D5DFFDCD8108}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{83CBE79B-6575-4770-8E04-D5DFFDCD8108}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C7462C15-6177-4AE5-AA8E-EC0AE2DB73AA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C7462C15-6177-4AE5-AA8E-EC0AE2DB73AA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C7462C15-6177-4AE5-AA8E-EC0AE2DB73AA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C7462C15-6177-4AE5-AA8E-EC0AE2DB73AA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{14128F92-E4CF-4E95-9ED3-9D8DF4E8E4DC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{14128F92-E4CF-4E95-9ED3-9D8DF4E8E4DC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{14128F92-E4CF-4E95-9ED3-9D8DF4E8E4DC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{14128F92-E4CF-4E95-9ED3-9D8DF4E8E4DC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8112D68F-01E9-4815-A770-9C3DC86DCF1B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8112D68F-01E9-4815-A770-9C3DC86DCF1B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8112D68F-01E9-4815-A770-9C3DC86DCF1B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8112D68F-01E9-4815-A770-9C3DC86DCF1B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8C7E0AB4-654E-4947-A390-2B984FF9125A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8C7E0AB4-654E-4947-A390-2B984FF9125A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8C7E0AB4-654E-4947-A390-2B984FF9125A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8C7E0AB4-654E-4947-A390-2B984FF9125A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{43113738-F066-457B-8AE5-A610E430C374} = {7A670F37-1823-4A6F-B721-50D6DB2D35A2}
+		{83CBE79B-6575-4770-8E04-D5DFFDCD8108} = {7A670F37-1823-4A6F-B721-50D6DB2D35A2}
+		{C7462C15-6177-4AE5-AA8E-EC0AE2DB73AA} = {7A670F37-1823-4A6F-B721-50D6DB2D35A2}
+		{14128F92-E4CF-4E95-9ED3-9D8DF4E8E4DC} = {7A670F37-1823-4A6F-B721-50D6DB2D35A2}
+		{8112D68F-01E9-4815-A770-9C3DC86DCF1B} = {7A670F37-1823-4A6F-B721-50D6DB2D35A2}
+		{8C7E0AB4-654E-4947-A390-2B984FF9125A} = {CE5A8A84-B7E0-46DF-B592-139A5E0DBCC4}
+	EndGlobalSection
+EndGlobal
