@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>AgentSwarm.Messaging.Core</RootNamespace>
+    <AssemblyName>AgentSwarm.Messaging.Core</AssemblyName>
+    <Description>Cross-platform messaging primitives: durable queues, retry policies, deduplication, audit pipeline, and shared options.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

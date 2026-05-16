@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>AgentSwarm.Messaging.Abstractions</RootNamespace>
+    <AssemblyName>AgentSwarm.Messaging.Abstractions</AssemblyName>
+    <Description>Shared contracts (interfaces, records, enums) for the AgentSwarm messaging gateway. Consumed by all platform connectors.</Description>
+  </PropertyGroup>
+
+</Project>
