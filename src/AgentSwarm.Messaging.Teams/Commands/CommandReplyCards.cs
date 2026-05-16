@@ -184,7 +184,7 @@ internal static class CommandReplyCards
     /// <summary>
     /// Build a confirmation card rendered after a successful text-based
     /// approve/reject resolution, using the canonical decision-confirmation layout from
-    /// <see cref="Cards.AdaptiveCardBuilder.RenderDecisionConfirmationCard"/>.
+    /// <see cref="Cards.AdaptiveCardBuilder.RenderDecisionConfirmationCard(HumanDecisionEvent)"/>.
     /// </summary>
     public static IMessageActivity BuildDecisionConfirmationCard(
         Cards.IAdaptiveCardRenderer renderer,

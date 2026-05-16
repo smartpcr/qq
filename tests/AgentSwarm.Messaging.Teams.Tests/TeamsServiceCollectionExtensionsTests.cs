@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Extensions.DependencyInjection;
@@ -212,6 +213,200 @@ public sealed class TeamsServiceCollectionExtensionsTests
         var resolvedRouter = sp.GetRequiredService<IConversationReferenceRouter>();
         Assert.Same(explicitRouter, resolvedRouter);
         Assert.IsType<RecordingConversationReferenceRouter>(resolvedRouter);
+    }
+
+    /// <summary>
+    /// Stage 3.3 step 6 / iter-5 critique #1 — the lifecycle helper must register
+    /// every Stage 3.3 collaborator in a single call: <see cref="ITeamsCardManager"/>
+    /// (delegating to the same <see cref="TeamsMessengerConnector"/> singleton),
+    /// <see cref="ICardActionHandler"/>, and the <see cref="QuestionExpiryProcessor"/>
+    /// hosted service. This test pins the wiring shape so a regression that splits
+    /// the helper or drops a registration trips the suite.
+    /// </summary>
+    [Fact]
+    public void AddTeamsCardLifecycle_RegistersCardManager_Handler_AndExpiryHostedService()
+    {
+        var services = BuildServices();
+        services.AddSingleton<IAuditLogger, RecordingAuditLogger>();
+
+        services.AddTeamsCardLifecycle();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        // ITeamsCardManager resolves and is the same singleton as the connector.
+        var cardManager = sp.GetRequiredService<ITeamsCardManager>();
+        var connector = sp.GetRequiredService<TeamsMessengerConnector>();
+        Assert.Same(connector, cardManager);
+
+        // ICardActionHandler is the concrete CardActionHandler (replacing any NoOp stub).
+        var handler = sp.GetRequiredService<ICardActionHandler>();
+        Assert.IsType<CardActionHandler>(handler);
+
+        // QuestionExpiryProcessor is registered as IHostedService.
+        var hosted = sp.GetServices<Microsoft.Extensions.Hosting.IHostedService>();
+        Assert.Contains(hosted, h => h is AgentSwarm.Messaging.Teams.Lifecycle.QuestionExpiryProcessor);
+    }
+
+    /// <summary>
+    /// Iter-8 fix #2 — Stage 2.1 typically pre-registers no-op stubs for
+    /// <see cref="ICardActionHandler"/> and <see cref="ITeamsCardManager"/>.
+    /// <see cref="TeamsServiceCollectionExtensions.AddTeamsCardLifecycle"/> must
+    /// unconditionally replace those stubs with the concrete Stage 3.3 implementations
+    /// (per the implementation-plan requirement that the production handler/manager
+    /// wins). This test pre-registers stubs <i>before</i> calling the lifecycle helper
+    /// and asserts the resolved services are the concrete types — not the stubs.
+    /// </summary>
+    [Fact]
+    public void AddTeamsCardLifecycle_ReplacesPreRegisteredStubs_WithConcrete()
+    {
+        var services = BuildServices();
+        services.AddSingleton<IAuditLogger, RecordingAuditLogger>();
+
+        // Simulate Stage 2.1 stub pre-registration. Both must be replaced by AddTeamsCardLifecycle.
+        services.AddSingleton<ICardActionHandler, StubCardActionHandler>();
+        services.AddSingleton<ITeamsCardManager, StubTeamsCardManager>();
+
+        services.AddTeamsCardLifecycle();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var handler = sp.GetRequiredService<ICardActionHandler>();
+        Assert.IsType<CardActionHandler>(handler);
+        Assert.IsNotType<StubCardActionHandler>(handler);
+
+        var cardManager = sp.GetRequiredService<ITeamsCardManager>();
+        Assert.IsType<TeamsMessengerConnector>(cardManager);
+        Assert.IsNotType<StubTeamsCardManager>(cardManager);
+
+        // And IEnumerable<T> resolution must not leave behind the stub either — RemoveAll
+        // clears ALL prior descriptors for the contract, not just the one Replace would.
+        var allHandlers = sp.GetServices<ICardActionHandler>().ToList();
+        Assert.Single(allHandlers);
+        Assert.IsType<CardActionHandler>(allHandlers[0]);
+
+        var allManagers = sp.GetServices<ITeamsCardManager>().ToList();
+        Assert.Single(allManagers);
+        Assert.IsType<TeamsMessengerConnector>(allManagers[0]);
+    }
+
+    private sealed class StubCardActionHandler : ICardActionHandler
+    {
+        public Task<Microsoft.Bot.Schema.AdaptiveCardInvokeResponse> HandleAsync(
+            Microsoft.Bot.Builder.ITurnContext turnContext, CancellationToken ct)
+            => Task.FromResult(new Microsoft.Bot.Schema.AdaptiveCardInvokeResponse());
+    }
+
+    private sealed class StubTeamsCardManager : ITeamsCardManager
+    {
+        public Task UpdateCardAsync(string questionId, CardUpdateAction action, CancellationToken ct)
+            => Task.CompletedTask;
+
+        public Task UpdateCardAsync(string questionId, CardUpdateAction action, HumanDecisionEvent decision, string? actorDisplayName, CancellationToken ct)
+            => Task.CompletedTask;
+
+        public Task DeleteCardAsync(string questionId, CancellationToken ct)
+            => Task.CompletedTask;
+    }
+
+    // ---- AddTeamsProactiveNotifier (Stage 4.2 / iter-3 evaluator feedback #4) ----
+
+    [Fact]
+    public void AddTeamsProactiveNotifier_NullServices_Throws()
+    {
+        Assert.Throws<ArgumentNullException>(
+            () => TeamsServiceCollectionExtensions.AddTeamsProactiveNotifier(null!));
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #4 — DI coverage for the Stage 4.2 helper. Resolves
+    /// the concrete <see cref="TeamsProactiveNotifier"/> AND the
+    /// <see cref="IProactiveNotifier"/> contract from a fully-wired host graph and
+    /// asserts both resolve to the SAME singleton instance (the contract registration
+    /// delegates to the concrete via <c>sp.GetRequiredService&lt;TeamsProactiveNotifier&gt;()</c>).
+    /// </summary>
+    [Fact]
+    public void AddTeamsProactiveNotifier_RegistersNotifierAsSingleton_AndIProactiveNotifierResolvesToSameInstance()
+    {
+        var services = BuildServices();
+        services.AddTeamsProactiveNotifier();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var concrete = sp.GetRequiredService<TeamsProactiveNotifier>();
+        var iface = sp.GetRequiredService<IProactiveNotifier>();
+
+        Assert.Same(concrete, iface);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #4 — proves the helper composes
+    /// <see cref="TeamsServiceCollectionExtensions.AddTeamsMessengerConnector"/> so the
+    /// shared <see cref="IAdaptiveCardRenderer"/> default registration is in place when
+    /// the notifier resolves. This is the ONLY collaborator
+    /// <c>AddTeamsMessengerConnector</c> contributes for the notifier graph; everything
+    /// else (CloudAdapter, IConversationReferenceStore, IAgentQuestionStore,
+    /// ICardStateStore, TeamsMessagingOptions, logger) is host-supplied — see
+    /// <c>BuildServices</c>.
+    /// </summary>
+    [Fact]
+    public void AddTeamsProactiveNotifier_ComposesAdaptiveCardRendererDefault()
+    {
+        var services = BuildServices();
+        services.AddTeamsProactiveNotifier();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var renderer = sp.GetRequiredService<IAdaptiveCardRenderer>();
+        Assert.IsType<AdaptiveCardBuilder>(renderer);
+
+        // The notifier resolves end-to-end with the host-supplied dependencies + the
+        // auto-wired renderer.
+        var notifier = sp.GetRequiredService<TeamsProactiveNotifier>();
+        Assert.NotNull(notifier);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #4 — idempotency. Calling
+    /// <see cref="TeamsServiceCollectionExtensions.AddTeamsProactiveNotifier"/> more
+    /// than once must leave the descriptor count at exactly one per affected service
+    /// type (every registration uses <c>TryAdd*</c>).
+    /// </summary>
+    [Fact]
+    public void AddTeamsProactiveNotifier_CalledTwice_LeavesSingletonDescriptorsAtOnePerServiceType()
+    {
+        var services = BuildServices();
+        services.AddTeamsProactiveNotifier();
+        services.AddTeamsProactiveNotifier();
+
+        Assert.Equal(1, services.Count(d => d.ServiceType == typeof(TeamsProactiveNotifier)));
+        Assert.Equal(1, services.Count(d => d.ServiceType == typeof(IProactiveNotifier)));
+        // Transitively-composed registrations must also remain unique.
+        Assert.Equal(1, services.Count(d => d.ServiceType == typeof(TeamsMessengerConnector)));
+        Assert.Equal(1, services.Count(d => d.ServiceType == typeof(IAdaptiveCardRenderer)));
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #4 — host pre-registration wins. When the host wires
+    /// its own <see cref="IProactiveNotifier"/> implementation BEFORE calling the
+    /// helper, the helper's <c>TryAddSingleton</c> registration is a no-op and the
+    /// host's instance is what the DI container yields.
+    /// </summary>
+    [Fact]
+    public void AddTeamsProactiveNotifier_ExplicitNotifierPreRegistered_AutoWiringIsNoOp()
+    {
+        var services = BuildServices();
+        var explicitNotifier = new StubProactiveNotifier();
+        services.AddSingleton<IProactiveNotifier>(explicitNotifier);
+        services.AddTeamsProactiveNotifier();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var resolved = sp.GetRequiredService<IProactiveNotifier>();
+        Assert.Same(explicitNotifier, resolved);
+        Assert.IsType<StubProactiveNotifier>(resolved);
+    }
+
+    private sealed class StubProactiveNotifier : IProactiveNotifier
+    {
+        public Task SendProactiveAsync(string tenantId, string userId, MessengerMessage message, CancellationToken ct) => Task.CompletedTask;
+        public Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct) => Task.CompletedTask;
+        public Task SendToChannelAsync(string tenantId, string channelId, MessengerMessage message, CancellationToken ct) => Task.CompletedTask;
+        public Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct) => Task.CompletedTask;
     }
 
     private static ServiceCollection BuildServices()

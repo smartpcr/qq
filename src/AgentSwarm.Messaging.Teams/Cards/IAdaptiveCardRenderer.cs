@@ -67,4 +67,34 @@ public interface IAdaptiveCardRenderer
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="decision"/> is <c>null</c>.</exception>
     Attachment RenderDecisionConfirmationCard(HumanDecisionEvent decision);
+
+    /// <summary>
+    /// Render a read-only confirmation card that carries an actor display name in the
+    /// header (for example, <c>"Approved by Alice Wong"</c>). Used by
+    /// <c>CardActionHandler</c> (Stage 3.3) when the inbound turn context exposed a
+    /// human-readable name for the actor — when only the AAD object ID is available the
+    /// caller passes <c>null</c> for <paramref name="actorDisplayName"/> and this method
+    /// falls back to the AAD object ID.
+    /// </summary>
+    /// <param name="decision">The recorded decision payload.</param>
+    /// <param name="actorDisplayName">Friendly display name of the responding human; null/empty falls back to <see cref="HumanDecisionEvent.ExternalUserId"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="decision"/> is <c>null</c>.</exception>
+    Attachment RenderDecisionConfirmationCard(HumanDecisionEvent decision, string? actorDisplayName);
+
+    /// <summary>
+    /// Render a read-only notice replacing the original card after the question expired
+    /// before any human responded. Used by <c>ITeamsCardManager.UpdateCardAsync</c>
+    /// with <see cref="CardUpdateAction.MarkExpired"/>.
+    /// </summary>
+    /// <param name="questionId">Originating question ID — surfaced on the replacement card for traceability.</param>
+    Attachment RenderExpiredNoticeCard(string questionId);
+
+    /// <summary>
+    /// Render a read-only notice replacing the original card after the question was
+    /// cancelled (for example, the underlying agent task was withdrawn). Used by
+    /// <c>ITeamsCardManager.UpdateCardAsync</c> with
+    /// <see cref="CardUpdateAction.MarkCancelled"/>.
+    /// </summary>
+    /// <param name="questionId">Originating question ID — surfaced on the replacement card for traceability.</param>
+    Attachment RenderCancelledNoticeCard(string questionId);
 }

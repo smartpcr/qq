@@ -60,6 +60,21 @@ public sealed class TeamsMessagingOptions : ConnectorOptions
     public int DeduplicationTtlMinutes { get; set; } = 10;
 
     /// <summary>
+    /// Cadence (in seconds) at which <c>QuestionExpiryProcessor</c> scans
+    /// <c>IAgentQuestionStore</c> for open questions whose <c>ExpiresAt</c> deadline has
+    /// elapsed. Default 60 (per implementation-plan §3.3 step 6). Setting a non-positive
+    /// value disables the periodic scan when interpreted by the processor.
+    /// </summary>
+    public int ExpiryScanIntervalSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Maximum number of expired questions read from the store per scan. Default 50 (per
+    /// implementation-plan §3.3 step 6). Larger batches reduce database round-trips at
+    /// the cost of holding lock-equivalent state on the store for longer.
+    /// </summary>
+    public int ExpiryBatchSize { get; set; } = 50;
+
+    /// <summary>
     /// Total number of delivery attempts (1 initial + retries) for outbound Bot Framework
     /// calls, per <c>tech-spec.md</c> §4.4. Default 5. Setting this also recomputes
     /// <see cref="ConnectorOptions.RetryCount"/> to <c>value - 1</c> so the base contract

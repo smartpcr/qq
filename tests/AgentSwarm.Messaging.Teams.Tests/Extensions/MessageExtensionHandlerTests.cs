@@ -501,7 +501,7 @@ public sealed class MessageExtensionHandlerTests
         IInboundEventPublisher publisher)
     {
         var auditLogger = new RecordingAuditLogger();
-        var renderer = new Cards.AdaptiveCardBuilder();
+        var renderer = new AgentSwarm.Messaging.Teams.Cards.AdaptiveCardBuilder();
         var statusProvider = new NullAgentSwarmStatusProvider();
         var questionStore = new InMemoryAgentQuestionStore();
 

@@ -2,8 +2,10 @@ using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Extensions;
+using AgentSwarm.Messaging.Teams.Lifecycle;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 
 namespace AgentSwarm.Messaging.Teams;
 
@@ -205,6 +207,132 @@ public static class TeamsServiceCollectionExtensions
         services.TryAddEnumerable(ServiceDescriptor.Singleton<ICommandHandler, ResumeCommandHandler>());
 
         services.TryAddSingleton<ICommandDispatcher, CommandDispatcher>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Composes the Stage 3.3 card-lifecycle dependency graph in a single call: registers
+    /// <see cref="TeamsMessengerConnector"/> under <see cref="ITeamsCardManager"/>
+    /// (delegating to the existing singleton wired by
+    /// <see cref="AddTeamsMessengerConnector"/>), the concrete
+    /// <see cref="Cards.CardActionHandler"/> under
+    /// <see cref="ICardActionHandler"/> (<b>replacing</b> the Stage 2.1 <c>NoOpCardActionHandler</c>),
+    /// and the <see cref="QuestionExpiryProcessor"/> hosted service so the lifecycle worker
+    /// boots with the host.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Persistence-store registration is intentionally NOT included</b>: the SQL-backed
+    /// <c>IAgentQuestionStore</c> and <c>ICardStateStore</c> implementations live in the
+    /// <c>AgentSwarm.Messaging.Teams.EntityFrameworkCore</c> package and are wired by
+    /// <c>AddSqlAgentQuestionStore()</c> / <c>AddSqlCardStateStore()</c> on the EF
+    /// service-collection extensions. Hosts compose those helpers BEFORE calling this
+    /// method so the lifecycle worker sees the production stores rather than the
+    /// Stage 2.1 in-memory stubs.
+    /// </para>
+    /// <para>
+    /// <b>Iter-8 fix:</b> the <see cref="ICardActionHandler"/> and
+    /// <see cref="ITeamsCardManager"/> registrations now use
+    /// <see cref="ServiceCollectionDescriptorExtensions.RemoveAll{T}(IServiceCollection)"/>
+    /// + <see cref="ServiceCollectionServiceExtensions.AddSingleton{TService}(IServiceCollection, Func{IServiceProvider, TService})"/>
+    /// rather than <c>TryAddSingleton</c>. This unconditionally replaces any Stage 2.1
+    /// no-op stub previously registered for either contract — the implementation-plan
+    /// requirement that the concrete Stage 3.3 handler/connector wins regardless of
+    /// composition order.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddTeamsCardLifecycle(this IServiceCollection services)
+    {
+        if (services is null)
+        {
+            throw new ArgumentNullException(nameof(services));
+        }
+
+        // Compose the base connector first so TryAddSingleton<TeamsMessengerConnector>()
+        // there resolves the same instance we register under ITeamsCardManager below.
+        services.AddTeamsMessengerConnector();
+
+        // Connector is the canonical ITeamsCardManager implementation per
+        // architecture.md §4.1.1 ("TeamsMessengerConnector implements both
+        // IMessengerConnector and ITeamsCardManager"). Replace any prior stub
+        // registration so hosts that wired a no-op in Stage 2.1 get the concrete here.
+        services.RemoveAll<ITeamsCardManager>();
+        services.AddSingleton<ITeamsCardManager>(
+            sp => sp.GetRequiredService<TeamsMessengerConnector>());
+
+        // Replace the Stage 2.1 NoOpCardActionHandler (or any other prior stub) with the
+        // concrete CardActionHandler implementation.
+        services.RemoveAll<ICardActionHandler>();
+        services.AddSingleton<ICardActionHandler, CardActionHandler>();
+
+        // Lifecycle worker — singleton per BackgroundService convention. Registered via
+        // AddHostedService<T>() so the runtime picks it up automatically.
+        services.AddHostedService<QuestionExpiryProcessor>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Register the Stage 4.2 <see cref="TeamsProactiveNotifier"/> as a singleton under
+    /// both the concrete type and <see cref="IProactiveNotifier"/>. Intended for hosts
+    /// that need to drive agent-originated proactive deliveries (the Phase 6 outbox
+    /// engine, the orchestrator's "ask a question" trigger, etc.) without going through
+    /// an inbound activity.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The notifier shares its <c>CloudAdapter</c>,
+    /// <see cref="IConversationReferenceStore"/>, <see cref="ICardStateStore"/>,
+    /// <see cref="IAgentQuestionStore"/>, and <see cref="Cards.IAdaptiveCardRenderer"/>
+    /// dependencies with <see cref="TeamsMessengerConnector"/>; this helper therefore
+    /// composes <see cref="AddTeamsMessengerConnector"/> first so the shared
+    /// <see cref="Cards.IAdaptiveCardRenderer"/> default registration (and the
+    /// <see cref="IConversationReferenceRouter"/> cast-adapter) are in place.
+    /// </para>
+    /// <para>
+    /// <b>Host-supplied dependencies</b>: <see cref="AddTeamsMessengerConnector"/> does
+    /// <i>not</i> register the underlying <see cref="Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter"/>,
+    /// <see cref="IConversationReferenceStore"/>, <see cref="IAgentQuestionStore"/>,
+    /// <see cref="ICardStateStore"/>, <see cref="TeamsMessagingOptions"/>, or the
+    /// <see cref="Microsoft.Extensions.Logging.ILogger{T}"/> the notifier consumes —
+    /// those are owned by the host application (typically: the EF Core extension
+    /// package's <c>AddSql*Store</c> helpers and the host's
+    /// <see cref="Microsoft.Extensions.Logging.LoggerFactory"/> wiring). The host MUST
+    /// register all of them BEFORE calling this helper, otherwise resolving
+    /// <see cref="TeamsProactiveNotifier"/> from the built provider will throw the
+    /// canonical <see cref="InvalidOperationException"/> for a missing service. The only
+    /// dependencies <i>auto-wired</i> by <see cref="AddTeamsMessengerConnector"/> (and
+    /// therefore satisfied transitively by this helper) are the default
+    /// <see cref="Cards.IAdaptiveCardRenderer"/> (
+    /// <see cref="Cards.AdaptiveCardBuilder"/>) and the
+    /// <see cref="IConversationReferenceRouter"/> cast-adapter that re-exposes the
+    /// host-supplied store under the router contract.
+    /// </para>
+    /// <para>
+    /// <b>Idempotent</b> — every registration uses <c>TryAdd*</c> variants so calling
+    /// this helper multiple times leaves the descriptor count unchanged, and explicit
+    /// pre-registrations of either service type are preserved.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddTeamsProactiveNotifier(this IServiceCollection services)
+    {
+        if (services is null)
+        {
+            throw new ArgumentNullException(nameof(services));
+        }
+
+        // Compose the shared default graph: the IAdaptiveCardRenderer default and the
+        // IConversationReferenceRouter cast-adapter are populated by
+        // AddTeamsMessengerConnector. The host is responsible for registering
+        // CloudAdapter, IConversationReferenceStore, IAgentQuestionStore,
+        // ICardStateStore, TeamsMessagingOptions, and ILogger<T> before resolving the
+        // notifier from the built provider — see the remarks on this method for the
+        // full list and the rationale.
+        services.AddTeamsMessengerConnector();
+
+        services.TryAddSingleton<TeamsProactiveNotifier>();
+        services.TryAddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<TeamsProactiveNotifier>());
 
         return services;
     }
