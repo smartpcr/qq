@@ -53,43 +53,46 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 ///   §4.3 cross-doc note, two tenants may independently use the same
 ///   alias without collision.
 ///   <para>
-///   <b>Lifecycle invariant — deactivation requires alias cleanup
-///   (review-r0 follow-up).</b> This index is intentionally NOT
-///   filtered on <see cref="OperatorBinding.IsActive"/>; it is a
-///   plain SQL <c>UNIQUE</c> covering both active and inactive
-///   rows. That choice keeps the schema portable across the
-///   three providers we target (SQLite uses
-///   <c>WHERE "IsActive" = 1</c>, PostgreSQL prefers
-///   <c>WHERE "IsActive" = TRUE</c>, SQL Server uses
-///   <c>WHERE [IsActive] = 1</c>) without baking a
-///   provider-specific filter fragment into the model config or
-///   the generated migration. The trade-off is that any code path
-///   that flips <see cref="OperatorBinding.IsActive"/> to
-///   <see langword="false"/> MUST also clear or scramble the row's
-///   <see cref="OperatorBinding.OperatorAlias"/> (e.g. rewrite it
-///   to <c>__deactivated__&lt;Guid&gt;</c> or similar) in the same
-///   <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
-///   call. Otherwise a NEW operator (different
-///   <see cref="OperatorBinding.TelegramUserId"/>) attempting to
-///   claim the same <c>(OperatorAlias, TenantId)</c> pair will be
-///   rejected by this index even though the holder is logically
-///   dead, and
-///   <see cref="PersistentOperatorRegistry"/>'s upsert paths
-///   (<c>StageUpsertAsync</c> /
-///   <c>StageUpsertForBatch</c>) will NOT find the stale row to
-///   refresh because they look up by
-///   <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> — a
-///   different user's deactivated alias-holder lives under a
-///   different lookup key and is invisible to the upsert. Nothing
-///   in the current code base sets <c>IsActive = false</c> (the
-///   read-side <c>x.IsActive</c> filters in
-///   <see cref="PersistentOperatorRegistry"/> exist for the
-///   anticipated <c>/deregister</c> / admin-revocation paths), so
-///   today this invariant binds future deactivation code only,
-///   not any existing flow. When the deactivation code lands it
-///   MUST add a regression test covering the
-///   "operator A deactivates → operator B reclaims alias" sequence
-///   to pin the cleanup behaviour against this index.
+///   <b>Lifecycle note — deactivation does NOT release the alias
+///   (review-r0 item).</b> The unique index is intentionally
+///   <i>not</i> filtered on <see cref="OperatorBinding.IsActive"/>.
+///   Setting <c>IsActive = false</c> is a reversible soft-revocation
+///   (architecture.md §7.1 "Access revocation is modeled by setting
+///   <c>OperatorBinding.IsActive=false</c>" plus the
+///   <c>RegisterAsync_RecreatesDeactivatedBinding_AsActive</c> test
+///   in <c>PersistentOperatorRegistryTests</c>), and the alias is
+///   treated as part of the operator's persistent identity — it
+///   stays reserved for as long as the row exists so a subsequent
+///   soft-restore of the same operator cannot silently lose its
+///   identifier or collide with a fresh claimant that grabbed the
+///   alias in the meantime. A partial index filtered on
+///   <c>WHERE IsActive = 1</c> would defeat that guarantee: an
+///   admin re-activating the original row would either fail at
+///   <c>SaveChangesAsync</c> time (a now-active claimant occupies
+///   the (alias, tenant) pair) or, worse, the race would resolve
+///   non-deterministically depending on transaction ordering and
+///   leave two rows that <i>both</i> claim the same alias
+///   within the tenant — <see cref="IOperatorRegistry.GetByAliasAsync"/>
+///   would then arbitrarily pick one and silently break
+///   <c>/handoff @alias</c> routing.
+///   </para>
+///   <para>
+///   <b>Operational consequence.</b> If an administrator wants to
+///   transfer an alias to a different operator inside the same
+///   tenant, they must FIRST mutate the deactivated row's
+///   <see cref="OperatorBinding.OperatorAlias"/> (rename it to a
+///   tombstone value, or hard-delete the row) before the new
+///   registration can claim the freed <c>(alias, tenant)</c> pair.
+///   The upsert path in
+///   <see cref="PersistentOperatorRegistry"/>'s
+///   <c>StageUpsertAsync</c> only looks up by
+///   <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> so it
+///   will NOT discover a deactivated alias-holder owned by a
+///   <i>different</i> user; the unique index will surface the
+///   collision as a <see cref="DbUpdateException"/> on the new
+///   operator's <c>/start</c>, which is the correct fail-loud
+///   signal that alias transfer requires the explicit
+///   admin-side alias-release step rather than silent reassignment.
 ///   </para></description></item>
 ///   <item><description><b><c>ux_operator_bindings_user_chat_workspace</c>
 ///   on <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c></b> —
@@ -209,10 +212,19 @@ public sealed class OperatorBindingConfiguration : IEntityTypeConfiguration<Oper
         builder.HasIndex(x => new { x.TelegramUserId, x.TelegramChatId })
             .HasDatabaseName("ix_operator_bindings_user_chat");
 
-        // Unfiltered unique index — deactivation MUST clear / scramble
-        // OperatorAlias to free this slot. See the "Lifecycle
-        // invariant" paragraph in the class XML doc above for the
-        // full rationale and the required regression-test shape.
+        // ux_operator_bindings_alias_tenant — see the class-level
+        // <remarks> "Lifecycle note" for why this index is
+        // intentionally NOT filtered on IsActive. Deactivation is a
+        // reversible soft-revoke (architecture.md §7.1 and the
+        // RegisterAsync_RecreatesDeactivatedBinding_AsActive test);
+        // the alias remains reserved for the dead row so the
+        // soft-restore path cannot silently lose its identifier or
+        // collide with a fresh claimant. Transferring an alias to a
+        // different operator therefore requires an explicit admin
+        // step that first renames or hard-deletes the deactivated
+        // row — a new /start that tries to claim a soft-revoked
+        // alias inside the same tenant will surface a
+        // DbUpdateException, which is the correct fail-loud signal.
         builder.HasIndex(x => new { x.OperatorAlias, x.TenantId })
             .IsUnique()
             .HasDatabaseName("ux_operator_bindings_alias_tenant");
