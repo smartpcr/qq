@@ -423,6 +423,7 @@ public static class TeamsOutboxServiceCollectionExtensions
     private sealed class KeyedTeamsConnectorInterceptor : IServiceProvider, IKeyedServiceProvider
     {
         private readonly IServiceProvider _inner;
+        private readonly IKeyedServiceProvider _keyedInner;
         private readonly Func<IServiceProvider, IMessengerConnector> _capturedKeyedTeamsFactory;
         private IMessengerConnector? _capturedKeyedTeamsResult;
 
@@ -431,6 +432,23 @@ public static class TeamsOutboxServiceCollectionExtensions
             Func<IServiceProvider, IMessengerConnector> capturedKeyedTeamsFactory)
         {
             _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+
+            // Fail at decoration time with a clear, actionable message rather than at
+            // first keyed resolution with a cryptic InvalidCastException. The interceptor
+            // only makes sense if the host's IServiceProvider supports keyed lookups —
+            // the .NET 8 default ServiceProvider does, but a third-party DI container or
+            // a wrapping decorator may not.
+            _keyedInner = inner as IKeyedServiceProvider
+                ?? throw new ArgumentException(
+                    $"The supplied IServiceProvider ({inner.GetType().Name}) must implement " +
+                    "IKeyedServiceProvider. AddTeamsOutboxEngine relies on keyed-service " +
+                    "lookups when the host registered both an unkeyed IMessengerConnector " +
+                    "factory and a keyed IMessengerConnector under " +
+                    $"TeamsServiceCollectionExtensions.MessengerKey (\"{TeamsServiceCollectionExtensions.MessengerKey}\"). " +
+                    "Use a DI container that implements IKeyedServiceProvider (the default " +
+                    "Microsoft.Extensions.DependencyInjection container does) or avoid this " +
+                    "decorator path by registering only one of the two shapes.",
+                    nameof(inner));
             _capturedKeyedTeamsFactory = capturedKeyedTeamsFactory
                 ?? throw new ArgumentNullException(nameof(capturedKeyedTeamsFactory));
         }
@@ -444,18 +462,17 @@ public static class TeamsOutboxServiceCollectionExtensions
             {
                 return _capturedKeyedTeamsResult ??= _capturedKeyedTeamsFactory(_inner);
             }
-            return ((IKeyedServiceProvider)_inner).GetKeyedService(serviceType, serviceKey);
+            return _keyedInner.GetKeyedService(serviceType, serviceKey);
         }
 
         public object GetRequiredKeyedService(Type serviceType, object? serviceKey)
         {
-            var result = GetKeyedService(serviceType, serviceKey);
-            if (result is null)
+            if (serviceType == typeof(IMessengerConnector)
+                && Equals(serviceKey, TeamsServiceCollectionExtensions.MessengerKey))
             {
-                throw new InvalidOperationException(
-                    $"No service for type '{serviceType.FullName}' has been registered with key '{serviceKey}'.");
+                return _capturedKeyedTeamsResult ??= _capturedKeyedTeamsFactory(_inner);
             }
-            return result;
+            return _keyedInner.GetRequiredKeyedService(serviceType, serviceKey);
         }
     }
 }
