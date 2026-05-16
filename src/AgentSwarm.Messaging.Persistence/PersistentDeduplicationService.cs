@@ -88,6 +88,20 @@ using Microsoft.Extensions.Logging;
 /// </remarks>
 public sealed class PersistentDeduplicationService : IDeduplicationService
 {
+    /// <summary>
+    /// Upper bound on retry attempts in
+    /// <see cref="PromoteToProcessedAsync"/>. In steady state the
+    /// promotion completes on the first attempt (SELECT + UPDATE) or
+    /// the second (SELECT-null + INSERT). The cap absorbs storm-load
+    /// jitter where racing <see cref="TryReserveAsync"/> /
+    /// <see cref="ReleaseReservationAsync"/> callers keep flipping
+    /// the row's existence between our SELECT and our SaveChanges,
+    /// but stays bounded so the upstream inbound pipeline can NAK +
+    /// retry rather than block indefinitely under pathological
+    /// contention.
+    /// </summary>
+    private const int PromotionMaxAttempts = 5;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<PersistentDeduplicationService> _logger;
@@ -288,37 +302,142 @@ public sealed class PersistentDeduplicationService : IDeduplicationService
     /// a racing <see cref="TryReserveAsync"/> just inserted and
     /// promotes it to the sticky-processed state via UPDATE.
     /// </summary>
-    private static async Task PromoteToProcessedAsync(
+    /// <remarks>
+    /// <para>
+    /// <b>Bounded retry loop.</b> Both branches of the recovery — the
+    /// "row exists, UPDATE it" path and the "row vanished, re-INSERT
+    /// it" path — can themselves lose a race against a concurrent
+    /// caller:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>
+    ///   The <b>UPDATE branch</b> can lose to a racing
+    ///   <see cref="ReleaseReservationAsync"/> that deletes the
+    ///   reservation-phase row between our SELECT and our UPDATE. EF
+    ///   Core surfaces this as <see cref="DbUpdateConcurrencyException"/>
+    ///   when the UPDATE statement affects zero rows (no optimistic
+    ///   concurrency token is required — the affected-rows mismatch
+    ///   alone trips the EF Core save-pipeline guard).
+    ///   </description></item>
+    ///   <item><description>
+    ///   The <b>re-INSERT branch</b> can lose to a racing
+    ///   <see cref="TryReserveAsync"/> (or another
+    ///   <see cref="MarkProcessedAsync"/> re-insert) that won the PK
+    ///   between our SELECT-null and our INSERT. The provider raises
+    ///   the same PK-uniqueness violation as the parent
+    ///   <see cref="MarkProcessedAsync"/> first INSERT — surfaced as
+    ///   <see cref="DbUpdateException"/>.
+    ///   </description></item>
+    /// </list>
+    /// <para>
+    /// Each lost race detaches/clears the change tracker so the next
+    /// iteration's SELECT reflects the live database state, then
+    /// retries. In steady state the promotion completes on the first
+    /// or second attempt; the
+    /// <see cref="PromotionMaxAttempts"/> cap absorbs storm-load
+    /// jitter without ever looping unboundedly. Exhausting the budget
+    /// throws — the upstream inbound pipeline must NAK + retry rather
+    /// than silently drop the sticky-processed marker, which would
+    /// allow duplicate processing on the next delivery.
+    /// </para>
+    /// </remarks>
+    private async Task PromoteToProcessedAsync(
         MessagingDbContext db,
         string eventId,
         DateTime now,
         CancellationToken ct)
     {
-        var row = await db.ProcessedEvents
-            .FirstOrDefaultAsync(x => x.EventId == eventId, ct)
-            .ConfigureAwait(false);
-        if (row is null)
+        for (var attempt = 1; attempt <= PromotionMaxAttempts; attempt++)
         {
-            // The racing reservation must have been rolled back; the
-            // row genuinely does not exist. Re-insert as a fully
-            // processed marker. This branch is extremely rare in
-            // practice — the original SaveChanges would have surfaced
-            // any non-conflict error long before we got here.
-            db.ProcessedEvents.Add(new ProcessedEvent
+            // Fresh SELECT each iteration — the change-tracker was
+            // cleared after every losing race below, so the next
+            // attempt sees the live DB state rather than a stale
+            // tracked entity from the identity map.
+            var row = await db.ProcessedEvents
+                .FirstOrDefaultAsync(x => x.EventId == eventId, ct)
+                .ConfigureAwait(false);
+
+            if (row is null)
             {
-                EventId = eventId,
-                ReservedAt = now,
-                ProcessedAt = now,
-            });
-            await db.SaveChangesAsync(ct).ConfigureAwait(false);
-            return;
+                // The racing reservation was rolled back, or a racing
+                // ReleaseReservationAsync deleted it after our caller's
+                // failed INSERT. Re-insert as a fully-processed marker.
+                var pending = new ProcessedEvent
+                {
+                    EventId = eventId,
+                    ReservedAt = now,
+                    ProcessedAt = now,
+                };
+                db.ProcessedEvents.Add(pending);
+                try
+                {
+                    await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                    return;
+                }
+                catch (DbUpdateException)
+                {
+                    // Yet another race: a concurrent TryReserveAsync (or
+                    // another MarkProcessedAsync re-insert) won the PK
+                    // between our SELECT-null and our INSERT. Mirrors the
+                    // parent MarkProcessedAsync's guard — detach the
+                    // failed Added entity and clear the change tracker
+                    // so the next iteration's SELECT sees the live row
+                    // and falls into the UPDATE branch.
+                    db.Entry(pending).State = EntityState.Detached;
+                    db.ChangeTracker.Clear();
+                    _logger.LogDebug(
+                        "PromoteToProcessedAsync INSERT race for event id {EventId} on attempt {Attempt}/{MaxAttempts}; retrying.",
+                        eventId,
+                        attempt,
+                        PromotionMaxAttempts);
+                    continue;
+                }
+            }
+
+            if (row.ProcessedAt is not null)
+            {
+                // Already promoted by a racing MarkProcessedAsync
+                // (e.g. another worker beat us to the recovery
+                // path). Sticky-processed — nothing more to do.
+                return;
+            }
+
+            row.ProcessedAt = now;
+            try
+            {
+                await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                return;
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                // The reservation-phase row was deleted by a racing
+                // ReleaseReservationAsync between our SELECT and our
+                // UPDATE. EF Core detects the 0-rows-affected UPDATE
+                // and raises this. Clear the tracker so the next
+                // iteration's SELECT reflects the deletion and falls
+                // into the null-row INSERT branch (the same code path
+                // a tooling-replay would take).
+                db.ChangeTracker.Clear();
+                _logger.LogDebug(
+                    "PromoteToProcessedAsync UPDATE race for event id {EventId} on attempt {Attempt}/{MaxAttempts}; racing release deleted the row, retrying as insert.",
+                    eventId,
+                    attempt,
+                    PromotionMaxAttempts);
+                continue;
+            }
         }
 
-        if (row.ProcessedAt is null)
-        {
-            row.ProcessedAt = now;
-            await db.SaveChangesAsync(ct).ConfigureAwait(false);
-        }
+        // Exhausted the retry budget — the sticky-processed contract
+        // cannot be silently dropped (the next delivery for this
+        // event id would re-execute the handler), so surface as an
+        // exception. The upstream inbound pipeline NAKs + retries.
+        _logger.LogError(
+            "PromoteToProcessedAsync exhausted {MaxAttempts} attempts for event id {EventId}; racing reservation/release callers prevented promotion.",
+            PromotionMaxAttempts,
+            eventId);
+        throw new InvalidOperationException(
+            $"PromoteToProcessedAsync exhausted {PromotionMaxAttempts} attempts for event id '{eventId}': "
+            + "racing reservation/release callers prevented the processed marker from being written.");
     }
 
     private static void ValidateEventId(string eventId)
