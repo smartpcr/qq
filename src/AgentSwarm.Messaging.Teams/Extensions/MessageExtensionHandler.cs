@@ -248,14 +248,25 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         // "the 'agent ask' command requires role 'operator'" and viewer-only users are
         // denied with `MessagingExtensionActionResponse` carrying an access-denied card,
         // no MessengerEvent, plus a `SecurityRejection` audit entry.
+        //
+        // CRITICAL: RBAC is keyed by the Entra AAD object ID (see
+        // `RbacAuthorizationService` xmldoc + `RbacOptions.TenantRoleAssignments`).
+        // Passing `resolvedIdentity.InternalUserId` here would silently deny
+        // AAD-keyed role assignments because the platform-internal user ID and
+        // the AAD object ID rarely coincide.
+        var rbacSubject = !string.IsNullOrEmpty(resolvedIdentity.AadObjectId)
+            ? resolvedIdentity.AadObjectId
+            : aadObjectId;
+
         var authorization = await _authorizationService
-            .AuthorizeAsync(tenantId, resolvedIdentity.InternalUserId, CommandNames.AgentAsk, ct)
+            .AuthorizeAsync(tenantId, rbacSubject, CommandNames.AgentAsk, ct)
             .ConfigureAwait(false);
 
         if (!authorization.IsAuthorized)
         {
             _logger.LogWarning(
-                "Message-extension invoke rejected — user {InternalUserId} (role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
+                "Message-extension invoke rejected — user {AadObjectId} (internal {InternalUserId}, role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
+                rbacSubject,
                 resolvedIdentity.InternalUserId,
                 authorization.UserRole,
                 authorization.RequiredRole,
