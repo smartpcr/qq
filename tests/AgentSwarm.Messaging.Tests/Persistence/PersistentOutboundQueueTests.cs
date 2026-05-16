@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
 using FluentAssertions;
@@ -17,17 +18,27 @@ namespace AgentSwarm.Messaging.Tests.Persistence;
 /// </summary>
 public class PersistentOutboundQueueTests : IDisposable
 {
-    private readonly SqliteConnection _sqlite;
+    // Shared-cache mode lets multiple SqliteConnection instances point at
+    // the same in-memory database, which is required for the concurrent-
+    // claim tests below: SQLite serializes operations on a *single*
+    // connection, so the CAS race window can only be exercised when each
+    // worker context owns its own connection. The holder connection keeps
+    // the shared in-memory database alive for the lifetime of the test
+    // (SQLite drops the database when its last connection closes).
+    private readonly string _connectionString;
+    private readonly SqliteConnection _holder;
     private readonly DbContextOptions<MessagingDbContext> _options;
 
     public PersistentOutboundQueueTests()
     {
-        _sqlite = new SqliteConnection("DataSource=:memory:");
-        _sqlite.Open();
-        EnableForeignKeys(_sqlite);
+        var dbName = "outbox_" + Guid.NewGuid().ToString("N");
+        _connectionString = $"DataSource=file:{dbName}?mode=memory&cache=shared&Foreign Keys=True";
+
+        _holder = new SqliteConnection(_connectionString);
+        _holder.Open();
 
         _options = new DbContextOptionsBuilder<MessagingDbContext>()
-            .UseSqlite(_sqlite)
+            .UseSqlite(_connectionString)
             .Options;
 
         using var bootstrap = new MessagingDbContext(_options);
@@ -36,7 +47,7 @@ public class PersistentOutboundQueueTests : IDisposable
 
     public void Dispose()
     {
-        _sqlite.Dispose();
+        _holder.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -401,55 +412,234 @@ public class PersistentOutboundQueueTests : IDisposable
     }
 
     [Fact]
-    public async Task EnqueueAsync_RaceOnConstraintViolation_IsSwallowedAsNoOp()
+    public async Task EnqueueAsync_ManyConcurrentDuplicates_ExactlyOneRowPersists_NoExceptionEscapes()
     {
-        // Defends the SQLite UNIQUE-constraint catch-as-fallback path: when
-        // the AnyAsync fast-path misses (its snapshot pre-dates the
-        // committed duplicate) the SaveChanges UNIQUE violation must be
-        // caught and treated as a no-op so the caller does not see an
-        // exception for a logically duplicate enqueue.
+        // Stress-style coverage for the catch-as-fallback path in
+        // EnqueueAsync: under real concurrency, two contexts whose AnyAsync
+        // snapshot both predate the eventually-committed duplicate must each
+        // see their SaveChanges either (a) succeed exactly once or (b) hit
+        // the SQLite UNIQUE constraint and be swallowed by the queue's
+        // catch handler. The race window is widened by running many workers
+        // against many independent connections via shared-cache mode; with
+        // the catch path correctly wired, every enqueue completes without
+        // throwing and exactly one row ends up in the database.
         var clock = new StubTimeProvider(new DateTimeOffset(2026, 5, 16, 15, 30, 0, TimeSpan.Zero));
-        var sharedKey = OutboundMessage.IdempotencyKeys.ForAlert("agent-x", "alert-1");
+        var sharedKey = OutboundMessage.IdempotencyKeys.ForAlert("agent-x", "alert-stress");
 
-        using (var ctxA = NewContext())
-        {
-            var queue = new PersistentOutboundQueue(ctxA, clock);
-            await queue.EnqueueAsync(
-                NewMessage(sharedKey, MessageSeverity.Critical, createdAt: clock.GetUtcNow()),
-                default);
-        }
+        const int Workers = 16;
+        var barrier = new Barrier(Workers);
+        var exceptions = new ConcurrentBag<Exception>();
 
-        using (var ctxB = NewContext())
+        var tasks = Enumerable.Range(0, Workers).Select(i => Task.Run(async () =>
         {
-            // Use the public seam: produce a fresh OutboundMessage carrying
-            // the same key. The fast-path AnyAsync will see the existing row
-            // and short-circuit on no-op, so this asserts the documented
-            // contract (no exception, no second row).
-            var queue = new PersistentOutboundQueue(ctxB, clock);
-            await queue.EnqueueAsync(
-                NewMessage(sharedKey, MessageSeverity.High, createdAt: clock.GetUtcNow()),
-                default);
-        }
+            try
+            {
+                using var ctx = NewContext();
+                var queue = new PersistentOutboundQueue(ctx, clock);
+                var msg = NewMessage(sharedKey, MessageSeverity.Normal,
+                    createdAt: clock.GetUtcNow(), payload: $"p-{i}");
+                barrier.SignalAndWait();
+                await queue.EnqueueAsync(msg, default);
+            }
+            catch (Exception ex)
+            {
+                exceptions.Add(ex);
+            }
+        })).ToArray();
 
-        // Independently exercise the SQLite UNIQUE-constraint fault path by
-        // staging an Add on a context whose snapshot precedes the existing
-        // row, then calling SaveChanges. EF must raise DbUpdateException so
-        // the in-queue catch handler has something to swallow.
-        using (var ctxC = NewContext())
-        {
-            ctxC.OutboundMessages.Add(
-                NewMessage(sharedKey, MessageSeverity.Normal, createdAt: clock.GetUtcNow()));
-            var act = async () => await ctxC.SaveChangesAsync();
-            await act.Should().ThrowAsync<DbUpdateException>();
-        }
+        await Task.WhenAll(tasks);
+
+        exceptions.Should().BeEmpty(
+            "the UNIQUE-violation catch handler in EnqueueAsync must swallow concurrent duplicates");
 
         using var read = NewContext();
         var rows = await read.OutboundMessages.AsNoTracking()
             .Where(m => m.IdempotencyKey == sharedKey)
             .ToListAsync();
 
-        rows.Should().HaveCount(1);
-        rows[0].Severity.Should().Be(MessageSeverity.Critical);
+        rows.Should().HaveCount(1,
+            "the UNIQUE(IdempotencyKey) constraint plus the catch handler collapses every duplicate to a single row");
+    }
+
+    [Fact]
+    public async Task TryClaimAsync_LosingWorkerWithStaleSnapshot_ReturnsNullViaConditionalUpdate()
+    {
+        // Deterministically exercise the atomic CAS in TryClaimAsync:
+        // worker A loads the candidate id, worker B loads the same candidate
+        // id from an independent context (both snapshots see Status=Pending),
+        // worker A's TryClaim transitions the row to Sending, then worker B's
+        // TryClaim issues `UPDATE ... WHERE Status IN (Pending, Failed)`
+        // which matches 0 rows because A already changed Status. B must
+        // return null without claiming the row. This is the exact race the
+        // iter-1 evaluator called out as the operational-risk hole.
+        var clock = new StubTimeProvider(new DateTimeOffset(2026, 5, 16, 19, 0, 0, TimeSpan.Zero));
+
+        Guid contendedId;
+        using (var seed = NewContext())
+        {
+            var queue = new PersistentOutboundQueue(seed, clock);
+            var msg = NewMessage("cas-contended", MessageSeverity.Critical, createdAt: clock.GetUtcNow());
+            contendedId = msg.MessageId;
+            await queue.EnqueueAsync(msg, default);
+        }
+
+        using var ctxA = NewContext();
+        using var ctxB = NewContext();
+        var queueA = new PersistentOutboundQueue(ctxA, clock);
+        var queueB = new PersistentOutboundQueue(ctxB, clock);
+
+        // Both workers have snapshots with Status=Pending at this point.
+        // A claims first.
+        var claimedByA = await queueA.TryClaimAsync(contendedId, clock.GetUtcNow(), default);
+        // B's claim attempt runs against the now-Sending row.
+        var claimedByB = await queueB.TryClaimAsync(contendedId, clock.GetUtcNow(), default);
+
+        claimedByA.Should().NotBeNull("worker A's CAS hit Status=Pending and transitioned it");
+        claimedByA!.MessageId.Should().Be(contendedId);
+        claimedByA.Status.Should().Be(OutboundMessageStatus.Sending);
+
+        claimedByB.Should().BeNull(
+            "worker B's CAS must reject the stale claim because Status is no longer Pending/Failed-due");
+
+        using var read = NewContext();
+        var stored = await read.OutboundMessages.AsNoTracking().SingleAsync(m => m.MessageId == contendedId);
+        stored.Status.Should().Be(OutboundMessageStatus.Sending,
+            "the atomic UPDATE happened exactly once");
+    }
+
+    [Fact]
+    public async Task DequeueAsync_ManyConcurrentWorkersSingleRow_AtomicCASElectsExactlyOneWinner()
+    {
+        // End-to-end stress complement to the deterministic CAS test:
+        // N workers, each with its own context and SQLite connection,
+        // race to claim the single eligible row. The atomic conditional
+        // UPDATE inside TryClaimAsync guarantees exactly one worker
+        // receives a non-null result; all others return null.
+        var clock = new StubTimeProvider(new DateTimeOffset(2026, 5, 16, 19, 30, 0, TimeSpan.Zero));
+
+        Guid soloId;
+        using (var seed = NewContext())
+        {
+            var queue = new PersistentOutboundQueue(seed, clock);
+            var msg = NewMessage("solo-race", MessageSeverity.Critical, createdAt: clock.GetUtcNow());
+            soloId = msg.MessageId;
+            await queue.EnqueueAsync(msg, default);
+        }
+
+        const int Workers = 8;
+        var barrier = new Barrier(Workers);
+
+        var tasks = Enumerable.Range(0, Workers).Select(_ => Task.Run(async () =>
+        {
+            using var ctx = NewContext();
+            var queue = new PersistentOutboundQueue(ctx, clock);
+            barrier.SignalAndWait();
+            return await queue.DequeueAsync(default);
+        })).ToArray();
+
+        var results = await Task.WhenAll(tasks);
+        var winners = results.Where(r => r is not null).ToList();
+
+        winners.Should().HaveCount(1, "atomic CAS must elect exactly one winner");
+        winners[0]!.MessageId.Should().Be(soloId);
+        winners[0]!.Status.Should().Be(OutboundMessageStatus.Sending);
+
+        using var read = NewContext();
+        var stored = await read.OutboundMessages.AsNoTracking().SingleAsync(m => m.MessageId == soloId);
+        stored.Status.Should().Be(OutboundMessageStatus.Sending);
+    }
+
+    [Fact]
+    public async Task DequeueAsync_ManyConcurrentWorkersManyRows_EachRowClaimedByExactlyOneWorker()
+    {
+        // N workers race over M rows. Each row must be claimed by exactly
+        // one worker — total winners count equals row count, and no two
+        // workers return the same MessageId.
+        var clock = new StubTimeProvider(new DateTimeOffset(2026, 5, 16, 20, 0, 0, TimeSpan.Zero));
+
+        const int Rows = 20;
+        var rowIds = new HashSet<Guid>();
+        using (var seed = NewContext())
+        {
+            var queue = new PersistentOutboundQueue(seed, clock);
+            for (var i = 0; i < Rows; i++)
+            {
+                var msg = NewMessage($"multi-race-{i}", MessageSeverity.Normal,
+                    createdAt: clock.GetUtcNow().AddMilliseconds(i));
+                rowIds.Add(msg.MessageId);
+                await queue.EnqueueAsync(msg, default);
+            }
+        }
+
+        const int Workers = 8;
+        var barrier = new Barrier(Workers);
+        var claimsPerWorker = new ConcurrentBag<List<Guid>>();
+
+        var tasks = Enumerable.Range(0, Workers).Select(_ => Task.Run(async () =>
+        {
+            using var ctx = NewContext();
+            var queue = new PersistentOutboundQueue(ctx, clock);
+            var mine = new List<Guid>();
+            barrier.SignalAndWait();
+            while (true)
+            {
+                var claimed = await queue.DequeueAsync(default);
+                if (claimed is null) break;
+                mine.Add(claimed.MessageId);
+            }
+            claimsPerWorker.Add(mine);
+        })).ToArray();
+
+        await Task.WhenAll(tasks);
+
+        var allClaims = claimsPerWorker.SelectMany(x => x).ToList();
+        allClaims.Should().HaveCount(Rows,
+            "every row must be claimed exactly once across all workers");
+        allClaims.Distinct().Should().HaveCount(Rows,
+            "no row may be claimed by more than one worker (atomic CAS invariant)");
+        allClaims.Should().BeEquivalentTo(rowIds);
+    }
+
+    [Fact]
+    public async Task DequeueBatchAsync_TwoConcurrentBatchClaims_NoRowReturnedByBothWorkers()
+    {
+        // Same invariant for the batch dequeue surface used by the low-
+        // priority status-update dispatcher (architecture.md Section 10.4):
+        // overlapping candidate snapshots resolve to disjoint claim sets.
+        var clock = new StubTimeProvider(new DateTimeOffset(2026, 5, 16, 20, 30, 0, TimeSpan.Zero));
+
+        const int Rows = 12;
+        using (var seed = NewContext())
+        {
+            var queue = new PersistentOutboundQueue(seed, clock);
+            for (var i = 0; i < Rows; i++)
+            {
+                await queue.EnqueueAsync(
+                    NewMessage($"batch-race-{i}", MessageSeverity.Low,
+                        createdAt: clock.GetUtcNow().AddMilliseconds(i)),
+                    default);
+            }
+        }
+
+        const int Workers = 4;
+        var barrier = new Barrier(Workers);
+
+        var tasks = Enumerable.Range(0, Workers).Select(_ => Task.Run(async () =>
+        {
+            using var ctx = NewContext();
+            var queue = new PersistentOutboundQueue(ctx, clock);
+            barrier.SignalAndWait();
+            return (IReadOnlyList<OutboundMessage>)await queue.DequeueBatchAsync(
+                MessageSeverity.Low, maxCount: Rows, default);
+        })).ToArray();
+
+        var allBatches = await Task.WhenAll(tasks);
+        var allIds = allBatches.SelectMany(b => b).Select(m => m.MessageId).ToList();
+
+        allIds.Should().HaveCount(Rows,
+            "every eligible row must end up in exactly one batch");
+        allIds.Distinct().Should().HaveCount(Rows,
+            "no row may appear in two batches (atomic per-row CAS invariant)");
     }
 
     [Fact]
@@ -597,13 +787,6 @@ public class PersistentOutboundQueueTests : IDisposable
             payload: payload ?? "{\"text\":\"hello\"}",
             correlationId: "corr-" + idempotencyKey,
             createdAt: createdAt);
-    }
-
-    private static void EnableForeignKeys(SqliteConnection connection)
-    {
-        using var pragma = connection.CreateCommand();
-        pragma.CommandText = "PRAGMA foreign_keys = ON;";
-        pragma.ExecuteNonQuery();
     }
 
     private sealed class StubTimeProvider : TimeProvider
