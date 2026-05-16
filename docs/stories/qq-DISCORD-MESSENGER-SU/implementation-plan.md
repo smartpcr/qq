@@ -32,7 +32,8 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 
 ### Implementation Steps
 - [ ] Create `MessageSeverity` enum in Abstractions with values: `Critical`, `High`, `Normal`, `Low` (used for priority queuing; name aligns with architecture.md Section 3.1)
-- [ ] Create `ChannelPurpose` enum in Abstractions with values: `Control`, `Alert`, `Workstream` (used in GuildBinding to route messages; see architecture.md Section 3.1)
+- [ ] Create `ChannelPurpose` enum in Abstractions with values: `Control`, `Alert`, `Workstream` (used in ChannelBinding to route messages; see architecture.md Section 3.1)
+- [ ] Create `ChannelBinding` record in Abstractions with properties: `GuildId` (ulong), `ChannelId` (ulong), `ChannelPurpose` (ChannelPurpose), `TenantId` (string), `WorkspaceId` (string), `AllowedRoleIds` (ulong[]), `CommandRestrictions` (IReadOnlyDictionary of string to ulong[]?), `IsActive` (bool) -- shared DTO used by Core's AuthorizationResult and Discord's IGuildRegistry; the Persistence layer maps between this DTO and the GuildBindingEntity database entity
 - [ ] Create `HumanAction` record in Abstractions with properties: `ActionId` (string), `Label` (string), `Value` (string), `RequiresComment` (bool) -- per architecture.md Section 3.1; Discord renders Label as button text or select menu option label
 - [ ] Create `AgentQuestion` record in Abstractions with properties: `QuestionId` (string, max 30 ASCII chars), `AgentId` (string), `TaskId` (string), `Title` (string), `Body` (string), `Severity` (MessageSeverity), `AllowedActions` (HumanAction[]), `ExpiresAt` (DateTimeOffset), `CorrelationId` (string) -- per architecture.md Section 3.1
 - [ ] Create `AgentQuestionEnvelope` record in Abstractions wrapping AgentQuestion with `ProposedDefaultActionId` (string?) and `RoutingMetadata` (Dictionary of string to string) -- for Discord, RoutingMetadata carries DiscordChannelId and optional DiscordThreadId
@@ -60,8 +61,8 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Create `IPendingQuestionStore` interface in Abstractions with methods: `StoreAsync`, `GetAsync(string questionId)`, `MarkAnsweredAsync`, `MarkAwaitingCommentAsync`, `RecordSelectionAsync`, `GetExpiredAsync` -- per architecture.md Section 4.7
 - [ ] Create `ISwarmCommandBus` interface in Abstractions with methods: `PublishCommandAsync(SwarmCommand, CancellationToken)`, `PublishHumanDecisionAsync(HumanDecisionEvent, CancellationToken)`, `QueryStatusAsync(SwarmStatusQuery, CancellationToken)`, `QueryAgentsAsync(SwarmAgentsQuery, CancellationToken)`, `SubscribeAsync(string tenantId, CancellationToken)` returning IAsyncEnumerable of SwarmEvent -- per architecture.md Section 4.6
 - [ ] Create `SendResult` record in Core with properties: `Success` (bool), `PlatformMessageId` (long?), `ErrorMessage` (string?) -- return type for IMessageSender methods per architecture.md Section 4.9
-- [ ] Create `AuthorizationResult` record in Core with properties: `IsAllowed` (bool), `DenialReason` (string?), `ResolvedBinding` (GuildBinding?) -- return type for IUserAuthorizationService per architecture.md Section 4.5
-- [ ] Create `IUserAuthorizationService` interface in Core with method: `AuthorizeAsync(string externalUserId, string chatId, string commandName, CancellationToken)` returning `AuthorizationResult` -- per architecture.md Section 4.5; Discord-specific implementation resolves GuildBinding and validates roles
+- [ ] Create `AuthorizationResult` record in Core with properties: `IsAllowed` (bool), `DenialReason` (string?), `ResolvedBinding` (ChannelBinding?) -- return type for IUserAuthorizationService per architecture.md Section 4.5; uses ChannelBinding from Abstractions (valid dependency: Core -> Abstractions)
+- [ ] Create `IUserAuthorizationService` interface in Core with method: `AuthorizeAsync(string externalUserId, string? platformGroupId, string chatId, string commandName, CancellationToken)` returning `AuthorizationResult` -- per architecture.md Section 4.5; `platformGroupId` carries the Discord guild ID (stringified) so the implementation can resolve the guild binding; platforms without group concept pass null
 - [ ] Create ISwarmCommandBus supporting DTOs in Abstractions: `SwarmStatusQuery` (TenantId, AgentId filter), `SwarmAgentsQuery` (TenantId, RoleFilter), `SwarmStatusSummary` (TotalAgents, ActiveTasks, BlockedCount), `AgentInfo` (AgentId, Role, CurrentTask, ConfidenceScore, BlockingQuestion), `SwarmEvent` (EventType, AgentId, Payload, CorrelationId, Timestamp) -- all referenced by ISwarmCommandBus methods
 - [ ] Add batch support methods to `IOutboundQueue`: `CountPendingAsync(MessageSeverity severity, CancellationToken)` returning int, and `DequeueBatchAsync(MessageSeverity severity, int maxCount, CancellationToken)` returning `IReadOnlyList<OutboundMessage>` -- required for low-priority batching per architecture.md Section 10.4
 - [ ] Add batch send method to `IMessageSender`: `SendBatchAsync(long channelId, IReadOnlyList<OutboundMessage> messages, CancellationToken)` returning `SendResult` -- combines multiple Low-severity status updates into a single summary embed per architecture.md Section 10.4
@@ -82,7 +83,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 
 ### Implementation Steps
 - [ ] Create `DiscordInteractionRecord` entity in Persistence with columns: `InteractionId` (ulong PK, Discord snowflake), `InteractionType` (enum: SlashCommand/ButtonClick/SelectMenu/ModalSubmit), `GuildId` (ulong), `ChannelId` (ulong), `UserId` (ulong), `RawPayload` (string, full serialized interaction JSON), `ReceivedAt` (DateTimeOffset), `ProcessedAt` (DateTimeOffset?), `IdempotencyStatus` (enum: Received/Processing/Completed/Failed), `AttemptCount` (int, default 0), `ErrorDetail` (string?) -- per architecture.md Section 3.1
-- [ ] Create `GuildBinding` entity in Persistence with columns: `Id` (Guid PK), `GuildId` (ulong), `ChannelId` (ulong), `ChannelPurpose` (enum: Control/Alert/Workstream), `TenantId` (string), `WorkspaceId` (string), `AllowedRoleIds` (ulong[]), `CommandRestrictions` (Dictionary of string to ulong[], nullable), `RegisteredAt` (DateTimeOffset), `IsActive` (bool) -- with UNIQUE(GuildId, ChannelId, WorkspaceId) and index on (GuildId, ChannelPurpose)
+- [ ] Create `GuildBindingEntity` entity in Persistence with columns: `Id` (Guid PK), `GuildId` (ulong), `ChannelId` (ulong), `ChannelPurpose` (enum: Control/Alert/Workstream), `TenantId` (string), `WorkspaceId` (string), `AllowedRoleIds` (ulong[]), `CommandRestrictions` (Dictionary of string to ulong[], nullable), `RegisteredAt` (DateTimeOffset), `IsActive` (bool) -- with UNIQUE(GuildId, ChannelId, WorkspaceId) and index on (GuildId, ChannelPurpose); maps to/from shared `ChannelBinding` DTO in Abstractions
 - [ ] Create `OutboundMessage` entity in Persistence mapping all fields from the shared OutboundMessage record including `MessageId` (Guid PK), `IdempotencyKey` (string, unique index), `ChatId` (long), `Severity` (int), `Status` (enum), `SourceType` (enum), `Payload` (string), `SourceEnvelopeJson` (string?), `AttemptCount` (int), `MaxAttempts` (int, default 5), `PlatformMessageId` (long?), `CorrelationId` (string)
 - [ ] Create `PendingQuestionRecord` entity in Persistence with columns: `QuestionId` (string PK), `AgentQuestion` (string, JSON), `DiscordChannelId` (ulong), `DiscordMessageId` (ulong), `DiscordThreadId` (ulong?), `DefaultActionId` (string?), `DefaultActionValue` (string?), `ExpiresAt` (DateTimeOffset), `Status` (enum: Pending/Answered/AwaitingComment/TimedOut), `SelectedActionId` (string?), `SelectedActionValue` (string?), `RespondentUserId` (ulong?), `StoredAt` (DateTimeOffset), `CorrelationId` (string) -- with index on (Status, ExpiresAt)
 - [ ] Create `AuditLogEntry` entity in Persistence with `Platform` (string), `ExternalUserId` (string), `MessageId` (string), `Details` (string, JSON for Discord-specific GuildId/ChannelId/InteractionId/ThreadId), `Timestamp` (DateTimeOffset), `CorrelationId` (string)
@@ -96,7 +97,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 ### Test Scenarios
 - [ ] Scenario: DbContext creates all tables -- Given an InMemory database provider, When EnsureCreated is called on MessagingDbContext, Then all tables are created without errors
 - [ ] Scenario: Unique InteractionId constraint enforced -- Given a saved DiscordInteractionRecord with InteractionId 12345, When a second record with InteractionId 12345 is inserted, Then DbUpdateException is thrown
-- [ ] Scenario: GuildBinding unique constraint -- Given a GuildBinding for (GuildId=1, ChannelId=2, WorkspaceId="ws-main"), When a duplicate is inserted, Then DbUpdateException is thrown
+- [ ] Scenario: GuildBindingEntity unique constraint -- Given a GuildBindingEntity for (GuildId=1, ChannelId=2, WorkspaceId="ws-main"), When a duplicate is inserted, Then DbUpdateException is thrown
 
 ## Stage 2.2: Repository and Deduplication Services
 
@@ -283,8 +284,8 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 ## Stage 5.1: Authorization and Role Enforcement
 
 ### Implementation Steps
-- [ ] Implement `IUserAuthorizationService` (defined in Core) for Discord: receive externalUserId (Discord user snowflake stringified), chatId (Discord channel snowflake stringified), and commandName (subcommand name) -- per architecture.md Section 4.5
-- [ ] Implement Discord-specific authorization logic: (1) resolve GuildBinding via IGuildRegistry.GetBindingAsync(guildId, channelId), (2) validate binding exists and IsActive=true, (3) check if CommandRestrictions has an override for the subcommand name -- if so use those role IDs, otherwise use AllowedRoleIds, (4) validate user has at least one required role
+- [ ] Implement `IUserAuthorizationService` (defined in Core) for Discord in the Discord project: the router extracts guildId, channelId, and userId from the SocketInteraction and calls `AuthorizeAsync(externalUserId: userId.ToString(), platformGroupId: guildId.ToString(), chatId: channelId.ToString(), commandName: subcommandName)` -- per architecture.md Section 4.5
+- [ ] Implement Discord-specific authorization logic inside the implementation class: (1) parse platformGroupId and chatId back to ulong, (2) resolve ChannelBinding via IGuildRegistry.GetBindingAsync(guildId, channelId), (3) validate binding exists and IsActive=true, (4) check if CommandRestrictions has an override for the commandName -- if so use those role IDs, otherwise use AllowedRoleIds, (5) validate user has at least one required role
 - [ ] Integrate authorization into DiscordInteractionRouter: call IUserAuthorizationService.AuthorizeAsync after DeferAsync; on denial, send ephemeral follow-up via FollowupAsync(text, ephemeral: true), then clean up the non-ephemeral deferred "thinking" indicator via DeleteOriginalResponseAsync -- per tech-spec Section 2.10
 - [ ] Log all authorization failures via IAuditLogger.LogAsync with Platform="Discord", ExternalUserId, attempted command, and denial reason in Details JSON
 - [ ] Three authorization checks in order: (a) guild ID is registered, (b) channel ID is authorized for the guild, (c) user has a required role; first failing check determines the denial reason -- per architecture.md Section 5.5
@@ -295,24 +296,24 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 ### Test Scenarios
 - [ ] Scenario: Authorized user proceeds -- Given a user with an allowed role in a registered guild's control channel, When they issue a slash command, Then AuthorizeAsync returns allowed and the command is dispatched
 - [ ] Scenario: Unauthorized role denied with ephemeral -- Given a user with no allowed roles, When they issue a slash command, Then an ephemeral follow-up is sent and DeleteOriginalResponseAsync cleans up the deferred indicator
-- [ ] Scenario: CommandRestrictions per-subcommand override -- Given a GuildBinding with CommandRestrictions restricting "approve" to role ID 999, When a user without role 999 runs /agent approve, Then authorization is denied even if they have a general AllowedRoleId
+- [ ] Scenario: CommandRestrictions per-subcommand override -- Given a ChannelBinding with CommandRestrictions restricting "approve" to role ID 999, When a user without role 999 runs /agent approve, Then authorization is denied even if they have a general AllowedRoleId
 
 ## Stage 5.2: Guild Registry and Channel Routing
 
 ### Implementation Steps
-- [ ] Implement `IGuildRegistry` in Discord project with methods: `GetBindingAsync(ulong guildId, ulong channelId, CancellationToken)` returning GuildBinding or null, `GetAlertChannelAsync(ulong guildId, CancellationToken)` returning the Alert-purpose binding, `GetWorkstreamChannelsAsync(ulong guildId, string workspaceId, CancellationToken)`, `IsAuthorizedChannelAsync(ulong guildId, ulong channelId, CancellationToken)`, `RegisterAsync(GuildBinding, CancellationToken)` -- per architecture.md Section 4.3
-- [ ] Implement `GuildRegistry` class that loads GuildBinding entities from database on startup and caches them with configurable TTL (default 5 minutes)
+- [ ] Implement `IGuildRegistry` in Discord project with methods: `GetBindingAsync(ulong guildId, ulong channelId, CancellationToken)` returning ChannelBinding or null, `GetAlertChannelAsync(ulong guildId, CancellationToken)` returning the Alert-purpose ChannelBinding, `GetWorkstreamChannelsAsync(ulong guildId, string workspaceId, CancellationToken)`, `IsAuthorizedChannelAsync(ulong guildId, ulong channelId, CancellationToken)`, `RegisterAsync(ChannelBinding, CancellationToken)` -- per architecture.md Section 4.3; all return shared ChannelBinding DTO from Abstractions
+- [ ] Implement `GuildRegistry` class that loads GuildBindingEntity records from database on startup, maps them to ChannelBinding DTOs, and caches with configurable TTL (default 5 minutes)
 - [ ] Implement channel routing: GetBindingAsync resolves by (guildId, channelId) for authorization; GetAlertChannelAsync finds the ChannelPurpose=Alert binding for priority alert routing; GetWorkstreamChannelsAsync finds all Workstream bindings for a workspace
 - [ ] Integrate IGuildRegistry into DiscordMessengerConnector: when enqueuing outbound question or alert messages, resolve the target Discord channel via the registry based on ChannelPurpose
-- [ ] Implement configuration seeding: on first startup if no GuildBinding exists for configured GuildId, create bindings from DiscordOptions.GuildBindings configuration array
+- [ ] Implement configuration seeding: on first startup if no GuildBindingEntity exists for configured GuildId, create entities from DiscordOptions.GuildBindings configuration array
 
 ### Dependencies
 - phase-security-and-reliability/stage-authorization-and-role-enforcement
 
 ### Test Scenarios
-- [ ] Scenario: Control channel binding lookup -- Given a GuildBinding with ChannelPurpose=Control for channelId=111, When GetBindingAsync is called with guildId and channelId=111, Then the Control binding is returned
-- [ ] Scenario: Alert channel routing -- Given a GuildBinding with ChannelPurpose=Alert for a guild, When GetAlertChannelAsync is called, Then the alert binding is returned with the correct ChannelId
-- [ ] Scenario: IsAuthorizedChannelAsync fast path -- Given a channelId not in any GuildBinding, When IsAuthorizedChannelAsync is called, Then it returns false
+- [ ] Scenario: Control channel binding lookup -- Given a ChannelBinding with ChannelPurpose=Control for channelId=111, When GetBindingAsync is called with guildId and channelId=111, Then the Control ChannelBinding is returned
+- [ ] Scenario: Alert channel routing -- Given a ChannelBinding with ChannelPurpose=Alert for a guild, When GetAlertChannelAsync is called, Then the alert ChannelBinding is returned with the correct ChannelId
+- [ ] Scenario: IsAuthorizedChannelAsync fast path -- Given a channelId not in any ChannelBinding, When IsAuthorizedChannelAsync is called, Then it returns false
 
 ## Stage 5.3: Interaction Recovery and Timeout Sweep
 
@@ -337,7 +338,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Create `DeadLetterProcessor` class in Discord project with methods: `ReviewAsync()` returning list of dead-lettered OutboundMessages (Status=DeadLettered), `RetryAsync(Guid outboundMessageId)` resetting AttemptCount and Status, `PurgeAsync(DateTimeOffset olderThan)`
 - [ ] Implement retry: look up the OutboundMessage by outboundMessageId (Status=DeadLettered); reset AttemptCount=0, Status=Pending, clear ErrorDetail and NextRetryAt; delete the linked DeadLetterMessage record; the message re-enters the outbound queue on next DequeueAsync cycle
 - [ ] Implement automatic purge: dead letters older than 7 days are purged by a sweep on each QuestionRecoverySweep cycle
-- [ ] Add optional `/agent admin dead-letters` diagnostic slash command restricted to admin roles that lists recent dead-lettered messages with IdempotencyKey, error detail, and CreatedAt
+- [ ] Expose dead letter diagnostic access via `DeadLetterProcessor.ReviewAsync()` callable from health check endpoints or operator CLI tooling; do not register an additional slash command (the story defines exactly 7 subcommands: ask, status, approve, reject, assign, pause, resume)
 
 ### Dependencies
 - phase-security-and-reliability/stage-interaction-recovery-and-timeout-sweep
@@ -377,7 +378,8 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Register DiscordSocketClient as singleton, DiscordGatewayService as IHostedService, DiscordInteractionRouter (implementing IDiscordInteractionPipeline) as singleton, DiscordInteractionMapper as singleton
 - [ ] Register SlashCommandDispatcher, ComponentInteractionHandler, IUserAuthorizationService implementation, GuildRegistry (implementing IGuildRegistry) as singletons
 - [ ] Register DiscordMessageSender (implementing IMessageSender), RateLimitTracker as singletons; register DiscordMessengerConnector (implementing IMessengerConnector) as singleton
-- [ ] Register InteractionRecoverySweep, QuestionTimeoutService, QuestionRecoverySweep as IHostedServices; register OutboundQueueProcessor as IHostedService
+- [ ] Register InteractionRecoverySweep as IHostedService in AddDiscordMessaging (Discord-layer sweep); do NOT register Worker-owned hosted services here -- OutboundQueueProcessor, QuestionTimeoutService, and QuestionRecoverySweep belong to the Worker assembly per architecture.md Section 6 assembly map
+- [ ] In Worker project's Program.cs, register Worker-owned hosted services directly: `OutboundQueueProcessor`, `QuestionTimeoutService`, and `QuestionRecoverySweep` as IHostedServices -- these use IOutboundQueue and IPendingQuestionStore from Abstractions, not Discord types
 - [ ] Create `AddMessagingPersistence` extension method in Persistence project registering MessagingDbContext, PersistentOutboundQueue, PersistentAuditLogger, PersistentPendingQuestionStore, PersistentDiscordInteractionStore, and IDeduplicationService (sliding-window in-memory impl)
 - [ ] Bind DiscordOptions from configuration section "Discord" using services.Configure; validate BotToken is not null/empty on startup
 - [ ] Add health checks: DiscordGatewayHealthCheck (checks ConnectionState == Connected) and DatabaseHealthCheck (checks CanConnectAsync)
