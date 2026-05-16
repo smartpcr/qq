@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Stage 7.1 — Integration Test Infrastructure for the Telegram
+    messenger Worker. Hosts WireMock.Net-backed end-to-end tests
+    that boot the real Program.cs via WebApplicationFactory<Program>
+    and exercise the Stage 2.3 outbound sender against a fake
+    Telegram API. See TelegramTestFixture / FakeTelegramApi for the
+    Stage 7.1 step-1 deliverables.
+
+    The project is separate from AgentSwarm.Messaging.Tests so that
+    (a) WireMock and its larger dependency graph do not slow down
+    the unit-test pass, and (b) `dotnet test` on this project alone
+    runs the heavier integration suite when you want it.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.0" />
+    <PackageReference Include="FluentAssertions" Version="8.9.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.*" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="8.*" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.*" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="8.*" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.*" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.*" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="8.*" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="WireMock.Net" Version="1.5.62" />
+    <PackageReference Include="xunit" Version="2.5.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj" />
+    <ProjectReference Include="..\..\src\AgentSwarm.Messaging.Persistence\AgentSwarm.Messaging.Persistence.csproj" />
+    <ProjectReference Include="..\..\src\AgentSwarm.Messaging.Telegram\AgentSwarm.Messaging.Telegram.csproj" />
+    <ProjectReference Include="..\..\src\AgentSwarm.Messaging.Worker\AgentSwarm.Messaging.Worker.csproj" />
+  </ItemGroup>
+
+</Project>

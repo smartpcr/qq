@@ -299,4 +299,71 @@ public class TelegramOptionsValidatorWebhookTests
         result.FailureMessage.Should().Contain("Telegram:BotToken");
         result.FailureMessage.Should().Contain("mutually exclusive");
     }
+
+    // ============================================================
+    // Iter-1 evaluator feedback item 6 — RateLimitOptions must be
+    // validated at host startup instead of being silently clamped
+    // by TokenBucketTelegramRateLimiter's prior Math.Max(1, ...)
+    // guards. TokenBucketTelegramRateLimiterTests pins the ctor
+    // throw; these tests pin the upstream validator that fires
+    // during IHost.StartAsync via ValidateOnStart().
+    // ============================================================
+
+    [Theory]
+    [InlineData(0, 10, 10, 10, "GlobalPerSecond")]
+    [InlineData(-1, 10, 10, 10, "GlobalPerSecond")]
+    [InlineData(10, 0, 10, 10, "GlobalBurstCapacity")]
+    [InlineData(10, -1, 10, 10, "GlobalBurstCapacity")]
+    [InlineData(10, 10, 0, 10, "PerChatPerMinute")]
+    [InlineData(10, 10, -1, 10, "PerChatPerMinute")]
+    [InlineData(10, 10, 10, 0, "PerChatBurstCapacity")]
+    [InlineData(10, 10, 10, -1, "PerChatBurstCapacity")]
+    public void RateLimits_NonPositiveValue_Fails(
+        int globalPerSecond,
+        int globalBurstCapacity,
+        int perChatPerMinute,
+        int perChatBurstCapacity,
+        string expectedFieldInMessage)
+    {
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UsePolling = true,
+            RateLimits = new AgentSwarm.Messaging.Telegram.Sending.RateLimitOptions
+            {
+                GlobalPerSecond = globalPerSecond,
+                GlobalBurstCapacity = globalBurstCapacity,
+                PerChatPerMinute = perChatPerMinute,
+                PerChatBurstCapacity = perChatBurstCapacity,
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue(
+            "non-positive rate-limit knobs must fail validation at host startup — silently clamping would mask the misconfiguration and degrade the §10.4 SLO envelope");
+        result.FailureMessage.Should().Contain(expectedFieldInMessage,
+            "the failure message must name the misconfigured field so the operator can fix it without reading source");
+    }
+
+    [Fact]
+    public void RateLimits_DefaultValues_Succeed()
+    {
+        // Defense-in-depth: the default RateLimitOptions instance
+        // (created via the property initialiser on TelegramOptions)
+        // must remain valid — otherwise every fresh TelegramOptions
+        // would trip the validator on first boot.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UsePolling = true,
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Succeeded.Should().BeTrue(
+            "the default RateLimitOptions must remain a valid configuration; otherwise the validator would block every default boot");
+    }
 }

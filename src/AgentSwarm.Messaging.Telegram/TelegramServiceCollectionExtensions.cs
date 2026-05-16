@@ -1,7 +1,9 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using AgentSwarm.Messaging.Telegram.Polling;
+using AgentSwarm.Messaging.Telegram.Sending;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -133,6 +135,33 @@ public static class TelegramServiceCollectionExtensions
         // hosted-service set, so reading the binding once at registration
         // time is the canonical pattern.
         services.AddSingleton<ITelegramUpdatePoller, TelegramBotClientUpdatePoller>();
+
+        // Stage 2.3: outbound sender + dual-layer token-bucket rate limiter
+        // + IDistributedCache for HumanAction lookups (see
+        // TelegramQuestionRenderer / TelegramMessageSender). The sender is
+        // a singleton because it is stateless beyond its injected
+        // dependencies; the limiter is a singleton so its per-chat token
+        // buckets survive across worker invocations within the same
+        // process. AddDistributedMemoryCache is idempotent via the
+        // TryAdd-based implementation inside the framework, so re-calling
+        // it from a higher layer (Worker host) does not double-register.
+        services.AddDistributedMemoryCache();
+        services.TryAddSingleton<ITelegramRateLimiter, TokenBucketTelegramRateLimiter>();
+        // Iter-3 evaluator item 3 — the sender depends on a durable
+        // message-id → CorrelationId index. The Telegram extension
+        // registers an InMemoryOutboundMessageIdIndex as the
+        // TryAddSingleton fallback so dev / unit-test bootstraps that
+        // skip the persistence module can still resolve the sender.
+        // Production replaces this registration with the EF-backed
+        // PersistentOutboundMessageIdIndex via
+        // AddMessagingPersistence's Replace() call.
+        services.TryAddSingleton<IOutboundMessageIdIndex, InMemoryOutboundMessageIdIndex>();
+        // Iter-4 evaluator item 4 — the sender also depends on a
+        // durable dead-letter ledger so retry-exhausted sends are
+        // observable in the database. Same TryAdd fallback +
+        // Replace pattern as the msg-id index.
+        services.TryAddSingleton<IOutboundDeadLetterStore, InMemoryOutboundDeadLetterStore>();
+        services.TryAddSingleton<IMessageSender, TelegramMessageSender>();
 
         var pollingSnapshot = configuration
             .GetSection(TelegramOptions.SectionName)

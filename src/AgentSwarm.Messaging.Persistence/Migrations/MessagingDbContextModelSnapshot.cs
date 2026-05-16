@@ -67,6 +67,78 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.ToTable("inbound_updates", (string)null);
                 });
+
+            modelBuilder.Entity("AgentSwarm.Messaging.Abstractions.OutboundDeadLetterRecord", b =>
+                {
+                    b.Property<System.Guid>("DeadLetterId")
+                        .ValueGeneratedNever()
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("ChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("CorrelationId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("FailedAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("FailureCategory")
+                        .IsRequired()
+                        .HasMaxLength(48)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LastErrorMessage")
+                        .IsRequired()
+                        .HasMaxLength(1024)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LastErrorType")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("DeadLetterId");
+
+                    b.HasIndex("ChatId")
+                        .HasDatabaseName("ix_outbound_dlq_chat_id");
+
+                    b.HasIndex("CorrelationId")
+                        .HasDatabaseName("ix_outbound_dlq_correlation_id");
+
+                    b.ToTable("outbound_dead_letters", (string)null);
+                });
+
+            modelBuilder.Entity("AgentSwarm.Messaging.Abstractions.OutboundMessageIdMapping", b =>
+                {
+                    b.Property<long>("ChatId")
+                        .ValueGeneratedNever()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramMessageId")
+                        .ValueGeneratedNever()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("CorrelationId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("SentAt")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("ChatId", "TelegramMessageId");
+
+                    b.HasIndex("CorrelationId")
+                        .HasDatabaseName("ix_outbound_msgid_correlation_id");
+
+                    b.ToTable("outbound_message_id_mappings", (string)null);
+                });
 #pragma warning restore 612, 618
         }
     }

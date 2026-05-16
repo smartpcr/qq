@@ -27,22 +27,22 @@ namespace AgentSwarm.Messaging.Telegram.Webhook;
 ///   does not pick the same row twice.</description></item>
 ///   <item><description><b>RawPayload deserialization failure</b>
 ///   (<see cref="JsonException"/> or <c>null</c> deserialized result) —
-///   transitions to <see cref="IdempotencyStatus.Completed"/> with a
-///   diagnostic <c>HandlerErrorDetail</c>. The persisted RawPayload
-///   bytes are immutable, so a deserializer failure is deterministic
-///   against the row — replaying through the sweep would fail
-///   identically every tick. Per the
-///   <see cref="IInboundUpdateStore"/> hybrid retry contract
-///   ("return = terminal, throw = retryable") this is a permanent
-///   failure, so it lands via <see cref="IInboundUpdateStore.MarkCompletedAsync"/>
-///   in a single hop rather than burning <c>MaxRetries</c> sweep
-///   iterations through <see cref="IInboundUpdateStore.MarkFailedAsync"/>
-///   before surfacing as an exhausted-retry alert. This deliberately
-///   broadens the semantics of <c>HandlerErrorDetail</c> from
-///   "routed-handler diagnostic" to "terminal non-retryable
-///   diagnostic"; the alternative
-///   <see cref="InboundUpdate.ErrorDetail"/> column is reserved for
-///   retryable uncaught-exception text.</description></item>
+///   transitions to <see cref="IdempotencyStatus.Failed"/> via
+///   <see cref="IInboundUpdateStore.MarkFailedAsync"/> with a
+///   diagnostic written to <see cref="InboundUpdate.ErrorDetail"/>.
+///   The persisted RawPayload bytes are immutable, so a deserializer
+///   failure is deterministic against the row — replaying through the
+///   sweep will fail identically every tick. Per the four-status
+///   model (architecture.md §3.1), a row whose pipeline was NEVER
+///   invoked is semantically Failed, not Completed; "Completed" is
+///   reserved for rows whose routed handler ran to a definitive
+///   disposition (Succeeded=true or Succeeded=false). The sweep is
+///   bounded by the <c>AttemptCount &lt; MaxRetries</c> filter, so a
+///   deterministic parse failure naturally exhausts to the
+///   <c>inbound_update_exhausted_retries</c> metric path without an
+///   unbounded sweep loop. The dedup reservation was never written
+///   (pipeline never ran), so leaving the row Failed is safe — there
+///   is no stuck-dedup hazard.</description></item>
 ///   <item><description><b>Pipeline returns Succeeded=true</b> —
 ///   transitions to <see cref="IdempotencyStatus.Completed"/> with
 ///   <c>HandlerErrorDetail = null</c>.</description></item>
@@ -160,19 +160,28 @@ public sealed class InboundUpdateProcessor
         {
             // Deserialization is deterministic against the persisted
             // RawPayload bytes — a sweep replay would fail identically
-            // every tick. Per the IInboundUpdateStore hybrid retry
-            // contract ("return = terminal, throw = retryable"), this
-            // is a permanent error, so land via MarkCompletedAsync with
-            // a HandlerErrorDetail snapshot rather than MarkFailedAsync,
-            // which would burn MaxRetries sweep iterations before
-            // surfacing as an exhausted-retry alert. Mirrors the
-            // Succeeded=false disposition further below.
+            // every tick. Per the IInboundUpdateStore four-status model
+            // (architecture.md §3.1), a row that never produced a valid
+            // MessengerEvent — i.e. the pipeline was never invoked — is
+            // semantically Failed, not Completed. "Completed" is reserved
+            // for rows whose handler ran to a definitive disposition
+            // (Succeeded=true or Succeeded=false); collapsing a parse
+            // error into Completed would mask schema regressions in the
+            // audit log. The sweep is bounded by the
+            // AttemptCount < MaxRetries filter — a deterministic parse
+            // failure that returns true here STILL increments AttemptCount
+            // (the dispatcher / sweep tracks attempts on the row), so
+            // exhausted retries land in the metrics path
+            // (inbound_update_exhausted_retries) without an unbounded
+            // sweep loop. The dedup reservation was never written
+            // (pipeline never ran), so leaving the row Failed is safe —
+            // there is no stuck-dedup hazard.
             _logger.LogError(
                 ex,
-                "Failed to deserialize InboundUpdate.RawPayload — marking InboundUpdate Completed (terminal, deterministic failure). UpdateId={UpdateId} CorrelationId={CorrelationId}",
+                "Failed to deserialize InboundUpdate.RawPayload — marking InboundUpdate Failed (parse error, pipeline never invoked). UpdateId={UpdateId} CorrelationId={CorrelationId}",
                 row.UpdateId,
                 correlationId);
-            await _store.MarkCompletedAsync(
+            await _store.MarkFailedAsync(
                 row.UpdateId,
                 "RawPayload deserialization failed: " + ex.Message,
                 ct).ConfigureAwait(false);
@@ -183,15 +192,15 @@ public sealed class InboundUpdateProcessor
         {
             // Same rationale as the JsonException branch — the
             // deserializer's null result is deterministic against the
-            // persisted RawPayload bytes, so this is terminal, not
-            // retryable.
+            // persisted RawPayload bytes, the pipeline was never
+            // invoked, so the row's terminal state is Failed.
             _logger.LogError(
-                "InboundUpdate.RawPayload deserialized to null — marking InboundUpdate Completed (terminal, deterministic failure). UpdateId={UpdateId} CorrelationId={CorrelationId}",
+                "InboundUpdate.RawPayload deserialized to null — marking InboundUpdate Failed (deserialized to null, pipeline never invoked). UpdateId={UpdateId} CorrelationId={CorrelationId}",
                 row.UpdateId,
                 correlationId);
-            await _store.MarkCompletedAsync(
+            await _store.MarkFailedAsync(
                 row.UpdateId,
-                "RawPayload deserialized to null",
+                "RawPayload deserialization failed: result was null",
                 ct).ConfigureAwait(false);
             return true;
         }

@@ -4,6 +4,17 @@
     <ProjectReference Include="..\AgentSwarm.Messaging.Abstractions\AgentSwarm.Messaging.Abstractions.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!--
+      LoggingAlertService (iter-4 evaluator item 6) emits LogCritical
+      on every dead-letter alert; pulling Logging.Abstractions in here
+      keeps Core dependency-light (abstractions only, no concrete
+      logger backends) while letting the default IAlertService impl
+      be shared with any future connector that registers it.
+    -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.*" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
