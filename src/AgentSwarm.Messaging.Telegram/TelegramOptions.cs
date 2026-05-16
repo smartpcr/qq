@@ -95,6 +95,16 @@ public sealed class TelegramOptions
     public string? SecretToken { get; set; }
 
     /// <summary>
+    /// Long-poll timeout (seconds) for the Stage 2.5
+    /// <c>TelegramPollingService</c>. Telegram caps the server-side limit
+    /// at 50 seconds; values must be in <c>[1, 50]</c>. Defaults to 30
+    /// (the de-facto industry default that balances responsiveness
+    /// against open-connection budget). Ignored unless
+    /// <see cref="UsePolling"/> is <c>true</c>.
+    /// </summary>
+    public int PollingTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
     /// Returns a diagnostic representation of this options instance with
     /// <see cref="BotToken"/> and <see cref="SecretToken"/> replaced by
     /// <c>[REDACTED]</c> / <c>[NOT SET]</c>. The actual token value is
@@ -109,7 +119,8 @@ public sealed class TelegramOptions
              + $"WebhookUrl = {(string.IsNullOrEmpty(WebhookUrl) ? NotSetMarker : WebhookUrl)}, "
              + $"UsePolling = {UsePolling}, "
              + $"AllowedUserIds = [{allowedCount} ids], "
-             + $"SecretToken = {(string.IsNullOrEmpty(SecretToken) ? NotSetMarker : RedactedMarker)}"
+             + $"SecretToken = {(string.IsNullOrEmpty(SecretToken) ? NotSetMarker : RedactedMarker)}, "
+             + $"PollingTimeoutSeconds = {PollingTimeoutSeconds}"
              + " }";
     }
 }

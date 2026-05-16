@@ -1,9 +1,11 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
+using AgentSwarm.Messaging.Telegram.Polling;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
 
@@ -20,9 +22,11 @@ public static class TelegramServiceCollectionExtensions
     /// the named <see cref="HttpClient"/>, the
     /// <see cref="TelegramBotClientFactory"/>, a singleton
     /// <see cref="ITelegramBotClient"/> backed by the factory, the
-    /// Stage 2.2 <see cref="ITelegramUpdatePipeline"/>, and the Stage 2.2
+    /// Stage 2.2 <see cref="ITelegramUpdatePipeline"/>, the Stage 2.2
     /// in-memory stub implementations of the inbound pipeline's
-    /// dependencies.
+    /// dependencies, and (Stage 2.5) the long-polling
+    /// <see cref="TelegramPollingService"/> when
+    /// <see cref="TelegramOptions.UsePolling"/> is <c>true</c>.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -110,6 +114,50 @@ public static class TelegramServiceCollectionExtensions
         // FakeTimeProvider via TryAddSingleton-replacement before AddTelegram.
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<ITelegramUpdatePipeline, TelegramUpdatePipeline>();
+
+        // Stage 2.5: long-polling receiver (development mode).
+        //
+        // The poller abstraction is always registered so tests can resolve
+        // it without conditioning on configuration; the hosted service is
+        // only added when Telegram:UsePolling=true. The mutual-exclusion
+        // guard between polling and webhook modes lives in
+        // TelegramOptionsValidator (runs at host startup via
+        // ValidateOnStart) — keeping it there means the conflict is
+        // surfaced even when callers register the polling service
+        // manually and bypass this extension.
+        //
+        // Configuration is read here (synchronously, off the supplied
+        // IConfiguration) rather than via IOptionsMonitor at runtime
+        // because hosted-service registration is one-shot: changing
+        // UsePolling after the host has started has no effect on the
+        // hosted-service set, so reading the binding once at registration
+        // time is the canonical pattern.
+        services.AddSingleton<ITelegramUpdatePoller, TelegramBotClientUpdatePoller>();
+
+        var pollingSnapshot = configuration
+            .GetSection(TelegramOptions.SectionName)
+            .Get<TelegramOptions>();
+        if (pollingSnapshot is not null && pollingSnapshot.UsePolling)
+        {
+            // Defense-in-depth: even though the validator already rejects
+            // UsePolling=true + WebhookUrl set, refuse to register the
+            // hosted service when both are configured so a developer who
+            // disables ValidateOnStart cannot accidentally run both
+            // receivers in parallel. The validator path is still the
+            // canonical "fail at host startup" mechanism — see
+            // TelegramOptionsValidator.Validate.
+            if (!string.IsNullOrWhiteSpace(pollingSnapshot.WebhookUrl))
+            {
+                throw new InvalidOperationException(
+                    "Telegram:UsePolling and Telegram:WebhookUrl are mutually exclusive. "
+                    + "Refusing to register TelegramPollingService while WebhookUrl is set. "
+                    + "See TelegramOptionsValidator for the host-startup version of this guard.");
+            }
+
+            services.AddSingleton<TelegramPollingService>();
+            services.AddSingleton<IHostedService>(sp =>
+                sp.GetRequiredService<TelegramPollingService>());
+        }
 
         return services;
     }
