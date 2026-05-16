@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 using Microsoft.EntityFrameworkCore;
 
 namespace AgentSwarm.Messaging.Persistence;
@@ -35,6 +36,26 @@ public class MessagingDbContext : DbContext
     /// <see cref="OutboundDeadLetterConfiguration"/>.
     /// </summary>
     public DbSet<OutboundDeadLetterRecord> OutboundDeadLetters => Set<OutboundDeadLetterRecord>();
+
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the task-to-operator
+    /// oversight assignment table (Stage 3.2). One row per task; the
+    /// <c>/handoff</c> command upserts the row, the Stage 2.7
+    /// swarm-event subscription service reads it to route status
+    /// updates and alerts. Configured via
+    /// <see cref="TaskOversightConfiguration"/>.
+    /// </summary>
+    public DbSet<TaskOversight> TaskOversights => Set<TaskOversight>();
+
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the messenger gateway's
+    /// audit trail (Stage 3.2 iter-2 evaluator item 5). Single
+    /// discriminated table — both general <c>AuditEntry</c> and
+    /// typed <c>HumanResponseAuditEntry</c> writes share storage,
+    /// distinguished by <see cref="AuditLogEntry.EntryKind"/>.
+    /// Configured via <see cref="AuditLogEntryConfiguration"/>.
+    /// </summary>
+    public DbSet<AuditLogEntry> AuditLogEntries => Set<AuditLogEntry>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

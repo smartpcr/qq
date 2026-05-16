@@ -25,4 +25,21 @@ public sealed record AuthorizedOperator
     public required long TelegramUserId { get; init; }
 
     public required long TelegramChatId { get; init; }
+
+    /// <summary>
+    /// Human-readable operator handle (e.g. <c>@alice</c>) carried over
+    /// from the underlying <c>OperatorBinding.OperatorAlias</c>. Used by
+    /// Stage 3.2's <c>HandoffCommandHandler</c> when recording who
+    /// initiated an oversight transfer on the persisted
+    /// <c>TaskOversight.AssignedBy</c> field (per architecture.md §5.5
+    /// "Full oversight transfer (Decided)") so the audit trail names
+    /// operators by the alias the chat surfaces, not by an internal
+    /// <see cref="OperatorId"/> GUID a reviewer cannot read. Defaults
+    /// to <see cref="string.Empty"/> so existing call sites that omit
+    /// the field — e.g. pre-Stage 3.2 contract tests — continue to
+    /// compile; production construction is via
+    /// <c>TelegramUpdatePipeline.ProcessAsync</c>, which always copies
+    /// the binding's alias.
+    /// </summary>
+    public string OperatorAlias { get; init; } = string.Empty;
 }

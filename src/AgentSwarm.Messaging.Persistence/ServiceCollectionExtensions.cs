@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -37,6 +38,20 @@ public static class ServiceCollectionExtensions
         // the message-id index; replaces the in-memory fallback that
         // AddTelegram registers via TryAddSingleton.
         services.Replace(ServiceDescriptor.Singleton<IOutboundDeadLetterStore, PersistentOutboundDeadLetterStore>());
+
+        // Stage 3.2 — durable task-to-operator oversight assignment
+        // repository. Same singleton + IServiceScopeFactory pattern;
+        // replaces the in-memory StubTaskOversightRepository that
+        // AddTelegram registers via TryAddSingleton.
+        services.Replace(ServiceDescriptor.Singleton<ITaskOversightRepository, PersistentTaskOversightRepository>());
+
+        // Stage 3.2 iter-2 evaluator item 5 — durable audit log.
+        // Replaces the NullAuditLogger TryAddSingleton fallback in
+        // AddTelegram so handoff and human-response audit writes
+        // actually persist when persistence is wired. Stage 5.3 will
+        // extend the schema with tenant / platform columns; this
+        // writer is forward-compatible (additive columns).
+        services.Replace(ServiceDescriptor.Singleton<IAuditLogger, PersistentAuditLogger>());
 
         return services;
     }
