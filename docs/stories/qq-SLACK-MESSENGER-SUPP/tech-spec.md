@@ -36,12 +36,14 @@ The following capabilities are within the boundary of this story:
 
 ### 2.1 Inbound Event Handling
 
-- **Slash commands.** `/agent ask`, `/agent status`, `/agent approve [question-id]`,
-  `/agent reject [question-id]`, `/agent review`, `/agent escalate` -- six sub-commands
-  under the single `/agent` slash command. `approve` and `reject` accept an
-  optional question-id argument; when omitted they target the most recent
-  unanswered question in the thread. Users may also approve/reject via Block
-  Kit button clicks (both paths are supported).
+- **Slash commands.** `/agent ask <prompt>`, `/agent status [task-id]`,
+  `/agent approve <question-id>`, `/agent reject <question-id>`,
+  `/agent review <task-id>`, `/agent escalate <task-id>` -- six sub-commands
+  under the single `/agent` slash command. `approve` and `reject` require a
+  `question-id` argument (matching the upstream command table in
+  architecture.md section 2.7). Users may also approve/reject via Block Kit
+  button clicks in the thread (both CLI and button paths are supported per
+  operator decision OQ-3).
 - **App mentions.** `@AgentBot <sub-command> <args>` as an alternative
   invocation surface (same sub-commands).
 - **Interactive payloads.** Block Kit button clicks and modal view submissions
@@ -49,8 +51,11 @@ The following capabilities are within the boundary of this story:
 - **Events API subscription.** `app_mention` events, URL verification
   handshake, and message events relevant to agent conversations.
 - **Socket Mode.** WebSocket-based transport as the **default** for
-  development and environments without public ingress. Deployments requiring
-  prod-scale horizontal scaling should use Events API (see OQ-1 in section 9).
+  development and environments without public ingress. Per-workspace
+  transport selection is driven by `SlackWorkspaceConfig.app_level_token_ref`:
+  when present, Socket Mode is used; when absent, Events API is used
+  (architecture.md section 4.2). Deployments requiring prod-scale horizontal
+  scaling should configure Events API by omitting the app-level token ref.
 
 ### 2.2 Outbound Messaging
 
@@ -377,9 +382,9 @@ All questions from iteration 1 have been answered by the operator:
 
 | ID | Decision | Detail |
 |---|---|---|
-| OQ-1 | Socket Mode default; Events API for prod scale | Socket Mode is the default transport (no public endpoint required). Deployments expecting high-throughput or requiring horizontal scaling should switch to Events API. Configuration flag: `SlackTransportMode` = `SocketMode` or `EventsApi`. |
+| OQ-1 | Socket Mode default; Events API for prod scale | Socket Mode is the default transport (no public endpoint required). The active transport is selected per-workspace via the `SlackWorkspaceConfig.app_level_token_ref` field: when present, the connector uses Socket Mode for that workspace; when absent, it uses Events API (matching architecture.md section 4.2). Deployments expecting high-throughput or requiring horizontal scaling should omit `app_level_token_ref` and configure the Events API endpoint. |
 | OQ-2 | 30-day retention | `SlackInboundRequestRecord` and `SlackAuditEntry` rows are retained for 30 days. A background cleanup job purges rows older than 30 days. |
-| OQ-3 | Both CLI arg and button | `/agent approve <question-id>` and `/agent reject <question-id>` accept an optional question-id argument for CLI-driven approvals. Users may also approve/reject via Block Kit button clicks in the thread. When the CLI arg is omitted, the command applies to the most recent unanswered question in the thread. |
+| OQ-3 | Both CLI arg and button | `/agent approve <question-id>` and `/agent reject <question-id>` require the question-id as a CLI argument (matching architecture.md section 2.7 command table). Users may also approve/reject via Block Kit button clicks in the thread, which carry the question-id implicitly via the button's `action_id`. Both interaction paths produce a `HumanDecisionEvent`. |
 | OQ-4 | 15 workspaces, configurable | Maximum workspace count defaults to 15. The limit is configurable via `MaxWorkspaces` in `SlackConnectorOptions`. |
 | OQ-5 | Not in this story | Enterprise Grid support (org-level apps, cross-workspace channels) is explicitly out of scope. |
 | OQ-6 | All-or-nothing access | The three-layer authorization model (workspace, channel, user-group) grants or denies access to all sub-commands uniformly. Per-sub-command role mapping is not required. |
