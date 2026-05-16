@@ -212,4 +212,20 @@ public sealed class RetryPolicyTests
         act.Should().Throw<ArgumentNullException>(
             "the random source is required by the jitter math — passing null is a caller bug worth surfacing eagerly, not a silent zero-jitter fallback");
     }
+
+    [Fact]
+    public void SectionName_IsStableBindingKey_RetryPolicy()
+    {
+        // The DI binding in AddMessagingPersistence (and the keys in
+        // appsettings.json / appsettings.Development.json) all read
+        // from this constant. Renaming SectionName would silently
+        // break every host's RetryPolicy binding at runtime — the
+        // misconfig would only surface as the in-code defaults being
+        // used regardless of operator overrides, which is one of the
+        // hardest-to-diagnose production failure modes. Pin the
+        // value here so a rename is a compile-or-test break.
+        RetryPolicy.SectionName.Should().Be(
+            "RetryPolicy",
+            "the SectionName constant is the externally-observable configuration-binding contract — appsettings.json files in the worker host and any downstream deployment manifests reference this exact key, so a rename without a coordinated config rollout would silently fall back to the in-code defaults at every host on next deploy");
+    }
 }
