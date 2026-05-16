@@ -184,8 +184,18 @@ public sealed class TeamsMessengerConnectorTelemetryTests
     }
 
     [Fact]
-    public async Task SendMessageAsync_RouterReturnsNull_DoesNotRecordCounterButRecordsErrorSpan()
+    public async Task SendMessageAsync_RouterReturnsNull_RecordsCounterAndErrorSpan_ButOmitsHistogram()
     {
+        // Stage 6.3 — iter-5 reconciliation of two opposing signals:
+        //   (a) iter-2 evaluator feedback required `teams.messages.sent` to fire on
+        //       EVERY attempt regardless of outcome so the §4.4 failure-rate
+        //       dashboards observe a non-zero denominator on failed sends; and
+        //   (b) `teams.card.delivery.duration_ms` must STILL only record successful
+        //       deliveries so the P95 budget reflects user-visible latency rather
+        //       than transient-error retry timing.
+        // The test below pins both halves of that contract: the counter is
+        // recorded once on the failing path, the histogram is empty, and the
+        // surrounding span carries the Error status.
         var captured = new List<OtelActivity>();
         using var listener = new ActivityListener
         {
@@ -195,19 +205,38 @@ public sealed class TeamsMessengerConnectorTelemetryTests
         };
         ActivitySource.AddActivityListener(listener);
 
-        var counterObservations = new List<long>();
+        var counterObservations = new List<(long Value, IDictionary<string, object?> Tags)>();
+        var histogramObservations = new List<double>();
         using var meterListener = new MeterListener
         {
             InstrumentPublished = (instrument, l) =>
             {
-                if (instrument.Meter.Name == TeamsConnectorTelemetry.MeterName
-                    && instrument.Name == TeamsConnectorTelemetry.MessagesSentInstrumentName)
+                if (instrument.Meter.Name != TeamsConnectorTelemetry.MeterName)
+                {
+                    return;
+                }
+
+                if (instrument.Name == TeamsConnectorTelemetry.MessagesSentInstrumentName
+                    || instrument.Name == TeamsConnectorTelemetry.CardDeliveryDurationInstrumentName)
                 {
                     l.EnableMeasurementEvents(instrument);
                 }
             },
         };
-        meterListener.SetMeasurementEventCallback<long>((_, value, _, _) => counterObservations.Add(value));
+        meterListener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
+        {
+            if (instrument.Name == TeamsConnectorTelemetry.MessagesSentInstrumentName)
+            {
+                counterObservations.Add((value, tags.ToArray().ToDictionary(t => t.Key, t => t.Value)));
+            }
+        });
+        meterListener.SetMeasurementEventCallback<double>((instrument, value, _, _) =>
+        {
+            if (instrument.Name == TeamsConnectorTelemetry.CardDeliveryDurationInstrumentName)
+            {
+                histogramObservations.Add(value);
+            }
+        });
         meterListener.Start();
 
         using var harness = BuildHarness();
@@ -226,7 +255,17 @@ public sealed class TeamsMessengerConnectorTelemetryTests
 
         var span = Assert.Single(captured, a => a.OperationName == TeamsConnectorTelemetry.SendMessageActivityName);
         Assert.Equal(ActivityStatusCode.Error, span.Status);
-        Assert.Empty(counterObservations); // failed send must NOT inflate the messages.sent counter
+
+        // (a) failure-rate denominator — the counter MUST observe the failed attempt.
+        var counter = Assert.Single(counterObservations,
+            o => (string?)o.Tags[TeamsConnectorTelemetry.CorrelationIdTag] == "corr-err-1");
+        Assert.Equal(1L, counter.Value);
+        Assert.Equal(TeamsConnectorTelemetry.MessageTypeMessengerMessage, counter.Tags[TeamsConnectorTelemetry.MessageTypeTag]);
+        Assert.Equal(TeamsConnectorTelemetry.DestinationTypeConversation, counter.Tags[TeamsConnectorTelemetry.DestinationTypeTag]);
+
+        // (b) P95 SLA — the delivery-latency histogram MUST stay empty on failure
+        //     so the §4.4 budget is computed only from successful deliveries.
+        Assert.Empty(histogramObservations);
     }
 
     private static TelemetryHarness BuildHarness()

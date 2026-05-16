@@ -179,7 +179,46 @@ public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
                 ? new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword, client)
                 : new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword);
 
-            var token = await credentials.GetTokenAsync(forceRefresh: false).ConfigureAwait(false);
+            // Iter-5 reviewer feedback — MicrosoftAppCredentials.GetTokenAsync in the
+            // Bot Framework SDK (Microsoft.Bot.Connector 4.x) does NOT expose a
+            // CancellationToken overload, so without an explicit guard a slow or
+            // unresponsive Entra ID token endpoint would block the health check
+            // indefinitely and defeat the host's health-check timeout (the
+            // ThrowIfCancellationRequested above only fires BEFORE the call). We
+            // therefore race the token acquisition against a cancellation-bound
+            // TaskCompletionSource: if the caller's CancellationToken fires first,
+            // we throw OperationCanceledException so the host timeout actually
+            // interrupts the probe. The underlying HTTP request is unfortunately
+            // not abortable through the SDK surface, so the in-flight task is left
+            // running with an attached fault observer to avoid leaking it as an
+            // UnobservedTaskException when it eventually completes or faults.
+            var tokenTask = credentials.GetTokenAsync(forceRefresh: false);
+
+            if (cancellationToken.CanBeCanceled && !tokenTask.IsCompleted)
+            {
+                var cancellationTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                using (cancellationToken.Register(
+                    static state => ((TaskCompletionSource<bool>)state!).TrySetResult(true),
+                    cancellationTcs))
+                {
+                    var completed = await Task.WhenAny(tokenTask, cancellationTcs.Task).ConfigureAwait(false);
+                    if (completed != tokenTask)
+                    {
+                        // Cancellation fired before GetTokenAsync returned. Observe
+                        // tokenTask's eventual fault so an OperationCanceledException
+                        // / HttpRequestException raised after we've returned does not
+                        // surface as an UnobservedTaskException on the finalizer.
+                        _ = tokenTask.ContinueWith(
+                            static t => _ = t.Exception,
+                            CancellationToken.None,
+                            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                            TaskScheduler.Default);
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+                }
+            }
+
+            var token = await tokenTask.ConfigureAwait(false);
             if (string.IsNullOrEmpty(token))
             {
                 return new BotFrameworkTokenProbeResult(
