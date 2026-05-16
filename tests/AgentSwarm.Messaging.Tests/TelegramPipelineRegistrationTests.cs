@@ -22,7 +22,10 @@ public class TelegramPipelineRegistrationTests
     [InlineData(typeof(IDeduplicationService), typeof(InMemoryDeduplicationService))]
     [InlineData(typeof(IPendingQuestionStore), typeof(InMemoryPendingQuestionStore))]
     [InlineData(typeof(IPendingDisambiguationStore), typeof(InMemoryPendingDisambiguationStore))]
-    [InlineData(typeof(ICommandParser), typeof(StubCommandParser))]
+    // Stage 3.1 swapped StubCommandParser for the production
+    // TelegramCommandParser, so the locked-down registration now
+    // points at the real parser type.
+    [InlineData(typeof(ICommandParser), typeof(TelegramCommandParser))]
     [InlineData(typeof(ICommandRouter), typeof(StubCommandRouter))]
     [InlineData(typeof(ICallbackHandler), typeof(StubCallbackHandler))]
     [InlineData(typeof(ITelegramUpdatePipeline), typeof(TelegramUpdatePipeline))]
