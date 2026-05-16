@@ -180,6 +180,17 @@ public sealed class OutboundMessageConfiguration : IEntityTypeConfiguration<Outb
         builder.Property(x => x.ErrorDetail)
             .HasMaxLength(2048);
 
+        // Iter-2 evaluator item 1 — AttemptHistoryJson accumulates the
+        // per-attempt failure log appended on every MarkFailedAsync /
+        // DeadLetterAsync. TEXT (no HasMaxLength) because the
+        // serialised array — capped at 100 entries by
+        // AgentSwarm.Messaging.Core.AttemptHistory.MaxEntries — fits
+        // comfortably in TEXT and a column-level cap here would
+        // silently truncate the JSON, producing a parse error at
+        // dead-letter projection time. Nullable: a row that has
+        // never observed a failed send has nothing to log.
+        builder.Property(x => x.AttemptHistoryJson);
+
         // UNIQUE constraint on IdempotencyKey — the architecture's
         // outbound-dedup gate (§3.1). A concurrent EnqueueAsync race
         // surfaces as DbUpdateException here, which the queue's

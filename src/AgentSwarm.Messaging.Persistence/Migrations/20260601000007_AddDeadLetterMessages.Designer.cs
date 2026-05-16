@@ -3,6 +3,7 @@ using System;
 using AgentSwarm.Messaging.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,9 +11,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace AgentSwarm.Messaging.Persistence.Migrations
 {
     [DbContext(typeof(MessagingDbContext))]
-    partial class MessagingDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260601000007_AddDeadLetterMessages")]
+    partial class AddDeadLetterMessages
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "8.0.27");
@@ -20,10 +23,6 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
             modelBuilder.Entity("AgentSwarm.Messaging.Abstractions.DeadLetterMessage", b =>
                 {
                     b.Property<Guid>("Id")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("AgentId")
-                        .HasMaxLength(128)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("AlertStatus")
@@ -41,6 +40,10 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT")
                         .HasDefaultValue("[]");
+
+                    b.Property<string>("AgentId")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
 
                     b.Property<long>("ChatId")
                         .HasColumnType("INTEGER");
@@ -234,9 +237,6 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.Property<int>("AttemptCount")
                         .HasColumnType("INTEGER");
-
-                    b.Property<string>("AttemptHistoryJson")
-                        .HasColumnType("TEXT");
 
                     b.Property<long>("ChatId")
                         .HasColumnType("INTEGER");

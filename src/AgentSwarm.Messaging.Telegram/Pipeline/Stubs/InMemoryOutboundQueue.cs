@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 
 namespace AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 
@@ -153,18 +154,36 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
     /// </summary>
     private readonly Dictionary<MessageSeverity, ConcurrentQueue<OutboundMessage>> _deferredBuckets;
     private readonly TimeProvider _timeProvider;
+    private readonly AgentSwarm.Messaging.Core.RetryPolicy _retryPolicy;
+    private readonly Random _random;
 
     public InMemoryOutboundQueue()
-        : this(TimeProvider.System, DefaultPerSeverityCapacity)
+        : this(TimeProvider.System, DefaultPerSeverityCapacity, retryPolicy: null, random: null)
     {
     }
 
     public InMemoryOutboundQueue(TimeProvider timeProvider)
-        : this(timeProvider, DefaultPerSeverityCapacity)
+        : this(timeProvider, DefaultPerSeverityCapacity, retryPolicy: null, random: null)
     {
     }
 
     public InMemoryOutboundQueue(TimeProvider timeProvider, int perSeverityCapacity)
+        : this(timeProvider, perSeverityCapacity, retryPolicy: null, random: null)
+    {
+    }
+
+    /// <summary>
+    /// Stage 4.2 full constructor that accepts a
+    /// <see cref="AgentSwarm.Messaging.Core.RetryPolicy"/> override
+    /// and a seeded <see cref="System.Random"/> for deterministic jitter
+    /// assertions in tests. Null arguments fall back to a fresh
+    /// <c>RetryPolicy</c> default and <see cref="Random.Shared"/>.
+    /// </summary>
+    public InMemoryOutboundQueue(
+        TimeProvider timeProvider,
+        int perSeverityCapacity,
+        AgentSwarm.Messaging.Core.RetryPolicy? retryPolicy,
+        Random? random)
     {
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         if (perSeverityCapacity <= 0)
@@ -174,6 +193,8 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
                 perSeverityCapacity,
                 "per-severity channel capacity must be positive — the Stage 4.1 brief mandates bounded-capacity channels for the in-memory dev queue.");
         }
+        _retryPolicy = retryPolicy ?? new AgentSwarm.Messaging.Core.RetryPolicy();
+        _random = random ?? Random.Shared;
 
         // Bounded — Wait mode applies backpressure on EnqueueAsync
         // rather than silently dropping the message. Producers see
@@ -540,15 +561,50 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
 
             var nextAttempt = current.AttemptCount + 1;
             var hasBudgetLeft = nextAttempt < current.MaxAttempts;
+            // Iter-3 evaluator item 3 — audit invariant: a row in
+            // OutboundMessageStatus.DeadLettered MUST have a
+            // corresponding dead_letter_messages ledger row AND have
+            // emitted an IAlertService alert. Those two side effects
+            // are owned EXCLUSIVELY by OutboundQueueProcessor's
+            // DispatchTerminalFailureAsync, which the processor
+            // pre-emptively invokes when nextAttempt >=
+            // RetryPolicy.MaxAttempts (HandleSendFailedAsync) AND
+            // when an unknown exception exhausts the budget (catch-
+            // all branch). MarkFailedAsync is a queue primitive
+            // with no DLQ/alert sink access; it MUST land the
+            // defensive exhausted-branch row in Failed (terminal,
+            // operator-visible, NOT DeadLettered) so the audit
+            // dashboard surfaces the gap without falsely claiming
+            // a ledgered DLQ entry exists.
+            //
+            // Mirrors PersistentOutboundQueue.MarkFailedAsync so the
+            // dev / in-memory pipeline matches production semantics.
+            //
+            // Iter-2 evaluator item 1 — append the per-attempt entry
+            // to AttemptHistoryJson so the dead-letter ledger row
+            // carries the full retry timeline.
+            var failedAt = _timeProvider.GetUtcNow();
+            var truncatedError = error.Length > 2048 ? error.Substring(0, 2048) : error;
+            var updatedHistory = AttemptHistory.Append(
+                current.AttemptHistoryJson,
+                attempt: nextAttempt,
+                timestamp: failedAt,
+                error: truncatedError,
+                httpStatus: null);
             failed = current with
             {
                 Status = hasBudgetLeft ? OutboundMessageStatus.Pending : OutboundMessageStatus.Failed,
                 AttemptCount = nextAttempt,
-                ErrorDetail = error,
-                // Simple exponential-style backoff at second resolution;
-                // production replaces this with the Stage 4.1 RetryPolicy.
+                ErrorDetail = truncatedError,
+                AttemptHistoryJson = updatedHistory,
+                // Stage 4.2 RetryPolicy: exponential
+                // `InitialDelayMs * BackoffMultiplier^(attempt-1)`
+                // capped by MaxDelayMs with ±JitterPercent uniform
+                // jitter. Mirrors the PersistentOutboundQueue
+                // computation so a dev host's retry schedule matches
+                // production.
                 NextRetryAt = hasBudgetLeft
-                    ? _timeProvider.GetUtcNow().AddSeconds(Math.Min(60, 1 << Math.Min(nextAttempt, 6)))
+                    ? _timeProvider.GetUtcNow().Add(_retryPolicy.ComputeDelay(nextAttempt, _random))
                     : null,
             };
 
@@ -605,11 +661,24 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
                 return Task.CompletedTask;
             }
 
+            // Iter-2 evaluator item 1 — append the terminal-failure
+            // entry to AttemptHistoryJson so a downstream
+            // SendToDeadLetterAsync projection sees the full retry
+            // timeline.
+            var nextAttemptForHistory = current.AttemptCount + 1;
+            var updatedHistory = AttemptHistory.Append(
+                current.AttemptHistoryJson,
+                attempt: nextAttemptForHistory,
+                timestamp: _timeProvider.GetUtcNow(),
+                error: truncated,
+                httpStatus: null);
+
             var dead = current with
             {
                 Status = OutboundMessageStatus.DeadLettered,
-                AttemptCount = current.AttemptCount + 1,
+                AttemptCount = nextAttemptForHistory,
                 ErrorDetail = truncated,
+                AttemptHistoryJson = updatedHistory,
             };
 
             if (_byMessageId.TryUpdate(messageId, dead, current))

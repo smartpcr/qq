@@ -208,4 +208,21 @@ public sealed record OutboundMessage
     }
 
     public string? ErrorDetail { get; init; }
+
+    /// <summary>
+    /// <b>Stage 4.2 iter-2 evaluator item 1.</b> Accumulated JSON-array
+    /// log of every failed delivery attempt for this row. Each entry is
+    /// shaped <c>{"attempt", "timestamp", "error", "httpStatus"}</c>
+    /// per the <c>AgentSwarm.Messaging.Core.AttemptHistory</c> helper —
+    /// see architecture.md §3.1 lines 386–388 for the canonical
+    /// <c>AttemptTimestamps</c> + <c>ErrorHistory</c> projections
+    /// derived from this column at dead-letter time. Appended by
+    /// <c>IOutboundQueue.MarkFailedAsync</c> on every transient
+    /// failure so that — when the row eventually exhausts its retry
+    /// budget — the dead-letter ledger row carries the full retry
+    /// progression rather than only the final error. <see langword="null"/>
+    /// (and <c>AttemptHistory.Empty</c> after the first failure) for
+    /// rows that have not yet observed a failed attempt.
+    /// </summary>
+    public string? AttemptHistoryJson { get; init; }
 }

@@ -95,6 +95,21 @@ public class MessagingDbContext : DbContext
     /// </summary>
     public DbSet<PendingQuestionRecord> PendingQuestions => Set<PendingQuestionRecord>();
 
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the Stage 4.2 outbox-row
+    /// companion dead-letter ledger. Written by
+    /// <c>OutboundQueueProcessor</c> via
+    /// <see cref="PersistentDeadLetterQueue"/> when an outbox row
+    /// exhausts its retry budget or hits a permanent failure. UNIQUE
+    /// on <see cref="DeadLetterMessage.OriginalMessageId"/> gives the
+    /// outbox-row→DLQ-row 1-to-1 invariant described in
+    /// architecture.md §3.1. Distinct from
+    /// <see cref="OutboundDeadLetters"/> which is the sender-side
+    /// ledger keyed on <c>(ChatId, CorrelationId)</c>. Configured via
+    /// <see cref="DeadLetterMessageConfiguration"/>.
+    /// </summary>
+    public DbSet<DeadLetterMessage> DeadLetterMessages => Set<DeadLetterMessage>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

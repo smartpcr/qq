@@ -6,6 +6,8 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace AgentSwarm.Messaging.Persistence;
 
@@ -175,6 +177,23 @@ public static class ServiceCollectionExtensions
         services.AddOptions<OutboundQueueOptions>()
             .Configure<IConfiguration>((opts, cfg) =>
                 cfg.GetSection(OutboundQueueOptions.SectionName).Bind(opts));
+
+        // Stage 4.2 — bind the canonical RetryPolicy from the
+        // `RetryPolicy` configuration section. PersistentOutboundQueue
+        // and OutboundQueueProcessor both resolve IOptions<RetryPolicy>
+        // via DI so a host that overrides the section here gets the
+        // override in both the queue's MarkFailed backoff schedule
+        // and the processor's exhaustion verdict.
+        services.AddOptions<RetryPolicy>()
+            .Configure<IConfiguration>((opts, cfg) =>
+                cfg.GetSection(RetryPolicy.SectionName).Bind(opts));
+
+        // Stage 4.2 — bind the DeadLetterQueue options used by the
+        // dead-letter health check's unhealthy-threshold poll.
+        services.AddOptions<DeadLetterQueueOptions>()
+            .Configure<IConfiguration>((opts, cfg) =>
+                cfg.GetSection(DeadLetterQueueOptions.SectionName).Bind(opts));
+
         services.TryAddSingleton<OutboundQueueMetrics>();
         services.TryAddSingleton(TimeProvider.System);
 
@@ -186,7 +205,22 @@ public static class ServiceCollectionExtensions
         // implementations bridges the singleton consumer
         // (TelegramMessengerConnector) to the scoped MessagingDbContext
         // without violating the captive-dependency rule.
-        services.Replace(ServiceDescriptor.Singleton<IOutboundQueue, PersistentOutboundQueue>());
+        //
+        // Stage 4.2 — explicit factory so the RetryPolicy options
+        // bound above are actually injected (the DI activator picks
+        // the longest resolvable ctor; without an explicit factory it
+        // would fall back to the legacy 5-arg ctor when Random isn't
+        // registered, defeating the point of binding the RetryPolicy
+        // section).
+        services.Replace(ServiceDescriptor.Singleton<IOutboundQueue>(sp =>
+            new PersistentOutboundQueue(
+                sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<IOptions<OutboundQueueOptions>>(),
+                sp.GetRequiredService<IOptions<RetryPolicy>>(),
+                sp.GetRequiredService<OutboundQueueMetrics>(),
+                sp.GetRequiredService<TimeProvider>(),
+                random: null,
+                sp.GetRequiredService<ILogger<PersistentOutboundQueue>>())));
 
         // Iter-3 evaluator item 3 — durable Telegram message_id →
         // CorrelationId reverse index. Registered as a singleton
@@ -256,6 +290,17 @@ public static class ServiceCollectionExtensions
         // IDistributedCache entry has expired. Neither path touches
         // IDistributedCache at timeout.
         services.Replace(ServiceDescriptor.Singleton<IPendingQuestionStore, PersistentPendingQuestionStore>());
+
+        // Stage 4.2 — durable dead-letter queue for outbox-row
+        // companion ledger rows. Replaces the
+        // InMemoryDeadLetterQueue fallback that AddTelegram
+        // registers via TryAddSingleton so production hosts get the
+        // EF-backed durability contract. Same singleton +
+        // IServiceScopeFactory pattern as the other persistent
+        // implementations bridges the singleton consumer
+        // (OutboundQueueProcessor) to the scoped MessagingDbContext
+        // without violating the captive-dependency rule.
+        services.Replace(ServiceDescriptor.Singleton<IDeadLetterQueue, PersistentDeadLetterQueue>());
 
         return services;
     }

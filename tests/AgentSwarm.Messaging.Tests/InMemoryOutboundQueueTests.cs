@@ -152,8 +152,17 @@ public sealed class InMemoryOutboundQueueTests
         await queue.MarkFailedAsync(dequeued!.MessageId, "fatal", CancellationToken.None);
 
         var state = queue.Enqueued.Single(m => m.MessageId == dequeued.MessageId);
+        // Iter-3 evaluator item 3 — audit invariant: DeadLettered is
+        // reserved for rows that went through
+        // OutboundQueueProcessor.DispatchTerminalFailureAsync (which
+        // writes the dead_letter_messages ledger row AND emits the
+        // IAlertService alert before flipping the outbox). The
+        // queue's defensive exhausted-budget branch — reached only
+        // when a direct caller bypasses the processor — MUST land
+        // the row in Failed so the audit screen distinguishes
+        // "exhausted without DLQ ledger" from "ledgered + alerted".
         state.Status.Should().Be(OutboundMessageStatus.Failed,
-            "AttemptCount == MaxAttempts must transition out of Pending so the message stops being re-dequeued");
+            "Stage 4.2 iter-3 evaluator item 3 — the in-memory queue's defensive exhausted-budget branch transitions to Failed, NOT DeadLettered, because MarkFailedAsync has no access to the DLQ / IAlertService sinks; only OutboundQueueProcessor.DispatchTerminalFailureAsync may land a row in DeadLettered (after persisting the ledger row + emitting the alert).");
         state.NextRetryAt.Should().BeNull();
         state.AttemptCount.Should().Be(1);
     }

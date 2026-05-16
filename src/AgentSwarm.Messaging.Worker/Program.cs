@@ -5,7 +5,10 @@ using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Auth;
 using AgentSwarm.Messaging.Telegram.Webhook;
 using AgentSwarm.Messaging.Worker;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 // =============================================================
 // AgentSwarm.Messaging.Worker — production host for the Telegram
@@ -72,7 +75,21 @@ builder.Services.AddTelegramWebhook();
 // queue depth, dead-letter depth, database) — for now the bare
 // AddHealthChecks() registration gives us a 200-OK liveness probe
 // without depending on services that don't exist yet.
-builder.Services.AddHealthChecks();
+//
+// Stage 4.2 — `dead_letter_messages` depth check chained onto the
+// canonical AddHealthChecks() registration so the existing /healthz
+// liveness probe upgrades from a static "200 OK" to a live
+// "is the operator drowning in dead-letters?" signal. The check
+// reads IDeadLetterQueue.CountAsync and reports Unhealthy when the
+// count exceeds DeadLetterQueueOptions.UnhealthyThreshold (default
+// 100). IDeadLetterQueue is resolved by DI from the persistent
+// PersistentDeadLetterQueue registered via AddMessagingPersistence
+// above, so by the time the health check runs the EF-backed depth
+// is what surfaces.
+builder.Services.AddHealthChecks()
+    .AddCheck<DeadLetterQueueHealthCheck>(
+        DeadLetterQueueHealthCheck.Name,
+        tags: new[] { "dead_letter", "outbound" });
 
 // IUserAuthorizationService — iter-5 evaluator item 1 + Stage 3.4
 // onboarding. AddTelegram intentionally does NOT register one to
@@ -179,7 +196,26 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
 // AddMessagingPersistence (binds OutboundQueueOptions + replaces
 // IOutboundQueue with the persistent impl) and AFTER AddTelegram
 // (registers IMessageSender → TelegramMessageSender).
-builder.Services.AddHostedService<OutboundQueueProcessor>();
+//
+// Stage 4.2 — explicit factory so the new RetryPolicy options,
+// IDeadLetterQueue, and IAlertService are wired into the processor's
+// long ctor. Without the factory the DI activator would fall back
+// to the legacy 5-arg ctor (Random isn't registered as a DI service)
+// which would silently no-op the new dead-letter ledger and alert
+// routing.
+builder.Services.AddHostedService<OutboundQueueProcessor>(sp =>
+    new OutboundQueueProcessor(
+        sp.GetRequiredService<IServiceScopeFactory>(),
+        sp.GetRequiredService<IOutboundQueue>(),
+        sp.GetRequiredService<IMessageSender>(),
+        sp.GetRequiredService<IOptions<OutboundQueueOptions>>(),
+        sp.GetRequiredService<IOptions<RetryPolicy>>(),
+        sp.GetRequiredService<IDeadLetterQueue>(),
+        sp.GetRequiredService<IAlertService>(),
+        sp.GetRequiredService<OutboundQueueMetrics>(),
+        sp.GetRequiredService<TimeProvider>(),
+        random: null,
+        sp.GetRequiredService<ILogger<OutboundQueueProcessor>>()));
 
 var app = builder.Build();
 

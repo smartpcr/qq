@@ -485,8 +485,20 @@ public sealed class PersistentOutboundQueueTests : IAsyncLifetime
         await using var ctx = new MessagingDbContext(_options);
         var row = await ctx.OutboundMessages.AsNoTracking()
             .FirstAsync(x => x.MessageId == dequeued.MessageId);
+        // Iter-3 evaluator item 3 — audit invariant: a row in
+        // OutboundMessageStatus.DeadLettered MUST have a
+        // corresponding dead_letter_messages ledger row AND have
+        // emitted an IAlertService alert. Those side effects are
+        // owned exclusively by OutboundQueueProcessor's
+        // DispatchTerminalFailureAsync. MarkFailedAsync is a queue
+        // primitive that has no access to those sinks, so the
+        // defensive exhausted-budget branch MUST land the row in
+        // Failed (terminal, operator-visible) NOT DeadLettered.
+        // The processor pre-empts budget exhaustion before calling
+        // MarkFailedAsync; this branch is only reached by direct
+        // callers that bypassed the processor.
         row.Status.Should().Be(OutboundMessageStatus.Failed,
-            "with MaxAttempts=1 a single failure must transition out of Pending so the message stops being re-dequeued");
+            "Stage 4.2 iter-3 evaluator item 3 — the queue's defensive exhausted-budget branch MUST transition to Failed, not DeadLettered, because MarkFailedAsync has no access to the DLQ ledger / IAlertService sinks; only OutboundQueueProcessor.DispatchTerminalFailureAsync may land a row in DeadLettered (after persisting the ledger row + emitting the alert).");
         row.AttemptCount.Should().Be(1);
     }
 

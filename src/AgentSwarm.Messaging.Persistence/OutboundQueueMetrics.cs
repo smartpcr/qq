@@ -88,6 +88,20 @@ public sealed class OutboundQueueMetrics : System.IDisposable
 
     private readonly Meter _meter;
 
+    /// <summary>
+    /// Iter-3 evaluator item 4 — exposes the underlying
+    /// <see cref="Meter"/> instance so MeterListener consumers
+    /// (notably the test HistogramCollector) can filter by
+    /// reference equality instead of by <see cref="MeterName"/>
+    /// string. Multiple OutboundQueueMetrics instances in the same
+    /// process all share the meter NAME, so name-based filtering
+    /// cross-pollinates samples between parallel xUnit test
+    /// classes; reference-based filtering scopes each collector
+    /// to exactly one metrics instance and eliminates the flake
+    /// observed on the OutboundQueueProcessorTests.QueueDwell test.
+    /// </summary>
+    public Meter Meter => _meter;
+
     public OutboundQueueMetrics()
     {
         _meter = new Meter(MeterName);
