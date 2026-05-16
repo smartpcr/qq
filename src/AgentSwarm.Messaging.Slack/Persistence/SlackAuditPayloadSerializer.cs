@@ -27,7 +27,8 @@ using System.Text.Json;
 /// <see cref="ISlackAuditLogger.QueryAsync"/>.
 /// </para>
 /// <para>
-/// Output is capped at <see cref="MaxPayloadBytes"/> (16 KiB) so a
+/// Output is capped at <see cref="MaxPayloadChars"/> (16,000 UTF-16
+/// code units, matching <see cref="string.Length"/> semantics) so a
 /// pathologically large modal cannot bloat the audit table. When the
 /// serialised representation exceeds the cap, the truncated prefix is
 /// followed by a literal <c>"...&lt;truncated&gt;"</c> marker so an
@@ -44,11 +45,16 @@ using System.Text.Json;
 public static class SlackAuditPayloadSerializer
 {
     /// <summary>
-    /// Maximum size in characters of the JSON written to
+    /// Maximum length, in <see cref="string.Length"/> units (UTF-16
+    /// code units, i.e. characters), of the JSON written to
     /// <see cref="Entities.SlackAuditEntry.ResponsePayload"/>.
     /// Matches the persistence column's 16&#160;000-character cap.
+    /// Note: this is a character cap, not a byte cap; multi-byte
+    /// content (e.g. CJK) may serialise to more UTF-8 bytes than this
+    /// value, but the audit column is <c>NVARCHAR(MAX)</c> so no
+    /// downstream byte limit is exceeded.
     /// </summary>
-    public const int MaxPayloadBytes = 16_000;
+    public const int MaxPayloadChars = 16_000;
 
     /// <summary>Suffix appended to a truncated payload.</summary>
     public const string TruncationMarker = "\"...<truncated>\"";
@@ -98,13 +104,13 @@ public static class SlackAuditPayloadSerializer
 
     private static string Truncate(string value)
     {
-        if (value.Length <= MaxPayloadBytes)
+        if (value.Length <= MaxPayloadChars)
         {
             return value;
         }
 
         return string.Concat(
-            value.AsSpan(0, MaxPayloadBytes - TruncationMarker.Length),
+            value.AsSpan(0, MaxPayloadChars - TruncationMarker.Length),
             TruncationMarker.AsSpan());
     }
 }
