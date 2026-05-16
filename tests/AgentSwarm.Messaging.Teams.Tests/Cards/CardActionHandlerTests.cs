@@ -610,6 +610,110 @@ public sealed class CardActionHandlerTests
         Assert.Equal(2, throwingStore.GetByIdCalls);
     }
 
+    /// <summary>
+    /// Stage 5.2 iter-7 (eval iter-6 item 2) — when the injected <see cref="IAuditLogger"/>
+    /// throws while persisting the <c>CardActionReceived</c> entry, the handler MUST NOT
+    /// swallow the failure. The prior log-and-swallow design allowed an audit-store
+    /// outage to silently drop card-action audit rows even though the workstream's
+    /// compliance contract requires every Adaptive Card action callback to land a row in
+    /// the <c>AuditLog</c> table (per <c>tech-spec.md</c> §4.3). Propagating the
+    /// exception triggers the outer dedupe-eviction <c>finally</c> in
+    /// <see cref="CardActionHandler.HandleAsync"/>, so Teams' invoke retry re-runs the
+    /// action and gets another chance to land the idempotent audit row.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_AuditLoggerThrows_PropagatesException_DoesNotSwallow()
+    {
+        var auditError = new InvalidOperationException("simulated audit-store outage");
+
+        var questionStore = new InMemoryAgentQuestionStore();
+        questionStore.Seed(BuildOpenQuestion());
+        var cardStore = new RecordingCardStateStore_();
+        var cardManager = new RecordingTeamsCardManager();
+        var publisher = new RecordingInboundEventPublisher();
+        var throwingAudit = new ThrowingAuditLogger(auditError);
+        var handler = new CardActionHandler(
+            questionStore,
+            cardStore,
+            cardManager,
+            publisher,
+            throwingAudit,
+            NullLogger<CardActionHandler>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
+
+        Assert.Same(auditError, ex);
+        // The audit logger DID attempt the write (proves the path reached the emit) —
+        // the failure is on persistence, not on a guard-rejection upstream.
+        Assert.Single(throwingAudit.AttemptedEntries);
+        Assert.Equal(AuditEventTypes.CardActionReceived, throwingAudit.AttemptedEntries[0].EventType);
+
+        // Dedupe entry was evicted by the outer HandleAsync finally on throw —
+        // a retry with the same actor+question MUST re-enter the pipeline (not
+        // short-circuit) so the idempotent audit row gets another chance to land.
+        var retry = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
+        Assert.Same(auditError, retry);
+        // First attempt landed Open→Resolved; retry sees Resolved and writes a
+        // Rejected audit row (not Success). That's the documented compliance
+        // degradation under audit-store outage: an inaccurate-outcome row is still
+        // better than a missing row.
+        Assert.Equal(2, throwingAudit.AttemptedEntries.Count);
+        Assert.Equal(AuditOutcomes.Rejected, throwingAudit.AttemptedEntries[1].Outcome);
+    }
+
+    /// <summary>
+    /// Stage 5.2 iter-7 (eval iter-6 item 2) companion — when audit fails on a REJECTION
+    /// path (e.g. action not in <c>AllowedActions</c>) before any CAS / publish has
+    /// happened, the exception still propagates. Pins that the audit-propagation
+    /// behaviour applies uniformly across success AND rejection branches, not just the
+    /// post-CAS success path.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_AuditThrowsOnRejectionPath_AlsoPropagates()
+    {
+        var auditError = new InvalidOperationException("simulated audit-store outage");
+
+        var questionStore = new InMemoryAgentQuestionStore();
+        questionStore.Seed(BuildOpenQuestion());
+        var cardStore = new RecordingCardStateStore_();
+        var cardManager = new RecordingTeamsCardManager();
+        var publisher = new RecordingInboundEventPublisher();
+        var throwingAudit = new ThrowingAuditLogger(auditError);
+        var handler = new CardActionHandler(
+            questionStore,
+            cardStore,
+            cardManager,
+            publisher,
+            throwingAudit,
+            NullLogger<CardActionHandler>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            handler.HandleAsync(BuildInvokeTurn("disapprove"), CancellationToken.None));
+
+        Assert.Same(auditError, ex);
+        var attempted = Assert.Single(throwingAudit.AttemptedEntries);
+        Assert.Equal(AuditEventTypes.CardActionReceived, attempted.EventType);
+        Assert.Equal(AuditOutcomes.Rejected, attempted.Outcome);
+        // Rejection happened BEFORE any side effects so no decision event was published
+        // and no CAS was attempted — only the audit emit ran.
+        Assert.Empty(publisher.Published);
+        Assert.Empty(cardManager.Calls);
+    }
+
+    private sealed class ThrowingAuditLogger : IAuditLogger
+    {
+        private readonly Exception _toThrow;
+        public ThrowingAuditLogger(Exception toThrow) => _toThrow = toThrow;
+        public List<AuditEntry> AttemptedEntries { get; } = new();
+        public Task LogAsync(AuditEntry entry, CancellationToken cancellationToken)
+        {
+            AttemptedEntries.Add(entry);
+            throw _toThrow;
+        }
+    }
+
     private sealed class ThrowingQuestionStore : IAgentQuestionStore
     {
         public int GetByIdCalls;
