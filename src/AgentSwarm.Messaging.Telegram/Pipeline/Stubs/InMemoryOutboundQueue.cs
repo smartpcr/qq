@@ -113,41 +113,53 @@ internal sealed class InMemoryOutboundQueue : IOutboundQueue
 
     public Task<OutboundMessage?> DequeueAsync(CancellationToken ct)
     {
-        ct.ThrowIfCancellationRequested();
-
-        var now = _timeProvider.GetUtcNow();
-
-        // Order: highest-severity first, then oldest-created first.
-        // The MessageSeverity enum is declared in ascending priority
-        // order (Critical=0, High=1, Normal=2, Low=3) so "highest
-        // severity" corresponds to the LOWEST ordinal — OrderBy, not
-        // OrderByDescending. Matches IOutboundQueue.DequeueAsync
-        // contract ("Critical > High > Normal > Low") and the Stage 4.1
-        // SQL ORDER BY clause (which sorts by an explicit priority
-        // mapping table for the same reason).
-        var candidate = _byMessageId.Values
-            .Where(m => m.Status == OutboundMessageStatus.Pending
-                        && (m.NextRetryAt is null || m.NextRetryAt <= now))
-            .OrderBy(m => m.Severity)
-            .ThenBy(m => m.CreatedAt)
-            .FirstOrDefault();
-
-        if (candidate is null)
+        // Loop (rather than tail-recurse) on CAS failure. C# does not
+        // guarantee tail-call optimisation, and the previous comment's
+        // "bounded recursion: walks the entire queue once" reasoning
+        // only holds in the absence of concurrent mutation. Under
+        // sustained contention from multiple OutboundQueueProcessor
+        // workers — or interleaved EnqueueAsync calls that introduce
+        // fresh Pending records between snapshots — TryUpdate can fail
+        // repeatedly and grow the call stack without bound, eventually
+        // triggering StackOverflowException. A while-loop is equivalent
+        // in behaviour (each iteration re-snapshots and re-claims) with
+        // O(1) stack usage.
+        while (true)
         {
-            return Task.FromResult<OutboundMessage?>(null);
-        }
+            ct.ThrowIfCancellationRequested();
 
-        // Claim atomically: transition Pending → Sending via TryUpdate.
-        // If another worker beats us to it, recurse to find the next
-        // candidate. Bounded recursion: in the worst case this walks
-        // the entire queue once.
-        var claimed = candidate with { Status = OutboundMessageStatus.Sending };
-        if (!_byMessageId.TryUpdate(candidate.MessageId, claimed, candidate))
-        {
-            return DequeueAsync(ct);
-        }
+            var now = _timeProvider.GetUtcNow();
 
-        return Task.FromResult<OutboundMessage?>(claimed);
+            // Order: highest-severity first, then oldest-created first.
+            // The MessageSeverity enum is declared in ascending priority
+            // order (Critical=0, High=1, Normal=2, Low=3) so "highest
+            // severity" corresponds to the LOWEST ordinal — OrderBy, not
+            // OrderByDescending. Matches IOutboundQueue.DequeueAsync
+            // contract ("Critical > High > Normal > Low") and the Stage 4.1
+            // SQL ORDER BY clause (which sorts by an explicit priority
+            // mapping table for the same reason).
+            var candidate = _byMessageId.Values
+                .Where(m => m.Status == OutboundMessageStatus.Pending
+                            && (m.NextRetryAt is null || m.NextRetryAt <= now))
+                .OrderBy(m => m.Severity)
+                .ThenBy(m => m.CreatedAt)
+                .FirstOrDefault();
+
+            if (candidate is null)
+            {
+                return Task.FromResult<OutboundMessage?>(null);
+            }
+
+            // Claim atomically: transition Pending → Sending via TryUpdate.
+            // If another worker beats us to it (TryUpdate returns false
+            // because the dictionary entry no longer equals our snapshot),
+            // loop and re-pick the next-best candidate.
+            var claimed = candidate with { Status = OutboundMessageStatus.Sending };
+            if (_byMessageId.TryUpdate(candidate.MessageId, claimed, candidate))
+            {
+                return Task.FromResult<OutboundMessage?>(claimed);
+            }
+        }
     }
 
     public Task MarkSentAsync(Guid messageId, long telegramMessageId, CancellationToken ct)

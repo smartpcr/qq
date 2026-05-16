@@ -116,18 +116,20 @@ public static class TelegramServiceCollectionExtensions
         // FakeTimeProvider via TryAddSingleton-replacement before AddTelegram.
         services.TryAddSingleton(TimeProvider.System);
 
-        // Stage 2.6: bridge channel between the inbound pipeline (writer)
-        // and the IMessengerConnector.ReceiveAsync drain (reader). Singleton
-        // so the producer and consumer share ONE unbounded in-process
-        // buffer — iter-2 evaluator item 4 made this channel
-        // Channel.CreateUnbounded<MessengerEvent> so every processed
-        // update reaches the connector drain losslessly (the Stage 2.6
-        // "burst from 100+ agents without message loss" SLO precludes
-        // any fast-drop / bounded-with-overflow shape on this hop, and
-        // unlike the Webhook/InboundUpdateChannel there is no durable
-        // backstop row here for replay). Registered BEFORE the pipeline
-        // so the pipeline's [ActivatorUtilitiesConstructor] ten-arg
-        // overload can resolve it as a constructor argument.
+        // Stage 2.6: unbounded in-process bridge channel between the
+        // inbound pipeline (writer) and the IMessengerConnector.ReceiveAsync
+        // drain (reader). The backing channel is constructed via
+        // Channel.CreateUnbounded<MessengerEvent> (see
+        // ProcessedMessengerEventChannel.ctor) so every processed update
+        // reaches the connector drain losslessly — the Stage 2.6
+        // "burst from 100+ agents without message loss" SLO forbids any
+        // bounded / fast-drop shape on this hop, and unlike the
+        // Webhook/InboundUpdateChannel there is no durable InboundUpdate
+        // backstop row here for replay. Registered as a singleton so
+        // the producer and consumer share ONE in-process buffer, and
+        // registered BEFORE the pipeline so the pipeline's
+        // [ActivatorUtilitiesConstructor] overload can resolve it as
+        // a constructor argument.
         services.TryAddSingleton<ProcessedMessengerEventChannel>();
 
         // Stage 2.6: stub IOutboundQueue so TelegramMessengerConnector's
