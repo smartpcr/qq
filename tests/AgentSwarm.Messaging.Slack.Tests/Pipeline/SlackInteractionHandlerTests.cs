@@ -595,18 +595,22 @@ public sealed class SlackInteractionHandlerTests
     }
 
     // -----------------------------------------------------------------
-    // Stage 5.3 iter-4 evaluator item #3 (STRUCTURAL fix). The escalate
-    // modal renders text-only inputs (target + reason) with no
-    // static_select, so the view-submission handler cannot read a
-    // verdict from view.state.values. The renderer therefore MUST pin
-    // actionValue in private_metadata so the handler's pinned-metadata
-    // precedence branch produces a clean HumanDecisionEvent rather
-    // than falling back to a raw text-input value (which is the bug
-    // the evaluator flagged). The handler ALSO drops the
-    // FirstStaticSelectValueFallback branch from its actionValue
-    // resolution chain so the only paths to a published decision are
-    // (a) pinned metadata.ActionValue, or (b) a real static_select in
-    // view.state.values; everything else is discarded.
+    // Stage 5.3 iter-4 evaluator item #3 (STRUCTURAL fix), refreshed
+    // for Stage 6.1 iter 5 per evaluator item 4. The escalate modal
+    // renders a severity static_select (escalate_severity) PLUS one
+    // plain_text_input (the reason); no longer a text-only target +
+    // reason layout. The renderer pins actionValue = "escalate" in
+    // private_metadata so the handler's pinned-metadata precedence
+    // branch produces a clean HumanDecisionEvent. The Stage 5.3
+    // handler then composes the published ActionValue as
+    // "escalate:<severity>" using the severity static_select's
+    // selected_option (see SEVERITY PROPAGATION comments in
+    // DefaultSlackMessageRenderer.RenderEscalateModal). The handler
+    // ALSO drops the FirstStaticSelectValueFallback branch from its
+    // actionValue resolution chain so the only paths to a published
+    // decision are (a) pinned metadata.ActionValue (optionally
+    // composed with the severity suffix), or (b) a real static_select
+    // in view.state.values; everything else is discarded.
     // -----------------------------------------------------------------
     [Fact]
     public void DefaultSlackMessageRenderer_escalate_modal_private_metadata_pins_actionValue_escalate()
@@ -703,6 +707,127 @@ public sealed class SlackInteractionHandlerTests
 
         harness.TaskService.PublishedDecisions.Should().BeEmpty(
             "an escalate view_submission with no pinned actionValue and no static_select MUST be discarded -- the iter-3 evaluator item #3 bug was the handler silently using a text-input value as ActionValue; iter-4's FirstStaticSelectValueFallback removal closes that hole");
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 6.1 evaluator item 2: the escalate modal's severity
+    // static_select MUST propagate into the typed HumanDecisionEvent.
+    // Since HumanDecisionEvent has no Metadata slot (architecture.md
+    // §3.6.3 pins eight fields), the handler composes
+    // ActionValue = "<pinned>{EscalateSeveritySeparator}<severity>"
+    // -- e.g. "escalate:critical". Downstream consumers route on the
+    // bare verdict via StartsWith("escalate") and on the urgency via
+    // the suffix. The composition fires ONLY for the escalate
+    // callback so /agent review's verdict is never wrapped.
+    // -----------------------------------------------------------------
+    [Theory]
+    [InlineData(DefaultSlackMessageRenderer.SeverityCritical, "escalate:critical")]
+    [InlineData(DefaultSlackMessageRenderer.SeverityWarning, "escalate:warning")]
+    [InlineData(DefaultSlackMessageRenderer.SeverityInfo, "escalate:info")]
+    public async Task Escalate_view_submission_with_severity_static_select_composes_actionValue_as_escalate_colon_severity(
+        string severity, string expectedActionValue)
+    {
+        TestHarness harness = new();
+        string privateMetadata = JsonSerializer.Serialize(new
+        {
+            questionId = "TASK-ESC-SEV",
+            taskId = "TASK-ESC-SEV",
+            subCommand = "escalate",
+            actionValue = DefaultSlackMessageRenderer.EscalateActionValue,
+            correlationId = "corr-esc-sev",
+        });
+        string payloadJson = BuildViewSubmissionPayload(
+            viewId: "V_ESC_SEV",
+            callbackId: DefaultSlackMessageRenderer.EscalateCallbackId,
+            privateMetadata: privateMetadata,
+            staticSelectValue: severity,
+            commentText: "db replication lag > 30s for 10 minutes",
+            userId: "U_ESCALATOR",
+            teamId: "T1");
+        SlackInboundEnvelope envelope = BuildEnvelope(
+            idempotencyKey: "int:T1:U_ESCALATOR:view-esc-sev-" + severity,
+            payload: "payload=" + Uri.EscapeDataString(payloadJson));
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        HumanDecisionEvent decision = harness.TaskService.PublishedDecisions.Should().ContainSingle().Subject;
+        decision.QuestionId.Should().Be("TASK-ESC-SEV");
+        decision.ActionValue.Should().Be(expectedActionValue,
+            "the escalate modal's severity static_select MUST propagate into HumanDecisionEvent.ActionValue as '<pinned>:<severity>' -- the typed-decision surface for severity since HumanDecisionEvent has no Metadata slot");
+        decision.ActionValue.Should().StartWith(DefaultSlackMessageRenderer.EscalateActionValue,
+            "the bare verdict prefix MUST be preserved so downstream consumers can route on StartsWith('escalate')");
+        decision.Comment.Should().Be("db replication lag > 30s for 10 minutes",
+            "the reason plain_text_input MUST still land in Comment unchanged by the severity composition");
+    }
+
+    [Fact]
+    public async Task Escalate_view_submission_severity_composition_is_idempotent_when_pinned_value_already_namespaced()
+    {
+        // Belt-and-braces guard: a hand-rolled escalate modal that
+        // pins actionValue = "escalate:warning" directly in
+        // private_metadata MUST NOT have the severity appended a
+        // second time (which would produce "escalate:warning:warning").
+        // The handler only composes when the pinned base does NOT yet
+        // contain the separator.
+        TestHarness harness = new();
+        string privateMetadata = JsonSerializer.Serialize(new
+        {
+            questionId = "TASK-ESC-IDM",
+            taskId = "TASK-ESC-IDM",
+            subCommand = "escalate",
+            actionValue = "escalate:warning",
+            correlationId = "corr-esc-idm",
+        });
+        string payloadJson = BuildViewSubmissionPayload(
+            viewId: "V_ESC_IDM",
+            callbackId: DefaultSlackMessageRenderer.EscalateCallbackId,
+            privateMetadata: privateMetadata,
+            staticSelectValue: DefaultSlackMessageRenderer.SeverityCritical,
+            commentText: "reason",
+            userId: "U_ESCALATOR",
+            teamId: "T1");
+        SlackInboundEnvelope envelope = BuildEnvelope(
+            idempotencyKey: "int:T1:U_ESCALATOR:view-esc-idm",
+            payload: "payload=" + Uri.EscapeDataString(payloadJson));
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        HumanDecisionEvent decision = harness.TaskService.PublishedDecisions.Should().ContainSingle().Subject;
+        decision.ActionValue.Should().Be("escalate:warning",
+            "the severity composition MUST be idempotent -- a pinned value already containing the separator is left unchanged so the verdict format stays canonical");
+    }
+
+    [Fact]
+    public async Task Review_view_submission_with_static_select_is_not_severity_composed()
+    {
+        // /agent review's verdict ("approve" / "request-changes" /
+        // "reject") MUST NOT be wrapped by the severity composer;
+        // the composition fires only for the escalate callback.
+        TestHarness harness = new();
+        string privateMetadata = JsonSerializer.Serialize(new
+        {
+            questionId = "TASK-REV",
+            taskId = "TASK-REV",
+            subCommand = "review",
+            correlationId = "corr-rev",
+        });
+        string payloadJson = BuildViewSubmissionPayload(
+            viewId: "V_REV",
+            callbackId: DefaultSlackMessageRenderer.ReviewCallbackId,
+            privateMetadata: privateMetadata,
+            staticSelectValue: "approve",
+            commentText: "looks good",
+            userId: "U_REVIEWER",
+            teamId: "T1");
+        SlackInboundEnvelope envelope = BuildEnvelope(
+            idempotencyKey: "int:T1:U_REVIEWER:view-rev",
+            payload: "payload=" + Uri.EscapeDataString(payloadJson));
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        HumanDecisionEvent decision = harness.TaskService.PublishedDecisions.Should().ContainSingle().Subject;
+        decision.ActionValue.Should().Be("approve",
+            "the severity composer MUST fire only on the escalate callback so the /agent review verdict stays bare");
     }
 
     // -----------------------------------------------------------------
@@ -1317,5 +1442,11 @@ public sealed class SlackInteractionHandlerTests
                 question_id = context.QuestionId,
             };
         }
+
+        public object RenderQuestion(AgentSwarm.Messaging.Abstractions.AgentQuestion question)
+            => new { type = "question", question_id = question.QuestionId };
+
+        public object RenderMessage(AgentSwarm.Messaging.Abstractions.MessengerMessage message)
+            => new { type = "message", message_id = message.MessageId };
     }
 }
