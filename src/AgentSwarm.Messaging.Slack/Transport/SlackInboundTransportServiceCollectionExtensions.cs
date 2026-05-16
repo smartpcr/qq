@@ -8,6 +8,7 @@ namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
 using System.Collections.Generic;
+using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Queues;
 using Microsoft.AspNetCore.Mvc;
@@ -100,11 +101,34 @@ public static class SlackInboundTransportServiceCollectionExtensions
         // AddSlackSignatureValidation's TryAdd fallback.
         services.TryAddSingleton<SlackModalAuditRecorder>();
 
-        // Named HttpClient registration so the host can layer
-        // resilience handlers (retry, circuit-breaker) on it without
-        // subclassing the client.
+        // Stage 6.4 (evaluator iter-2 item #1, STRUCTURAL): the
+        // production modal fast-path resolves to SlackDirectApiClient
+        // -- the SlackNet-backed implementation that wraps views.open
+        // through ISlackApiClient.Post, shares the per-tier
+        // ISlackRateLimiter singleton with SlackOutboundDispatcher,
+        // and enforces the ~2.5s trigger_id deadline that Slack's
+        // 3-second ACK budget requires. The legacy
+        // HttpClientSlackViewsOpenClient remains in the codebase as a
+        // fall-back for hosts that explicitly register it BEFORE
+        // calling AddSlackInboundTransport (TryAdd lets the earlier
+        // registration win), but the default for every Worker host is
+        // now the SlackNet wrapper -- implementation-plan.md Stage
+        // 6.4 step 1.
+        //
+        // The shared ISlackRateLimiter singleton is TryAdd-registered
+        // here so any host that wires only AddSlackInboundTransport
+        // (e.g., a fast-path-only deployment) still resolves the
+        // direct client. AddSlackOutboundDispatcher uses the same
+        // TryAddSingleton<ISlackRateLimiter, SlackTokenBucketRateLimiter>
+        // call, so whichever extension runs first wins and the second
+        // one becomes a no-op; either way both pipelines bind to the
+        // SAME singleton instance per architecture.md §2.12.
         services.AddHttpClient(HttpClientSlackViewsOpenClient.HttpClientName);
-        services.TryAddSingleton<ISlackViewsOpenClient, HttpClientSlackViewsOpenClient>();
+        services.AddOptions<SlackConnectorOptions>();
+        services.TryAddSingleton<ISlackRateLimiter, SlackTokenBucketRateLimiter>();
+        services.TryAddSingleton<SlackDirectApiClient>();
+        services.TryAddSingleton<ISlackViewsOpenClient>(sp =>
+            sp.GetRequiredService<SlackDirectApiClient>());
 
         // Stage 5.2: production threaded-reply poster (chat.postMessage)
         // for the app-mention handler. Registered here -- alongside the

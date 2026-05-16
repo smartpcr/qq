@@ -14,6 +14,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Slack.Entities;
+using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Rendering;
 using AgentSwarm.Messaging.Slack.Transport;
@@ -831,13 +832,22 @@ public sealed class SlackInteractionHandlerTests
     }
 
     // -----------------------------------------------------------------
-    // Evaluator iter-1 item #4: a RequiresComment button whose follow-up
-    // views.open fails MUST throw so the pipeline retries / dead-letters
-    // -- the human action was ACKed and NO HumanDecisionEvent landed, so
-    // silent-return loses the click.
+    // Stage 6.4 evaluator iter-3 round-2 item #1 (STRUCTURAL REVERSAL
+    // of iter-1 item #4): a RequiresComment button whose follow-up
+    // views.open fails MUST NOT throw into the inbound retry /
+    // dead-letter pipeline. The brief is unambiguous:
+    //   "On views.open failure ... return an ephemeral error message
+    //    to the user; do not retry via the outbound queue because the
+    //    trigger_id is already expired."
+    // The async fallback is by definition POST-ACK, so the trigger_id
+    // is already dead by the time the failure surfaces -- retrying
+    // would just re-fail until the DLQ budget exhausts. The handler
+    // now surfaces an ephemeral via the interaction's response_url
+    // and returns cleanly. The audit row (pinned by the iter-3 audit
+    // tests below) gives operators a durable trace.
     // -----------------------------------------------------------------
     [Fact]
-    public async Task Button_click_with_RequiresComment_propagates_views_open_failure()
+    public async Task Button_click_with_RequiresComment_returns_ephemeral_and_does_NOT_throw_when_views_open_fails()
     {
         TestHarness harness = new();
         harness.ViewsOpenClient.NextResult = SlackViewsOpenResult.NetworkFailure("simulated trigger_id expired");
@@ -849,17 +859,68 @@ public sealed class SlackInteractionHandlerTests
             channelId: "C123",
             messageTs: "1700000000.000VFAIL",
             userId: "U_REVIEWER",
-            triggerId: "trig-vfail");
+            triggerId: "trig-vfail",
+            responseUrl: "https://hooks.slack.com/actions/T1/abc/def");
         SlackInboundEnvelope envelope = BuildEnvelope(
             idempotencyKey: "int:T1:U_REVIEWER:trig-vfail",
             payload: "payload=" + Uri.EscapeDataString(payloadJson));
 
-        Func<Task> act = () => harness.Handler.HandleAsync(envelope, CancellationToken.None);
+        // No throw: the brief mandates ephemeral + no-retry because
+        // the trigger_id is already dead post-ACK. Re-throwing here
+        // would drive the inbound pipeline to retry the same dead
+        // trigger and DLQ after the budget exhausts.
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
 
-        await act.Should().ThrowAsync<InvalidOperationException>(
-            "a failed views.open for a RequiresComment click leaves the human action without a decision -- the pipeline MUST be allowed to retry / dead-letter");
         harness.TaskService.PublishedDecisions.Should().BeEmpty(
             "no decision was published yet (RequiresComment defers the publish until the comment modal submits)");
+
+        EphemeralCall ephemeral = harness.EphemeralResponder.Messages.Should().ContainSingle(
+            "the views.open failure MUST surface an ephemeral via the interaction's response_url instead of throwing into inbound retry / dead-letter -- the Stage 6.4 brief mandates this so the user sees feedback while the dead trigger_id is not re-attempted").Subject;
+        ephemeral.Url.Should().Be(
+            "https://hooks.slack.com/actions/T1/abc/def",
+            "the ephemeral MUST go to the Slack-issued response_url from the interaction payload -- that URL is valid for ~30 minutes post-interaction even after the trigger_id has expired");
+        ephemeral.Message.Should().Contain(
+            "click",
+            "the ephemeral MUST tell the user to click again so the next attempt rides a fresh trigger_id (the only way the failure can recover -- a server-side retry would re-use the same dead trigger)");
+    }
+
+    [Fact]
+    public async Task Button_click_with_RequiresComment_returns_ephemeral_and_does_NOT_throw_when_terminal_trigger_error_classifies_as_permanent()
+    {
+        // Terminal trigger errors (expired_trigger_id, trigger_exchanged, ...)
+        // are PERMANENT: the trigger_id is one-shot and Slack will
+        // reject any retry. iter-3 round-2 item #1 mandates ephemeral
+        // + no-retry for these too -- the previous SlackTriggerExpiredException
+        // throw path drove the inbound pipeline through a guaranteed-fail
+        // retry budget before DLQ; surfacing the ephemeral directly
+        // pages the user immediately without consuming retries.
+        TestHarness harness = new();
+        harness.ViewsOpenClient.NextResult = SlackViewsOpenResult.Failure("expired_trigger_id");
+        string blockId = SlackInteractionEncoding.EncodeQuestionBlockId("Q-VTERM", requiresComment: true);
+        string payloadJson = BuildBlockActionsPayload(
+            blockId: blockId,
+            actionValue: "request-changes",
+            actionLabel: "Request changes",
+            channelId: "C123",
+            messageTs: "1700000000.000VTERM",
+            userId: "U_REVIEWER",
+            triggerId: "trig-vterm",
+            responseUrl: "https://hooks.slack.com/actions/T1/term/url");
+        SlackInboundEnvelope envelope = BuildEnvelope(
+            idempotencyKey: "int:T1:U_REVIEWER:trig-vterm",
+            payload: "payload=" + Uri.EscapeDataString(payloadJson));
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        harness.TaskService.PublishedDecisions.Should().BeEmpty();
+        EphemeralCall ephemeral = harness.EphemeralResponder.Messages.Should().ContainSingle().Subject;
+        ephemeral.Url.Should().Be("https://hooks.slack.com/actions/T1/term/url");
+        ephemeral.Message.Should().Contain(
+            "expired",
+            "the terminal-trigger branch MUST tell the user the click expired so they understand why their action was lost");
+        harness.AuditWriter.Entries.Should().ContainSingle(e =>
+            e.RequestType == SlackModalAuditRecorder.RequestTypeModalOpen
+            && e.Outcome == SlackModalAuditRecorder.OutcomeError);
     }
 
     [Fact]
@@ -868,7 +929,12 @@ public sealed class SlackInteractionHandlerTests
         TestHarness harness = new();
         string blockId = SlackInteractionEncoding.EncodeQuestionBlockId("Q-NOTRG", requiresComment: true);
         // Build payload WITHOUT trigger_id at all -- and also clear it
-        // from the envelope so the handler cannot recover it.
+        // from the envelope so the handler cannot recover it. Missing
+        // trigger_id is a payload-shape regression (not a views.open
+        // failure), so iter-1 item #4's throw / DLQ contract applies
+        // unchanged: the operator MUST see this in the DLQ because it
+        // indicates Slack delivered a malformed payload, not a normal
+        // views.open failure.
         string payloadJson = JsonSerializer.Serialize(new
         {
             type = SlackInteractionHandler.BlockActionsType,
@@ -902,6 +968,151 @@ public sealed class SlackInteractionHandlerTests
 
         await act.Should().ThrowAsync<InvalidOperationException>();
         harness.TaskService.PublishedDecisions.Should().BeEmpty();
+        harness.EphemeralResponder.Messages.Should().BeEmpty(
+            "no views.open call was attempted (trigger_id was missing on the payload entirely), so no ephemeral is sent -- the throw / DLQ contract applies because this is a payload-shape regression, not a views.open failure");
+    }
+
+    // -----------------------------------------------------------------
+    // Stage 6.4 evaluator iter-3 item #1: the async RequiresComment
+    // path opens the follow-up comment modal via the same
+    // ISlackViewsOpenClient seam that the synchronous fast-path uses,
+    // and the brief requires every views.open call to land a
+    // modal_open audit row. These tests pin the audit-on-every-call
+    // contract for both the success and the failure branch of
+    // OpenCommentModalAsync -- a regression that strips the recorder
+    // call would fail here.
+    // -----------------------------------------------------------------
+    [Fact]
+    public async Task RequiresComment_button_writes_modal_open_success_audit_row_on_views_open_success()
+    {
+        TestHarness harness = new();
+        harness.ViewsOpenClient.NextResult = SlackViewsOpenResult.Success();
+        string blockId = SlackInteractionEncoding.EncodeQuestionBlockId("Q-AUDIT-OK", requiresComment: true);
+        string payloadJson = BuildBlockActionsPayload(
+            blockId: blockId,
+            actionValue: "request-changes",
+            actionLabel: "Request changes",
+            channelId: "C123",
+            messageTs: "1700000000.000AUDITOK",
+            userId: "U_REVIEWER",
+            triggerId: "trig-audit-ok");
+        SlackInboundEnvelope envelope = BuildEnvelope(
+            idempotencyKey: "int:T1:U_REVIEWER:trig-audit-ok",
+            payload: "payload=" + Uri.EscapeDataString(payloadJson));
+
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        harness.AuditWriter.Entries.Should().ContainSingle(
+            "the async RequiresComment path must write exactly one modal_open audit row per views.open call (success branch) -- the brief requires every views.open to be logged");
+        SlackAuditEntry row = harness.AuditWriter.Entries[0];
+        row.RequestType.Should().Be(SlackModalAuditRecorder.RequestTypeModalOpen);
+        row.Direction.Should().Be(SlackModalAuditRecorder.DirectionInbound);
+        row.Outcome.Should().Be(SlackModalAuditRecorder.OutcomeSuccess);
+        row.TeamId.Should().Be(envelope.TeamId);
+        row.UserId.Should().Be(envelope.UserId);
+        row.ChannelId.Should().Be(envelope.ChannelId);
+        row.CorrelationId.Should().Be(envelope.IdempotencyKey);
+        row.CommandText.Should().Be(
+            "/agent " + DefaultSlackInteractionFastPathHandler.AuditSubCommand,
+            "the async comment-modal sub-command tag MUST match the fast-path's so operators querying by request_type + command_text see a unified row stream regardless of whether the modal was opened inline or post-ACK");
+        row.ErrorDetail.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task RequiresComment_button_writes_modal_open_error_audit_row_when_views_open_fails_AND_does_NOT_throw()
+    {
+        TestHarness harness = new();
+        harness.ViewsOpenClient.NextResult = SlackViewsOpenResult.NetworkFailure("simulated trigger_id timeout");
+        string blockId = SlackInteractionEncoding.EncodeQuestionBlockId("Q-AUDIT-FAIL", requiresComment: true);
+        string payloadJson = BuildBlockActionsPayload(
+            blockId: blockId,
+            actionValue: "request-changes",
+            actionLabel: "Request changes",
+            channelId: "C123",
+            messageTs: "1700000000.000AUDITFAIL",
+            userId: "U_REVIEWER",
+            triggerId: "trig-audit-fail",
+            responseUrl: "https://hooks.slack.com/actions/T1/audit/fail");
+        SlackInboundEnvelope envelope = BuildEnvelope(
+            idempotencyKey: "int:T1:U_REVIEWER:trig-audit-fail",
+            payload: "payload=" + Uri.EscapeDataString(payloadJson));
+
+        // iter-3 round-2 item #1 (STRUCTURAL REVERSAL of iter-3 item #1's
+        // original re-throw contract): the handler MUST surface the
+        // views.open failure as an ephemeral via the interaction's
+        // response_url and return WITHOUT throwing. The brief mandates
+        // no-retry because the trigger_id is dead by the time the async
+        // path runs post-ACK. The audit row + ephemeral together
+        // replace the prior throw + DLQ contract: durable trace via
+        // audit, user feedback via ephemeral, no wasted retries on a
+        // dead trigger_id.
+        await harness.Handler.HandleAsync(envelope, CancellationToken.None);
+
+        harness.AuditWriter.Entries.Should().ContainSingle(
+            "the async RequiresComment path must write the modal_open error audit row -- the brief's 'log every views.open call' requirement is satisfied even when the failure surfaces as an ephemeral instead of an exception");
+        SlackAuditEntry row = harness.AuditWriter.Entries[0];
+        row.RequestType.Should().Be(SlackModalAuditRecorder.RequestTypeModalOpen);
+        row.Outcome.Should().Be(SlackModalAuditRecorder.OutcomeError);
+        row.ErrorDetail.Should().NotBeNull()
+            .And.Contain("simulated trigger_id timeout",
+                "the durable audit row must surface the underlying Slack-reported error so an operator querying by correlation_id can trace the views.open failure back to its cause");
+        row.ErrorDetail.Should().Contain("views_open_NetworkFailure",
+            "the error-detail must encode the SlackViewsOpenResultKind so queries can distinguish Slack errors from network failures from missing configuration");
+        row.CommandText.Should().Be(
+            "/agent " + DefaultSlackInteractionFastPathHandler.AuditSubCommand);
+        row.CorrelationId.Should().Be(envelope.IdempotencyKey);
+
+        EphemeralCall ephemeral = harness.EphemeralResponder.Messages.Should().ContainSingle(
+            "the views.open failure MUST surface an ephemeral so the user sees feedback for the dead-trigger failure -- the no-retry contract from the Stage 6.4 brief depends on this user-visible signal").Subject;
+        ephemeral.Url.Should().Be("https://hooks.slack.com/actions/T1/audit/fail");
+    }
+
+    [Fact]
+    public async Task RequiresComment_button_without_trigger_id_does_NOT_write_audit_row_because_no_views_open_call_was_attempted()
+    {
+        // Mirrors the SlackCommandHandler guard: when the
+        // RequiresComment click arrives without a trigger_id the
+        // handler throws BEFORE OpenAsync runs, so there is no
+        // views.open call to log -- the audit table must not carry a
+        // phantom modal_open row for requests that never reached
+        // Slack.
+        TestHarness harness = new();
+        string blockId = SlackInteractionEncoding.EncodeQuestionBlockId("Q-NOTRGAUD", requiresComment: true);
+        string payloadJson = JsonSerializer.Serialize(new
+        {
+            type = SlackInteractionHandler.BlockActionsType,
+            team = new { id = "T1" },
+            user = new { id = "U_REVIEWER" },
+            channel = new { id = "C123" },
+            message = new { ts = "1700000000.000NOTRGAUD" },
+            actions = new object[]
+            {
+                new
+                {
+                    type = "button",
+                    block_id = blockId,
+                    action_id = "agent_action",
+                    value = "request-changes",
+                    text = new { type = "plain_text", text = "Request changes" },
+                },
+            },
+        });
+        SlackInboundEnvelope envelope = new(
+            IdempotencyKey: "int:T1:U_REVIEWER:notrgaud",
+            SourceType: SlackInboundSourceType.Interaction,
+            TeamId: "T1",
+            ChannelId: "C123",
+            UserId: "U_REVIEWER",
+            RawPayload: "payload=" + Uri.EscapeDataString(payloadJson),
+            TriggerId: null,
+            ReceivedAt: DateTimeOffset.UtcNow);
+
+        Func<Task> act = () => harness.Handler.HandleAsync(envelope, CancellationToken.None);
+        await act.Should().ThrowAsync<InvalidOperationException>();
+
+        harness.ViewsOpenClient.Requests.Should().BeEmpty();
+        harness.AuditWriter.Entries.Should().BeEmpty(
+            "without a trigger_id the handler never reaches views.open, so it must NOT write a phantom modal_open audit row");
     }
 
     // -----------------------------------------------------------------
@@ -1175,7 +1386,8 @@ public sealed class SlackInteractionHandlerTests
         string userId,
         string triggerId,
         string teamId = "T1",
-        string? threadTs = null)
+        string? threadTs = null,
+        string? responseUrl = null)
     {
         // Slack ships message.thread_ts ONLY when the click landed on
         // a message inside an existing thread. Tests that simulate a
@@ -1186,15 +1398,15 @@ public sealed class SlackInteractionHandlerTests
             ? new { ts = messageTs }
             : (object)new { ts = messageTs, thread_ts = threadTs };
 
-        var payload = new
+        Dictionary<string, object?> payload = new()
         {
-            type = SlackInteractionHandler.BlockActionsType,
-            trigger_id = triggerId,
-            team = new { id = teamId },
-            user = new { id = userId },
-            channel = new { id = channelId },
-            message = messageObj,
-            actions = new object[]
+            ["type"] = SlackInteractionHandler.BlockActionsType,
+            ["trigger_id"] = triggerId,
+            ["team"] = new { id = teamId },
+            ["user"] = new { id = userId },
+            ["channel"] = new { id = channelId },
+            ["message"] = messageObj,
+            ["actions"] = new object[]
             {
                 new
                 {
@@ -1206,6 +1418,16 @@ public sealed class SlackInteractionHandlerTests
                 },
             },
         };
+
+        // response_url is per-invocation and Slack-issued; tests that
+        // exercise the async comment-modal failure ephemeral pass it
+        // explicitly so RecordingEphemeralResponder can assert the URL
+        // it received. Tests that do not care leave it null so the
+        // payload mirrors the historical (pre-iter-3-round-2) shape.
+        if (!string.IsNullOrEmpty(responseUrl))
+        {
+            payload["response_url"] = responseUrl;
+        }
 
         return JsonSerializer.Serialize(payload);
     }
@@ -1301,12 +1523,20 @@ public sealed class SlackInteractionHandlerTests
             this.ChatUpdateClient = new RecordingChatUpdateClient();
             this.ViewsOpenClient = new RecordingViewsOpenClient();
             this.MessageRenderer = new RecordingMessageRenderer();
+            this.AuditWriter = new InMemorySlackAuditEntryWriter();
+            this.ModalAuditRecorder = new SlackModalAuditRecorder(
+                this.AuditWriter,
+                NullLogger<SlackModalAuditRecorder>.Instance,
+                TimeProvider.System);
+            this.EphemeralResponder = new RecordingEphemeralResponder();
             this.Handler = new SlackInteractionHandler(
                 this.TaskService,
                 this.ThreadMappingLookup,
                 this.ChatUpdateClient,
                 this.ViewsOpenClient,
                 this.MessageRenderer,
+                this.ModalAuditRecorder,
+                this.EphemeralResponder,
                 NullLogger<SlackInteractionHandler>.Instance,
                 TimeProvider.System);
         }
@@ -1321,8 +1551,30 @@ public sealed class SlackInteractionHandlerTests
 
         public RecordingMessageRenderer MessageRenderer { get; }
 
+        public InMemorySlackAuditEntryWriter AuditWriter { get; }
+
+        public SlackModalAuditRecorder ModalAuditRecorder { get; }
+
+        public RecordingEphemeralResponder EphemeralResponder { get; }
+
         public SlackInteractionHandler Handler { get; }
     }
+
+    private sealed class RecordingEphemeralResponder : ISlackEphemeralResponder
+    {
+        private readonly ConcurrentQueue<EphemeralCall> calls = new();
+
+        public IReadOnlyList<EphemeralCall> Messages => this.calls.ToArray();
+
+        public Task SendEphemeralAsync(string? responseUrl, string message, CancellationToken ct)
+        {
+            this.calls.Enqueue(new EphemeralCall(responseUrl ?? string.Empty, message));
+            return Task.CompletedTask;
+        }
+    }
+
+    internal sealed record EphemeralCall(string Url, string Message);
+
 
     private sealed class RecordingAgentTaskService : IAgentTaskService
     {
