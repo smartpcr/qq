@@ -142,6 +142,17 @@ public static class TeamsOutboxServiceCollectionExtensions
         services.TryAddSingleton<OutboxMetrics>();
         services.TryAddSingleton<TokenBucketRateLimiter>();
 
+        // Stage 6.2 step 4 — outbound deduplication singleton + background eviction
+        // service. Registered via TryAdd* so hosts that supplied a custom
+        // OutboundDeduplicationOptions or replaced the deduplicator with a no-op for
+        // tests keep their override. The eviction service purges entries older than
+        // OutboundDeduplicationOptions.Window on the configured cadence.
+        services.TryAddSingleton<OutboundDeduplicationOptions>();
+        services.TryAddSingleton<OutboundMessageDeduplicator>(sp => new OutboundMessageDeduplicator(
+            sp.GetRequiredService<OutboundDeduplicationOptions>(),
+            sp.GetRequiredService<TimeProvider>()));
+        services.AddHostedService<OutboundDeduplicationEvictionService>();
+
         services.RemoveAll<IOutboxDispatcher>();
         services.AddSingleton<IOutboxDispatcher, TeamsOutboxDispatcher>();
 
@@ -291,13 +302,16 @@ public static class TeamsOutboxServiceCollectionExtensions
         }
 
         // Always install the unkeyed IMessengerConnector wrapper — this is what
-        // GetRequiredService<IMessengerConnector>() resolves to.
+        // GetRequiredService<IMessengerConnector>() resolves to. Stage 6.2 step 4: the
+        // wrapper receives the OutboundMessageDeduplicator so duplicate (CorrelationId,
+        // ConversationId) sends are suppressed before an OutboxEntry is enqueued.
         services.AddSingleton<IMessengerConnector>(sp => new OutboxBackedMessengerConnector(
             sp.GetRequiredService<IInnerTeamsMessengerConnector>().Inner,
             sp.GetRequiredService<IMessageOutbox>(),
             sp.GetRequiredService<IConversationReferenceRouter>(),
             sp.GetRequiredService<ILogger<OutboxBackedMessengerConnector>>(),
-            sp.GetService<TimeProvider>()));
+            sp.GetService<TimeProvider>(),
+            sp.GetService<OutboundMessageDeduplicator>()));
 
         // Rebind the keyed "teams" alias to the wrapper ONLY when the host originally
         // registered a keyed alias (critique #3). The concrete TeamsMessengerConnector

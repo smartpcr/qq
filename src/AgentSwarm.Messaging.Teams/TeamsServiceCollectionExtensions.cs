@@ -309,6 +309,19 @@ public static class TeamsServiceCollectionExtensions
         services.RemoveAll<ICardActionHandler>();
         services.AddSingleton<ICardActionHandler, CardActionHandler>();
 
+        // Stage 6.2 — domain-level processed-action dedupe set shared across every
+        // CardActionHandler resolution AND the background eviction service. Registered
+        // via TryAdd* so hosts that wired a custom CardActionDedupeOptions /
+        // ProcessedCardActionSet (e.g. a shortened TTL for integration tests) keep their
+        // override. The eviction service runs on a 5-minute cadence by default and
+        // purges entries older than CardActionDedupeOptions.EntryLifetime (24 hours by
+        // default) per the canonical Stage 6.2 brief.
+        services.TryAddSingleton<CardActionDedupeOptions>();
+        services.TryAddSingleton<ProcessedCardActionSet>(sp => new ProcessedCardActionSet(
+            sp.GetRequiredService<CardActionDedupeOptions>(),
+            sp.GetRequiredService<TimeProvider>()));
+        services.AddHostedService<ProcessedCardActionEvictionService>();
+
         // Lifecycle worker — singleton per BackgroundService convention. Registered via
         // AddHostedService<T>() so the runtime picks it up automatically.
         services.AddHostedService<QuestionExpiryProcessor>();
