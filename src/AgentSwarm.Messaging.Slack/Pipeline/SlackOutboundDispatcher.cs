@@ -7,11 +7,14 @@
 namespace AgentSwarm.Messaging.Slack.Pipeline;
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Entities;
+using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Retry;
@@ -304,11 +307,49 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
 
     private async Task DispatchOneAsync(SlackOutboundEnvelope envelope, CancellationToken ct)
     {
+        // Stage 7.2: every outbound dispatch produces a single
+        // `slack.outbound.send` span wrapping the full retry / rate-
+        // limit loop. The span carries the §6.3 attribute set
+        // (correlation_id, task_id, team_id, channel_id,
+        // operation_kind) and the loop emits per-attempt latency
+        // into the `slack.outbound.latency_ms` histogram tagged with
+        // the operation kind + final outcome. The counter
+        // `slack.outbound.count` is incremented exactly once with
+        // the terminal outcome so the dashboard's "calls vs.
+        // attempts" ratio stays interpretable. Each HTTP 429
+        // observed by the loop bumps `slack.ratelimit.backoff_count`.
+        long startTicks = this.timeProvider.GetTimestamp();
         SlackThreadMapping? mapping = await this.threadManager
             .GetThreadAsync(envelope.TaskId, ct)
             .ConfigureAwait(false);
+
+        using Activity? sendSpan = SlackTelemetry.StartOutboundSpan(
+            envelope,
+            mapping?.TeamId ?? string.Empty,
+            mapping?.ChannelId,
+            mapping?.AgentId);
+        using IDisposable logScope = SlackTelemetry.CreateScope(
+            this.logger,
+            envelope,
+            mapping?.TeamId,
+            mapping?.ChannelId,
+            mapping?.AgentId);
+
         if (mapping is null)
         {
+            sendSpan?.SetTag(SlackTelemetry.AttributeOutcome, "thread_mapping_missing");
+            sendSpan?.SetStatus(ActivityStatusCode.Error, "thread_mapping_missing");
+            SlackTelemetry.OutboundCount.Add(
+                1,
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeOperationKind, envelope.MessageType.ToString()),
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeOutcome, "thread_mapping_missing"),
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, string.Empty));
+            SlackTelemetry.OutboundLatencyMs.Record(
+                this.ElapsedMs(startTicks),
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeOperationKind, envelope.MessageType.ToString()),
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeOutcome, "thread_mapping_missing"),
+                new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, string.Empty));
+
             await this.DeadLetterAsync(
                 envelope,
                 mapping: null,
@@ -434,6 +475,20 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
                         responsePayload: result.ResponsePayload,
                         messageTs: result.MessageTs,
                         ct).ConfigureAwait(false);
+
+                    SlackTelemetry.OutboundCount.Add(
+                        1,
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeOperationKind, envelope.MessageType.ToString()),
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeOutcome, OutcomeSuccess),
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, mapping.TeamId));
+                    SlackTelemetry.OutboundLatencyMs.Record(
+                        this.ElapsedMs(startTicks),
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeOperationKind, envelope.MessageType.ToString()),
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeOutcome, OutcomeSuccess),
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, mapping.TeamId));
+                    sendSpan?.SetTag(SlackTelemetry.AttributeOutcome, OutcomeSuccess);
+                    sendSpan?.SetTag("slack.attempts", attempt);
+                    sendSpan?.SetStatus(ActivityStatusCode.Ok);
                     return;
 
                 case SlackOutboundDispatchOutcome.RateLimited:
@@ -442,6 +497,17 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
                     this.rateLimiter.NotifyRetryAfter(tier, scopeKey, pause);
                     firstFailedAt ??= this.timeProvider.GetUtcNow();
                     lastReason = $"http_429_retry_after_{(int)pause.TotalMilliseconds}ms";
+
+                    // Stage 7.2: every 429 observed bumps the shared
+                    // rate-limit back-off counter so dashboards can
+                    // alert on persistent throttling per workspace +
+                    // operation kind without sampling audit rows.
+                    SlackTelemetry.RateLimitBackoffCount.Add(
+                        1,
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeOperationKind, envelope.MessageType.ToString()),
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, mapping.TeamId),
+                        new KeyValuePair<string, object?>("slack.tier", tier.ToString()));
+
                     await this.WriteAuditAsync(
                         envelope,
                         mapping,
@@ -563,6 +629,20 @@ exhausted:
         // triaging the DLQ row sees the full effort spent on the
         // envelope; the per-attempt audit rows distinguish the
         // outcomes.
+        SlackTelemetry.OutboundCount.Add(
+            1,
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeOperationKind, envelope.MessageType.ToString()),
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeOutcome, OutcomeDeadLettered),
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, mapping?.TeamId ?? string.Empty));
+        SlackTelemetry.OutboundLatencyMs.Record(
+            this.ElapsedMs(startTicks),
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeOperationKind, envelope.MessageType.ToString()),
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeOutcome, OutcomeDeadLettered),
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, mapping?.TeamId ?? string.Empty));
+        sendSpan?.SetTag(SlackTelemetry.AttributeOutcome, OutcomeDeadLettered);
+        sendSpan?.SetTag("slack.attempts", Math.Max(1, actualAttempts));
+        sendSpan?.SetStatus(ActivityStatusCode.Error, lastReason);
+
         await this.DeadLetterAsync(
             envelope,
             mapping,
@@ -573,6 +653,18 @@ exhausted:
             attemptCount: Math.Max(1, actualAttempts),
             firstFailedAt: firstFailedAt ?? this.timeProvider.GetUtcNow(),
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Computes elapsed wall-clock milliseconds since the supplied
+    /// start tick stamp, using the dispatcher's <see cref="TimeProvider"/>
+    /// so virtual-clock unit tests can advance the histogram value
+    /// deterministically.
+    /// </summary>
+    private double ElapsedMs(long startTicks)
+    {
+        TimeSpan elapsed = this.timeProvider.GetElapsedTime(startTicks);
+        return elapsed.TotalMilliseconds;
     }
 
     /// <summary>

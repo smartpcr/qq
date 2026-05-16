@@ -7,8 +7,10 @@
 namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Persistence;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -88,8 +90,21 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
         ArgumentNullException.ThrowIfNull(envelope);
         ArgumentNullException.ThrowIfNull(httpContext);
 
+        // Stage 7.2: synchronous modal fast-path traces every
+        // views.open invocation as a `slack.modal.open` span so
+        // dashboards can split modal latency from the async
+        // outbound dispatch path. The span is decorated with the
+        // §6.3 attribute set sourced from the inbound envelope.
+        using Activity? span = SlackTelemetry.StartInboundSpan(
+            SlackTelemetry.ModalOpenSpanName,
+            envelope,
+            ActivityKind.Server);
+        using IDisposable scope = SlackTelemetry.CreateScope(this.logger, envelope);
+
         if (string.IsNullOrEmpty(envelope.TriggerId))
         {
+            span?.SetTag(SlackTelemetry.AttributeOutcome, "missing_trigger_id");
+            span?.SetStatus(ActivityStatusCode.Error, "missing trigger_id");
             this.logger.LogWarning(
                 "Slack modal fast-path rejected envelope idempotency_key={IdempotencyKey} team_id={TeamId}: missing trigger_id (cannot call views.open).",
                 envelope.IdempotencyKey,
@@ -104,6 +119,8 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
         SlackCommandPayload payload = SlackInboundPayloadParser.ParseCommand(envelope.RawPayload);
         if (string.IsNullOrEmpty(payload.SubCommand))
         {
+            span?.SetTag(SlackTelemetry.AttributeOutcome, "missing_sub_command");
+            span?.SetStatus(ActivityStatusCode.Error, "missing sub-command");
             this.logger.LogWarning(
                 "Slack modal fast-path rejected envelope idempotency_key={IdempotencyKey} team_id={TeamId}: missing sub-command in text='{Text}'.",
                 envelope.IdempotencyKey,
@@ -116,6 +133,8 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
                 BuildEphemeralError(
                     "Could not open the modal: missing sub-command (expected `/agent review …` or `/agent escalate …`)."));
         }
+
+        span?.SetTag(SlackTelemetry.AttributeSubCommand, payload.SubCommand);
 
         // Stage 5.1 iter-3 evaluator item 1 (STRUCTURAL fix): both
         // /agent review and /agent escalate REQUIRE a task-id argument
@@ -232,6 +251,8 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
 
         if (viewsResult.IsSuccess)
         {
+            span?.SetTag(SlackTelemetry.AttributeOutcome, "opened");
+            span?.SetStatus(ActivityStatusCode.Ok);
             // Iter-4 fix: transition the durable idempotency row from
             // "reserved" to "modal_opened" so Stage 4.3's async ingestor
             // recognises this row as terminal and does NOT replay the
@@ -313,6 +334,8 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
         // async processing because the trigger_id is already expired (or
         // about to expire) and the orchestrator cannot make any progress
         // toward opening a modal once that happens (architecture.md §5.3).
+        span?.SetTag(SlackTelemetry.AttributeOutcome, $"views_open_{viewsResult.Kind}");
+        span?.SetStatus(ActivityStatusCode.Error, viewsResult.Error);
         await this.idempotencyStore.ReleaseAsync(envelope.IdempotencyKey, ct).ConfigureAwait(false);
         string userMessage = viewsResult.Kind switch
         {
