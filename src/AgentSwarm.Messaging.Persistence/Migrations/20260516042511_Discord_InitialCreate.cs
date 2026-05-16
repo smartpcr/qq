@@ -84,11 +84,11 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                     SourceId = table.Column<string>(type: "TEXT", nullable: true),
                     AttemptCount = table.Column<int>(type: "INTEGER", nullable: false),
                     MaxAttempts = table.Column<int>(type: "INTEGER", nullable: false, defaultValue: 5),
-                    NextRetryAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: true),
+                    NextRetryAt = table.Column<long>(type: "INTEGER", nullable: true),
                     PlatformMessageId = table.Column<long>(type: "INTEGER", nullable: true),
                     CorrelationId = table.Column<string>(type: "TEXT", nullable: false),
-                    CreatedAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: false),
-                    SentAt = table.Column<DateTimeOffset>(type: "TEXT", nullable: true),
+                    CreatedAt = table.Column<long>(type: "INTEGER", nullable: false),
+                    SentAt = table.Column<long>(type: "INTEGER", nullable: true),
                     ErrorDetail = table.Column<string>(type: "TEXT", nullable: true)
                 },
                 constraints: table =>
