@@ -26,6 +26,14 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// </param>
 /// <param name="CorrelationId">Trace identifier propagated from the originating question.</param>
 /// <param name="Timestamp">When the operator's decision was received.</param>
+/// <param name="Comment">
+/// Optional free-form text supplied by the operator. Required (non-null) when the
+/// chosen <see cref="HumanAction.RequiresComment"/> is <see langword="true"/>; the
+/// connector collects the text via a modal/follow-up reply and forwards it here so
+/// the orchestrator receives the rationale alongside the decision. <see langword="null"/>
+/// when no comment was requested or provided. Default <see langword="null"/> keeps
+/// the parameter additive — existing positional callers do not break.
+/// </param>
 public sealed record HumanDecisionEvent(
     string Messenger,
     string ExternalUserId,
@@ -34,4 +42,5 @@ public sealed record HumanDecisionEvent(
     string SelectedActionId,
     string ActionValue,
     string CorrelationId,
-    DateTimeOffset Timestamp);
+    DateTimeOffset Timestamp,
+    string? Comment = null);

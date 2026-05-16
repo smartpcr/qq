@@ -83,4 +83,70 @@ public class AgentQuestionSerializationTests
         roundTripped.Should().NotBeNull();
         roundTripped!.AllowedActions.Should().BeEmpty();
     }
+
+    [Fact]
+    public void Severity_IsSerializedAsStringName_NotNumber()
+    {
+        var question = new AgentQuestion(
+            QuestionId: "Q-shape",
+            AgentId: "agent",
+            TaskId: "task",
+            Title: "title",
+            Body: "body",
+            Severity: MessageSeverity.High,
+            AllowedActions: Array.Empty<HumanAction>(),
+            ExpiresAt: DateTimeOffset.UnixEpoch,
+            CorrelationId: "trace");
+
+        var json = JsonSerializer.Serialize(question, JsonOptions);
+
+        json.Should().Contain("\"Severity\":\"High\"");
+        json.Should().NotContain("\"Severity\":1");
+    }
+
+    [Fact]
+    public void AllowedActions_IsDefensivelyCopied_SoCallerMutationDoesNotLeakIn()
+    {
+        var mutable = new List<HumanAction>
+        {
+            new("a1", "L1", "v1", false),
+            new("a2", "L2", "v2", false),
+        };
+
+        var question = new AgentQuestion(
+            QuestionId: "Q-defcopy",
+            AgentId: "agent",
+            TaskId: "task",
+            Title: "title",
+            Body: "body",
+            Severity: MessageSeverity.Normal,
+            AllowedActions: mutable,
+            ExpiresAt: DateTimeOffset.UnixEpoch,
+            CorrelationId: "trace");
+
+        mutable.Add(new HumanAction("evil", "L3", "v3", false));
+        mutable[0] = new HumanAction("hacked", "X", "y", true);
+
+        question.AllowedActions.Should().HaveCount(2);
+        question.AllowedActions[0].ActionId.Should().Be("a1");
+        question.AllowedActions[1].ActionId.Should().Be("a2");
+    }
+
+    [Fact]
+    public void Constructor_ThrowsOnNullAllowedActions()
+    {
+        var act = () => new AgentQuestion(
+            QuestionId: "Q-null",
+            AgentId: "agent",
+            TaskId: "task",
+            Title: "title",
+            Body: "body",
+            Severity: MessageSeverity.Normal,
+            AllowedActions: null!,
+            ExpiresAt: DateTimeOffset.UnixEpoch,
+            CorrelationId: "trace");
+
+        act.Should().Throw<ArgumentNullException>();
+    }
 }
+

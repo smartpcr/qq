@@ -18,7 +18,10 @@ namespace AgentSwarm.Messaging.Abstractions;
 /// <param name="Severity">Priority severity (drives queue ordering).</param>
 /// <param name="AllowedActions">
 /// Operator-selectable actions. Rendered as buttons (Discord, Slack, Teams) or as
-/// an inline keyboard (Telegram).
+/// an inline keyboard (Telegram). Stored as a defensively-copied snapshot so the
+/// shared contract cannot be mutated after construction; the typed surface is
+/// <see cref="IReadOnlyList{T}"/> to keep callers honest. Validate each
+/// <see cref="HumanAction.ActionId"/> with <see cref="ActionIdValidator"/>.
 /// </param>
 /// <param name="ExpiresAt">Deadline after which the question is considered timed out.</param>
 /// <param name="CorrelationId">End-to-end trace identifier.</param>
@@ -29,6 +32,21 @@ public sealed record AgentQuestion(
     string Title,
     string Body,
     MessageSeverity Severity,
-    HumanAction[] AllowedActions,
+    IReadOnlyList<HumanAction> AllowedActions,
     DateTimeOffset ExpiresAt,
-    string CorrelationId);
+    string CorrelationId)
+{
+    private readonly IReadOnlyList<HumanAction> _allowedActions = CopyOrThrow(AllowedActions);
+
+    /// <inheritdoc cref="AgentQuestion(string, string, string, string, string, MessageSeverity, IReadOnlyList{HumanAction}, DateTimeOffset, string)"/>
+    public IReadOnlyList<HumanAction> AllowedActions
+    {
+        get => _allowedActions;
+        init => _allowedActions = CopyOrThrow(value);
+    }
+
+    private static IReadOnlyList<HumanAction> CopyOrThrow(IReadOnlyList<HumanAction>? value)
+        => value is null
+            ? throw new ArgumentNullException(nameof(AllowedActions))
+            : value.ToArray();
+}

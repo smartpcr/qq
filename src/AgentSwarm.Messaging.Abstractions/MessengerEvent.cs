@@ -1,8 +1,12 @@
+using System.Text.Json.Serialization;
+
 namespace AgentSwarm.Messaging.Abstractions;
 
 /// <summary>
 /// Classification of an inbound <see cref="MessengerEvent"/>.
+/// Serialized as the member name string in JSON.
 /// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum MessengerEventType
 {
     /// <summary>A slash command / typed command invocation.</summary>
