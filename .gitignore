@@ -1,4 +1,3 @@
-
 .forge-attachments/
 
 # .NET build output
@@ -30,3 +29,7 @@ coverage.json
 src/AgentSwarm.Messaging.Teams/Manifest/bin/
 
 .forge/
+
+# Local NuGet package cache (when NuGet.Config sets globalPackagesFolder=.nuget-packages
+# to avoid touching the machine-level cache during isolated builds).
+.nuget-packages/
