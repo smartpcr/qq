@@ -1,7 +1,7 @@
+namespace AgentSwarm.Messaging.Slack.Configuration;
+
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-
-namespace AgentSwarm.Messaging.Slack.Configuration;
 
 /// <summary>
 /// Service collection extensions that bind the Slack connector options
