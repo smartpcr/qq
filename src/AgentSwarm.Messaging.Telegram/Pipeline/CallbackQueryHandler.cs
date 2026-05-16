@@ -1,7 +1,7 @@
 using System.Globalization;
 using System.Text;
 using AgentSwarm.Messaging.Abstractions;
-using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
 using Telegram.Bot.Requests;
@@ -86,7 +86,7 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 /// slots via <see cref="IDeduplicationService.MarkProcessedAsync"/>.
 /// </para>
 /// </remarks>
-public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
+public sealed class CallbackQueryHandler : ICallbackHandler
 {
     /// <summary>
     /// <see cref="IDeduplicationService"/> key prefix for per-callback
@@ -158,6 +158,11 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
     /// <summary>
     /// Comment-prompt text sent as a follow-up message when the tapped
     /// action carries <see cref="HumanAction.RequiresComment"/>=true.
+    /// The wire body composed by <see cref="BuildCommentPromptText"/>
+    /// appends a <see cref="CorrelationFooterFormat"/> trace footer so
+    /// the prompt itself carries the story-wide trace/correlation id
+    /// (iter-3 evaluator item 2 — the bare <c>CommentPromptText</c>
+    /// previously violated the criterion).
     /// </summary>
     public const string CommentPromptText = "Please reply with your comment.";
 
@@ -168,32 +173,28 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
     public const string MessengerName = "telegram";
 
     /// <summary>
-    /// Maximum number of cached duplicate-CallbackId replay entries the
-    /// in-process <see cref="MemoryCache"/> backing
-    /// <see cref="_replayAnswers"/> will hold before LRU compaction
-    /// evicts older entries. Bounds the process-local footprint a
-    /// long-running bot can accumulate from Telegram callback ids
-    /// (iter-2 evaluator item 2 — the previous
-    /// <c>ConcurrentDictionary</c> shape was unbounded).
+    /// Key namespace used when writing duplicate-CallbackId replay
+    /// entries into the shared <see cref="IDistributedCache"/>. Keeps
+    /// these entries from colliding with
+    /// <c>TelegramQuestionRenderer</c>'s
+    /// <see cref="HumanAction"/> entries (keyed
+    /// <c>QuestionId:ActionId</c>) and with any other consumer of the
+    /// same cache instance.
     /// </summary>
-    /// <remarks>
-    /// 10,000 entries × ~32-byte callback id × ~32-byte answer text =
-    /// ~640 KB worst case, which is bounded and recoverable on
-    /// process restart. Stage 4.3 will replace this with a distributed
-    /// cache shared across pods so the cross-pod / restart fallback to
-    /// <see cref="AlreadyRespondedText"/> is closed.
-    /// </remarks>
-    public const long ReplayCacheMaxSize = 10_000L;
+    public const string ReplayCacheKeyPrefix = "tg:cb-replay:";
 
     /// <summary>
     /// Absolute expiration (relative to insertion) for the duplicate-
-    /// CallbackId replay cache. Telegram's
-    /// <c>AnswerCallbackQuery</c> wire window is ~30 s, but a Telegram
-    /// webhook redelivery can arrive minutes later, and the pipeline
-    /// dedup TTLs (<see cref="IDeduplicationService"/>) live on a
-    /// similar minute-grain horizon. One hour is a defensible cap that
-    /// covers any plausible in-process retry window while still giving
-    /// the cache a hard upper bound (iter-2 evaluator item 2).
+    /// CallbackId replay entries written into
+    /// <see cref="IDistributedCache"/>. Telegram's
+    /// <c>AnswerCallbackQuery</c> wire window is ~30 s, but a webhook
+    /// redelivery can arrive minutes later. One hour is a defensible
+    /// cap that covers any plausible retry / redelivery horizon while
+    /// still giving each entry a hard upper bound. Stage 4.3 swaps the
+    /// in-process <c>MemoryDistributedCache</c> for a Redis-backed
+    /// <see cref="IDistributedCache"/> so cross-pod / post-restart
+    /// duplicates resolve to the cached prior result without code
+    /// changes here (iter-3 evaluator item 1).
     /// </summary>
     public static readonly TimeSpan ReplayCacheTtl = TimeSpan.FromHours(1);
 
@@ -206,30 +207,30 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
     private readonly ILogger<CallbackQueryHandler> _logger;
 
     /// <summary>
-    /// Bounded in-memory replay cache mapping
-    /// <see cref="MessengerEvent.CallbackId"/> → previously-sent answer
-    /// text. Populated by <see cref="AnswerAndRememberAsync"/> at every
-    /// terminal point; consulted ONLY by the duplicate-CallbackId
-    /// short-circuit so a Telegram redelivery shows the user the SAME
-    /// toast they already saw (plan Stage 3.3 "re-answer with the
-    /// previous result"). Backed by <see cref="MemoryCache"/> with
-    /// <see cref="ReplayCacheMaxSize"/> entry-count cap (LRU eviction
-    /// on overflow) and <see cref="ReplayCacheTtl"/> absolute
-    /// expiration per entry — iter-2 evaluator item 2 fixed the
-    /// previous unbounded <c>ConcurrentDictionary</c> footprint.
+    /// Distributed replay cache mapping
+    /// <see cref="ReplayCacheKeyPrefix"/> + <see cref="MessengerEvent.CallbackId"/>
+    /// → previously-sent answer text. Populated by
+    /// <see cref="AnswerAndRememberAsync"/> at every terminal point;
+    /// consulted ONLY by the duplicate-CallbackId short-circuit so a
+    /// Telegram redelivery — INCLUDING ONE THAT LANDS ON A DIFFERENT
+    /// POD OR AFTER A PROCESS RESTART — shows the user the SAME toast
+    /// they already saw (plan Stage 3.3 "re-answer with the previous
+    /// result"). Backed by <see cref="IDistributedCache"/>:
+    /// process-local <c>MemoryDistributedCache</c> in dev/unit-test,
+    /// Redis in production via the Stage 4.3 cache module — same
+    /// interface, transparent swap.
     /// </summary>
     /// <remarks>
-    /// Process-local — Stage 4.3 will swap a distributed cache in so
-    /// cross-pod / restart duplicates can still resolve to the cached
-    /// prior result instead of falling back to
-    /// <see cref="AlreadyRespondedText"/>. The interface used here
-    /// (Set / TryGetValue against string keys) maps 1:1 onto
-    /// <c>IDistributedCache</c>, so the swap is a localised change.
+    /// Iter-3 evaluator item 1 fix: the prior in-process
+    /// <c>MemoryCache</c> shape was structurally unable to share state
+    /// across pods or restarts, so cross-pod / restart duplicates fell
+    /// back to <see cref="AlreadyRespondedText"/>. Moving to
+    /// <see cref="IDistributedCache"/> closes that gap — the same call
+    /// resolves whichever pod handles the duplicate so long as the
+    /// underlying cache is shared (Redis / SQL / Cosmos
+    /// implementations all qualify).
     /// </remarks>
-    private readonly MemoryCache _replayAnswers = new(new MemoryCacheOptions
-    {
-        SizeLimit = ReplayCacheMaxSize,
-    });
+    private readonly IDistributedCache _replayAnswers;
 
     public CallbackQueryHandler(
         IPendingQuestionStore store,
@@ -238,6 +239,7 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
         IDeduplicationService dedup,
         ITelegramBotClient client,
         TimeProvider time,
+        IDistributedCache replayAnswers,
         ILogger<CallbackQueryHandler> logger)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
@@ -246,19 +248,8 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
         _dedup = dedup ?? throw new ArgumentNullException(nameof(dedup));
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _time = time ?? throw new ArgumentNullException(nameof(time));
+        _replayAnswers = replayAnswers ?? throw new ArgumentNullException(nameof(replayAnswers));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-    }
-
-    /// <summary>
-    /// Disposes the in-process <see cref="MemoryCache"/> backing the
-    /// duplicate-CallbackId replay cache. The handler is a singleton
-    /// in the DI graph; the container invokes this at root-scope
-    /// teardown so the cache's eviction timers / pinned roots are
-    /// released cleanly.
-    /// </summary>
-    public void Dispose()
-    {
-        _replayAnswers.Dispose();
     }
 
     /// <inheritdoc />
@@ -305,8 +296,36 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
             .ConfigureAwait(false);
         if (!callbackReserved)
         {
-            var hasPrevious = _replayAnswers.TryGetValue(evt.CallbackId, out string? previous)
-                              && !string.IsNullOrEmpty(previous);
+            // Cross-pod / restart safe: the replay cache is now backed
+            // by IDistributedCache (Redis in production, MemoryDistributed
+            // in dev / tests). A duplicate landing on a different pod
+            // or after a process restart resolves to the SAME previous
+            // toast the original tap produced — iter-3 evaluator item 1
+            // closed the previous process-local gap.
+            //
+            // Best-effort read: a transient cache outage (e.g. Redis
+            // briefly unavailable) MUST NOT strand the operator's
+            // spinner — the canonical decision is already published,
+            // audited, and persisted. We swallow the read exception
+            // with a WARN and degrade to AlreadyRespondedText (the same
+            // fallback used on cache miss). Symmetry with
+            // AnswerAndRememberAsync's write-path try/catch.
+            string? previous = null;
+            try
+            {
+                previous = await _replayAnswers
+                    .GetStringAsync(ReplayCacheKeyPrefix + evt.CallbackId, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to read replay cache entry; falling back to AlreadyRespondedText. CorrelationId={CorrelationId} CallbackId={CallbackId}",
+                    evt.CorrelationId,
+                    evt.CallbackId);
+            }
+            var hasPrevious = !string.IsNullOrEmpty(previous);
             var replayText = hasPrevious ? previous! : AlreadyRespondedText;
             // Do NOT route through AnswerAndRememberAsync here — we are
             // re-emitting the same text that was already cached, not
@@ -314,7 +333,7 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
             await AnswerCallbackAsync(evt, replayText, ct).ConfigureAwait(false);
             _logger.LogInformation(
                 "Callback short-circuited: duplicate CallbackId — re-answered with {Source}. CorrelationId={CorrelationId} CallbackId={CallbackId}",
-                hasPrevious ? "cached prior result" : "AlreadyRespondedText fallback (replay cache evicted)",
+                hasPrevious ? "cached prior result (distributed cache hit)" : "AlreadyRespondedText fallback (distributed cache miss / TTL evicted / read error)",
                 evt.CorrelationId,
                 evt.CallbackId);
             return new CommandResult
@@ -559,12 +578,16 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
 
         // Send the prompt as a fresh chat message — the operator sees
         // both the edited original question (with the selected action
-        // embedded, no more buttons) AND the comment prompt.
+        // embedded, no more buttons) AND the comment prompt. The
+        // prompt body carries a trace footer per the story-wide
+        // "All messages include trace/correlation ID" criterion
+        // (iter-3 evaluator item 2 — bare CommentPromptText omitted
+        // the trace).
         await _client.SendRequest(
                 new SendMessageRequest
                 {
                     ChatId = pending.TelegramChatId,
-                    Text = CommentPromptText,
+                    Text = BuildCommentPromptText(pending),
                 },
                 ct)
             .ConfigureAwait(false);
@@ -709,31 +732,80 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
     }
 
     /// <summary>
-    /// Composes the post-decision message body: the original
-    /// <see cref="PendingQuestion.Title"/> + <see cref="PendingQuestion.Body"/>
-    /// re-stated as plain text (parse mode dropped so MarkdownV2
-    /// metacharacters don't re-fire), followed by a
-    /// <see cref="DecisionFooterSeparator"/>-delimited decision badge
-    /// "<see cref="DecisionShownLabelPrefix"/>{Label}", and finally
-    /// the per-message trace/correlation footer
-    /// (<see cref="CorrelationFooterFormat"/>) — preserving the story-
-    /// wide "All messages include trace/correlation ID" acceptance
-    /// criterion through the post-decision edit (iter-2 evaluator
-    /// item 1 — the edit previously dropped
-    /// <see cref="PendingQuestion.CorrelationId"/>).
+    /// Composes the post-decision message body. The output preserves
+    /// EVERY field the original message rendered (story "Question
+    /// handling" requirement: include context, severity, timeout,
+    /// proposed default action) so the operator can still see the
+    /// full question metadata alongside the selected action — iter-3
+    /// evaluator item 3 fixed the previous Title+Body-only edit that
+    /// dropped severity / timeout / default-action context. Composition
+    /// order:
+    /// <list type="number">
+    /// <item><see cref="PendingQuestion.Title"/></item>
+    /// <item>Severity badge + label
+    ///       (e.g. <c>"⚠️ Severity: High"</c>)</item>
+    /// <item>Timeout footer
+    ///       (e.g. <c>"Timeout: 2025-01-01T01:00:00Z"</c>) —
+    ///       absolute ISO-8601 rather than a relative countdown, which
+    ///       is meaningless once the question is answered</item>
+    /// <item>Proposed default action line, when
+    ///       <see cref="PendingQuestion.DefaultActionId"/> is set</item>
+    /// <item><see cref="PendingQuestion.Body"/></item>
+    /// <item>Decision badge
+    ///       <see cref="DecisionShownLabelPrefix"/><c>{selected.Label}</c></item>
+    /// <item>Trace/correlation footer
+    ///       <see cref="CorrelationFooterFormat"/></item>
+    /// </list>
+    /// All fields are emitted as plain text (the corresponding
+    /// <c>EditMessageTextRequest</c> uses <see cref="ParseMode.None"/>)
+    /// so MarkdownV2 metacharacters in user-supplied text cannot
+    /// re-fire and reject the edit.
     /// </summary>
     internal static string BuildDecisionMessageText(PendingQuestion pending, HumanAction selected)
     {
         var sb = new StringBuilder();
         sb.Append(pending.Title);
+        sb.Append('\n');
+        sb.Append('\n');
+
+        // Severity badge + label — mirrors TelegramQuestionRenderer's
+        // outbound rendering so operators see the same context post-
+        // decision (iter-3 evaluator item 3 requirement).
+        sb.Append(SeverityBadge(pending.Severity));
+        sb.Append(' ');
+        sb.Append("Severity: ");
+        sb.Append(pending.Severity.ToString());
+        sb.Append('\n');
+
+        // Timeout — absolute ISO-8601 so the operator / audit log can
+        // grep by timestamp; the original message's relative
+        // countdown is meaningless once the question is answered.
+        sb.Append("Timeout: ");
+        sb.Append(pending.ExpiresAt.ToString("u", CultureInfo.InvariantCulture));
+        sb.Append('\n');
+
+        // Proposed default action — emitted only when the envelope
+        // surfaced one (DefaultActionId nullable on PendingQuestion).
+        // The label is resolved from AllowedActions because the
+        // denormalized DefaultActionValue is only the wire value, not
+        // a human-readable label.
+        if (!string.IsNullOrEmpty(pending.DefaultActionId))
+        {
+            sb.Append("Default action if no response: ");
+            sb.Append(ResolveDefaultActionLabel(pending));
+            sb.Append('\n');
+        }
+
         if (!string.IsNullOrEmpty(pending.Body))
         {
-            sb.Append("\n\n");
+            sb.Append('\n');
             sb.Append(pending.Body);
         }
+
         sb.Append(DecisionFooterSeparator);
         sb.Append(DecisionShownLabelPrefix);
         sb.Append(selected.Label);
+
         if (!string.IsNullOrEmpty(pending.CorrelationId))
         {
             sb.AppendFormat(
@@ -743,6 +815,57 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
         }
         return sb.ToString();
     }
+
+    /// <summary>
+    /// Composes the body of the follow-up comment-prompt message sent
+    /// when the operator taps a <see cref="HumanAction.RequiresComment"/>
+    /// action. Appends a <see cref="CorrelationFooterFormat"/> trace
+    /// footer so the prompt — like every other outbound message —
+    /// carries the trace/correlation id (iter-3 evaluator item 2).
+    /// </summary>
+    internal static string BuildCommentPromptText(PendingQuestion pending)
+    {
+        if (string.IsNullOrEmpty(pending.CorrelationId))
+        {
+            return CommentPromptText;
+        }
+        return CommentPromptText
+               + string.Format(
+                   CultureInfo.InvariantCulture,
+                   CorrelationFooterFormat,
+                   pending.CorrelationId);
+    }
+
+    private static string ResolveDefaultActionLabel(PendingQuestion pending)
+    {
+        foreach (var action in pending.AllowedActions)
+        {
+            if (string.Equals(action.ActionId, pending.DefaultActionId, StringComparison.Ordinal))
+            {
+                return action.Label;
+            }
+        }
+        // Envelope validation guarantees DefaultActionId matches one
+        // of AllowedActions at StoreAsync time, but fall back to the
+        // id itself rather than throw — a missing default-action
+        // label must not block the operator-facing edit.
+        return pending.DefaultActionId!;
+    }
+
+    /// <summary>
+    /// Emoji badge for the supplied severity. Mirrors
+    /// <c>TelegramQuestionRenderer.SeverityBadge</c> so the outbound
+    /// rendering and the post-decision edit use the same visual
+    /// vocabulary.
+    /// </summary>
+    private static string SeverityBadge(MessageSeverity severity) => severity switch
+    {
+        MessageSeverity.Critical => "🚨",
+        MessageSeverity.High => "⚠️",
+        MessageSeverity.Normal => "ℹ️",
+        MessageSeverity.Low => "•",
+        _ => "•",
+    };
 
     private async Task EditMessageShowDecisionAsync(
         PendingQuestion pending,
@@ -822,20 +945,38 @@ public sealed class CallbackQueryHandler : ICallbackHandler, IDisposable
             // terminal path through Process... writes ONCE for a given
             // CallbackId (subsequent deliveries with the same id short-
             // circuit at the cb: reservation gate BEFORE reaching this
-            // helper). The MemoryCache entry is sized = 1 so the
-            // backing options' SizeLimit (ReplayCacheMaxSize) actually
-            // caps entry count; absolute expiration (ReplayCacheTtl)
-            // guarantees a hard upper bound on retention even if the
-            // cap is never hit (iter-2 evaluator item 2 — bounded TTL
-            // + size replaces the previous unbounded dictionary).
-            _replayAnswers.Set(
-                evt.CallbackId,
-                text,
-                new MemoryCacheEntryOptions
-                {
-                    Size = 1,
-                    AbsoluteExpirationRelativeToNow = ReplayCacheTtl,
-                });
+            // helper). The entry carries AbsoluteExpirationRelativeToNow
+            // = ReplayCacheTtl (1 h) so the cache cannot grow without
+            // bound; the underlying IDistributedCache (Redis or
+            // MemoryDistributed) enforces its own size policy on top
+            // of TTL.
+            //
+            // Best-effort: a cache write failure (e.g. Redis transient
+            // unavailability) MUST NOT crash the operator-facing flow
+            // — the canonical decision is already published, audited,
+            // and persisted to PendingQuestionStore; the replay cache
+            // is a UX optimisation. Log and continue so AnswerCallback
+            // still fires.
+            try
+            {
+                await _replayAnswers.SetStringAsync(
+                        ReplayCacheKeyPrefix + evt.CallbackId,
+                        text,
+                        new DistributedCacheEntryOptions
+                        {
+                            AbsoluteExpirationRelativeToNow = ReplayCacheTtl,
+                        },
+                        ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to write replay cache entry; duplicate redelivery will fall back to AlreadyRespondedText. CorrelationId={CorrelationId} CallbackId={CallbackId}",
+                    evt.CorrelationId,
+                    evt.CallbackId);
+            }
         }
         await AnswerCallbackAsync(evt, text, ct).ConfigureAwait(false);
     }

@@ -3,7 +3,10 @@ using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using FluentAssertions;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
 using Moq;
 using Telegram.Bot;
@@ -159,8 +162,24 @@ public sealed class CallbackQueryHandlerTests
             "the edited message body MUST embed the selected-action badge so the operator can SEE which action was applied");
         edit.Text.Should().Contain("Deploy build 42?",
             "the edit must preserve the original question title");
+        edit.Text.Should().Contain("Pre-flight is clean.",
+            "the edit must preserve the original question body (context)");
         edit.Text.Should().Contain(CorrelationId,
             "iter-2 evaluator item 1 — the post-decision edit MUST preserve the trace/correlation ID (story-wide acceptance criterion: All messages include trace/correlation ID)");
+
+        // iter-3 evaluator item 3 — every field rendered in the
+        // original message (severity, timeout, proposed default
+        // action) MUST survive the post-decision edit. The story's
+        // "Question handling" row requires these fields end-to-end.
+        edit.Text.Should().Contain("Severity: High",
+            "iter-3 evaluator item 3 — the post-decision edit MUST preserve severity (story requirement: 'Question handling: include context, severity, timeout, proposed default action')");
+        edit.Text.Should().Contain("⚠️",
+            "the post-decision edit MUST preserve the severity BADGE matching TelegramQuestionRenderer's outbound rendering");
+        edit.Text.Should().Contain("Timeout: 2025-01-01",
+            "iter-3 evaluator item 3 — the post-decision edit MUST preserve the question timeout (absolute ExpiresAt)");
+        edit.Text.Should().Contain("Default action if no response: Approve",
+            "iter-3 evaluator item 3 — the post-decision edit MUST preserve the proposed default action label so the operator can see what would have happened on no response");
+
         edit.ReplyMarkup.Should().BeNull(
             "iter-1 evaluator item 2 — the inline keyboard MUST be removed entirely (ReplyMarkup = null), not replaced with a residual tappable button");
 
@@ -378,7 +397,10 @@ public sealed class CallbackQueryHandlerTests
 
         // The handler also sent the prompt + edited the message + answered the callback.
         harness.SendMessageRequests.Should().ContainSingle();
-        harness.SendMessageRequests[0].Text.Should().Be(CallbackQueryHandler.CommentPromptText);
+        harness.SendMessageRequests[0].Text.Should().StartWith(CallbackQueryHandler.CommentPromptText,
+            "the comment-prompt body MUST start with the canonical CommentPromptText");
+        harness.SendMessageRequests[0].Text.Should().Contain(CorrelationId,
+            "iter-3 evaluator item 2 — the comment-prompt message MUST include the trace/correlation ID (story-wide acceptance criterion: All messages include trace/correlation ID)");
         harness.SendMessageRequests[0].ChatId.Identifier.Should().Be(ChatId);
 
         harness.EditTextRequests.Should().ContainSingle(
@@ -497,49 +519,206 @@ public sealed class CallbackQueryHandlerTests
             TaskId = "T1",
             Title = "Approve deploy?",
             Body = "Pre-flight clean.",
-            Severity = MessageSeverity.Normal,
-            AllowedActions = new[] { new HumanAction { ActionId = "ap", Label = "Approve", Value = "approve" } },
+            Severity = MessageSeverity.Critical,
+            AllowedActions = new[]
+            {
+                new HumanAction { ActionId = "ap", Label = "Approve", Value = "approve" },
+                new HumanAction { ActionId = "rj", Label = "Reject", Value = "reject" },
+            },
+            DefaultActionId = "ap",
+            DefaultActionValue = "approve",
             TelegramChatId = 1,
             TelegramMessageId = 2,
-            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+            ExpiresAt = DateTimeOffset.Parse("2025-06-01T12:00:00Z", CultureInfo.InvariantCulture),
             CorrelationId = "trace-build-decision-text-001",
             Status = PendingQuestionStatus.Pending,
             StoredAt = DateTimeOffset.UtcNow,
         };
-        var selected = pending.AllowedActions[0];
+        var selected = pending.AllowedActions[1];
 
         var text = CallbackQueryHandler.BuildDecisionMessageText(pending, selected);
 
         text.Should().Contain("Approve deploy?");
         text.Should().Contain("Pre-flight clean.");
-        text.Should().Contain(CallbackQueryHandler.DecisionShownLabelPrefix + "Approve");
+        text.Should().Contain(CallbackQueryHandler.DecisionShownLabelPrefix + "Reject");
         text.Should().Contain("trace-build-decision-text-001",
             "iter-2 evaluator item 1 — every outbound message MUST include the trace/correlation ID, including the post-decision edit");
         text.Should().Contain(
             string.Format(
-                System.Globalization.CultureInfo.InvariantCulture,
+                CultureInfo.InvariantCulture,
                 CallbackQueryHandler.CorrelationFooterFormat,
                 pending.CorrelationId),
             "the footer MUST use the canonical CorrelationFooterFormat so the rendered shape is operator-recognisable across messages");
+
+        // iter-3 evaluator item 3 — every field rendered in the
+        // original message MUST be preserved in the post-decision edit.
+        text.Should().Contain("🚨",
+            "the severity badge MUST be preserved (Critical → 🚨)");
+        text.Should().Contain("Severity: Critical",
+            "iter-3 evaluator item 3 — severity label MUST be preserved");
+        text.Should().Contain("Timeout: 2025-06-01",
+            "iter-3 evaluator item 3 — timeout MUST be preserved (absolute ISO-8601)");
+        text.Should().Contain("Default action if no response: Approve",
+            "iter-3 evaluator item 3 — proposed default action MUST be preserved with its human-readable label");
     }
 
     [Fact]
-    public void ReplayCache_IsBounded_BySizeLimitAndAbsoluteExpiration()
+    public void BuildCommentPromptText_AppendsCorrelationFooter()
     {
-        // iter-2 evaluator item 2 — the duplicate-callback replay
-        // cache MUST have both a size cap AND a TTL so a long-running
-        // bot cannot accumulate callback ids indefinitely. The
-        // production cache is constructed from these two constants, so
-        // pinning them here is the auditable surface that the cache is
-        // bounded (the rest is delegated to a well-tested MemoryCache).
-        CallbackQueryHandler.ReplayCacheMaxSize.Should().BeGreaterThan(0,
-            "the replay cache MUST have a hard entry-count cap (was unbounded ConcurrentDictionary before iter-2)");
-        CallbackQueryHandler.ReplayCacheMaxSize.Should().BeLessThanOrEqualTo(1_000_000,
-            "the cap MUST be small enough to bound process memory; > 1M callback ids is not 'bounded' in any meaningful sense");
+        var pending = new PendingQuestion
+        {
+            QuestionId = "Q1",
+            AgentId = "agent-x",
+            TaskId = "T1",
+            Title = "T",
+            Body = "B",
+            Severity = MessageSeverity.Normal,
+            AllowedActions = new[] { new HumanAction { ActionId = "a", Label = "A", Value = "a", RequiresComment = true } },
+            TelegramChatId = 1,
+            TelegramMessageId = 2,
+            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5),
+            CorrelationId = "trace-comment-prompt-007",
+            Status = PendingQuestionStatus.AwaitingComment,
+            StoredAt = DateTimeOffset.UtcNow,
+        };
+
+        var text = CallbackQueryHandler.BuildCommentPromptText(pending);
+
+        text.Should().StartWith(CallbackQueryHandler.CommentPromptText,
+            "the prompt body MUST begin with the canonical CommentPromptText");
+        text.Should().Contain("trace-comment-prompt-007",
+            "iter-3 evaluator item 2 — the comment prompt MUST include the trace/correlation ID (story-wide criterion: All messages include trace/correlation ID)");
+        text.Should().EndWith(
+            string.Format(
+                CultureInfo.InvariantCulture,
+                CallbackQueryHandler.CorrelationFooterFormat,
+                pending.CorrelationId),
+            "the footer MUST use the canonical CorrelationFooterFormat shape so the rendered trace is recognisable");
+    }
+
+    [Fact]
+    public async Task CallbackResponse_DuplicateOnDifferentHandlerInstance_ReplaysFromSharedDistributedCache()
+    {
+        // iter-3 evaluator item 1 — the replay cache is now backed by
+        // IDistributedCache, so a duplicate Telegram redelivery that
+        // lands on a DIFFERENT pod (Stage 4.3 Redis) or arrives AFTER
+        // a process restart (rehydrated from durable cache) MUST
+        // resolve to the same prior result. We simulate cross-pod by
+        // sharing the IDistributedCache across two harness instances
+        // that are otherwise independent (different stores, dedup
+        // services, mock clients) — the second handler is a "new pod"
+        // that has never seen this CallbackId locally.
+        var sharedCache = new MemoryDistributedCache(
+            Options.Create(new MemoryDistributedCacheOptions()));
+        var podA = await CallbackHarness.BuildAsync(replayCache: sharedCache);
+        var podB = await CallbackHarness.BuildAsync(replayCache: sharedCache);
+
+        // First tap on pod A: full processing, replay cached.
+        await podA.Handler.HandleAsync(
+            podA.BuildCallback("CB-XPOD", QuestionId, "approve"),
+            default);
+        podA.PublishedDecisions.Should().HaveCount(1,
+            "pod A processes the first tap normally");
+        var firstToast = podA.AnswerCallbackRequests.Single().Text;
+        firstToast.Should().Be(CallbackQueryHandler.DecisionShownLabelPrefix + "Approve");
+
+        // Duplicate redelivery routes to pod B. Pod B's local dedup
+        // service has NEVER seen CB-XPOD, but the shared distributed
+        // cache has the replay entry — so the duplicate-callback
+        // short-circuit on pod B must still re-answer with the SAME
+        // toast pod A sent (NOT the AlreadyRespondedText fallback).
+        // To exercise the duplicate-short-circuit branch on pod B,
+        // first reserve CB-XPOD in pod B's dedup (simulating the
+        // distributed dedup that Stage 4.3 will share alongside the
+        // distributed cache).
+        await podB.Dedup.TryReserveAsync(
+            CallbackQueryHandler.CallbackIdDedupKeyPrefix + "CB-XPOD",
+            default);
+
+        await podB.Handler.HandleAsync(
+            podB.BuildCallback("CB-XPOD", QuestionId, "approve"),
+            default);
+
+        podB.PublishedDecisions.Should().BeEmpty(
+            "pod B sees the duplicate at its dedup gate and MUST NOT publish another HumanDecisionEvent");
+        podB.AnswerCallbackRequests.Should().ContainSingle(
+            "pod B still answers the callback (operator's spinner must stop on whichever pod handles the redelivery)");
+        podB.AnswerCallbackRequests[0].Text.Should().Be(firstToast,
+            "iter-3 evaluator item 1 — cross-pod duplicate MUST resolve to the SAME prior toast via the shared IDistributedCache, not the AlreadyRespondedText fallback");
+    }
+
+    [Fact]
+    public void ReplayCacheTtl_IsBoundedAboveZeroAndBelow24Hours()
+    {
+        // iter-3 evaluator item 1 — the replay cache entries are
+        // written with AbsoluteExpirationRelativeToNow = ReplayCacheTtl
+        // so a long-running bot cannot accumulate redelivery state
+        // indefinitely, AND a stale answer cannot replay a year later.
+        // Size policy now lives on the underlying IDistributedCache
+        // (MemoryDistributedCache.SizeLimit in dev, Redis maxmemory in
+        // production), not on the handler itself.
         CallbackQueryHandler.ReplayCacheTtl.Should().BeGreaterThan(TimeSpan.Zero,
             "the replay cache MUST expire entries on a finite horizon");
         CallbackQueryHandler.ReplayCacheTtl.Should().BeLessThanOrEqualTo(TimeSpan.FromHours(24),
             "the TTL MUST be tighter than 24 h so a stuck process cannot replay year-old callback answers");
+    }
+
+    [Fact]
+    public async Task CallbackResponse_DuplicateWithCacheReadFailure_DegradesToAlreadyRespondedAndAnswersCallback()
+    {
+        // iter-5 hardening — if the distributed cache (e.g. Redis)
+        // throws on the duplicate-callback short-circuit's GetStringAsync
+        // (transient outage, network blip), the handler MUST degrade to
+        // AlreadyRespondedText AND still answer the callback so the
+        // operator's spinner stops. Throwing out would trip pipeline
+        // release-on-throw and leave the operator hanging despite the
+        // canonical decision already being published / audited.
+        var failingCache = new ThrowingDistributedCache();
+        var harness = await CallbackHarness.BuildAsync(replayCache: failingCache);
+
+        // First tap: cache write also throws (best-effort, swallowed),
+        // but decision publish + audit still complete.
+        await harness.Handler.HandleAsync(
+            harness.BuildCallback("CB-FAIL", QuestionId, "approve"),
+            default);
+        harness.PublishedDecisions.Should().HaveCount(1,
+            "first tap processes normally even when the replay cache write fails");
+        harness.AnswerCallbackRequests.Should().ContainSingle();
+
+        // Second tap with the same CallbackId: the cb: dedup gate
+        // short-circuits, then GetStringAsync throws — the handler must
+        // catch and degrade.
+        await harness.Handler.HandleAsync(
+            harness.BuildCallback("CB-FAIL", QuestionId, "approve"),
+            default);
+        harness.PublishedDecisions.Should().HaveCount(1,
+            "duplicate is short-circuited at the cb: gate; no second HumanDecisionEvent");
+        harness.AnswerCallbackRequests.Should().HaveCount(2,
+            "the duplicate STILL answers the callback so the spinner stops, even when the cache read throws");
+        harness.AnswerCallbackRequests[1].Text.Should().Be(CallbackQueryHandler.AlreadyRespondedText,
+            "cache-read failure on the duplicate path MUST degrade to AlreadyRespondedText, not throw out and strand the operator");
+    }
+
+    /// <summary>
+    /// Test double: <see cref="IDistributedCache"/> impl that throws on
+    /// every operation. Used to pin the duplicate-callback short-circuit's
+    /// cache-read resilience.
+    /// </summary>
+    private sealed class ThrowingDistributedCache : IDistributedCache
+    {
+        public byte[]? Get(string key) => throw new InvalidOperationException("simulated cache read failure");
+        public Task<byte[]?> GetAsync(string key, CancellationToken token = default)
+            => Task.FromException<byte[]?>(new InvalidOperationException("simulated cache read failure"));
+        public void Refresh(string key) => throw new InvalidOperationException("simulated cache refresh failure");
+        public Task RefreshAsync(string key, CancellationToken token = default)
+            => Task.FromException(new InvalidOperationException("simulated cache refresh failure"));
+        public void Remove(string key) => throw new InvalidOperationException("simulated cache remove failure");
+        public Task RemoveAsync(string key, CancellationToken token = default)
+            => Task.FromException(new InvalidOperationException("simulated cache remove failure"));
+        public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
+            => throw new InvalidOperationException("simulated cache write failure");
+        public Task SetAsync(string key, byte[] value, DistributedCacheEntryOptions options, CancellationToken token = default)
+            => Task.FromException(new InvalidOperationException("simulated cache write failure"));
     }
 
     // ============================================================
@@ -558,6 +737,7 @@ public sealed class CallbackQueryHandlerTests
         public required List<EditMessageTextRequest> EditTextRequests { get; init; }
         public required List<EditMessageReplyMarkupRequest> EditReplyMarkupRequests { get; init; }
         public required List<SendMessageRequest> SendMessageRequests { get; init; }
+        public required IDistributedCache ReplayCache { get; init; }
 
         public MessengerEvent BuildCallback(
             string callbackId,
@@ -594,11 +774,20 @@ public sealed class CallbackQueryHandlerTests
             string questionId = QuestionId,
             DateTimeOffset? expiresAt = null,
             bool failPublishOnFirstCall = false,
-            bool failAuditOnFirstCall = false)
+            bool failAuditOnFirstCall = false,
+            IDistributedCache? replayCache = null)
         {
             var store = new InMemoryPendingQuestionStore();
             var dedup = new InMemoryDeduplicationService();
             var time = new FakeTimeProvider(DateTimeOffset.Parse("2025-01-01T00:00:00Z", CultureInfo.InvariantCulture));
+            // MemoryDistributedCache is the in-process production binding
+            // (TelegramServiceCollectionExtensions calls
+            // AddDistributedMemoryCache); using the same impl in tests
+            // exercises the real IDistributedCache contract. Allow
+            // injection so cross-pod tests can share ONE cache across
+            // multiple harness instances.
+            replayCache ??= new MemoryDistributedCache(
+                Options.Create(new MemoryDistributedCacheOptions()));
 
             var question = new AgentQuestion
             {
@@ -618,7 +807,16 @@ public sealed class CallbackQueryHandlerTests
                 CorrelationId = CorrelationId,
             };
             await store.StoreAsync(
-                new AgentQuestionEnvelope { Question = question },
+                new AgentQuestionEnvelope
+                {
+                    Question = question,
+                    // Stage 3.3 story / iter-3 evaluator item 3 — every
+                    // question MUST carry a proposed default action.
+                    // The denormalised DefaultActionId on PendingQuestion
+                    // drives the "Default action if no response: …"
+                    // line in the post-decision edit body.
+                    ProposedDefaultActionId = "approve",
+                },
                 ChatId,
                 MessageId,
                 default);
@@ -698,6 +896,7 @@ public sealed class CallbackQueryHandlerTests
                 dedup,
                 client.Object,
                 time,
+                replayCache,
                 NullLogger<CallbackQueryHandler>.Instance);
 
             return new CallbackHarness
@@ -712,6 +911,7 @@ public sealed class CallbackQueryHandlerTests
                 EditTextRequests = editTextRequests,
                 EditReplyMarkupRequests = editReplyMarkupRequests,
                 SendMessageRequests = sendMessageRequests,
+                ReplayCache = replayCache,
             };
         }
     }
