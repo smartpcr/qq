@@ -51,6 +51,19 @@ using Microsoft.Extensions.Options;
 /// a single loop is sufficient for the brief's "10 outbound
 /// messages queued for the same channel" scenario.
 /// </para>
+/// <para>
+/// Retry-budget accounting (Stage 6.3 reviewer iter-2 item #1,
+/// FR-005 / FR-007 zero-message-loss): rate-limited (HTTP 429)
+/// iterations are tracked in a *separate* counter from the
+/// configured <c>MaxAttempts</c> budget. Slack explicitly asks us
+/// to retry via the <c>Retry-After</c> header and the rate limiter
+/// already pauses the bucket for that window, so back-pressure
+/// alone must never exhaust the retry budget reserved for genuine
+/// transient/permanent failures. A separate, generously sized
+/// circuit-breaker guards against a pathological 429 storm (e.g.,
+/// a misconfigured scope Slack would never accept) so the loop is
+/// still bounded.
+/// </para>
 /// </remarks>
 internal sealed class SlackOutboundDispatcher : BackgroundService
 {
@@ -90,6 +103,21 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
     /// FR-005 / FR-007's zero-message-loss constraint.
     /// </summary>
     public const string OutcomeDeadLetterFailed = "dead_letter_failed";
+
+    /// <summary>
+    /// Circuit-breaker bound for consecutive HTTP 429 iterations.
+    /// Sized far above the typical <c>MaxAttempts</c> budget so
+    /// back-pressure cannot exhaust the retry budget reserved for
+    /// genuine transient/permanent failures (FR-005 / FR-007), while
+    /// still preventing an unbounded loop in pathological cases
+    /// (e.g., a misconfigured scope Slack persistently throttles).
+    /// The cancellation token always provides the hard escape on
+    /// connector shutdown; this bound only matters in steady-state
+    /// misconfiguration scenarios. A future iteration may surface
+    /// this as a configurable option on <see cref="SlackRetryOptions"/>
+    /// if operators need to tune it.
+    /// </summary>
+    internal const int MaxRateLimitedIterations = 50;
 
     private readonly ISlackOutboundQueue queue;
     private readonly ISlackThreadManager threadManager;
@@ -317,10 +345,27 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
         Exception? lastException = null;
         SlackOutboundDispatchResult lastResult = default;
         string lastReason = "exhausted";
+        int attempt = 0;
         int actualAttempts = 0;
 
-        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        // Stage 6.3 reviewer iter-2 item #1 (FR-005 / FR-007
+        // zero-message-loss): genuine failure attempts (client
+        // exceptions, TransientFailure, PermanentFailure,
+        // MissingConfiguration) consume the configured `maxAttempts`
+        // budget via `retryBudgetUsed`. HTTP 429 RateLimited
+        // iterations DO NOT consume this budget -- Slack explicitly
+        // asked us to retry and the rate limiter already paused the
+        // bucket for the Retry-After window, so the next
+        // AcquireAsync naturally waits. A separate
+        // `rateLimitedIterations` counter is bounded by
+        // MaxRateLimitedIterations purely as a circuit-breaker for
+        // pathological 429 storms (e.g., misconfigured scopes).
+        int retryBudgetUsed = 0;
+        int rateLimitedIterations = 0;
+
+        while (!ct.IsCancellationRequested)
         {
+            attempt++;
             actualAttempts = attempt;
             await this.rateLimiter.AcquireAsync(tier, scopeKey, ct).ConfigureAwait(false);
 
@@ -345,6 +390,7 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
             }
             catch (Exception ex)
             {
+                retryBudgetUsed++;
                 lastException = ex;
                 lastReason = $"client_exception:{ex.GetType().Name}";
                 firstFailedAt ??= this.timeProvider.GetUtcNow();
@@ -359,12 +405,13 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
                     messageTs: null,
                     ct).ConfigureAwait(false);
 
-                if (!this.retryPolicy.ShouldRetry(attempt, ex))
+                if (!this.retryPolicy.ShouldRetry(retryBudgetUsed, ex)
+                    || retryBudgetUsed >= maxAttempts)
                 {
                     break;
                 }
 
-                TimeSpan delay = this.retryPolicy.GetDelay(attempt);
+                TimeSpan delay = this.retryPolicy.GetDelay(retryBudgetUsed);
                 if (delay > TimeSpan.Zero)
                 {
                     await Task.Delay(delay, this.timeProvider, ct).ConfigureAwait(false);
@@ -390,6 +437,7 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
                     return;
 
                 case SlackOutboundDispatchOutcome.RateLimited:
+                    rateLimitedIterations++;
                     TimeSpan pause = result.RetryAfter ?? TimeSpan.FromSeconds(1);
                     this.rateLimiter.NotifyRetryAfter(tier, scopeKey, pause);
                     firstFailedAt ??= this.timeProvider.GetUtcNow();
@@ -405,8 +453,27 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
                         messageTs: null,
                         ct).ConfigureAwait(false);
 
-                    if (attempt >= maxAttempts)
+                    // FR-005 / FR-007: rate-limited iterations do NOT
+                    // consume the `maxAttempts` retry budget. The
+                    // circuit-breaker below caps the loop only in
+                    // pathological 429-storm scenarios so a transient
+                    // burst cannot dead-letter a message Slack asked
+                    // us to retry. When this bound is hit the
+                    // envelope IS dead-lettered with a distinct
+                    // `rate_limited_circuit_breaker_*` reason so
+                    // operators can triage the misconfiguration
+                    // separately from genuine transient/permanent
+                    // failures.
+                    if (rateLimitedIterations >= MaxRateLimitedIterations)
                     {
+                        lastReason = $"rate_limited_circuit_breaker_after_{rateLimitedIterations}_iterations";
+                        this.logger.LogError(
+                            "SlackOutboundDispatcher hit rate-limit circuit breaker task_id={TaskId} correlation_id={CorrelationId} tier={Tier} scope={ScopeKey} consecutive_429s={Count} -- dead-lettering for operator triage; check rate-limit config / Slack workspace scopes.",
+                            envelope.TaskId,
+                            envelope.CorrelationId,
+                            tier,
+                            scopeKey,
+                            rateLimitedIterations);
                         goto exhausted;
                     }
 
@@ -417,6 +484,7 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
                     continue;
 
                 case SlackOutboundDispatchOutcome.TransientFailure:
+                    retryBudgetUsed++;
                     firstFailedAt ??= this.timeProvider.GetUtcNow();
                     lastReason = $"transient:{result.SlackError ?? "unknown"}";
                     await this.WriteAuditAsync(
@@ -430,12 +498,13 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
                         messageTs: null,
                         ct).ConfigureAwait(false);
 
-                    if (!this.retryPolicy.ShouldRetry(attempt, new TransientSlackApiException(lastReason)))
+                    if (!this.retryPolicy.ShouldRetry(retryBudgetUsed, new TransientSlackApiException(lastReason))
+                        || retryBudgetUsed >= maxAttempts)
                     {
                         goto exhausted;
                     }
 
-                    TimeSpan tdelay = this.retryPolicy.GetDelay(attempt);
+                    TimeSpan tdelay = this.retryPolicy.GetDelay(retryBudgetUsed);
                     if (tdelay > TimeSpan.Zero)
                     {
                         await Task.Delay(tdelay, this.timeProvider, ct).ConfigureAwait(false);
@@ -475,13 +544,25 @@ internal sealed class SlackOutboundDispatcher : BackgroundService
             }
         }
 
+        // Reached only if `ct` was cancelled between iterations
+        // (mid-iteration cancellation surfaces as OCE from the
+        // awaits above). Surface it so the outer ExecuteAsync loop
+        // observes a cancellation -- which leaves the envelope
+        // un-acked for durable replay -- instead of falling through
+        // to the dead-letter path.
+        ct.ThrowIfCancellationRequested();
+
 exhausted:
         // Stage 6.3 evaluator iter-1 item #5: record the *actual*
         // number of attempts made (1 for a single PermanentFailure or
         // MissingConfiguration), not the configured ceiling. The DLQ
         // / audit row's AttemptCount is operator-facing triage data;
         // an inflated count masks "we gave up immediately" from
-        // "we exhausted the budget".
+        // "we exhausted the budget". `actualAttempts` includes both
+        // genuine-failure and rate-limited iterations so an operator
+        // triaging the DLQ row sees the full effort spent on the
+        // envelope; the per-attempt audit rows distinguish the
+        // outcomes.
         await this.DeadLetterAsync(
             envelope,
             mapping,
