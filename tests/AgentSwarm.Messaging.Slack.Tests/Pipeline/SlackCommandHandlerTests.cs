@@ -511,6 +511,12 @@ public sealed class SlackCommandHandlerTests
             this.LastCommentContext = context;
             return new { type = "modal", callback_id = SlackInteractionEncoding.CommentCallbackId, question_id = context.QuestionId };
         }
+
+        public object RenderQuestion(AgentSwarm.Messaging.Abstractions.AgentQuestion question)
+            => new { type = "question", question_id = question.QuestionId };
+
+        public object RenderMessage(AgentSwarm.Messaging.Abstractions.MessengerMessage message)
+            => new { type = "message", message_id = message.MessageId };
     }
 
     private static SlackInboundEnvelope BuildCommandEnvelope(

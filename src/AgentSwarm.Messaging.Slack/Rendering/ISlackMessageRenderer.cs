@@ -6,6 +6,7 @@
 
 namespace AgentSwarm.Messaging.Slack.Rendering;
 
+using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Slack.Transport;
 
 /// <summary>
@@ -67,6 +68,44 @@ internal interface ISlackMessageRenderer
     /// <c>Comment</c> is read from the text input.
     /// </summary>
     object RenderCommentModal(SlackCommentModalContext context);
+
+    /// <summary>
+    /// Stage 6.1: renders an <see cref="AgentQuestion"/> into a
+    /// Block Kit message payload (suitable for
+    /// <c>chat.postMessage</c>). Architecture.md §2.10 / §5.2 pins the
+    /// shape:
+    /// <list type="bullet">
+    ///   <item><description><c>Title</c> -> <c>header</c> block (with
+    ///   severity emoji prefix).</description></item>
+    ///   <item><description><c>Body</c> -> <c>section</c> block with
+    ///   <c>mrkdwn</c> text (truncated at 3000 characters).</description></item>
+    ///   <item><description><c>AllowedActions</c> -> <c>actions</c>
+    ///   block(s) with one <c>button</c> per
+    ///   <see cref="HumanAction"/>. The block's <c>block_id</c>
+    ///   carries the <see cref="AgentQuestion.QuestionId"/> via
+    ///   <see cref="SlackInteractionEncoding"/>; each button's
+    ///   <c>value</c> equals <see cref="HumanAction.Value"/> so the
+    ///   Stage 5.3 <see cref="Pipeline.SlackInteractionHandler"/> can
+    ///   reconstruct the originating action.</description></item>
+    ///   <item><description><c>ExpiresAt</c> -> <c>context</c> block
+    ///   showing the deadline.</description></item>
+    /// </list>
+    /// The whole block list is wrapped in a single legacy
+    /// <c>attachments</c> element whose <c>color</c> renders the
+    /// severity-driven sidebar.
+    /// </summary>
+    /// <param name="question">The agent question to render.</param>
+    object RenderQuestion(AgentQuestion question);
+
+    /// <summary>
+    /// Stage 6.1: renders a <see cref="MessengerMessage"/> into a
+    /// Block Kit message payload. <see cref="MessageType"/> drives the
+    /// emoji prefix and color sidebar (status update / completion /
+    /// error). <see cref="MessengerMessage.Content"/> is truncated at
+    /// 3000 characters with an ellipsis indicator.
+    /// </summary>
+    /// <param name="message">The agent-produced outbound message.</param>
+    object RenderMessage(MessengerMessage message);
 }
 
 /// <summary>

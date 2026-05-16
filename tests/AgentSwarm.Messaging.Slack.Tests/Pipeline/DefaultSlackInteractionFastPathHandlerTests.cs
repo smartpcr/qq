@@ -1011,6 +1011,12 @@ public sealed class DefaultSlackInteractionFastPathHandlerTests
             this.LastContext = context;
             return new { type = "modal", callback_id = "agent_comment_modal" };
         }
+
+        public object RenderQuestion(AgentSwarm.Messaging.Abstractions.AgentQuestion question)
+            => new { type = "question", question_id = question.QuestionId };
+
+        public object RenderMessage(AgentSwarm.Messaging.Abstractions.MessengerMessage message)
+            => new { type = "message", message_id = message.MessageId };
     }
 
     private sealed class RecordingThreadMappingLookup : ISlackThreadMappingLookup

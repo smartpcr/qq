@@ -528,6 +528,12 @@ public sealed class SlackAppMentionHandlerTests
 
         public object RenderCommentModal(SlackCommentModalContext context)
             => new { type = "modal", question_id = context.QuestionId };
+
+        public object RenderQuestion(AgentSwarm.Messaging.Abstractions.AgentQuestion question)
+            => new { type = "question", question_id = question.QuestionId };
+
+        public object RenderMessage(AgentSwarm.Messaging.Abstractions.MessengerMessage message)
+            => new { type = "message", message_id = message.MessageId };
     }
 
     private sealed class RecordingThreadedReplyPoster : ISlackThreadedReplyPoster
