@@ -183,25 +183,26 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ArgumentNullException.ThrowIfNull(message);
 
         // Stage 5.2 — every proactive send emits exactly one ProactiveNotification audit
-        // entry per tech-spec.md §4.3. The emit happens in `finally` so the trail is
-        // durable on Success, Failed (BotFramework throws / reference missing), and
-        // Rejected (install-state gate). The audit helper does NOT swallow its own
-        // exceptions — durable audit emission is a hard compliance requirement, so an
-        // audit-store outage MUST surface to the outbox dispatcher for retry rather
-        // than be silently logged. See the `LogProactiveNotificationAsync` XML doc and
-        // implementation comment for the rationale; see iter-1 evaluator item 7 for
-        // the explicit rejection of silent loss. Note: in the current `try{...}catch
-        // {throw;}finally{await audit}` shape an audit-store failure raised from
-        // `finally` will replace any in-flight send exception — a separate caller-side
-        // restructuring (ExceptionDispatchInfo + AggregateException, modeled on
-        // TeamsSwarmActivityHandler.OnMessageActivityAsync) is required to preserve
-        // both. That restructuring is tracked in the companion review comment and
-        // landed by the partner fix; this method's contract is unchanged: do not
-        // swallow audit failures.
+        // entry per tech-spec.md §4.3. Stage 5.2 iter-r0 (review comment at line 544):
+        // the audit emit MUST run AFTER the send try/catch — NOT from a `finally` block —
+        // because LogProactiveNotificationAsync deliberately does NOT swallow audit-store
+        // failures (durability contract), and a throw from `finally` would replace the
+        // original send exception per the CLR's exception-replacement semantics. We
+        // capture the send failure via ExceptionDispatchInfo and surface both root causes
+        // through AggregateException when audit ALSO fails, mirroring the proven
+        // dual-failure pattern in TeamsSwarmActivityHandler.OnMessageActivityAsync.
+        // Branch summary (matches the activity handler):
+        //   * send OK,    audit OK    → no exception (Success audit row landed).
+        //   * send fails, audit OK    → send exception re-thrown via ExceptionDispatchInfo.Throw()
+        //                               with the original stack preserved.
+        //   * send OK,    audit fails → audit exception propagates uncaught (`when` filter false).
+        //                               Outbox retries; idempotent audit emit eventually lands.
+        //   * send fails, audit fails → AggregateException(send, audit) thrown.
+        //                               Both root causes carried in InnerExceptions.
         var auditTimestamp = _timeProvider.GetUtcNow();
         var outcome = AuditOutcomes.Success;
         var gateRejected = false;
-        Exception? capturedException = null;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? capturedSendFailure = null;
         try
         {
             // Stage 5.1 iter-5 evaluator feedback item 1 — STRUCTURAL fix. The install-state
@@ -264,11 +265,11 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         }
         catch (Exception ex)
         {
-            capturedException = ex;
             outcome = gateRejected ? AuditOutcomes.Rejected : AuditOutcomes.Failed;
-            throw;
+            capturedSendFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
         }
-        finally
+
+        try
         {
             await LogProactiveNotificationAsync(
                 action: "send_message",
@@ -277,11 +278,26 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
                 taskId: message.TaskId,
                 conversationId: message.ConversationId,
                 correlationId: message.CorrelationId ?? string.Empty,
-                payloadJson: BuildSendMessagePayload(message, targetUserId: userId, targetChannelId: null, capturedException),
+                payloadJson: BuildSendMessagePayload(message, targetUserId: userId, targetChannelId: null, capturedSendFailure?.SourceException),
                 outcome: outcome,
                 timestamp: auditTimestamp,
                 ct: ct).ConfigureAwait(false);
         }
+        catch (Exception auditEx) when (capturedSendFailure is not null)
+        {
+            _logger.LogError(
+                auditEx,
+                "ProactiveNotification audit emit failed AFTER proactive MessengerMessage send failure to user {InternalUserId} in tenant {TenantId} (correlation {CorrelationId}); surfacing AggregateException carrying BOTH root causes so the outbox sees the dispatch failure and the missing audit row.",
+                userId,
+                tenantId,
+                message.CorrelationId);
+            throw new AggregateException(
+                $"Proactive MessengerMessage send to user '{userId}' in tenant '{tenantId}' failed AND ProactiveNotification audit-row persistence failed (correlation {message.CorrelationId}). Both root causes are carried in InnerExceptions; the outbox should retry so the idempotent audit row can eventually land.",
+                capturedSendFailure.SourceException,
+                auditEx);
+        }
+
+        capturedSendFailure?.Throw();
     }
 
     /// <inheritdoc />
@@ -319,11 +335,12 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(message);
 
-        // Stage 5.2 — see SendProactiveAsync above for the audit-emission contract.
+        // Stage 5.2 — see SendProactiveAsync above for the full dual-failure contract;
+        // identical capture/rethrow/AggregateException shape applies here.
         var auditTimestamp = _timeProvider.GetUtcNow();
         var outcome = AuditOutcomes.Success;
         var gateRejected = false;
-        Exception? capturedException = null;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? capturedSendFailure = null;
         try
         {
             // Stage 5.1 iter-5 evaluator feedback item 1 — gate BEFORE the active-only
@@ -380,11 +397,11 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         }
         catch (Exception ex)
         {
-            capturedException = ex;
             outcome = gateRejected ? AuditOutcomes.Rejected : AuditOutcomes.Failed;
-            throw;
+            capturedSendFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
         }
-        finally
+
+        try
         {
             await LogProactiveNotificationAsync(
                 action: "send_message",
@@ -393,11 +410,26 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
                 taskId: message.TaskId,
                 conversationId: message.ConversationId,
                 correlationId: message.CorrelationId ?? string.Empty,
-                payloadJson: BuildSendMessagePayload(message, targetUserId: null, targetChannelId: channelId, capturedException),
+                payloadJson: BuildSendMessagePayload(message, targetUserId: null, targetChannelId: channelId, capturedSendFailure?.SourceException),
                 outcome: outcome,
                 timestamp: auditTimestamp,
                 ct: ct).ConfigureAwait(false);
         }
+        catch (Exception auditEx) when (capturedSendFailure is not null)
+        {
+            _logger.LogError(
+                auditEx,
+                "ProactiveNotification audit emit failed AFTER proactive MessengerMessage send failure to channel {ChannelId} in tenant {TenantId} (correlation {CorrelationId}); surfacing AggregateException carrying BOTH root causes so the outbox sees the dispatch failure and the missing audit row.",
+                channelId,
+                tenantId,
+                message.CorrelationId);
+            throw new AggregateException(
+                $"Proactive MessengerMessage send to channel '{channelId}' in tenant '{tenantId}' failed AND ProactiveNotification audit-row persistence failed (correlation {message.CorrelationId}). Both root causes are carried in InnerExceptions; the outbox should retry so the idempotent audit row can eventually land.",
+                capturedSendFailure.SourceException,
+                auditEx);
+        }
+
+        capturedSendFailure?.Throw();
     }
 
     /// <inheritdoc />
@@ -492,15 +524,23 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         }
 
         // Stage 5.2 — every question delivery (Success / Failed / Rejected) emits one
-        // ProactiveNotification audit row per tech-spec.md §4.3. The emit happens in
-        // `finally` so the trail is durable regardless of how the send terminated.
+        // ProactiveNotification audit row per tech-spec.md §4.3. Stage 5.2 iter-r0
+        // (review comment at line 544): the audit emit runs AFTER the send try/catch
+        // (NOT from `finally`) because LogProactiveNotificationAsync does NOT swallow
+        // audit-store failures, and a throw-from-finally would replace the original
+        // send exception via the CLR's exception-replacement semantics. The send
+        // failure is captured via ExceptionDispatchInfo so it can be re-thrown with
+        // the original stack OR combined with the audit failure into an
+        // AggregateException — same dual-failure pattern as
+        // TeamsSwarmActivityHandler.OnMessageActivityAsync (see comment there for the
+        // full branch matrix).
         var auditTimestamp = _timeProvider.GetUtcNow();
         var outcome = AuditOutcomes.Success;
         var gateRejected = false;
         string? deliveredActivityId = null;
         string? deliveredConversationId = null;
         string? deliveredReferenceJson = null;
-        Exception? capturedException = null;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? capturedSendFailure = null;
         try
         {
             // Step 1b (iter-4 evaluator feedback #1 — duplicate-PK protection).
@@ -681,11 +721,11 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         }
         catch (Exception ex)
         {
-            capturedException = ex;
             outcome = gateRejected ? AuditOutcomes.Rejected : AuditOutcomes.Failed;
-            throw;
+            capturedSendFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
         }
-        finally
+
+        try
         {
             await LogProactiveNotificationAsync(
                 action: "send_card",
@@ -694,11 +734,27 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
                 taskId: question.TaskId,
                 conversationId: deliveredConversationId ?? question.ConversationId,
                 correlationId: question.CorrelationId ?? string.Empty,
-                payloadJson: BuildSendCardPayload(question, deliveredActivityId, capturedException),
+                payloadJson: BuildSendCardPayload(question, deliveredActivityId, capturedSendFailure?.SourceException),
                 outcome: outcome,
                 timestamp: auditTimestamp,
                 ct: ct).ConfigureAwait(false);
         }
+        catch (Exception auditEx) when (capturedSendFailure is not null)
+        {
+            _logger.LogError(
+                auditEx,
+                "ProactiveNotification audit emit failed AFTER proactive AgentQuestion {QuestionId} send failure to {Target} in tenant {TenantId} (correlation {CorrelationId}); surfacing AggregateException carrying BOTH root causes so the outbox sees the dispatch failure and the missing audit row.",
+                question.QuestionId,
+                targetDescription,
+                tenantId,
+                question.CorrelationId);
+            throw new AggregateException(
+                $"Proactive AgentQuestion '{question.QuestionId}' send to {targetDescription} in tenant '{tenantId}' failed AND ProactiveNotification audit-row persistence failed (correlation {question.CorrelationId}). Both root causes are carried in InnerExceptions; the outbox should retry so the idempotent audit row can eventually land.",
+                capturedSendFailure.SourceException,
+                auditEx);
+        }
+
+        capturedSendFailure?.Throw();
     }
 
     private static void ValidateRequiredArgument(string value, string paramName)
@@ -966,38 +1022,34 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
 
     /// <summary>
     /// Emit a single <see cref="AuditEventTypes.ProactiveNotification"/> row to
-    /// <see cref="IAuditLogger"/> per tech-spec.md §4.3. Called from the send paths
+    /// <see cref="IAuditLogger"/> per tech-spec.md §4.3. Called from all three send paths
     /// (<see cref="SendProactiveAsync"/>, <see cref="SendToChannelAsync"/>,
-    /// <see cref="SendQuestionCoreAsync"/>) so the audit trail is durable regardless of
-    /// whether the send succeeded, was rejected by <see cref="InstallationStateGate"/>,
-    /// or threw at the Bot Framework layer.
+    /// <see cref="SendQuestionCoreAsync"/>) AFTER the send try/catch (NOT from a
+    /// <c>finally</c> block) so an audit-emit failure cannot replace the original send
+    /// exception via the CLR's throw-from-finally semantics. The audit trail is durable
+    /// regardless of whether the send succeeded, was rejected by
+    /// <see cref="InstallationStateGate"/>, or threw at the Bot Framework layer.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Does NOT swallow <see cref="IAuditLogger"/> exceptions.</b> Durable audit
-    /// emission is a hard compliance requirement of this workstream ("Persist immutable
-    /// audit trail suitable for enterprise review"); silently logging-and-continuing on
-    /// an audit-store outage would lose the audit row for a notification that already
-    /// went out at the Bot Framework layer. Instead, any failure from
-    /// <see cref="IAuditLogger.LogAsync"/> is rethrown so the outbox dispatcher sees it
-    /// and retries; same-correlation-id idempotency in the outbox guarantees the user
-    /// will not receive a duplicate notification on the retry attempt. This decision
-    /// reverses the iter-1 design — iter-1 evaluator item 7 explicitly rejected silent
-    /// audit loss even with a logged warning.
+    /// Does NOT swallow <see cref="IAuditLogger"/> exceptions. Audit durability is a
+    /// hard compliance requirement — the workstream's "Persist immutable audit trail
+    /// suitable for enterprise review" contract demands that every outbound notification
+    /// land an <see cref="AuditEntry"/> row, and silently logging-and-discarding an
+    /// audit-store outage would make the gap invisible (this design choice was driven by
+    /// iter-1 evaluator item 7 which explicitly rejected silent loss of audit rows even
+    /// with a logged warning).
     /// </para>
     /// <para>
-    /// <b>Caller contract — preserving the in-flight send exception.</b> Because this
-    /// method may throw, awaiting it from a bare <c>finally</c> block on a send path
-    /// that is already propagating a Bot Framework exception will cause the CLR to
-    /// replace the original send failure with the audit failure (lost-exception bug).
-    /// Callers that emit audit from a failure path MUST capture the send exception via
-    /// <see cref="System.Runtime.ExceptionServices.ExceptionDispatchInfo"/>, invoke this
-    /// helper in a separate <c>try/catch</c>, and either rethrow the captured send
-    /// exception (audit succeeded) or surface both via
-    /// <see cref="AggregateException"/> (audit also failed) — the same pattern used in
-    /// <c>TeamsSwarmActivityHandler.OnMessageActivityAsync</c>. The durability
-    /// contract is further reinforced by the DB-level triggers and grants documented
-    /// in <c>20260516120058_InitialAuditLog</c>.
+    /// Because this method propagates audit failures, the caller MUST invoke it OUTSIDE
+    /// the original send's <c>try</c> block (specifically not from a <c>finally</c>) and
+    /// MUST use <see cref="System.Runtime.ExceptionServices.ExceptionDispatchInfo"/> +
+    /// <see cref="AggregateException"/> so that:
+    /// (a) a successful audit emit does not mask a prior send failure; and
+    /// (b) an audit-emit failure that follows a send failure does not silently replace
+    ///     the send failure on the wire per the CLR's throw-from-finally semantics.
+    /// All three callers in this class implement that pattern; it mirrors
+    /// <see cref="TeamsSwarmActivityHandler.OnMessageActivityAsync"/>.
     /// </para>
     /// </remarks>
     private async Task LogProactiveNotificationAsync(
@@ -1016,14 +1068,19 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         // workstream's compliance contract ("Persist immutable audit trail suitable for
         // enterprise review") is a hard requirement, not a best-effort guideline: every
         // outbound notification has to land an AuditLog row. We deliberately do NOT
-        // wrap this in try/catch — if the audit store is unreachable, the caller (the
-        // outbox dispatcher) must see the failure and retry; a notification that
+        // wrap this in try/catch here — if the audit store is unreachable, the caller
+        // (the outbox dispatcher) must see the failure and retry; a notification that
         // succeeded at the Bot Framework layer but failed at the audit layer is a
         // partial-write that the outbox's idempotency layer is responsible for
         // reconciling (same correlation-id → no double user message; eventual audit
         // row lands on the successful attempt). Swallowing here was iter-1 evaluator
         // item 7 — the eval rejected silent loss of audit rows even with a logged
-        // warning.
+        // warning. The Stage 5.2 iter-r0 review (comment at line 544) further required
+        // that callers NOT await this from `finally`: that pattern would let a throw
+        // from this method REPLACE an in-flight send exception via the CLR's
+        // exception-replacement semantics, silently losing the original send failure.
+        // The three callers therefore capture the send failure via ExceptionDispatchInfo
+        // and combine it with any audit failure into an AggregateException.
         var checksum = AuditEntry.ComputeChecksum(
             timestamp: timestamp,
             correlationId: correlationId,
