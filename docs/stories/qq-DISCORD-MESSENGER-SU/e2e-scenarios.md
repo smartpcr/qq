@@ -89,8 +89,13 @@ Feature: Slash command -- /agent reject
   Scenario: Operator rejects a pending question with a reason
     Given a PendingQuestionRecord exists with QuestionId "Q-42" and Status "Pending"
     When the operator sends "/agent reject Q-42 architecture does not support this approach" in the control channel
-    Then SlashCommandDispatcher publishes a HumanDecisionEvent with ActionValue "reject"
-    And HumanDecisionEvent.Comment contains "architecture does not support this approach"
+    Then SlashCommandDispatcher publishes a HumanDecisionEvent with:
+      | Field            | Value   |
+      | QuestionId       | Q-42    |
+      | SelectedActionId | reject  |
+      | ActionValue      | reject  |
+      | Messenger        | Discord |
+    And the rejection reason "architecture does not support this approach" is stored in the AuditLogEntry Details JSON
     And the question embed is updated to show rejection with the reason
     And AuditLogger records the rejection
 ```
@@ -209,6 +214,16 @@ Feature: Button interaction -- approve
 
 ### Scenario 2.3: Question with more than 5 actions uses select menu
 
+> **Platform adaptation:** Buttons encode `ActionId` in `custom_id` as
+> `q:{QuestionId}:{ActionId}` (per architecture.md Section 8.3). Discord
+> select menus have one `custom_id` per component (not per option), so the
+> select menu carries `q:{QuestionId}:select` as its component `custom_id`
+> and each option encodes `ActionId` in the option `value` field. The
+> `ComponentInteractionHandler` handles both encodings: for buttons it
+> parses `ActionId` from `custom_id`; for select menus it parses
+> `QuestionId` from `custom_id` and reads `ActionId` from the selected
+> option value.
+
 ```gherkin
 Feature: Select menu for questions with many actions
 
@@ -216,11 +231,11 @@ Feature: Select menu for questions with many actions
     Given an AgentQuestionEnvelope wraps an AgentQuestion with 6 AllowedActions
     When DiscordMessageSender renders the question embed
     Then the message uses a select menu component instead of buttons
-    And the select menu component has custom_id "q:{QuestionId}:select"
+    And the select menu component has custom_id "q:Q-42:select" (QuestionId in custom_id)
     And each AllowedAction appears as a select menu option with:
-      | Option field | Value                          |
-      | label        | HumanAction.Label              |
-      | value        | HumanAction.ActionId           |
+      | Option field | Value                                      |
+      | label        | HumanAction.Label (display text)           |
+      | value        | HumanAction.ActionId (parsed on selection) |
     And the select menu placeholder reads "Choose an action..."
 ```
 
@@ -245,9 +260,15 @@ Feature: Modal for comment-required actions
     When the operator submits the modal with text "Approach violates the caching policy"
     Then a DiscordInteractionRecord is persisted with InteractionType "ModalSubmit"
     And DeferAsync is called for the modal submit interaction
-    And ISwarmCommandBus.PublishHumanDecisionAsync is called with Comment "Approach violates the caching policy"
+    And ISwarmCommandBus.PublishHumanDecisionAsync is called with:
+      | Field            | Value   |
+      | QuestionId       | Q-55    |
+      | SelectedActionId | reject  |
+      | ActionValue      | reject  |
+      | Messenger        | Discord |
+    And the modal comment text "Approach violates the caching policy" is stored in AuditLogEntry Details JSON
     And IPendingQuestionStore.MarkAnsweredAsync is called for "Q-55"
-    And the question embed is updated to show rejection and the comment
+    And the question embed is updated to show rejection and the comment text from the audit record
 ```
 
 ### Scenario 2.5: Question times out with default action
@@ -260,7 +281,12 @@ Feature: Question timeout with default action
     And ProposedDefaultActionId is "approve" with Value "approve"
     When 30 minutes elapse without operator response
     Then QuestionTimeoutService detects "Q-60" via IPendingQuestionStore.GetExpiredAsync
-    And ISwarmCommandBus.PublishHumanDecisionAsync is called with ActionValue "approve" and Comment indicating auto-timeout
+    And ISwarmCommandBus.PublishHumanDecisionAsync is called with:
+      | Field            | Value   |
+      | QuestionId       | Q-60    |
+      | SelectedActionId | approve |
+      | ActionValue      | approve |
+    And the auto-timeout reason is recorded in AuditLogEntry Details JSON
     And IPendingQuestionStore status transitions to "TimedOut"
     And the question embed is edited to show "Timed out -- default action 'Approve' applied"
     And buttons are disabled on the embed
@@ -445,7 +471,7 @@ Feature: Outbound idempotency
 
   Scenario: Same question is not enqueued twice
     Given an OutboundMessage with IdempotencyKey "q:build-agent-3:Q-42" is already in the outbound queue
-    When DiscordMessengerConnector.SendQuestionAsync is called again for the same AgentQuestion
+    When DiscordMessengerConnector.SendQuestionAsync is called again with the same AgentQuestionEnvelope
     Then the OutboundMessage UNIQUE constraint on IdempotencyKey rejects the duplicate
     And no second message is enqueued
 ```
@@ -1048,7 +1074,9 @@ Feature: Duplicate skips ACK
 
 ## Feature 12: Select Menu Interaction
 
-Validates select menu behavior for questions with many actions.
+Validates select menu behavior for questions with many actions. Uses the
+platform-adapted encoding described in Scenario 2.3 above: component
+`custom_id` = `q:{QuestionId}:select`, option `value` = `ActionId`.
 
 ### Scenario 12.1: Operator selects an action from a select menu
 
@@ -1058,11 +1086,18 @@ Feature: Select menu interaction
   Scenario: Operator selects an action from a dropdown menu
     Given a pending question "Q-70" has 6 AllowedActions rendered as a select menu
     And the select menu component has custom_id "q:Q-70:select"
-    When the operator selects the option with value "need-info" (ActionId) from the dropdown
+    When the operator selects the option with value "need-info" from the dropdown
     Then DiscordGatewayService persists a DiscordInteractionRecord with InteractionType "SelectMenu"
-    And ComponentInteractionHandler parses QuestionId "Q-70" from the component custom_id "q:Q-70:select"
+    And ComponentInteractionHandler parses QuestionId "Q-70" from the component custom_id
     And ActionId "need-info" is read from the selected option's value field
-    And the same HumanDecisionEvent flow as button clicks is followed
+    And IPendingQuestionStore.GetAsync("Q-70") returns the pending question
+    And HumanAction.Value is resolved for ActionId "need-info"
+    And ISwarmCommandBus.PublishHumanDecisionAsync is called with:
+      | Field            | Value       |
+      | QuestionId       | Q-70        |
+      | SelectedActionId | need-info   |
+      | ActionValue      | need-info   |
+      | Messenger        | Discord     |
     And the question embed is updated to show the selection
 ```
 
