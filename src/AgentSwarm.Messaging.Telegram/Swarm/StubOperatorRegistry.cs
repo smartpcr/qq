@@ -40,6 +40,19 @@ namespace AgentSwarm.Messaging.Telegram.Swarm;
 /// pre-populating <c>TelegramOptions.DevOperators</c>.
 /// </para>
 /// <para>
+/// <b>Deterministic <see cref="OperatorBinding.RegisteredAt"/>.</b> The
+/// stub also stamps <see cref="OperatorBinding.RegisteredAt"/> with a
+/// fixed sentinel (<see cref="DateTimeOffset.UnixEpoch"/>) rather than
+/// <c>DateTimeOffset.UtcNow</c>. The configuration-backed projection has
+/// no notion of "when /start ran" (that field only carries real meaning
+/// for the Stage 3.4 <c>PersistentOperatorRegistry</c>), and using
+/// <c>UtcNow</c> would make successive reads of the same logical binding
+/// return different <see cref="OperatorBinding.RegisteredAt"/> values —
+/// breaking consumers that compare, sort, or cache by it. The epoch
+/// sentinel keeps the projection stable across calls and signals "not a
+/// real registration time" to anyone inspecting a stub binding.
+/// </para>
+/// <para>
 /// <b>IOptionsMonitor.</b> The stub reads
 /// <see cref="IOptionsMonitor{TOptions}.CurrentValue"/> on every call so
 /// that <c>DevOperators</c> reloads (e.g. from a test
@@ -198,7 +211,7 @@ public sealed class StubOperatorRegistry : IOperatorRegistry
                 TenantId = entry.TenantId,
                 WorkspaceId = entry.WorkspaceId,
                 Roles = roles,
-                RegisteredAt = DateTimeOffset.UtcNow,
+                RegisteredAt = DateTimeOffset.UnixEpoch,
                 IsActive = true,
             };
         }
