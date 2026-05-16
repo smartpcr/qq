@@ -259,6 +259,25 @@ public class Program
         // returns null until rows exist.
         builder.Services.AddSlackEntityFrameworkThreadMappingLookup<SlackPersistenceDbContext>();
 
+        // Stage 6.2 (workstream:
+        // ws-qq-slack-messenger-supp-phase-outbound-messaging-stage-thread-lifecycle-management):
+        // register the SlackThreadManager that owns the one-to-one
+        // mapping between agent tasks and Slack threads. The manager
+        // creates root messages via chat.postMessage on first call,
+        // persists the SlackThreadMapping, and recovers into the
+        // workspace's FallbackChannelId when the previously-stored
+        // channel/thread is no longer reachable (architecture.md
+        // §2.11 lifecycle steps 1, 3, 4). Stage 6.3's outbound
+        // dispatcher will consume ISlackThreadManager to resolve
+        // thread_ts before posting threaded replies. Wired before
+        // AddSlackInboundDevelopmentHandlerStubs so any composition
+        // root that already opted in to the EF lookup keeps that
+        // wiring; the thread manager registration uses RemoveAll +
+        // AddSingleton (the whole point is to replace placeholder
+        // implementations).
+        builder.Services.AddSlackThreadLifecycleManagement<SlackPersistenceDbContext>();
+        builder.Services.AddSlackChatPostMessageOptions(builder.Configuration);
+
         // Stage 4.3 iter 6 evaluator item #2 (STRUCTURAL fix):
         // AddSlackInboundIngestor INTENTIONALLY no longer registers
         // no-op handler defaults. A production host that resolved
