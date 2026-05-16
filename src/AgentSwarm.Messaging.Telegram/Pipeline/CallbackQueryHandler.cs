@@ -1022,12 +1022,21 @@ public sealed class CallbackQueryHandler : ICallbackHandler
         {
             await _dedup.ReleaseReservationAsync(dedupKey, ct).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Best-effort release. The dedup service's sticky-processed
             // guard means a release-after-MarkProcessed is already a
             // no-op; a hard release failure is rare but should be
             // visible without crashing the handler.
+            //
+            // OperationCanceledException is intentionally NOT caught
+            // here (consistent with every other catch in this class):
+            // cancellation is a control-flow signal that must propagate
+            // so the caller's catch-and-rethrow path can unwind and the
+            // worker-level cancellation pipeline can tear things down.
+            // Silently logging a cancellation as a warning would mask
+            // shutdown / token-revocation and corrupt the rethrow chain
+            // in HandleCallbackAsync's release-on-throw block.
             _logger.LogWarning(
                 ex,
                 "Failed to release dedup reservation. CorrelationId={CorrelationId} DedupKey={DedupKey}",
