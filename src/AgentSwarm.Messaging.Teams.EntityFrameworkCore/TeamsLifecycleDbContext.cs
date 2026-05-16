@@ -48,7 +48,7 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// <c>"double-quoted string literals"</c> behaviour). In that case the filter expression
 /// degenerates to <c>'Status' = 'Open'</c>, which is a constant <c>false</c>, and SQLite
 /// either rejects the partial index or silently builds one that matches no rows. Either
-/// way the in-memory <c>Microsoft.EntityFrameworkCore.Sqlite</c> SQLite
+/// way the in-memory <see cref="Microsoft.EntityFrameworkCore.SqliteDbContextOptionsBuilderExtensions">SQLite</see>
 /// test suite does <b>not</b> validate filtered-index <i>selectivity</i> — it only
 /// validates that the migration applies cleanly. Filtered-index <i>behaviour</i>
 /// (predicate restriction, index hit rate) is exercised solely against SQL Server in
