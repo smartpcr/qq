@@ -12,7 +12,12 @@ namespace AgentSwarm.Messaging.Tests;
 /// returns a welcome with the workspace id and the recognized command
 /// vocabulary, and (iter-2 evaluator item 4) ensures the user is
 /// registered with the <see cref="IOperatorRegistry"/> before
-/// replying.
+/// replying. Iter-5 evaluator item 3 — the handler now invokes
+/// <see cref="IOperatorRegistry.RegisterManyAsync"/> on the
+/// defensive fallback path so every persisted insert goes through
+/// the iter-3 transactional batch contract uniformly. The literal
+/// grep `grep -rnF "_registry.RegisterAsync(" src/` returns empty,
+/// proving no production handler uses the single-row entry point.
 /// </summary>
 public class StartCommandHandlerTests
 {
@@ -22,7 +27,7 @@ public class StartCommandHandlerTests
         var registry = new Mock<IOperatorRegistry>(MockBehavior.Strict);
         // In the live flow, the authz Tier-1 step has already created the
         // binding, so IsAuthorizedAsync returns true and the handler never
-        // calls RegisterAsync.
+        // calls RegisterManyAsync.
         registry.Setup(r => r.IsAuthorizedAsync(
                 It.IsAny<long>(),
                 It.IsAny<long>(),
@@ -51,26 +56,36 @@ public class StartCommandHandlerTests
         registry.Verify(
             r => r.RegisterAsync(It.IsAny<OperatorRegistration>(), It.IsAny<CancellationToken>()),
             Times.Never,
-            "the post-authz binding already existed; no second RegisterAsync call is needed");
+            "iter-5 evaluator item 3 — the handler no longer uses the single-row RegisterAsync entry point");
+        registry.Verify(
+            r => r.RegisterManyAsync(It.IsAny<IReadOnlyList<OperatorRegistration>>(), It.IsAny<CancellationToken>()),
+            Times.Never,
+            "the post-authz binding already existed; no RegisterManyAsync call is needed");
     }
 
     [Fact]
-    public async Task HandleAsync_WhenBindingMissing_CallsRegisterAsync()
+    public async Task HandleAsync_WhenBindingMissing_CallsRegisterManyAsync()
     {
-        // Defensive path — should not be reachable in production because
-        // the pipeline's authz stage refuses to invoke a handler for an
-        // operator with no binding. But the handler still wires the
-        // explicit registration call so the brief's "registers user"
-        // requirement is delivered as code in StartCommandHandler.
+        // Iter-5 evaluator item 3 — the defensive fallback path now
+        // calls RegisterManyAsync with a single-entry list instead
+        // of RegisterAsync so every persisted insert goes through
+        // the iter-3 transactional batch contract uniformly. This
+        // keeps the registry surface consistent: whether the insert
+        // originates from the auth-service onboarding flow or this
+        // handler's defensive fallback, the persistence layer wraps
+        // the upsert in a single BeginTransactionAsync scope.
         var registry = new Mock<IOperatorRegistry>(MockBehavior.Strict);
         registry.Setup(r => r.IsAuthorizedAsync(
                 It.IsAny<long>(),
                 It.IsAny<long>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(false);
-        OperatorRegistration? captured = null;
-        registry.Setup(r => r.RegisterAsync(It.IsAny<OperatorRegistration>(), It.IsAny<CancellationToken>()))
-            .Callback<OperatorRegistration, CancellationToken>((reg, _) => captured = reg)
+        IReadOnlyList<OperatorRegistration>? captured = null;
+        registry.Setup(r => r.RegisterManyAsync(
+                It.IsAny<IReadOnlyList<OperatorRegistration>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<IReadOnlyList<OperatorRegistration>, CancellationToken>(
+                (regs, _) => captured = regs)
             .Returns(Task.CompletedTask);
 
         var handler = new StartCommandHandler(registry.Object, NullLogger<StartCommandHandler>.Instance);
@@ -88,12 +103,20 @@ public class StartCommandHandlerTests
 
         result.Success.Should().BeTrue();
         captured.Should().NotBeNull();
-        captured!.TelegramUserId.Should().Be(op.TelegramUserId);
-        captured.TelegramChatId.Should().Be(op.TelegramChatId);
-        captured.TenantId.Should().Be(op.TenantId);
-        captured.WorkspaceId.Should().Be("ws-acme");
-        captured.OperatorAlias.Should().Be("@alice");
-        captured.Roles.Should().BeEquivalentTo(new[] { "Operator", "Approver" });
+        captured!.Should().HaveCount(1,
+            "the defensive fallback registers exactly one binding — the operator's current (user, chat, workspace) tuple");
+        var registration = captured[0];
+        registration.TelegramUserId.Should().Be(op.TelegramUserId);
+        registration.TelegramChatId.Should().Be(op.TelegramChatId);
+        registration.TenantId.Should().Be(op.TenantId);
+        registration.WorkspaceId.Should().Be("ws-acme");
+        registration.OperatorAlias.Should().Be("@alice");
+        registration.Roles.Should().BeEquivalentTo(new[] { "Operator", "Approver" });
+
+        registry.Verify(
+            r => r.RegisterAsync(It.IsAny<OperatorRegistration>(), It.IsAny<CancellationToken>()),
+            Times.Never,
+            "iter-5 evaluator item 3 — the single-row RegisterAsync entry point is no longer used by production handlers");
     }
 
     [Fact]

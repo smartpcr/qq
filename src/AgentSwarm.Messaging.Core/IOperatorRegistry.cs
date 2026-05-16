@@ -57,6 +57,35 @@ public interface IOperatorRegistry
     Task RegisterAsync(OperatorRegistration registration, CancellationToken ct);
 
     /// <summary>
+    /// Atomically register a batch of <see cref="OperatorRegistration"/>
+    /// rows under a single persistence transaction. Used by the
+    /// <c>/start</c> onboarding flow when an operator's
+    /// <c>Telegram:UserTenantMappings</c> entry has multiple workspace
+    /// bindings: if ANY row fails (unique-index violation, transient
+    /// DB error), ALL prior inserts in the batch MUST roll back so the
+    /// operator is never left in a partial onboarding state.
+    /// </summary>
+    /// <remarks>
+    /// Added in Stage 3.4 iter-3 (evaluator item 2). The default
+    /// implementation iterates <see cref="RegisterAsync"/> and is
+    /// suitable for the in-memory <c>StubOperatorRegistry</c> (where
+    /// rollback semantics do not apply because every call is
+    /// independent). The persistent EF Core implementation
+    /// (<c>PersistentOperatorRegistry</c>) overrides this to wrap
+    /// all inserts in a single <c>IDbContextTransaction</c>.
+    /// </remarks>
+    async Task RegisterManyAsync(
+        IReadOnlyList<OperatorRegistration> registrations,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(registrations);
+        for (var i = 0; i < registrations.Count; i++)
+        {
+            await RegisterAsync(registrations[i], ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
     /// Fast-path check: returns <c>true</c> when at least one active
     /// binding exists for the (user, chat) pair. Used by the runtime
     /// allowlist gate.

@@ -57,6 +57,17 @@ public class MessagingDbContext : DbContext
     /// </summary>
     public DbSet<AuditLogEntry> AuditLogEntries => Set<AuditLogEntry>();
 
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the operator identity
+    /// mapping table (Stage 3.4). One row per
+    /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> binding;
+    /// queried by <see cref="PersistentOperatorRegistry"/> for runtime
+    /// authorization, alias resolution, alert fallback routing, and
+    /// the <c>/start</c> onboarding upsert. Configured via
+    /// <see cref="OperatorBindingConfiguration"/>.
+    /// </summary>
+    public DbSet<OperatorBinding> OperatorBindings => Set<OperatorBinding>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
