@@ -97,22 +97,22 @@ public enum BotFrameworkTokenProbeStatus
 /// supply their own probe implementation.
 /// </para>
 /// <para>
-/// <b>HttpClient ownership.</b> When an <see cref="IHttpClientFactory"/> is supplied,
-/// the probe obtains its <see cref="HttpClient"/> via
-/// <see cref="IHttpClientFactory.CreateClient(string)"/> and intentionally does NOT
-/// dispose it. Per the official .NET guidance on
-/// <see cref="IHttpClientFactory"/>
-/// (<see href="https://learn.microsoft.com/dotnet/core/extensions/httpclient-factory"/>),
-/// callers must not dispose factory-issued <see cref="HttpClient"/> instances —
-/// the factory pools and rotates the underlying <see cref="HttpMessageHandler"/>
-/// (<see cref="System.Net.Http.SocketsHttpHandler"/> wrapped in a
-/// <c>LifetimeTrackingHttpMessageHandler</c>), and disposing the wrapper does
-/// not free sockets. <see cref="MicrosoftAppCredentials"/> is not
-/// <see cref="IDisposable"/> and holds the <see cref="HttpClient"/> by reference
-/// (exposed as <c>AppCredentials.CustomHttpClient</c>) without taking ownership of
-/// its disposal. Because both objects are method-local in
-/// <see cref="AcquireTokenAsync"/>, they become GC-eligible together when the
-/// method returns — no socket churn, no leak.
+/// <b>HttpClient lifetime / ownership contract.</b> When an
+/// <see cref="IHttpClientFactory"/> is provided, each probe invocation creates a
+/// short-lived <see cref="HttpClient"/> via the factory, hands the reference to a
+/// freshly-constructed <see cref="MicrosoftAppCredentials"/>, and disposes the
+/// client when the probe call returns. This is safe because (a) the
+/// <c>Microsoft.Bot.Connector</c> SDK's <see cref="MicrosoftAppCredentials"/>
+/// constructor stores the supplied <see cref="HttpClient"/> by reference but
+/// does NOT take ownership of its lifetime — it never calls <c>Dispose</c> on
+/// the client and has no <c>IDisposable</c> surface itself — and (b) the
+/// credentials instance is itself local to this method and goes out of scope at
+/// the same time, so no caller retains a stale handle to the disposed client.
+/// Disposing a factory-sourced <see cref="HttpClient"/> only releases the
+/// lightweight wrapper; the underlying <c>HttpMessageHandler</c> is pooled and
+/// kept alive by <see cref="IHttpClientFactory"/>'s
+/// <c>LifetimeTrackingHttpMessageHandler</c>, so this pattern does not invalidate
+/// pooled connections and does not cause socket-exhaustion on repeated probes.
 /// </para>
 /// </remarks>
 public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
@@ -127,9 +127,9 @@ public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
     /// custom <see cref="HttpClient"/> for the credentials object; honors the named
     /// client <see cref="BotFrameworkConnectivityHealthCheck.HttpClientName"/> when
     /// the factory is provided, otherwise the credentials use their own default
-    /// HTTP client. The factory owns the disposal of any <see cref="HttpClient"/>
-    /// instances it issues; see the type-level <b>HttpClient ownership</b> remark
-    /// for the full contract.</param>
+    /// HTTP client. The probe takes ownership of each client it creates and
+    /// disposes it before returning (see the type-level remarks for the
+    /// <c>MicrosoftAppCredentials</c> ownership contract).</param>
     /// <param name="logger">Optional logger; failures are logged at Warning level.</param>
     /// <exception cref="ArgumentNullException">If <paramref name="messagingOptions"/> is null.</exception>
     public MicrosoftAppCredentialsTokenProbe(
@@ -189,43 +189,28 @@ public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        // Iter-6 reviewer feedback — make HttpClient ownership explicit. The
+        // Microsoft.Bot.Connector SDK's MicrosoftAppCredentials stores the supplied
+        // HttpClient by reference but never disposes it (it has no IDisposable
+        // surface and never invokes Dispose on the client). To prevent the
+        // factory-sourced client from leaking past the probe call, we own it here
+        // with a `using` declaration so it is released as soon as this method
+        // returns — both on the success path (token acquired, credentials instance
+        // is also leaving scope) and on every failure / cancellation path.
+        // Disposing an IHttpClientFactory-sourced client only releases the
+        // lightweight wrapper; the underlying HttpMessageHandler is pooled by
+        // IHttpClientFactory's LifetimeTrackingHttpMessageHandler, so this does
+        // not invalidate connection pooling and does not affect concurrent
+        // probes that obtain their own client from the same factory.
+        using HttpClient? client = _httpClientFactory?.CreateClient(BotFrameworkConnectivityHealthCheck.HttpClientName);
+
         try
         {
             // Use the named HttpClient when available so the probe honors test-host
             // substitutes (e.g. a mock handler in unit tests). The probe never mutates
             // the client, so reusing the factory-provided instance is safe.
-            //
-            // Iter-5 reviewer feedback (PR comment on this line) — HttpClient
-            // ownership contract is INTENTIONALLY one of non-disposal here, and the
-            // contract is documented exhaustively below so future maintainers do not
-            // "fix" this by adding a `using`:
-            //
-            //   (a) IHttpClientFactory owns the lifecycle. Per Microsoft's official
-            //       guidance on IHttpClientFactory
-            //       (https://learn.microsoft.com/dotnet/core/extensions/httpclient-factory),
-            //       callers MUST NOT dispose HttpClient instances returned by
-            //       CreateClient. The factory pools and rotates the underlying
-            //       SocketsHttpHandler via a LifetimeTrackingHttpMessageHandler;
-            //       disposing the wrapper does NOT free sockets (the pooled handler
-            //       is shared and refcounted) — it only marks this wrapper unusable,
-            //       which would break the still-live MicrosoftAppCredentials reference.
-            //
-            //   (b) MicrosoftAppCredentials (Microsoft.Bot.Connector 4.x) is NOT
-            //       IDisposable and stores the HttpClient as a non-owning reference
-            //       (exposed as AppCredentials.CustomHttpClient). It re-uses the
-            //       reference across GetTokenAsync calls but never disposes it.
-            //
-            //   (c) Both `credentials` and `httpClient` are method-local and
-            //       unreachable when AcquireTokenAsync returns, so they are GC-eligible
-            //       together. The fallback path (httpClient == null) hands ownership of
-            //       the default HttpClient to MicrosoftAppCredentials' internal SDK
-            //       construction, which is likewise managed by the SDK and must not be
-            //       disposed by us.
-            //
-            // Net effect: zero socket-pool churn, zero leak, no double-dispose risk.
-            HttpClient? httpClient = _httpClientFactory?.CreateClient(BotFrameworkConnectivityHealthCheck.HttpClientName);
-            var credentials = httpClient is not null
-                ? new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword, httpClient)
+            var credentials = client is not null
+                ? new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword, client)
                 : new MicrosoftAppCredentials(messaging.MicrosoftAppId, messaging.MicrosoftAppPassword);
 
             // Iter-5 reviewer feedback — MicrosoftAppCredentials.GetTokenAsync in the
@@ -257,6 +242,11 @@ public sealed class MicrosoftAppCredentialsTokenProbe : IBotFrameworkTokenProbe
                         // tokenTask's eventual fault so an OperationCanceledException
                         // / HttpRequestException raised after we've returned does not
                         // surface as an UnobservedTaskException on the finalizer.
+                        // Note: the outer `using HttpClient? client` will dispose the
+                        // client as we unwind; the in-flight tokenTask may then fault
+                        // with ObjectDisposedException when it next touches the
+                        // client. That fault is intentionally observed (and
+                        // discarded) by the continuation below.
                         _ = tokenTask.ContinueWith(
                             static t => _ = t.Exception,
                             CancellationToken.None,
