@@ -179,6 +179,37 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
             }
         }
 
+        // Stage 2.7 — same TenantId/WorkspaceId guard applies to the
+        // DevOperators directory consumed by StubOperatorRegistry. A
+        // blank tenant would silently coalesce subscription bootstrap
+        // into a single "" tenant, suppressing real per-tenant streams;
+        // a blank workspace would break the alert fallback's
+        // GetByWorkspaceAsync resolution (§5.6).
+        if (options.DevOperators is { Count: > 0 })
+        {
+            for (var i = 0; i < options.DevOperators.Count; i++)
+            {
+                var binding = options.DevOperators[i];
+                if (binding is null) { continue; }
+
+                if (string.IsNullOrWhiteSpace(binding.TenantId))
+                {
+                    failures.Add(
+                        $"Telegram:DevOperators[{i}].TenantId must be non-blank. "
+                        + "A blank tenant id would silently coalesce all dev operators into "
+                        + "one tenant boundary, breaking per-tenant swarm-event subscription.");
+                }
+
+                if (string.IsNullOrWhiteSpace(binding.WorkspaceId))
+                {
+                    failures.Add(
+                        $"Telegram:DevOperators[{i}].WorkspaceId must be non-blank. "
+                        + "A blank workspace id would break alert fallback routing via "
+                        + "IOperatorRegistry.GetByWorkspaceAsync (architecture.md §5.6).");
+                }
+            }
+        }
+
         ValidateRateLimits(options.RateLimits, failures);
 
         return failures.Count == 0

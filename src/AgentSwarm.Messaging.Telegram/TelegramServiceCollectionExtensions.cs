@@ -4,6 +4,7 @@ using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using AgentSwarm.Messaging.Telegram.Polling;
 using AgentSwarm.Messaging.Telegram.Sending;
+using AgentSwarm.Messaging.Telegram.Swarm;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -199,6 +200,30 @@ public static class TelegramServiceCollectionExtensions
         services.TryAddSingleton<TelegramMessengerConnector>();
         services.TryAddSingleton<IMessengerConnector>(sp =>
             sp.GetRequiredService<TelegramMessengerConnector>());
+
+        // Stage 2.7: Swarm Event Ingress Service stubs + hosted service.
+        //
+        // The three stubs (StubOperatorRegistry, StubTaskOversightRepository,
+        // StubSwarmCommandBus) are registered via TryAddSingleton so the
+        // production replacements (Stage 3.4 PersistentOperatorRegistry,
+        // Stage 3.2 PersistentTaskOversightRepository, and the concrete
+        // swarm transport adapter — out of scope for this story) win by
+        // AddSingleton last-wins semantics. A Phase 6.3 startup health
+        // check is required to assert that the resolved types are NOT
+        // the stubs when ASPNETCORE_ENVIRONMENT=Production.
+        //
+        // SwarmEventSubscriptionService runs as a hosted background
+        // service that, on startup, calls IOperatorRegistry.GetActiveTenantsAsync
+        // and opens one ISwarmCommandBus.SubscribeAsync stream per tenant.
+        // Events are routed through the connector — questions via
+        // SendQuestionAsync, alerts/status via SendMessageAsync — per
+        // implementation-plan.md Stage 2.7.
+        services.TryAddSingleton<IOperatorRegistry, StubOperatorRegistry>();
+        services.TryAddSingleton<ITaskOversightRepository, StubTaskOversightRepository>();
+        services.TryAddSingleton<ISwarmCommandBus, StubSwarmCommandBus>();
+        services.AddSingleton<SwarmEventSubscriptionService>();
+        services.AddSingleton<IHostedService>(sp =>
+            sp.GetRequiredService<SwarmEventSubscriptionService>());
 
         var pollingSnapshot = configuration
             .GetSection(TelegramOptions.SectionName)
