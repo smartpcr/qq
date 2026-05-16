@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using AgentSwarm.Messaging.Teams.Security;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
@@ -152,6 +153,15 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(message);
 
+        // Stage 6.3 iter-2 — push the canonical CorrelationId/TenantId/UserId enrichment
+        // onto every log entry emitted by this proactive send (both via ILogger.BeginScope
+        // and via the AsyncLocal-backed Serilog enricher feed).
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: message.CorrelationId,
+            tenantId: tenantId,
+            userId: userId);
+
         // Stage 5.1 iter-5 evaluator feedback item 1 — STRUCTURAL fix. The install-state
         // gate MUST run BEFORE the active-only GetByInternalUserIdAsync lookup. The real
         // SqlConversationReferenceStore filters by `e.IsActive`, so an inactive (or
@@ -211,11 +221,21 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     }
 
     /// <inheritdoc />
-    public Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
+    public async Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Stage 6.3 iter-2 — enrichment scope is opened BEFORE argument-cross-check so
+        // even validation-failure logs carry the canonical keys. Method is async (not
+        // sync-returning-Task) so the scope persists across the entire SendQuestionCore
+        // await chain.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: userId);
 
         // Security-relevant consistency guard (iter-2 evaluator feedback #1, #2):
         // refuse to send a question through a tenant / user / scope that does not match
@@ -229,13 +249,13 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         EnsureTenantMatchesQuestion(tenantId, question);
         EnsureScopeUserTargeted(userId, question);
 
-        return SendQuestionCoreAsync(
+        await SendQuestionCoreAsync(
             tenantId,
             question,
             lookupAsync: innerCt => _conversationReferenceStore.GetByInternalUserIdAsync(tenantId, userId, innerCt),
             notFoundFactory: () => ConversationReferenceNotFoundException.ForUser(tenantId, userId, question.QuestionId),
             targetDescription: $"user '{userId}'",
-            ct);
+            ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -244,6 +264,15 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(message);
+
+        // Stage 6.3 iter-2 — channel sends carry the same enrichment minus UserId; the
+        // tenant + channel + correlation triple is what dashboards key on for
+        // channel-scoped delivery audits.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: message.CorrelationId,
+            tenantId: tenantId,
+            userId: null);
 
         // Stage 5.1 iter-5 evaluator feedback item 1 — gate BEFORE the active-only
         // channel lookup. Same structural fix as SendProactiveAsync above; see comment
@@ -298,24 +327,31 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     }
 
     /// <inheritdoc />
-    public Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
+    public async Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Stage 6.3 iter-2 — channel-scoped question enrichment scope.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: null);
 
         // Security-relevant consistency guard (iter-2 evaluator feedback #1, #2) —
         // see SendProactiveQuestionAsync for the full rationale.
         EnsureTenantMatchesQuestion(tenantId, question);
         EnsureScopeChannelTargeted(channelId, question);
 
-        return SendQuestionCoreAsync(
+        await SendQuestionCoreAsync(
             tenantId,
             question,
             lookupAsync: innerCt => _conversationReferenceStore.GetByChannelIdAsync(tenantId, channelId, innerCt),
             notFoundFactory: () => ConversationReferenceNotFoundException.ForChannel(tenantId, channelId, question.QuestionId),
             targetDescription: $"channel '{channelId}'",
-            ct);
+            ct).ConfigureAwait(false);
     }
 
     /// <summary>

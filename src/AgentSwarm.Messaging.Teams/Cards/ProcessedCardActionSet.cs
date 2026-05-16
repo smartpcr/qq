@@ -228,7 +228,7 @@ public sealed class ProcessedCardActionSet
     /// snapshot and the removal, inserting a <i>fresh</i> entry under the same key —
     /// a key-only <c>TryRemove</c> would silently delete that fresh entry and signal
     /// its in-flight waiters with <c>null</c>, dropping the new pipeline's slot. The
-    /// sibling <see cref="Outbox.OutboundMessageDeduplicator.EvictExpired"/> uses the
+    /// sibling <see cref="Outbox.OutboundMessageDeduplicator.EvictExpired(DateTimeOffset)"/> uses the
     /// same value-checked pattern.
     /// </remarks>
     public int EvictExpired(DateTimeOffset now)

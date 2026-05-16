@@ -1,6 +1,7 @@
 using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Schema;
 using Microsoft.Extensions.Logging;
@@ -201,6 +202,17 @@ public sealed class CardActionHandler : ICardActionHandler
         var actorDisplayName = activity?.From?.Name;
         var tenantId = ResolveTenantId(activity);
         var receivedAt = activity?.Timestamp ?? _timeProvider.GetUtcNow();
+
+        // Stage 6.3 iter-2 — open the canonical enrichment scope for every log entry
+        // emitted while handling this card invoke. Tenant + actor are best-effort —
+        // the activity may be malformed, in which case the scope simply elides any
+        // null/empty key (TeamsLogScope.BeginScope handles that internally).
+        var preliminaryCorrelationId = ResolveCorrelationId(activity, fallback: Guid.NewGuid().ToString("N"));
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: preliminaryCorrelationId,
+            tenantId: tenantId,
+            userId: actorAad);
 
         // Guard: an Adaptive Card invoke without an Action.Submit payload is malformed ΓÇö
         // surface as Rejected so operators can investigate via the audit trail without a
