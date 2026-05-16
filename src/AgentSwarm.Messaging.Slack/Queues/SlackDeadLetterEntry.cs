@@ -7,6 +7,7 @@
 namespace AgentSwarm.Messaging.Slack.Queues;
 
 using System;
+using AgentSwarm.Messaging.Slack.Transport;
 
 /// <summary>
 /// Represents a Slack message that has exhausted its retry budget and
@@ -14,7 +15,13 @@ using System;
 /// the original payload (inbound or outbound) along with enough metadata
 /// for an operator to triage, replay, or discard the message.
 /// </summary>
-public sealed record SlackDeadLetterEntry
+/// <remarks>
+/// Declared <c>internal</c> to match the visibility of the dead-letter
+/// queue contract (<see cref="ISlackDeadLetterQueue"/>) and the inbound
+/// /outbound envelope types it carries. The Slack test assembly observes
+/// it through <c>[assembly: InternalsVisibleTo]</c>.
+/// </remarks>
+internal sealed record SlackDeadLetterEntry
 {
     /// <summary>
     /// Gets the stable identifier assigned to this dead-letter entry.
