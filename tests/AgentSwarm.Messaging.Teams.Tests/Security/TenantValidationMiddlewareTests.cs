@@ -188,6 +188,129 @@ public sealed class TenantValidationMiddlewareTests
             () => middleware.InvokeAsync(context, null!));
     }
 
+    // iter-10 hardening regression suite — whitespace-only tenant IDs must NOT pass the
+    // allow-list comparison, and surrounding whitespace must not be able to mask a
+    // mismatching tenant. The middleware now trims + rejects whitespace-only values at
+    // both the parse layer (ExtractTenantIdAsync) and the allow-list layer (InvokeAsync)
+    // so the fail-closed contract holds even if a future parser regression returns "  ".
+
+    [Fact]
+    public async Task InvokeAsync_WhitespaceOnlyChannelDataTenantId_FallsBackToConversationTenantId()
+    {
+        var (auditLogger, middleware) = BuildMiddleware(allowed: AllowedTenant);
+        var body = "{\"type\":\"message\",\"channelData\":{\"tenant\":{\"id\":\"   \"}},\"conversation\":{\"tenantId\":\"" + AllowedTenant + "\"}}";
+        var context = NewBotContext(body);
+        var called = false;
+
+        await middleware.InvokeAsync(context, _ => { called = true; return Task.CompletedTask; });
+
+        Assert.True(called);
+        Assert.Empty(auditLogger.Entries);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_WhitespaceOnlyConversationTenantId_Rejects403AsTenantMissing()
+    {
+        var (auditLogger, middleware) = BuildMiddleware(allowed: AllowedTenant);
+        var body = "{\"type\":\"message\",\"conversation\":{\"tenantId\":\"\\t\\t \"}}";
+        var context = NewBotContext(body);
+
+        await middleware.InvokeAsync(context, _ => Task.CompletedTask);
+
+        Assert.Equal(StatusCodes.Status403Forbidden, context.Response.StatusCode);
+        var entry = Assert.Single(auditLogger.Entries);
+        Assert.Equal("unknown", entry.ActorId);
+        Assert.Equal(string.Empty, entry.TenantId);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_PaddedTenantId_IsTrimmedAndAccepted()
+    {
+        var (auditLogger, middleware) = BuildMiddleware(allowed: AllowedTenant);
+        // Leading + trailing whitespace must be trimmed by the parser; otherwise a benign
+        // operator-supplied allow-list entry would be defeated by a stray channel-formatting
+        // space.
+        var body = "{\"type\":\"message\",\"channelData\":{\"tenant\":{\"id\":\"  " + AllowedTenant + "  \"}}}";
+        var context = NewBotContext(body);
+        var called = false;
+
+        await middleware.InvokeAsync(context, _ => { called = true; return Task.CompletedTask; });
+
+        Assert.True(called);
+        Assert.Empty(auditLogger.Entries);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_JsonNullTenantId_FallsBackToConversationTenantId()
+    {
+        var (auditLogger, middleware) = BuildMiddleware(allowed: AllowedTenant);
+        // The channelData.tenant.id is JSON null (ValueKind.Null, not String) — the parser
+        // must skip it and consult the conversation.tenantId fallback rather than blowing up.
+        var body = "{\"type\":\"message\",\"channelData\":{\"tenant\":{\"id\":null}},\"conversation\":{\"tenantId\":\"" + AllowedTenant + "\"}}";
+        var context = NewBotContext(body);
+        var called = false;
+
+        await middleware.InvokeAsync(context, _ => { called = true; return Task.CompletedTask; });
+
+        Assert.True(called);
+        Assert.Empty(auditLogger.Entries);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_TenantIdCaseMismatch_Rejects()
+    {
+        // Acceptance criteria: "Unauthorized tenant/user is rejected." The allow-list uses
+        // StringComparer.Ordinal (case-sensitive) so an operator-supplied lower-case allow-list
+        // entry MUST reject an upper-case inbound tenant ID. This regression locks the
+        // Ordinal comparer contract: if a future refactor swaps to OrdinalIgnoreCase the
+        // assertion below flips.
+        var (auditLogger, middleware) = BuildMiddleware(allowed: "tenant-lower");
+        var body = "{\"type\":\"message\",\"channelData\":{\"tenant\":{\"id\":\"TENANT-LOWER\"}}}";
+        var context = NewBotContext(body);
+
+        await middleware.InvokeAsync(context, _ => Task.CompletedTask);
+
+        Assert.Equal(StatusCodes.Status403Forbidden, context.Response.StatusCode);
+        var entry = Assert.Single(auditLogger.Entries);
+        Assert.Equal("UnauthorizedTenantRejected", entry.Action);
+        Assert.Equal("TENANT-LOWER", entry.TenantId);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ChannelDataTenantIdAsObject_FallsBackToConversationTenantId()
+    {
+        // Malformed channelData.tenant.id (object instead of string) must NOT throw — the
+        // parser checks ValueKind == String and otherwise falls through to the conversation
+        // fallback, preserving the "fail closed, not crash" invariant for the host pipeline.
+        var (auditLogger, middleware) = BuildMiddleware(allowed: AllowedTenant);
+        var body = "{\"type\":\"message\",\"channelData\":{\"tenant\":{\"id\":{\"nested\":1}}},\"conversation\":{\"tenantId\":\"" + AllowedTenant + "\"}}";
+        var context = NewBotContext(body);
+        var called = false;
+
+        await middleware.InvokeAsync(context, _ => { called = true; return Task.CompletedTask; });
+
+        Assert.True(called);
+        Assert.Empty(auditLogger.Entries);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_AllowListContainingWhitespaceOnlyEntry_DoesNotMatchWhitespaceTenantId()
+    {
+        // Defence-in-depth: even if the operator configures a pathological allow-list entry
+        // containing only whitespace, a whitespace-only inbound tenant ID must still reject
+        // because InvokeAsync now short-circuits on IsNullOrWhiteSpace before consulting the
+        // allow-list. This locks the iter-10 fail-closed contract.
+        var (auditLogger, middleware) = BuildMiddleware(allowed: "   ");
+        var body = "{\"type\":\"message\",\"channelData\":{\"tenant\":{\"id\":\"   \"}}}";
+        var context = NewBotContext(body);
+
+        await middleware.InvokeAsync(context, _ => Task.CompletedTask);
+
+        Assert.Equal(StatusCodes.Status403Forbidden, context.Response.StatusCode);
+        var entry = Assert.Single(auditLogger.Entries);
+        Assert.Equal("UnauthorizedTenantRejected", entry.Action);
+    }
+
     [Fact]
     public void Constructor_NullArgs_Throw()
     {
