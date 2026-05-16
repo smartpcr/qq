@@ -331,20 +331,31 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             sw.Stop();
             if (Telemetry is not null)
             {
-                // Stage 6.3 — record the histogram observation and the messages.sent
-                // counter on every send attempt regardless of success so dashboards see
-                // failure rates. The histogram observation is gated on success so the
-                // P95 budget is computed only from successful deliveries (matching the
-                // tech-spec.md §4.4 definition: "P95 Adaptive Card delivery from
-                // outbound queue pickup to Bot Connector acknowledgement").
+                // Stage 6.3 — iter-2 evaluator feedback item 2 (FIX). The
+                // teams.messages.sent counter fires on EVERY send attempt regardless
+                // of outcome so failure-rate dashboards observe a non-zero
+                // denominator on failed sends; previously this counter was gated on
+                // `succeeded` together with the histogram and a failing send produced
+                // ZERO counter increments, leaving the §4.4 dashboards blind to
+                // failure spikes. The failure rate is now derivable as
+                // `1 - (teams.card.delivery.duration_ms.count / teams.messages.sent)`
+                // because the histogram remains gated on success below.
+                //
+                // The teams.card.delivery.duration_ms histogram observation stays
+                // gated on success so the P95 budget is computed only from
+                // successful deliveries (matching the tech-spec.md §4.4 definition:
+                // "P95 Adaptive Card delivery from outbound queue pickup to Bot
+                // Connector acknowledgement"). Including failed-send latencies would
+                // mix transient-error retry timing into the SLA bucket and pull P95
+                // away from the user-visible delivery latency the SLA targets.
+                Telemetry.RecordMessageSent(
+                    message.CorrelationId,
+                    TeamsConnectorTelemetry.MessageTypeMessengerMessage,
+                    TeamsConnectorTelemetry.DestinationTypeConversation);
                 if (succeeded)
                 {
                     Telemetry.RecordCardDeliveryDurationMs(
                         sw.Elapsed.TotalMilliseconds,
-                        message.CorrelationId,
-                        TeamsConnectorTelemetry.MessageTypeMessengerMessage,
-                        TeamsConnectorTelemetry.DestinationTypeConversation);
-                    Telemetry.RecordMessageSent(
                         message.CorrelationId,
                         TeamsConnectorTelemetry.MessageTypeMessengerMessage,
                         TeamsConnectorTelemetry.DestinationTypeConversation);
@@ -563,17 +574,30 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         finally
         {
             sw.Stop();
-            if (Telemetry is not null && succeeded)
+            if (Telemetry is not null)
             {
-                Telemetry.RecordCardDeliveryDurationMs(
-                    sw.Elapsed.TotalMilliseconds,
-                    question.CorrelationId,
-                    TeamsConnectorTelemetry.MessageTypeAgentQuestion,
-                    destinationType);
+                // Stage 6.3 — iter-2 evaluator feedback item 2 (FIX). Mirrors the
+                // SendMessageAsync finally block above: the teams.messages.sent
+                // counter MUST fire on every attempt so the §4.4 failure-rate
+                // dashboards observe a non-zero denominator on failed proactive
+                // question delivery, while the teams.card.delivery.duration_ms
+                // histogram stays gated on success so the P95 budget is computed
+                // only from successful deliveries. Previously both signals were
+                // gated together inside `if (succeeded)`, which contradicted the
+                // surrounding comment ("on every send attempt regardless of
+                // success") and made failure spikes invisible to operators.
                 Telemetry.RecordMessageSent(
                     question.CorrelationId,
                     TeamsConnectorTelemetry.MessageTypeAgentQuestion,
                     destinationType);
+                if (succeeded)
+                {
+                    Telemetry.RecordCardDeliveryDurationMs(
+                        sw.Elapsed.TotalMilliseconds,
+                        question.CorrelationId,
+                        TeamsConnectorTelemetry.MessageTypeAgentQuestion,
+                        destinationType);
+                }
             }
         }
     }

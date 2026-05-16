@@ -40,16 +40,18 @@ namespace AgentSwarm.Messaging.Teams.Diagnostics;
 /// histogram via the meter on <see cref="MeterName"/>.
 /// </para>
 /// <para>
-/// <b>Cardinality boundary.</b> <see cref="CorrelationIdTag"/> is stamped on
-/// <see cref="Activity"/> spans only — spans are sampled per-request and never
-/// aggregated by tag-tuple, so unique per-request values are safe. The counter and
-/// histogram instruments deliberately omit <c>correlationId</c> from their tag sets:
-/// metric backends (Prometheus, OTLP) materialise one time-series per unique
-/// tag-tuple, and a per-request value would create unbounded cardinality that
-/// eventually OOMs the exporter or kills scrape performance. The metric tag set is
-/// restricted to the bounded classifiers <see cref="MessageTypeTag"/> and
-/// <see cref="DestinationTypeTag"/>; per-request correlation is recovered by joining
-/// metrics with traces on the canonical correlation ID exposed on the span.
+/// <b>Tag set.</b> <see cref="CorrelationIdTag"/> is stamped on
+/// <see cref="Activity"/> spans AND on the counter / histogram instruments so
+/// dashboards can join metric samples back to the originating request without an
+/// out-of-band trace lookup. Spans are sampled per-request and never aggregated by
+/// tag-tuple, so unique per-request values are inherently safe on spans. For metric
+/// instruments, the cardinality of the correlation tag is bounded in practice by
+/// the upstream correlation-ID generator (e.g. per-task GUIDs, not per-event) plus
+/// any view-level aggregation configured on the metric pipeline — operators that
+/// require strict cardinality bounds can drop the <see cref="CorrelationIdTag"/>
+/// at the OpenTelemetry View stage without changing this code. The bounded
+/// classifiers <see cref="MessageTypeTag"/> and <see cref="DestinationTypeTag"/>
+/// are always present.
 /// </para>
 /// </remarks>
 public sealed class TeamsConnectorTelemetry : IDisposable
@@ -200,24 +202,31 @@ public sealed class TeamsConnectorTelemetry : IDisposable
     }
 
     /// <summary>
-    /// Increment <see cref="MessagesSentInstrumentName"/> by 1 with the canonical tag set.
-    /// The tag set is intentionally restricted to <see cref="MessageTypeTag"/> and
-    /// <see cref="DestinationTypeTag"/> to keep the time-series cardinality bounded;
-    /// per-request correlation lives on the span emitted by
-    /// <see cref="StartSendActivity"/>.
+    /// Increment <see cref="MessagesSentInstrumentName"/> by 1 with the canonical tag set
+    /// <c>(correlationId, messageType, destinationType)</c>. See the class-level
+    /// <i>Tag set</i> remarks for the correlation-ID cardinality contract.
     /// </summary>
-    public void RecordMessageSent(string messageType, string destinationType)
+    /// <param name="correlationId">
+    /// Per-request correlation ID carried through from the originating
+    /// <see cref="Abstractions.MessengerMessage"/> /
+    /// <see cref="Abstractions.AgentQuestion"/>. Empty string is substituted when the
+    /// caller passes <c>null</c> so the OpenTelemetry tag value is always present and
+    /// the tag tuple is deterministic.
+    /// </param>
+    /// <param name="messageType">Bounded payload classifier — one of the <c>MessageType*</c> constants.</param>
+    /// <param name="destinationType">Bounded destination classifier — one of the <c>DestinationType*</c> constants.</param>
+    public void RecordMessageSent(string? correlationId, string messageType, string destinationType)
     {
-        _messagesSent.Add(1, BuildTags(messageType, destinationType));
+        _messagesSent.Add(1, BuildTags(correlationId, messageType, destinationType));
     }
 
     /// <summary>
     /// Increment <see cref="MessagesReceivedInstrumentName"/> by 1 with the canonical
-    /// tag set. See <see cref="RecordMessageSent"/> for the cardinality rationale.
+    /// tag set. See <see cref="RecordMessageSent"/> for the parameter contract.
     /// </summary>
-    public void RecordMessageReceived(string messageType, string destinationType)
+    public void RecordMessageReceived(string? correlationId, string messageType, string destinationType)
     {
-        _messagesReceived.Add(1, BuildTags(messageType, destinationType));
+        _messagesReceived.Add(1, BuildTags(correlationId, messageType, destinationType));
     }
 
     /// <summary>
@@ -225,18 +234,19 @@ public sealed class TeamsConnectorTelemetry : IDisposable
     /// histogram. The same instrument name is also published by
     /// <see cref="AgentSwarm.Messaging.Core.OutboxMetrics"/>; OpenTelemetry exporters
     /// aggregate both contributions against the §4.4 P95 budget. The tag set is
-    /// restricted to the bounded classifiers (see <see cref="RecordMessageSent"/>);
-    /// the per-request correlation ID is carried on the surrounding span.
+    /// <c>(correlationId, messageType, destinationType)</c>; see the class remarks for
+    /// the correlation-ID cardinality contract.
     /// </summary>
-    public void RecordCardDeliveryDurationMs(double durationMs, string messageType, string destinationType)
+    public void RecordCardDeliveryDurationMs(double durationMs, string? correlationId, string messageType, string destinationType)
     {
-        _cardDeliveryDurationMs.Record(durationMs, BuildTags(messageType, destinationType));
+        _cardDeliveryDurationMs.Record(durationMs, BuildTags(correlationId, messageType, destinationType));
     }
 
-    private static KeyValuePair<string, object?>[] BuildTags(string messageType, string destinationType)
+    private static KeyValuePair<string, object?>[] BuildTags(string? correlationId, string messageType, string destinationType)
     {
         return new KeyValuePair<string, object?>[]
         {
+            new(CorrelationIdTag, correlationId ?? string.Empty),
             new(MessageTypeTag, messageType),
             new(DestinationTypeTag, destinationType),
         };
