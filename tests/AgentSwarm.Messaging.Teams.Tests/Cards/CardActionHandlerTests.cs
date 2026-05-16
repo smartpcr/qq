@@ -99,20 +99,30 @@ public sealed class CardActionHandlerTests
         public required RecordingInboundEventPublisher Publisher { get; init; }
         public required RecordingAuditLogger Audit { get; init; }
 
-        public static HandlerHarness Build(ICardStateStore? cardStateStore = null)
+        public static HandlerHarness Build(ICardStateStore? cardStateStore = null, TimeProvider? timeProvider = null)
         {
             var questionStore = new InMemoryAgentQuestionStore();
             var cardStore = (cardStateStore as RecordingCardStateStore_) ?? new RecordingCardStateStore_();
             var cardManager = new RecordingTeamsCardManager();
             var publisher = new RecordingInboundEventPublisher();
             var audit = new RecordingAuditLogger();
-            var handler = new CardActionHandler(
-                questionStore,
-                cardStateStore ?? cardStore,
-                cardManager,
-                publisher,
-                audit,
-                NullLogger<CardActionHandler>.Instance);
+            var handler = timeProvider is null
+                ? new CardActionHandler(
+                    questionStore,
+                    cardStateStore ?? cardStore,
+                    cardManager,
+                    publisher,
+                    audit,
+                    NullLogger<CardActionHandler>.Instance)
+                : new CardActionHandler(
+                    questionStore,
+                    cardStateStore ?? cardStore,
+                    cardManager,
+                    publisher,
+                    audit,
+                    NullLogger<CardActionHandler>.Instance,
+                    timeProvider,
+                    TimeSpan.FromMinutes(5));
 
             return new HandlerHarness
             {
@@ -124,6 +134,19 @@ public sealed class CardActionHandlerTests
                 Audit = audit,
             };
         }
+    }
+
+    /// <summary>
+    /// Minimal <see cref="TimeProvider"/> that always returns a pinned instant. Used by
+    /// the iter-3 expiry tests so the deadline arithmetic is deterministic and the
+    /// race-window assertions do not depend on wall-clock skew between
+    /// <c>BuildOpenQuestion</c> and <c>HandleAsync</c>.
+    /// </summary>
+    private sealed class FixedTimeProvider : TimeProvider
+    {
+        private readonly DateTimeOffset _now;
+        public FixedTimeProvider(DateTimeOffset now) => _now = now;
+        public override DateTimeOffset GetUtcNow() => _now;
     }
 
     private sealed class RecordingCardStateStore_ : ICardStateStore
@@ -263,6 +286,98 @@ public sealed class CardActionHandlerTests
         Assert.Empty(harness.CardManager.Calls);
         var entry = Assert.Single(harness.Audit.Entries);
         Assert.Equal(AuditOutcomes.Rejected, entry.Outcome);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #3 — when the durable <see cref="AgentQuestion.Status"/>
+    /// is already <see cref="AgentQuestionStatuses.Expired"/> (the
+    /// <see cref="AgentSwarm.Messaging.Teams.Lifecycle.QuestionExpiryProcessor"/> sweep
+    /// has already run), the handler must reject with the distinct <c>"Expired"</c>
+    /// code rather than the generic <c>"AlreadyResolved"</c> code — operators and the
+    /// Teams client both need to distinguish these two terminal states.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_QuestionStatusExpired_EmitsRejectedAudit_WithExpiredCode()
+    {
+        var harness = HandlerHarness.Build();
+        harness.QuestionStore.Seed(BuildOpenQuestion(status: AgentQuestionStatuses.Expired));
+
+        var response = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+
+        // Inspect the response value for the rejection code (Universal Action error contract).
+        Assert.NotNull(response);
+        var json = System.Text.Json.JsonSerializer.Serialize(response.Value);
+        Assert.Contains("Expired", json, StringComparison.Ordinal);
+
+        Assert.Empty(harness.QuestionStore.StatusTransitionCalls);
+        Assert.Empty(harness.Publisher.Published);
+        Assert.Empty(harness.CardManager.Calls);
+        var entry = Assert.Single(harness.Audit.Entries);
+        Assert.Equal(AuditOutcomes.Rejected, entry.Outcome);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #3 — race-window guard. After
+    /// <see cref="AgentQuestion.ExpiresAt"/> elapses but BEFORE
+    /// <see cref="AgentSwarm.Messaging.Teams.Lifecycle.QuestionExpiryProcessor"/>'s next
+    /// sweep flips <see cref="AgentQuestion.Status"/> to
+    /// <see cref="AgentQuestionStatuses.Expired"/>, the question is still
+    /// <c>Open</c>. Accepting a card action in that window would mint a stale Resolved
+    /// row past the deadline; the handler must reject explicitly with the
+    /// <c>"Expired"</c> code. The strict <c>&lt;</c> comparison matches
+    /// <see cref="AgentSwarm.Messaging.Teams.EntityFrameworkCore.SqlAgentQuestionStore.GetOpenExpiredAsync"/>
+    /// so the boundary semantics are identical across the handler and the worker.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_OpenButPastExpiresAt_EmitsRejectedAudit_NoCasAttempt()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var time = new FixedTimeProvider(now);
+        var harness = HandlerHarness.Build(timeProvider: time);
+        // Open question whose deadline elapsed five seconds ago — the expiry sweep has
+        // not yet flipped Status to Expired.
+        var question = BuildOpenQuestion() with { ExpiresAt = now.AddSeconds(-5) };
+        harness.QuestionStore.Seed(question);
+
+        var response = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+
+        Assert.NotNull(response);
+        var json = System.Text.Json.JsonSerializer.Serialize(response.Value);
+        Assert.Contains("Expired", json, StringComparison.Ordinal);
+
+        // No CAS was attempted — the deadline check fires BEFORE TryUpdateStatusAsync.
+        Assert.Empty(harness.QuestionStore.StatusTransitionCalls);
+        Assert.Empty(harness.Publisher.Published);
+        Assert.Empty(harness.CardManager.Calls);
+
+        var entry = Assert.Single(harness.Audit.Entries);
+        Assert.Equal(AuditOutcomes.Rejected, entry.Outcome);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #3 — boundary case: an Open question whose
+    /// <see cref="AgentQuestion.ExpiresAt"/> equals the current instant must be
+    /// accepted (the handler uses strict <c>&lt;</c>, matching
+    /// <see cref="AgentSwarm.Messaging.Teams.EntityFrameworkCore.SqlAgentQuestionStore.GetOpenExpiredAsync"/>).
+    /// Without this test, a future refactor that flipped the comparison to <c>&lt;=</c>
+    /// would silently regress the boundary alignment with the worker.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_OpenAtExactExpiresAtInstant_AcceptsAction()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var time = new FixedTimeProvider(now);
+        var harness = HandlerHarness.Build(timeProvider: time);
+        var question = BuildOpenQuestion() with { ExpiresAt = now };
+        harness.QuestionStore.Seed(question);
+
+        await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+
+        // Acceptance signal — CAS attempted, decision published, success audit row.
+        Assert.Single(harness.QuestionStore.StatusTransitionCalls);
+        Assert.Single(harness.Publisher.Published);
+        var entry = Assert.Single(harness.Audit.Entries);
+        Assert.Equal(AuditOutcomes.Success, entry.Outcome);
     }
 
     [Fact]
