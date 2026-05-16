@@ -217,7 +217,7 @@ public static class TeamsServiceCollectionExtensions
     /// (delegating to the existing singleton wired by
     /// <see cref="AddTeamsMessengerConnector"/>), the concrete
     /// <see cref="Cards.CardActionHandler"/> under
-    /// <see cref="ICardActionHandler"/> (replacing the Stage 2.1 <c>NoOpCardActionHandler</c>),
+    /// <see cref="ICardActionHandler"/> (<b>replacing</b> the Stage 2.1 <c>NoOpCardActionHandler</c>),
     /// and the <see cref="QuestionExpiryProcessor"/> hosted service so the lifecycle worker
     /// boots with the host.
     /// </summary>
@@ -232,10 +232,14 @@ public static class TeamsServiceCollectionExtensions
     /// Stage 2.1 in-memory stubs.
     /// </para>
     /// <para>
-    /// Every registration uses <c>TryAdd*</c>: calling the helper multiple times is
-    /// idempotent, and host-supplied custom <see cref="ICardActionHandler"/> or
-    /// <see cref="ITeamsCardManager"/> registrations made BEFORE this call are
-    /// preserved.
+    /// <b>Iter-8 fix:</b> the <see cref="ICardActionHandler"/> and
+    /// <see cref="ITeamsCardManager"/> registrations now use
+    /// <see cref="ServiceCollectionDescriptorExtensions.RemoveAll{T}(IServiceCollection)"/>
+    /// + <see cref="ServiceCollectionServiceExtensions.AddSingleton{TService}(IServiceCollection, Func{IServiceProvider, TService})"/>
+    /// rather than <c>TryAddSingleton</c>. This unconditionally replaces any Stage 2.1
+    /// no-op stub previously registered for either contract — the implementation-plan
+    /// requirement that the concrete Stage 3.3 handler/connector wins regardless of
+    /// composition order.
     /// </para>
     /// </remarks>
     public static IServiceCollection AddTeamsCardLifecycle(this IServiceCollection services)
@@ -251,12 +255,16 @@ public static class TeamsServiceCollectionExtensions
 
         // Connector is the canonical ITeamsCardManager implementation per
         // architecture.md §4.1.1 ("TeamsMessengerConnector implements both
-        // IMessengerConnector and ITeamsCardManager").
-        services.TryAddSingleton<ITeamsCardManager>(
+        // IMessengerConnector and ITeamsCardManager"). Replace any prior stub
+        // registration so hosts that wired a no-op in Stage 2.1 get the concrete here.
+        services.RemoveAll<ITeamsCardManager>();
+        services.AddSingleton<ITeamsCardManager>(
             sp => sp.GetRequiredService<TeamsMessengerConnector>());
 
-        // Replace the Stage 2.1 NoOpCardActionHandler with the concrete CardActionHandler.
-        services.TryAddSingleton<ICardActionHandler, CardActionHandler>();
+        // Replace the Stage 2.1 NoOpCardActionHandler (or any other prior stub) with the
+        // concrete CardActionHandler implementation.
+        services.RemoveAll<ICardActionHandler>();
+        services.AddSingleton<ICardActionHandler, CardActionHandler>();
 
         // Lifecycle worker — singleton per BackgroundService convention. Registered via
         // AddHostedService<T>() so the runtime picks it up automatically.

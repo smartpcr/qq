@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
@@ -26,6 +27,14 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 /// <c>ActionId</c>, <c>ActionValue</c>, <c>CorrelationId</c>, and the optional
 /// <c>Comment</c> — the same code path used by Stage 3.1's
 /// <see cref="CardActionMapper"/> so a typo on either side fails fast.</description></item>
+/// <item><description>Apply the <c>architecture.md</c> §2.6 fast-path dedupe — the
+/// <see cref="_processedActions"/> in-memory set keyed on <c>QuestionId + ActorAad</c>
+/// short-circuits within-session duplicate submissions (double-taps) <i>before</i>
+/// touching any store. Entries are kept for
+/// <see cref="DedupeRetentionPeriod"/> on every terminal outcome (success or known
+/// rejection) so a user cannot get a different reply by spamming the same action;
+/// entries are explicitly evicted on unhandled exceptions so transient infrastructure
+/// failures remain retryable.</description></item>
 /// <item><description>Resolve the originating <see cref="AgentQuestion"/> via
 /// <see cref="IAgentQuestionStore.GetByIdAsync"/>. A missing question reports a
 /// <c>Rejected</c> audit entry and surfaces a "question not found" card without
@@ -51,8 +60,12 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 /// (the actor-attributed overload — the canonical 3-arg
 /// <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, CancellationToken)"/>
 /// remains intact for callers that have no decision payload), and write a
-/// <see cref="AuditEventTypes.CardActionReceived"/> audit entry with
-/// <see cref="AuditOutcomes.Success"/>.</description></item>
+/// <see cref="AuditEventTypes.CardActionReceived"/> audit entry. <b>Iter-8 fix #3:</b>
+/// if the card update throws after the durable resolution succeeds, the audit row is
+/// written with <see cref="AuditOutcomes.Failed"/> and a <c>cardUpdateError</c>
+/// marker in the sanitised payload JSON — the decision itself is durably recorded so
+/// the caller still receives an <c>Accept</c> response, but operators see the
+/// lifecycle gap in the audit trail.</description></item>
 /// </list>
 /// <para>
 /// <b>Audit payload sanitisation.</b> The <see cref="AuditEntry.PayloadJson"/> field is
@@ -68,6 +81,17 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 /// </remarks>
 public sealed class CardActionHandler : ICardActionHandler
 {
+    /// <summary>
+    /// Retention window for the in-memory processed-action dedupe set
+    /// (<c>architecture.md</c> §2.6 layer 2). Entries older than this are pruned on
+    /// every <see cref="HandleAsync"/> entry so the set does not grow unbounded.
+    /// Five minutes is intentionally wider than the typical card-double-tap window but
+    /// narrow enough that a user who genuinely retries after a transient failure can
+    /// recover. Tests opt in to a shorter window via the
+    /// <c>internal</c> 8-argument constructor.
+    /// </summary>
+    internal static readonly TimeSpan DedupeRetentionPeriod = TimeSpan.FromMinutes(5);
+
     private readonly IAgentQuestionStore _questionStore;
     private readonly ICardStateStore _cardStateStore;
     private readonly ITeamsCardManager _cardManager;
@@ -75,6 +99,13 @@ public sealed class CardActionHandler : ICardActionHandler
     private readonly IAuditLogger _auditLogger;
     private readonly ILogger<CardActionHandler> _logger;
     private readonly CardActionMapper _mapper;
+    private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _dedupeRetention;
+
+    // architecture.md §2.6 layer 2 — fast-path dedupe keyed on "{questionId}|{actorAad}".
+    // Tracks the timestamp the key was first claimed so stale entries (older than
+    // _dedupeRetention) can be evicted lazily on every HandleAsync entry.
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _processedActions = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Construct the handler with the six dependencies required by
@@ -88,6 +119,25 @@ public sealed class CardActionHandler : ICardActionHandler
         IInboundEventPublisher inboundEventPublisher,
         IAuditLogger auditLogger,
         ILogger<CardActionHandler> logger)
+        : this(questionStore, cardStateStore, cardManager, inboundEventPublisher, auditLogger, logger, TimeProvider.System, DedupeRetentionPeriod)
+    {
+    }
+
+    /// <summary>
+    /// Test-friendly constructor that accepts a deterministic
+    /// <see cref="TimeProvider"/> and a configurable dedupe retention window. Hosts
+    /// resolve the public 6-arg constructor via DI; unit tests opt in to this overload
+    /// to advance the dedupe clock without sleeping.
+    /// </summary>
+    internal CardActionHandler(
+        IAgentQuestionStore questionStore,
+        ICardStateStore cardStateStore,
+        ITeamsCardManager cardManager,
+        IInboundEventPublisher inboundEventPublisher,
+        IAuditLogger auditLogger,
+        ILogger<CardActionHandler> logger,
+        TimeProvider timeProvider,
+        TimeSpan dedupeRetention)
     {
         _questionStore = questionStore ?? throw new ArgumentNullException(nameof(questionStore));
         _cardStateStore = cardStateStore ?? throw new ArgumentNullException(nameof(cardStateStore));
@@ -95,6 +145,8 @@ public sealed class CardActionHandler : ICardActionHandler
         _inboundEventPublisher = inboundEventPublisher ?? throw new ArgumentNullException(nameof(inboundEventPublisher));
         _auditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _dedupeRetention = dedupeRetention > TimeSpan.Zero ? dedupeRetention : DedupeRetentionPeriod;
         _mapper = new CardActionMapper();
     }
 
@@ -107,11 +159,12 @@ public sealed class CardActionHandler : ICardActionHandler
         var actorAad = activity?.From?.AadObjectId ?? activity?.From?.Id ?? "unknown";
         var actorDisplayName = activity?.From?.Name;
         var tenantId = ResolveTenantId(activity);
-        var receivedAt = activity?.Timestamp ?? DateTimeOffset.UtcNow;
+        var receivedAt = activity?.Timestamp ?? _timeProvider.GetUtcNow();
 
         // Guard: an Adaptive Card invoke without an Action.Submit payload is malformed —
         // surface as Rejected so operators can investigate via the audit trail without a
-        // stack trace blowing up the bot framework pipeline.
+        // stack trace blowing up the bot framework pipeline. The dedupe layer cannot key
+        // off a missing question ID so we skip it for this malformed branch.
         if (activity?.Value is null)
         {
             _logger.LogWarning("Adaptive card invoke arrived with a null Activity.Value; rejecting.");
@@ -150,6 +203,72 @@ public sealed class CardActionHandler : ICardActionHandler
         var correlationId = !string.IsNullOrWhiteSpace(payload.CorrelationId)
             ? payload.CorrelationId
             : ResolveCorrelationId(activity, fallback: Guid.NewGuid().ToString("N"));
+
+        // architecture.md §2.6 layer 2 — in-memory processed-action dedupe set, keyed on
+        // (QuestionId + UserId). Fast-path short-circuits within-session duplicate
+        // submissions (e.g. user double-tapped the Approve button or the Bot Framework
+        // delivered the same invoke twice) before any I/O. Entries are kept for
+        // _dedupeRetention on every terminal outcome (success or planned rejection); only
+        // unhandled exceptions evict the entry so transient infrastructure failures stay
+        // retryable.
+        var dedupeKey = BuildDedupeKey(payload.QuestionId, actorAad);
+        var nowForDedupe = _timeProvider.GetUtcNow();
+        PruneStaleDedupeEntries(nowForDedupe);
+        if (!_processedActions.TryAdd(dedupeKey, nowForDedupe))
+        {
+            _logger.LogInformation(
+                "Card action {ActionValue} for question {QuestionId} by actor {Actor} short-circuited by in-memory dedupe.",
+                payload.ActionValue,
+                payload.QuestionId,
+                actorAad);
+            return Reject($"Decision for question '{payload.QuestionId}' has already been submitted.");
+        }
+
+        var keepDedupeEntry = false;
+        try
+        {
+            var response = await ProcessHandledAsync(
+                turnContext,
+                activity,
+                payload,
+                actorAad,
+                actorDisplayName,
+                tenantId,
+                receivedAt,
+                correlationId,
+                ct).ConfigureAwait(false);
+            keepDedupeEntry = true;
+            return response;
+        }
+        catch
+        {
+            // Unhandled exception means we never reached a terminal outcome — let the
+            // user retry the action by evicting the dedupe entry. Planned rejections and
+            // the Failed-audit branch flow through the normal return path above and keep
+            // the entry.
+            throw;
+        }
+        finally
+        {
+            if (!keepDedupeEntry)
+            {
+                _processedActions.TryRemove(dedupeKey, out _);
+            }
+        }
+    }
+
+    private async Task<AdaptiveCardInvokeResponse> ProcessHandledAsync(
+        ITurnContext turnContext,
+        Activity activity,
+        CardActionPayload payload,
+        string actorAad,
+        string? actorDisplayName,
+        string tenantId,
+        DateTimeOffset receivedAt,
+        string correlationId,
+        CancellationToken ct)
+    {
+        _ = turnContext;
 
         var question = await _questionStore.GetByIdAsync(payload.QuestionId, ct).ConfigureAwait(false);
         if (question is null)
@@ -268,6 +387,11 @@ public sealed class CardActionHandler : ICardActionHandler
 
         await _inboundEventPublisher.PublishAsync(decisionEvent, ct).ConfigureAwait(false);
 
+        // Iter-8 fix #3: capture the card-update exception (if any) so the audit row
+        // truthfully reflects the lifecycle outcome. The decision is durably resolved at
+        // this point and we still return Accept to the caller — but the audit must NOT
+        // report Success when the original card was not replaced.
+        Exception? cardUpdateException = null;
         try
         {
             await _cardManager
@@ -281,30 +405,57 @@ public sealed class CardActionHandler : ICardActionHandler
         }
         catch (Exception ex)
         {
-            // Card-update failure is logged but does NOT roll back the durable resolution
-            // — the decision has already been recorded and published. Operators can later
-            // re-render the confirmation card from the audit trail; we surface a Failed
-            // audit entry below by piggy-backing the success entry's PayloadJson with a
-            // best-effort cardUpdateError marker so triage can find the failure.
+            cardUpdateException = ex;
             _logger.LogError(
                 ex,
-                "Card update for question {QuestionId} failed after successful resolution; decision is durably recorded.",
+                "Card update for question {QuestionId} failed after successful resolution; decision is durably recorded but the original card remains active and is now stale.",
                 payload.QuestionId);
         }
 
-        var successPayload = await BuildSanitizedPayloadJsonAsync(payload, question.AgentId, ct).ConfigureAwait(false);
+        var auditOutcome = cardUpdateException is null
+            ? AuditOutcomes.Success
+            : AuditOutcomes.Failed;
+        var payloadJson = await BuildSanitizedPayloadJsonAsync(
+            payload,
+            question.AgentId,
+            ct,
+            cardUpdateError: cardUpdateException?.Message).ConfigureAwait(false);
         await WriteAuditAsync(
-            outcome: AuditOutcomes.Success,
+            outcome: auditOutcome,
             actorAad,
             tenantId,
             agentId: question.AgentId,
             action: payload.ActionValue,
-            payloadJson: successPayload,
+            payloadJson: payloadJson,
             correlationId,
             receivedAt,
             ct).ConfigureAwait(false);
 
         return Accept($"Recorded {payload.ActionValue} for {payload.QuestionId}.");
+    }
+
+    private static string BuildDedupeKey(string questionId, string actorAad)
+        => $"{questionId}|{actorAad}";
+
+    private void PruneStaleDedupeEntries(DateTimeOffset now)
+    {
+        // Lazy O(N) eviction on each entry — the dedupe set is bounded by the rate of
+        // distinct (question, user) pairs within _dedupeRetention. For a realistic
+        // approval workload this stays in the low hundreds of entries even at peak. We
+        // deliberately avoid a background sweep timer because keeping the handler free
+        // of timers makes lifetime reasoning and tests simpler.
+        if (_processedActions.IsEmpty)
+        {
+            return;
+        }
+
+        foreach (var kvp in _processedActions)
+        {
+            if (now - kvp.Value > _dedupeRetention)
+            {
+                _processedActions.TryRemove(kvp.Key, out _);
+            }
+        }
     }
 
     private static AdaptiveCardInvokeResponse Reject(string message)
@@ -366,7 +517,8 @@ public sealed class CardActionHandler : ICardActionHandler
     private async Task<string> BuildSanitizedPayloadJsonAsync(
         CardActionPayload payload,
         string? agentId,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? cardUpdateError = null)
     {
         // Sanitization rules per tech-spec.md §4.3 — payload JSON must carry no secrets or
         // PII beyond identity. We persist only the canonical card-action discriminators
@@ -374,6 +526,11 @@ public sealed class CardActionHandler : ICardActionHandler
         // — if available — the persisted card activity ID. The free-form user-supplied
         // comment text is replaced with a "<redacted>" sentinel so auditors can see that
         // a comment was provided without revealing its content.
+        //
+        // Iter-8 fix #3: when the post-resolution card update threw, surface the
+        // exception's Message via the `cardUpdateError` marker so operators can find the
+        // lifecycle gap in the audit trail. We log the full exception elsewhere; the
+        // PayloadJson keeps only the short message so the audit row stays compact.
         string? cardActivityId = null;
         try
         {
@@ -397,6 +554,7 @@ public sealed class CardActionHandler : ICardActionHandler
             comment = string.IsNullOrEmpty(payload.Comment) ? null : "<redacted>",
             cardActivityId,
             agentId,
+            cardUpdateError,
         };
 
         return JsonSerializer.Serialize(sanitized);

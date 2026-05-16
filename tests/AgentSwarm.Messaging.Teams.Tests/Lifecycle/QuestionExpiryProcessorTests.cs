@@ -80,8 +80,21 @@ public sealed class QuestionExpiryProcessorTests
         public List<string> DeleteCalls { get; } = new();
         public HashSet<string> DeleteFailures { get; } = new(StringComparer.Ordinal);
 
+        // Iter-8 fix #4: track UpdateCardAsync(MarkExpired) compensation calls so the
+        // recoverable-delete-failure test can assert the fallback path fires.
+        public List<(string QuestionId, CardUpdateAction Action)> UpdateCalls { get; } = new();
+        public HashSet<string> UpdateFailures { get; } = new(StringComparer.Ordinal);
+
         public Task UpdateCardAsync(string questionId, CardUpdateAction action, CancellationToken ct)
-            => Task.CompletedTask;
+        {
+            UpdateCalls.Add((questionId, action));
+            if (UpdateFailures.Contains(questionId))
+            {
+                throw new InvalidOperationException($"Simulated update failure for {questionId}.");
+            }
+
+            return Task.CompletedTask;
+        }
 
         public Task UpdateCardAsync(string questionId, CardUpdateAction action, HumanDecisionEvent decision, string? actorDisplayName, CancellationToken ct)
             => Task.CompletedTask;
@@ -194,8 +207,12 @@ public sealed class QuestionExpiryProcessorTests
     }
 
     [Fact]
-    public async Task ProcessOnceAsync_DeleteThrows_LogsAndContinues_DoesNotRollback()
+    public async Task ProcessOnceAsync_DeleteThrows_FallsBackToMarkExpired_CompensationSucceeds()
     {
+        // Iter-8 fix #4: when DeleteCardAsync fails after the Open→Expired CAS, the
+        // processor falls back to UpdateCardAsync(MarkExpired) so the user sees an
+        // "Expired" notice in place of the original interactive card rather than the
+        // delete failure leaving a stale actionable card forever.
         var now = DateTimeOffset.UtcNow;
         var time = new FakeTimeProvider_(now);
         var questionStore = new FakeAgentQuestionStore();
@@ -213,12 +230,60 @@ public sealed class QuestionExpiryProcessorTests
             time,
             NullLogger<QuestionExpiryProcessor>.Instance);
 
-        // The failure on "b" must NOT abort the loop, must NOT rollback "b"'s Expired
-        // transition (the deadline really elapsed), and "c" must still be processed.
         var processed = await processor.ProcessOnceAsync(batchSize: 10, CancellationToken.None);
 
-        Assert.Equal(2, processed); // a and c succeeded; b's delete threw
+        // All three CAS transitions succeeded; "b"'s delete failed but its MarkExpired
+        // compensation succeeded so the user-visible card lifecycle is closed for all.
+        Assert.Equal(3, processed);
         Assert.Equal(new[] { "a", "b", "c" }, cardManager.DeleteCalls);
+
+        // Only "b" should have triggered the fallback MarkExpired path.
+        var fallback = Assert.Single(cardManager.UpdateCalls);
+        Assert.Equal("b", fallback.QuestionId);
+        Assert.Equal(CardUpdateAction.MarkExpired, fallback.Action);
+
+        Assert.Equal(AgentQuestionStatuses.Expired, questionStore.Questions["a"].Status);
+        Assert.Equal(AgentQuestionStatuses.Expired, questionStore.Questions["b"].Status);
+        Assert.Equal(AgentQuestionStatuses.Expired, questionStore.Questions["c"].Status);
+    }
+
+    [Fact]
+    public async Task ProcessOnceAsync_DeleteAndFallbackBothFail_LogsAndContinues()
+    {
+        // Iter-8 fix #4 second branch: if BOTH the primary DeleteCardAsync and the
+        // MarkExpired compensation fall through (e.g. extended Bot Framework outage),
+        // the processor must still process the remaining batch and must NOT roll back
+        // the Open→Expired CAS — the deadline has truly elapsed and the durable
+        // resolution stands. Operators see two error-level log lines per orphan.
+        var now = DateTimeOffset.UtcNow;
+        var time = new FakeTimeProvider_(now);
+        var questionStore = new FakeAgentQuestionStore();
+        questionStore.Questions["a"] = BuildQuestion("a", now.AddMinutes(-3));
+        questionStore.Questions["b"] = BuildQuestion("b", now.AddMinutes(-2));
+        questionStore.Questions["c"] = BuildQuestion("c", now.AddMinutes(-1));
+
+        var cardManager = new RecordingTeamsCardManager();
+        cardManager.DeleteFailures.Add("b");
+        cardManager.UpdateFailures.Add("b");
+
+        var processor = new QuestionExpiryProcessor(
+            questionStore,
+            cardManager,
+            new TeamsMessagingOptions(),
+            time,
+            NullLogger<QuestionExpiryProcessor>.Instance);
+
+        var processed = await processor.ProcessOnceAsync(batchSize: 10, CancellationToken.None);
+
+        // "a" and "c" succeed; "b"'s delete AND fallback both fail.
+        Assert.Equal(2, processed);
+        Assert.Equal(new[] { "a", "b", "c" }, cardManager.DeleteCalls);
+        var fallbackAttempt = Assert.Single(cardManager.UpdateCalls);
+        Assert.Equal("b", fallbackAttempt.QuestionId);
+        Assert.Equal(CardUpdateAction.MarkExpired, fallbackAttempt.Action);
+
+        // Durable resolution stands for all three — we do not roll back on card-side
+        // failures because the deadline has truly elapsed.
         Assert.Equal(AgentQuestionStatuses.Expired, questionStore.Questions["b"].Status);
     }
 

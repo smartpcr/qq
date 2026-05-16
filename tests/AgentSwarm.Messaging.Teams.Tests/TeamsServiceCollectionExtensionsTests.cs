@@ -246,6 +246,66 @@ public sealed class TeamsServiceCollectionExtensionsTests
         Assert.Contains(hosted, h => h is AgentSwarm.Messaging.Teams.Lifecycle.QuestionExpiryProcessor);
     }
 
+    /// <summary>
+    /// Iter-8 fix #2 — Stage 2.1 typically pre-registers no-op stubs for
+    /// <see cref="ICardActionHandler"/> and <see cref="ITeamsCardManager"/>.
+    /// <see cref="TeamsServiceCollectionExtensions.AddTeamsCardLifecycle"/> must
+    /// unconditionally replace those stubs with the concrete Stage 3.3 implementations
+    /// (per the implementation-plan requirement that the production handler/manager
+    /// wins). This test pre-registers stubs <i>before</i> calling the lifecycle helper
+    /// and asserts the resolved services are the concrete types — not the stubs.
+    /// </summary>
+    [Fact]
+    public void AddTeamsCardLifecycle_ReplacesPreRegisteredStubs_WithConcrete()
+    {
+        var services = BuildServices();
+        services.AddSingleton<IAuditLogger, RecordingAuditLogger>();
+
+        // Simulate Stage 2.1 stub pre-registration. Both must be replaced by AddTeamsCardLifecycle.
+        services.AddSingleton<ICardActionHandler, StubCardActionHandler>();
+        services.AddSingleton<ITeamsCardManager, StubTeamsCardManager>();
+
+        services.AddTeamsCardLifecycle();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var handler = sp.GetRequiredService<ICardActionHandler>();
+        Assert.IsType<CardActionHandler>(handler);
+        Assert.IsNotType<StubCardActionHandler>(handler);
+
+        var cardManager = sp.GetRequiredService<ITeamsCardManager>();
+        Assert.IsType<TeamsMessengerConnector>(cardManager);
+        Assert.IsNotType<StubTeamsCardManager>(cardManager);
+
+        // And IEnumerable<T> resolution must not leave behind the stub either — RemoveAll
+        // clears ALL prior descriptors for the contract, not just the one Replace would.
+        var allHandlers = sp.GetServices<ICardActionHandler>().ToList();
+        Assert.Single(allHandlers);
+        Assert.IsType<CardActionHandler>(allHandlers[0]);
+
+        var allManagers = sp.GetServices<ITeamsCardManager>().ToList();
+        Assert.Single(allManagers);
+        Assert.IsType<TeamsMessengerConnector>(allManagers[0]);
+    }
+
+    private sealed class StubCardActionHandler : ICardActionHandler
+    {
+        public Task<Microsoft.Bot.Schema.AdaptiveCardInvokeResponse> HandleAsync(
+            Microsoft.Bot.Builder.ITurnContext turnContext, CancellationToken ct)
+            => Task.FromResult(new Microsoft.Bot.Schema.AdaptiveCardInvokeResponse());
+    }
+
+    private sealed class StubTeamsCardManager : ITeamsCardManager
+    {
+        public Task UpdateCardAsync(string questionId, CardUpdateAction action, CancellationToken ct)
+            => Task.CompletedTask;
+
+        public Task UpdateCardAsync(string questionId, CardUpdateAction action, HumanDecisionEvent decision, string? actorDisplayName, CancellationToken ct)
+            => Task.CompletedTask;
+
+        public Task DeleteCardAsync(string questionId, CancellationToken ct)
+            => Task.CompletedTask;
+    }
+
     private static ServiceCollection BuildServices()
     {
         var services = new ServiceCollection();

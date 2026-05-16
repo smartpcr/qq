@@ -365,4 +365,151 @@ public sealed class CardActionHandlerTests
         var entry = Assert.Single(harness.Audit.Entries);
         Assert.Equal(AuditOutcomes.Rejected, entry.Outcome);
     }
+
+    /// <summary>
+    /// Iter-8 fix #3 — when <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, HumanDecisionEvent, string?, CancellationToken)"/>
+    /// throws AFTER the durable Open→Resolved CAS succeeds, the audit row must reflect
+    /// the lifecycle gap. The previous implementation wrote a <c>Success</c> outcome
+    /// even though the original interactive card was not replaced — operators had no
+    /// signal that the user-visible card was stale. The handler now writes
+    /// <see cref="AuditOutcomes.Failed"/> with a <c>cardUpdateError</c> marker in the
+    /// sanitised payload. The decision event is still published and the caller still
+    /// gets an <c>Accept</c> response because the durable resolution stands.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_CardUpdateThrows_EmitsFailedAudit_DecisionStillPublished()
+    {
+        var harness = HandlerHarness.Build();
+        harness.QuestionStore.Seed(BuildOpenQuestion());
+        harness.CardManager.OnUpdate = () => throw new InvalidOperationException("update-card-down");
+
+        var response = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+
+        // Decision is still published and caller still gets a non-null Accept response.
+        Assert.NotNull(response);
+        var ev = Assert.Single(harness.Publisher.Published);
+        var decisionEvent = Assert.IsType<DecisionEvent>(ev);
+        Assert.Equal("approve", decisionEvent.Payload.ActionValue);
+
+        // CAS was attempted and succeeded.
+        var transition = Assert.Single(harness.QuestionStore.StatusTransitionCalls);
+        Assert.Equal(AgentQuestionStatuses.Open, transition.Expected);
+        Assert.Equal(AgentQuestionStatuses.Resolved, transition.New);
+
+        // Audit outcome is Failed (NOT Success) and the payload carries the error marker.
+        var entry = Assert.Single(harness.Audit.Entries);
+        Assert.Equal(AuditOutcomes.Failed, entry.Outcome);
+        Assert.Contains("cardUpdateError", entry.PayloadJson, StringComparison.Ordinal);
+        Assert.Contains("update-card-down", entry.PayloadJson, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Iter-8 fix #5 — architecture.md §2.6 layer 2 in-memory processed-action dedupe.
+    /// When the same actor submits the same action for the same question twice within
+    /// the dedupe TTL, the second call must short-circuit BEFORE touching any store
+    /// (no question lookup, no CAS, no audit row). The first call still produces its
+    /// full terminal outcome (decision event + Success audit). The architectural
+    /// guarantee is that double-taps cannot produce two terminal outcomes nor two
+    /// decision events.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_DuplicateSubmissionWithinTtl_ShortCircuits_NoSecondDecisionOrAudit()
+    {
+        var harness = HandlerHarness.Build();
+        harness.QuestionStore.Seed(BuildOpenQuestion());
+
+        // First submission completes normally.
+        await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+        Assert.Single(harness.Publisher.Published);
+        Assert.Single(harness.Audit.Entries);
+        Assert.Single(harness.CardManager.Calls);
+        var firstTransitionCount = harness.QuestionStore.StatusTransitionCalls.Count;
+
+        // Second submission (same actor, same question, same action) hits the dedupe set.
+        var response = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+        Assert.NotNull(response);
+
+        // No additional decision event, no additional card update, no additional CAS,
+        // no additional audit row — the dedupe layer short-circuits BEFORE any I/O.
+        Assert.Single(harness.Publisher.Published);
+        Assert.Single(harness.CardManager.Calls);
+        Assert.Single(harness.Audit.Entries);
+        Assert.Equal(firstTransitionCount, harness.QuestionStore.StatusTransitionCalls.Count);
+    }
+
+    /// <summary>
+    /// Iter-8 fix #5 — a different actor (different <c>AadObjectId</c>) submitting the
+    /// same question must NOT be deduped. The dedupe key is <c>(QuestionId, UserId)</c>
+    /// so per-user replay protection is independent.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_DuplicateSubmissionDifferentActor_NotDeduped()
+    {
+        var harness = HandlerHarness.Build();
+        harness.QuestionStore.Seed(BuildOpenQuestion());
+
+        // First actor resolves the question (lands at Resolved).
+        await harness.Handler.HandleAsync(BuildInvokeTurn("approve", actorAad: "actor-1"), CancellationToken.None);
+
+        // Second actor submits — different dedupe key, so the handler does run the full
+        // pipeline. The question is now Resolved so the handler reports a Rejected audit
+        // entry (status check). The crucial point is that the dedupe layer did NOT
+        // short-circuit — we see TWO audit rows, not one.
+        await harness.Handler.HandleAsync(BuildInvokeTurn("approve", actorAad: "actor-2"), CancellationToken.None);
+
+        Assert.Equal(2, harness.Audit.Entries.Count);
+    }
+
+    /// <summary>
+    /// Iter-8 fix #5 — when the handler throws (e.g. infrastructure outage) the dedupe
+    /// entry is removed so the actor can retry. The architecture guarantee is "fast-path
+    /// dedupe for duplicate submissions" — not "permanent reject on transient failure".
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_UnhandledException_EvictsDedupeEntry_PermitsRetry()
+    {
+        // Cause an unhandled exception in the pipeline by making the question store throw
+        // on GetByIdAsync. The handler does not catch general exceptions in the question
+        // lookup path; the dedupe finally block must still evict the entry.
+        var throwingStore = new ThrowingQuestionStore();
+        var cardStore = new RecordingCardStateStore_();
+        var cardManager = new RecordingTeamsCardManager();
+        var publisher = new RecordingInboundEventPublisher();
+        var audit = new RecordingAuditLogger();
+        var handler = new CardActionHandler(
+            throwingStore,
+            cardStore,
+            cardManager,
+            publisher,
+            audit,
+            NullLogger<CardActionHandler>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
+
+        // Retry must NOT be short-circuited by the dedupe set — the throwing store
+        // proves we re-entered the pipeline because it throws again.
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
+
+        Assert.Equal(2, throwingStore.GetByIdCalls);
+    }
+
+    private sealed class ThrowingQuestionStore : IAgentQuestionStore
+    {
+        public int GetByIdCalls;
+        public Task SaveAsync(AgentQuestion question, CancellationToken ct) => Task.CompletedTask;
+        public Task<AgentQuestion?> GetByIdAsync(string questionId, CancellationToken ct)
+        {
+            GetByIdCalls++;
+            throw new InvalidOperationException("store-down");
+        }
+        public Task<bool> TryUpdateStatusAsync(string questionId, string expectedStatus, string newStatus, CancellationToken ct) => Task.FromResult(false);
+        public Task UpdateConversationIdAsync(string questionId, string conversationId, CancellationToken ct) => Task.CompletedTask;
+        public Task<AgentQuestion?> GetMostRecentOpenByConversationAsync(string conversationId, CancellationToken ct) => Task.FromResult<AgentQuestion?>(null);
+        public Task<IReadOnlyList<AgentQuestion>> GetOpenByConversationAsync(string conversationId, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<AgentQuestion>>(Array.Empty<AgentQuestion>());
+        public Task<IReadOnlyList<AgentQuestion>> GetOpenExpiredAsync(DateTimeOffset cutoff, int batchSize, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<AgentQuestion>>(Array.Empty<AgentQuestion>());
+    }
 }

@@ -37,13 +37,24 @@ namespace AgentSwarm.Messaging.Teams.Lifecycle;
 /// (b) on a successful CAS calls
 /// <see cref="ITeamsCardManager.DeleteCardAsync"/> which performs the inline-retry
 /// Bot Framework delete and updates the card-state row to
-/// <see cref="TeamsCardStatuses.Expired"/>. Card-delete failures are logged at error
-/// level — the durable question state has already moved to <see cref="AgentQuestionStatuses.Expired"/>
-/// (the user-facing approval is dead) and the worst-case outcome is a stale visible card
-/// in the channel that an operator can later remove. Re-issuing a delete on the next scan
-/// is left to a future cleanup workstream because the canonical card vocabulary
-/// (Pending/Answered/Expired) does not support a "pending-deletion" state without
-/// widening the <see cref="ICardStateStore"/> surface.
+/// <see cref="TeamsCardStatuses.Expired"/>.
+/// </para>
+/// <para>
+/// <b>Iter-8 fix #4 — recoverable delete failures (compensation path).</b> When
+/// <see cref="ITeamsCardManager.DeleteCardAsync"/> throws after the CAS has succeeded,
+/// the processor falls back to
+/// <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, System.Threading.CancellationToken)"/>
+/// with <see cref="CardUpdateAction.MarkExpired"/>. The update path uses Bot Framework's
+/// <c>UpdateActivityAsync</c> (with its own stale-404 fallback that <i>sends a fresh
+/// replacement card</i>) and persists the card-state row as
+/// <see cref="TeamsCardStatuses.Expired"/> on success — so the user sees an "Expired"
+/// notice in place of the original interactive card even when the delete API is
+/// temporarily unavailable. The CAS-first order is intentional: flipping to
+/// delete-first would risk deleting a confirmation card a concurrent user-resolution
+/// just rendered (the card-state row's <c>Status</c> lags the Teams activity update,
+/// so a status guard cannot eliminate the race). Both failure paths log at error level
+/// and surface the orphan to the next scan via card-state inspection in future ops
+/// tooling, but the user-visible lifecycle is closed atomically with the CAS.
 /// </para>
 /// <para>
 /// <b>Cadence and batch size</b> are read from <see cref="TeamsMessagingOptions"/>:
@@ -188,15 +199,35 @@ public sealed class QuestionExpiryProcessor : BackgroundService
             }
             catch (Exception ex)
             {
-                // Card delete failed after the question moved to Expired. The durable
-                // resolution stands; an operator-visible card may remain in the channel
-                // until manual cleanup. We do NOT roll the question back to Open because
-                // the deadline has truly elapsed and re-promoting Open would re-trigger
-                // approval logic on a question that has already missed its SLA.
+                // Iter-8 fix #4: instead of silently swallowing the delete failure and
+                // leaving an orphan card in the channel forever, fall back to the
+                // UpdateCardAsync(MarkExpired) compensation path. UpdateActivityAsync has
+                // its own stale-404 fallback that sends a replacement card, so a
+                // transient delete failure does not necessarily block the update. On
+                // fallback success the card-state row lands at Expired (per the
+                // canonical MarkExpired → TeamsCardStatuses.Expired mapping on the
+                // connector). On fallback failure we log at error level — the durable
+                // question state has already moved to Expired so the user-facing approval
+                // is dead, but an operator-visible card may remain.
                 _logger.LogError(
                     ex,
-                    "ITeamsCardManager.DeleteCardAsync for question {QuestionId} failed after Open→Expired CAS; question remains Expired with stale card.",
+                    "ITeamsCardManager.DeleteCardAsync for question {QuestionId} failed after Open→Expired CAS; falling back to MarkExpired card update.",
                     question.QuestionId);
+
+                try
+                {
+                    await _cardManager
+                        .UpdateCardAsync(question.QuestionId, CardUpdateAction.MarkExpired, ct)
+                        .ConfigureAwait(false);
+                    processed++;
+                }
+                catch (Exception fallbackEx)
+                {
+                    _logger.LogError(
+                        fallbackEx,
+                        "ITeamsCardManager.UpdateCardAsync(MarkExpired) compensation for question {QuestionId} also failed; orphan card remains visible.",
+                        question.QuestionId);
+                }
             }
         }
 
