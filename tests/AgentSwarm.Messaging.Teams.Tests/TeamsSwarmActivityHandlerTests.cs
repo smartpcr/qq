@@ -674,5 +674,36 @@ public sealed class TeamsSwarmActivityHandlerTests
         var sent = Assert.Single(harness.Adapter.Sent);
         Assert.Single(sent.Attachments);
     }
+
+    /// <summary>
+    /// Stage 3.2 §"@mention stripped before dispatch" — E2E: a channel message with
+    /// <c>&lt;at&gt;AgentBot&lt;/at&gt; agent status</c> must reach
+    /// <c>StatusCommandHandler</c> through the real <c>CommandDispatcher</c> +
+    /// <c>HandlerFactory.BuildE2E</c> handler graph. Covers the positive path; the
+    /// no-stripping contract on the dispatcher itself is covered directly by
+    /// <c>CommandDispatcherTests.DispatchAsync_RawAtMentionText_DoesNotRouteToHandler_AndPublishesTextEvent</c>.
+    /// </summary>
+    [Fact]
+    public async Task OnMessageActivityAsync_ChannelMentionStrippedAgentStatus_RoutesToStatusHandlerEndToEnd()
+    {
+        var recording = new TestDoubles.RecordingInboundEventPublisher();
+        var harness = BuildE2E(recording);
+        MapDave(harness.IdentityResolver, "aad-obj-bob-002");
+
+        var activity = NewChannelMentionMessage("<at>AgentBot</at> agent status");
+        await ProcessE2EAsync(harness, activity);
+
+        var published = Assert.Single(recording.Published);
+        var commandEvent = Assert.IsType<AgentSwarm.Messaging.Abstractions.CommandEvent>(published);
+        Assert.Equal(AgentSwarm.Messaging.Abstractions.MessengerEventTypes.Command, commandEvent.EventType);
+        Assert.Equal(AgentSwarm.Messaging.Teams.Commands.CommandNames.AgentStatus, commandEvent.Payload.CommandType);
+        Assert.Equal("Teams", commandEvent.Messenger);
+        Assert.Equal("aad-obj-bob-002", commandEvent.ExternalUserId);
+        Assert.Equal(AgentSwarm.Messaging.Abstractions.MessengerEventSources.TeamChannel, commandEvent.Source);
+        Assert.Equal(string.Empty, commandEvent.Payload.Payload);
+
+        var sent = Assert.Single(harness.Adapter.Sent);
+        Assert.Single(sent.Attachments);
+    }
 }
 

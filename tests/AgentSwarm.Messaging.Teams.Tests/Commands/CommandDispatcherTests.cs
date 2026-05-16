@@ -217,6 +217,47 @@ public sealed class CommandDispatcherTests
         Assert.Equal("agent status", status.Invocations[0].NormalizedText);
     }
 
+    /// <summary>
+    /// Direct contract test for impl-plan §3.2 step 6: <see cref="CommandDispatcher"/>
+    /// MUST NOT call <c>Activity.RemoveMentionText</c> or strip <c>&lt;at&gt;...&lt;/at&gt;</c>
+    /// markup itself. If raw mention markup leaks into <see cref="CommandContext.NormalizedText"/>,
+    /// the dispatcher must treat the input as unrecognised text — NOT silently strip and
+    /// route it. Complements the E2E mention-stripping test in
+    /// <c>TeamsSwarmActivityHandlerTests</c> by isolating the dispatcher: if a future
+    /// refactor adds mention-stripping inside the dispatcher, this test fails even though
+    /// the E2E test would still pass.
+    /// </summary>
+    [Fact]
+    public async Task DispatchAsync_RawAtMentionText_DoesNotRouteToHandler_AndPublishesTextEvent()
+    {
+        var status = new RecordingCommandHandler(CommandNames.AgentStatus);
+        var ask = new RecordingCommandHandler(CommandNames.AgentAsk);
+        var approve = new RecordingCommandHandler(CommandNames.Approve);
+        var publisher = new RecordingInboundEventPublisher();
+        var dispatcher = new CommandDispatcher(
+            new ICommandHandler[] { status, ask, approve },
+            publisher,
+            NullLogger<CommandDispatcher>.Instance);
+
+        const string raw = "<at>AgentBot</at> agent status";
+        var (turn, adapter) = BuildTurnContext(raw);
+        await dispatcher.DispatchAsync(BuildContext(raw, turn), CancellationToken.None);
+
+        // Contract: no command handler is invoked when the dispatcher sees mention markup.
+        Assert.Empty(status.Invocations);
+        Assert.Empty(ask.Invocations);
+        Assert.Empty(approve.Invocations);
+
+        // Contract: unrecognised input publishes a TextEvent carrying the *raw* payload
+        // (mention markup intact — dispatcher did not strip).
+        var ev = Assert.IsType<TextEvent>(Assert.Single(publisher.Published));
+        Assert.Equal(raw, ev.Payload);
+        Assert.Equal(MessengerEventTypes.Text, ev.EventType);
+
+        // Contract: dispatcher replies with the help card on the unknown path.
+        Assert.Single(adapter.Sent);
+    }
+
     [Fact]
     public async Task DispatchAsync_EmptyAndWhitespaceText_PublishTextEventAndHelpCard()
     {
