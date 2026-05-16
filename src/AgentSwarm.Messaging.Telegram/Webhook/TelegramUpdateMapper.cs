@@ -16,12 +16,14 @@ namespace AgentSwarm.Messaging.Telegram.Webhook;
 /// <para>
 /// <b>EventType classification.</b>
 /// <list type="bullet">
-///   <item><description><see cref="Update.Message"/> with a non-empty
-///   <see cref="Message.Text"/> that starts with <c>/</c> maps to
-///   <see cref="EventType.Command"/>; <see cref="MessengerEvent.RawCommand"/>
-///   carries the verbatim text (slash included).</description></item>
-///   <item><description><see cref="Update.Message"/> with non-slash text
-///   maps to <see cref="EventType.TextReply"/>; the text flows through
+///   <item><description><see cref="Update.Message"/> with a non-null
+///   <see cref="Message.From"/> AND a non-empty <see cref="Message.Text"/>
+///   that starts with <c>/</c> maps to <see cref="EventType.Command"/>;
+///   <see cref="MessengerEvent.RawCommand"/> carries the verbatim text
+///   (slash included).</description></item>
+///   <item><description><see cref="Update.Message"/> with a non-null
+///   <see cref="Message.From"/> and non-slash text maps to
+///   <see cref="EventType.TextReply"/>; the text flows through
 ///   <see cref="MessengerEvent.Payload"/> so the text-reply handler can
 ///   read it (the pipeline reads <c>Payload</c> rather than
 ///   <c>RawCommand</c> for non-command events).</description></item>
@@ -37,11 +39,14 @@ namespace AgentSwarm.Messaging.Telegram.Webhook;
 ///   never reach the approval handler with a null
 ///   <see cref="MessengerEvent.Payload"/> or a synthetic
 ///   <c>ChatId = "0"</c>.</description></item>
-///   <item><description>Anything else — edited messages, channel posts,
+///   <item><description>Anything else — messages with a null
+///   <see cref="Message.From"/> (anonymous admin posts, channel forward
+///   headers, automatic forwards), edited messages, channel posts,
 ///   chat member updates, polls, etc. — maps to
 ///   <see cref="EventType.Unknown"/>. The pipeline's classify stage
 ///   short-circuits Unknown events BEFORE the dedup gate so no
-///   reservation slot is consumed.</description></item>
+///   reservation slot is consumed and no synthetic <c>UserId = "0"</c>
+///   reaches the authorization pipeline.</description></item>
 /// </list>
 /// </para>
 /// <para>
@@ -72,7 +77,18 @@ public static class TelegramUpdateMapper
 
         var eventId = "tg-update-" + update.Id.ToString(CultureInfo.InvariantCulture);
 
-        if (update.Message is { } msg && !string.IsNullOrEmpty(msg.Text))
+        // Guard the Command/TextReply branch on a non-null From in
+        // addition to non-empty Text. Telegram emits messages with
+        // From == null for anonymous group-admin posts, channel forward
+        // headers, and automatic forwards — they have no user identity,
+        // so promoting them to Command/TextReply would synthesize a
+        // UserId = "0" that is semantically wrong (the event isn't from
+        // user 0; it's from no user) and would consume a dedup
+        // reservation slot for an event the authorization pipeline
+        // would only reject anyway. Fall through to the Unknown branch
+        // so the pipeline's classify stage short-circuits before the
+        // dedup gate.
+        if (update.Message is { } msg && msg.From is not null && !string.IsNullOrEmpty(msg.Text))
         {
             var isCommand = msg.Text.StartsWith('/');
             return new MessengerEvent
@@ -80,7 +96,7 @@ public static class TelegramUpdateMapper
                 EventId = eventId,
                 EventType = isCommand ? EventType.Command : EventType.TextReply,
                 RawCommand = isCommand ? msg.Text : null,
-                UserId = (msg.From?.Id ?? 0L).ToString(CultureInfo.InvariantCulture),
+                UserId = msg.From.Id.ToString(CultureInfo.InvariantCulture),
                 ChatId = msg.Chat.Id.ToString(CultureInfo.InvariantCulture),
                 Timestamp = receivedAt,
                 CorrelationId = correlationId,
