@@ -25,21 +25,18 @@ namespace AgentSwarm.Messaging.Telegram.Webhook;
 ///   <see cref="MessengerEvent.Payload"/> so the text-reply handler can
 ///   read it (the pipeline reads <c>Payload</c> rather than
 ///   <c>RawCommand</c> for non-command events).</description></item>
-///   <item><description><see cref="Update.CallbackQuery"/> with a parent
-///   <see cref="CallbackQuery.Message"/> AND non-empty
-///   <see cref="CallbackQuery.Data"/> maps to
+///   <item><description><see cref="Update.CallbackQuery"/> with a
+///   non-empty <see cref="CallbackQuery.Data"/> AND a non-null parent
+///   <see cref="CallbackQuery.Message"/> maps to
 ///   <see cref="EventType.CallbackResponse"/>; the inline-button
 ///   callback data flows through <see cref="MessengerEvent.Payload"/>.
-///   Callbacks missing either field — bare dismissals, game callbacks,
-///   inline-mode callbacks bound to <c>InlineMessageId</c> only, or
-///   malformed deliveries — fall through to
-///   <see cref="EventType.Unknown"/>; the Stage 3.x approval contract is
-///   built on a non-empty <c>callback_data</c> payload + a chat-bound
-///   parent message, so emitting a typed <see cref="EventType.CallbackResponse"/>
-///   with <see cref="MessengerEvent.Payload"/>=null or a synthesized
-///   <c>ChatId="0"</c> would let a malformed callback reach
-///   <c>ICallbackHandler</c> with no payload to disambiguate and a
-///   chat id that fails authorization in a confusing way.</description></item>
+///   Callbacks missing either field (game callbacks, server-dispatched
+///   callbacks from outdated inline keyboards, inline-mode callbacks
+///   with only <see cref="CallbackQuery.InlineMessageId"/>) fall
+///   through to the <see cref="EventType.Unknown"/> branch so they
+///   never reach the approval handler with a null
+///   <see cref="MessengerEvent.Payload"/> or a synthetic
+///   <c>ChatId = "0"</c>.</description></item>
 ///   <item><description>Anything else — edited messages, channel posts,
 ///   chat member updates, polls, etc. — maps to
 ///   <see cref="EventType.Unknown"/>. The pipeline's classify stage
@@ -91,20 +88,18 @@ public static class TelegramUpdateMapper
             };
         }
 
-        // Only emit a typed CallbackResponse when the callback carries the
-        // two pieces of state the Stage 3.x approval/reject handler relies
-        // on: (a) a parent Message so ChatId is a real Telegram chat (not
-        // a synthesized "0" — orphaned inline-mode callbacks bound only to
-        // InlineMessageId have no chat); and (b) a non-empty Data string
-        // so Payload is a usable action token (bare dismissals, game
-        // callbacks, and malformed deliveries arrive with null/whitespace
-        // Data). Missing either one means the event has no contract a
-        // CallbackResponse handler can act on, so we fall through to the
-        // Unknown branch where the pipeline short-circuits before authz
-        // and dedup — same behaviour as the polling-stage mapper.
+        // Guard the CallbackResponse branch on BOTH a non-empty Data and
+        // a non-null parent Message. Telegram allows callback queries
+        // without a `data` payload (game callbacks, server-dispatched
+        // callbacks from outdated inline keyboards) and inline-mode
+        // callbacks carry only `InlineMessageId` with no parent Message.
+        // Promoting either shape to CallbackResponse would surface a
+        // null Payload or a synthetic `ChatId = "0"` to the approval
+        // handler — fall through to Unknown so the pipeline's classify
+        // stage short-circuits before the dedup gate.
         if (update.CallbackQuery is { } cb
-            && cb.Message is not null
-            && !string.IsNullOrWhiteSpace(cb.Data))
+            && !string.IsNullOrWhiteSpace(cb.Data)
+            && cb.Message is not null)
         {
             return new MessengerEvent
             {
