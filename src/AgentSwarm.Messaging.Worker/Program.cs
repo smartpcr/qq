@@ -140,6 +140,17 @@ public class Program
         // AgentSwarm.Messaging.Core without changing this call site.
         builder.Services.AddSlackInboundTransport();
 
+        // Stage 4.2: register the Socket Mode WebSocket transport
+        // services (connection factory, transport-factory selector,
+        // SlackSocketModeOptions) AND the
+        // SlackInboundTransportHostedService that enumerates
+        // ISlackWorkspaceConfigStore on host boot and starts the
+        // appropriate transport per workspace. Binding builder.Configuration
+        // exposes the Slack:SocketMode section so operators can override
+        // reconnect bounds, ACK timeout, and receive-buffer size from
+        // appsettings.json / environment variables without rebuilding.
+        builder.Services.AddSlackSocketModeTransport(builder.Configuration);
+
         // Stage 4.1 (evaluator iter-3 item 2): swap the default
         // in-process-only ISlackFastPathIdempotencyStore for the
         // durable two-level composite (in-process L1 + EF L2 backed by

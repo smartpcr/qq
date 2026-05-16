@@ -7,10 +7,14 @@
 namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
+using System.Collections.Generic;
 using AgentSwarm.Messaging.Slack.Queues;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 /// <summary>
 /// DI extensions that register the Stage 4.1 Slack inbound HTTP
@@ -104,6 +108,122 @@ public static class SlackInboundTransportServiceCollectionExtensions
     }
 
     /// <summary>
+    /// Registers the Stage 4.2 Socket Mode WebSocket transport services
+    /// (<see cref="ISlackSocketModeConnectionFactory"/>,
+    /// <see cref="ISlackInboundTransportFactory"/>, options binding,
+    /// named <see cref="System.Net.Http.HttpClient"/> for
+    /// <c>apps.connections.open</c>) on the supplied service
+    /// collection.
+    /// </summary>
+    /// <param name="services">Target service collection.</param>
+    /// <param name="configuration">
+    /// Optional configuration root. When supplied the extension binds
+    /// the <c>Slack:SocketMode</c> section into
+    /// <see cref="SlackSocketModeOptions"/> so operators can override
+    /// the reconnect bounds, ACK timeout, and receive-buffer size from
+    /// <c>appsettings.json</c> / environment variables without
+    /// recompiling the host. Stage 4.2 evaluator iter-1 item 3.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// All bindings use <c>TryAdd*</c> so a composition root can
+    /// override any single component by registering its own
+    /// implementation BEFORE calling this method (e.g., tests inject
+    /// a fake <see cref="ISlackSocketModeConnectionFactory"/>).
+    /// </para>
+    /// <para>
+    /// The Worker host calls
+    /// <see cref="AddSlackInboundTransport(IServiceCollection)"/> for
+    /// the Stage 4.1 HTTP transport AND
+    /// <see cref="AddSlackSocketModeTransport(IServiceCollection, IConfiguration)"/>
+    /// for the Stage 4.2 Socket Mode transport; the per-workspace
+    /// <see cref="ISlackInboundTransportFactory"/> chooses which one
+    /// to use for each registered workspace.
+    /// </para>
+    /// <para>
+    /// The bound <see cref="SlackSocketModeOptions"/> are validated by
+    /// <see cref="SlackSocketModeOptionsValidator"/> (registered as an
+    /// <see cref="IValidateOptions{TOptions}"/> singleton via
+    /// <see cref="ServiceCollectionDescriptorExtensions.TryAddEnumerable"/>)
+    /// and the validation is forced to run at host startup via
+    /// <see cref="OptionsBuilderExtensions.ValidateOnStart{TOptions}(OptionsBuilder{TOptions})"/>.
+    /// Operator misconfigurations -- <c>ReceiveBufferSize</c> &lt;= 0,
+    /// <c>InitialReconnectDelay</c> &gt; <c>MaxReconnectDelay</c>,
+    /// non-positive <c>AckTimeout</c>, etc. -- therefore fail the
+    /// generic host at boot rather than surfacing as
+    /// <see cref="ArgumentException"/> deep inside
+    /// <see cref="SlackSocketModeReceiver"/> /
+    /// <see cref="SlackSocketModeBackoffPolicy"/> at first connection
+    /// time.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddSlackSocketModeTransport(
+        this IServiceCollection services,
+        IConfiguration? configuration = null)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.TryAddSingleton(TimeProvider.System);
+
+        // Bind the Slack:SocketMode section so operators can override
+        // any field (initial/max reconnect delay, ACK timeout,
+        // receive-buffer size) from appsettings.json or environment
+        // variables. When no configuration is supplied (test hosts,
+        // composition roots that wire the options manually) the
+        // default SlackSocketModeOptions values apply.
+        OptionsBuilder<SlackSocketModeOptions> optionsBuilder =
+            services.AddOptions<SlackSocketModeOptions>();
+        if (configuration is not null)
+        {
+            IConfigurationSection section = configuration.GetSection(SlackSocketModeOptions.SectionName);
+            optionsBuilder.Bind(section);
+        }
+
+        // Wire a typed IValidateOptions<SlackSocketModeOptions> into
+        // the options pipeline so misconfigurations from
+        // appsettings.json / environment variables fail the host
+        // eagerly rather than surfacing deep inside the
+        // SlackSocketModeReceiver / SlackSocketModeBackoffPolicy
+        // constructors at first connection time. TryAddEnumerable keys
+        // on (serviceType, implementationType) so repeated calls to
+        // AddSlackSocketModeTransport register the validator exactly
+        // once.
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IValidateOptions<SlackSocketModeOptions>, SlackSocketModeOptionsValidator>());
+
+        // Force validation to run when the generic Host starts (rather
+        // than lazily on first IOptions<T>.Value resolution) so
+        // operators see the failure synchronously during host boot.
+        // Requires Microsoft.Extensions.Hosting (already referenced).
+        optionsBuilder.ValidateOnStart();
+
+        // Resolve a value-instance of SlackSocketModeOptions so the
+        // receiver / connection factory can take it by value without
+        // forcing every consumer to depend on IOptions<T>. The
+        // TryAdd registration lets a test host override the options
+        // block before this call. Note: IOptions<T>.Value resolution
+        // itself triggers the registered IValidateOptions<T>, which
+        // means test hosts that don't run ValidateOnStart() still get
+        // the same validation when they first resolve this singleton.
+        services.TryAddSingleton<SlackSocketModeOptions>(sp =>
+            sp.GetRequiredService<IOptions<SlackSocketModeOptions>>().Value);
+
+        services.AddHttpClient(DefaultSlackSocketModeConnectionFactory.HttpClientName);
+        services.TryAddSingleton<ISlackSocketModeConnectionFactory, DefaultSlackSocketModeConnectionFactory>();
+
+        services.TryAddSingleton<ISlackInboundTransportFactory, SlackInboundTransportFactory>();
+
+        // Stage 4.2 evaluator iter-1 item 1: register the hosted
+        // service that enumerates ISlackWorkspaceConfigStore and
+        // actually starts the per-workspace transports on host boot.
+        // Without this AddHostedService call the receiver classes
+        // exist in the container but no Slack workspace ever connects.
+        services.AddHostedService<SlackInboundTransportHostedService>();
+
+        return services;
+    }
+
+    /// <summary>
     /// Registers the Slack inbound controllers
     /// (<see cref="SlackEventsController"/>,
     /// <see cref="SlackCommandsController"/>,
@@ -156,5 +276,77 @@ public static class SlackInboundTransportServiceCollectionExtensions
             sp.GetRequiredService<FileSystemSlackInboundEnqueueDeadLetterSink>());
 
         return services;
+    }
+}
+
+/// <summary>
+/// <see cref="IValidateOptions{TOptions}"/> implementation that
+/// enforces the invariants the Stage 4.2 Socket Mode receiver and
+/// backoff policy require of <see cref="SlackSocketModeOptions"/>.
+/// Registered by
+/// <see cref="SlackInboundTransportServiceCollectionExtensions.AddSlackSocketModeTransport(IServiceCollection, IConfiguration)"/>
+/// and wired to <see cref="OptionsBuilderExtensions.ValidateOnStart{TOptions}(OptionsBuilder{TOptions})"/>
+/// so operator misconfigurations fail the host at boot.
+/// </summary>
+/// <remarks>
+/// The checks mirror the lazy <see cref="ArgumentException"/>s that
+/// <see cref="SlackSocketModeBackoffPolicy"/> raises in its constructor
+/// (positive <c>InitialReconnectDelay</c>, <c>MaxReconnectDelay</c>
+/// not below <c>InitialReconnectDelay</c>) and extend them to the two
+/// invariants the receiver / connection factory depend on but never
+/// validated explicitly: a positive <c>AckTimeout</c> (otherwise the
+/// <see cref="System.Threading.CancellationTokenSource.CancelAfter(System.TimeSpan)"/>
+/// call would cancel the ACK token immediately) and a positive
+/// <c>ReceiveBufferSize</c> (the underlying
+/// <see cref="System.Net.WebSockets.ClientWebSocket"/> requires a
+/// non-zero buffer).
+/// </remarks>
+internal sealed class SlackSocketModeOptionsValidator
+    : IValidateOptions<SlackSocketModeOptions>
+{
+    /// <inheritdoc />
+    public ValidateOptionsResult Validate(string? name, SlackSocketModeOptions options)
+    {
+        if (options is null)
+        {
+            return ValidateOptionsResult.Fail(
+                $"{nameof(SlackSocketModeOptions)} instance is null.");
+        }
+
+        List<string> failures = new();
+
+        if (options.InitialReconnectDelay <= TimeSpan.Zero)
+        {
+            failures.Add(
+                $"{SlackSocketModeOptions.SectionName}:{nameof(SlackSocketModeOptions.InitialReconnectDelay)} must be greater than zero (was {options.InitialReconnectDelay}).");
+        }
+
+        if (options.MaxReconnectDelay <= TimeSpan.Zero)
+        {
+            failures.Add(
+                $"{SlackSocketModeOptions.SectionName}:{nameof(SlackSocketModeOptions.MaxReconnectDelay)} must be greater than zero (was {options.MaxReconnectDelay}).");
+        }
+
+        if (options.MaxReconnectDelay < options.InitialReconnectDelay)
+        {
+            failures.Add(
+                $"{SlackSocketModeOptions.SectionName}:{nameof(SlackSocketModeOptions.MaxReconnectDelay)} ({options.MaxReconnectDelay}) must be greater than or equal to {nameof(SlackSocketModeOptions.InitialReconnectDelay)} ({options.InitialReconnectDelay}).");
+        }
+
+        if (options.AckTimeout <= TimeSpan.Zero)
+        {
+            failures.Add(
+                $"{SlackSocketModeOptions.SectionName}:{nameof(SlackSocketModeOptions.AckTimeout)} must be greater than zero (was {options.AckTimeout}).");
+        }
+
+        if (options.ReceiveBufferSize <= 0)
+        {
+            failures.Add(
+                $"{SlackSocketModeOptions.SectionName}:{nameof(SlackSocketModeOptions.ReceiveBufferSize)} must be greater than zero (was {options.ReceiveBufferSize}).");
+        }
+
+        return failures.Count == 0
+            ? ValidateOptionsResult.Success
+            : ValidateOptionsResult.Fail(failures);
     }
 }
