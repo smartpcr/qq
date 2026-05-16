@@ -144,7 +144,8 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
         // actionValue is therefore pinned in private_metadata so the
         // handler reads metadata.ActionValue as the verdict half.
         //
-        // SEVERITY PROPAGATION (Stage 6.1 evaluator item 2): the
+        // SEVERITY PROPAGATION (Stage 6.1 implemented; iter 5 doc
+        // refresh per evaluator item 4): the
         // SlackInteractionHandler composes
         // HumanDecisionEvent.ActionValue as
         // "<pinned>{EscalateSeveritySeparator}<severity>" --
@@ -154,7 +155,10 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
         // namespace-on-ActionValue encoding is the typed-decision
         // surface for severity. Downstream consumers can match the
         // bare verdict with ActionValue.StartsWith("escalate") and
-        // the urgency tier with the suffix after the separator.
+        // the urgency tier with the suffix after the separator. The
+        // handler's composition is idempotent: a pinned base that
+        // already contains the separator (e.g. a hand-rolled modal
+        // pinning "escalate:warning") is not appended a second time.
         // Slack always echoes initial_option on a submit without
         // touching the select, so production submissions always
         // carry one of the three severity values.
@@ -366,14 +370,18 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
     /// severity static_select. On submission Slack exposes the
     /// chosen value at
     /// <c>view.state.values[escalate_severity][escalate_severity_select].selected_option.value</c>.
-    /// Stage 6.1's contract is RENDER-ONLY: end-to-end propagation
-    /// of the severity into a typed <c>HumanDecisionEvent</c>
-    /// metadata field is intentionally deferred -- the current
-    /// <c>HumanDecisionEvent</c> record
-    /// (see <c>AgentSwarm.Messaging.Abstractions/HumanDecisionEvent.cs</c>)
-    /// has no Metadata slot, and adding one is an
-    /// Abstractions-story change that must land alongside a
-    /// coordinated Stage 5.3 handler update.
+    /// The Stage 5.3 <see cref="Pipeline.SlackInteractionHandler"/>
+    /// then composes
+    /// <c>HumanDecisionEvent.ActionValue = "{pinned}{EscalateSeveritySeparator}{severity}"</c>
+    /// (e.g. <c>"escalate:critical"</c>), which is the typed-decision
+    /// surface for the severity tier because
+    /// <c>HumanDecisionEvent</c> has no <c>Metadata</c> slot
+    /// (architecture.md §3.6.3 pins eight fields). The composition is
+    /// idempotent: if the pinned base already contains the separator
+    /// the handler does NOT append a second time. Downstream consumers
+    /// route on the bare verdict with
+    /// <c>ActionValue.StartsWith("escalate")</c> and on the urgency
+    /// with the suffix after the separator.
     /// </summary>
     public const string EscalateSeverityBlockId = "escalate_severity";
 
@@ -503,10 +511,10 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
         ArgumentNullException.ThrowIfNull(question);
 
         SeverityStyle severityStyle = ResolveSeverityStyle(question.Severity);
-        List<object> blocks = new(capacity: 8);
+        List<object> headerBlocks = new(capacity: 3);
 
         string headerText = Truncate($"{severityStyle.Emoji} {question.Title}".Trim(), MaxHeaderTextLength);
-        blocks.Add(new
+        headerBlocks.Add(new
         {
             type = "header",
             text = new
@@ -517,7 +525,7 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
             },
         });
 
-        blocks.Add(new
+        headerBlocks.Add(new
         {
             type = "section",
             block_id = "question_body",
@@ -528,39 +536,13 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
             },
         });
 
-        if (question.AllowedActions is { Count: > 0 } actions)
-        {
-            // Group by RequiresComment because the SlackInteractionEncoding
-            // contract bakes that flag into the block_id prefix
-            // (q: vs qc:); buttons that decode differently MUST live in
-            // separate actions blocks so the Stage 5.3 handler reads
-            // the correct flag from the block_id Slack echoes back.
-            //
-            // Within each group we ALSO chunk into Slack's 5-buttons-
-            // per-actions-block limit. Multiple chunks share the same
-            // QuestionId / RequiresComment pair; the chunk index is
-            // appended to each block_id via SlackInteractionEncoding
-            // so the block_ids are Slack-unique while still decoding
-            // back to one QuestionId. This satisfies the
-            // "one button per HumanAction" requirement
-            // (implementation-plan.md Stage 6.1 step 2 / scenario 1)
-            // without dropping any HumanAction even when there are
-            // more than 5 of the same kind.
-            foreach (IGrouping<bool, HumanAction> group in actions.GroupBy(a => a.RequiresComment))
-            {
-                HumanAction[] groupArray = group.ToArray();
-                int chunkIndex = 0;
-                foreach (HumanAction[] chunk in groupArray.Chunk(MaxButtonsPerActionsBlock))
-                {
-                    string blockId = SlackInteractionEncoding.EncodeQuestionBlockId(
-                        question.QuestionId, group.Key, chunkIndex);
-                    blocks.Add(BuildActionsBlock(blockId, chunk));
-                    chunkIndex++;
-                }
-            }
-        }
-
-        blocks.Add(new
+        // Stage 6.1 evaluator item 2 (iter 5): the expiry context block
+        // MUST always be rendered, even when an overflowing payload
+        // forces EnforceBlockLimit to drop trailing action blocks.
+        // Building the expiry context AS PART OF the always-preserved
+        // tail (passed to EnforceBlockLimit) guarantees the deadline
+        // is visible even on payloads with hundreds of actions.
+        object expiryContext = new
         {
             type = "context",
             block_id = "question_expiry",
@@ -572,9 +554,68 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
                     text = $":hourglass_flowing_sand: Expires at {FormatExpiry(question.ExpiresAt)}",
                 },
             },
-        });
+        };
 
-        object[] blockArray = EnforceBlockLimit(blocks);
+        List<object> actionBlocks = new();
+        if (question.AllowedActions is { Count: > 0 } actions)
+        {
+            // Stage 6.1 evaluator item 1 (iter 5): walk actions in
+            // CALLER ORDER, opening a new actions block whenever the
+            // RequiresComment flag flips OR the current chunk hits
+            // Slack's MaxButtonsPerActionsBlock cap. The previous
+            // GroupBy(a => a.RequiresComment) implementation rearranged
+            // buttons so all RequiresComment=false rendered first --
+            // an input order like approve / reject-with-comment /
+            // defer would have rendered approve / defer / reject-with-comment.
+            // Adjacent-grouping preserves the caller's intent.
+            //
+            // The SlackInteractionEncoding contract bakes RequiresComment
+            // into the block_id prefix (q: vs qc:), so adjacent groups
+            // with differing flags MUST live in separate actions blocks.
+            // Chunk indexes are tracked PER FLAG VALUE so block_ids
+            // stay unique even when the same flag appears in multiple
+            // non-adjacent groups (e.g. no / yes / no produces
+            // q:Q, qc:Q, qk:1:Q -- three Slack-unique block_ids that
+            // all decode back to the same QuestionId).
+            int chunkIndexFalse = 0;
+            int chunkIndexTrue = 0;
+            int i = 0;
+            while (i < actions.Count)
+            {
+                bool flag = actions[i].RequiresComment;
+                int chunkStart = i;
+                int chunkEnd = i;
+                while (chunkEnd < actions.Count
+                    && actions[chunkEnd].RequiresComment == flag
+                    && (chunkEnd - chunkStart) < MaxButtonsPerActionsBlock)
+                {
+                    chunkEnd++;
+                }
+
+                int chunkIndex = flag ? chunkIndexTrue++ : chunkIndexFalse++;
+                string blockId = SlackInteractionEncoding.EncodeQuestionBlockId(
+                    question.QuestionId, flag, chunkIndex);
+
+                HumanAction[] chunk = new HumanAction[chunkEnd - chunkStart];
+                for (int k = 0; k < chunk.Length; k++)
+                {
+                    chunk[k] = actions[chunkStart + k];
+                }
+
+                actionBlocks.Add(BuildActionsBlock(blockId, chunk));
+                i = chunkEnd;
+            }
+        }
+
+        List<object> assembled = new(capacity: headerBlocks.Count + actionBlocks.Count + 1);
+        assembled.AddRange(headerBlocks);
+        assembled.AddRange(actionBlocks);
+
+        // Pass the expiry context as a required tail so EnforceBlockLimit
+        // preserves it even when the action blocks overflow the 50-block
+        // cap. The truncation marker (when emitted) sits BETWEEN the
+        // kept prefix blocks and the preserved tail.
+        object[] blockArray = EnforceBlockLimit(assembled, new[] { expiryContext });
 
         // Wrap blocks in a legacy attachment whose `color` paints the
         // severity sidebar -- architecture.md §2.10 line 189:
@@ -607,19 +648,21 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
         int contentBudget = Math.Max(1, MaxTextFieldLength - prefix.Length);
         string text = prefix + Truncate(rawContent, contentBudget);
 
-        object[] blockArray = EnforceBlockLimit(new List<object>
-        {
-            new
+        object[] blockArray = EnforceBlockLimit(
+            new List<object>
             {
-                type = "section",
-                block_id = "message_body",
-                text = new
+                new
                 {
-                    type = "mrkdwn",
-                    text = text,
+                    type = "section",
+                    block_id = "message_body",
+                    text = new
+                    {
+                        type = "mrkdwn",
+                        text = text,
+                    },
                 },
             },
-        });
+            requiredTail: null);
 
         return new
         {
@@ -663,27 +706,58 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
     }
 
     /// <summary>
-    /// Caps <paramref name="blocks"/> at <see cref="MaxBlocksPerMessage"/>.
-    /// When the input would overflow, drops the tail and appends a
-    /// <c>context</c> block marking the truncation so the recipient
-    /// knows content is missing.
+    /// Caps <paramref name="blocks"/> + <paramref name="requiredTail"/>
+    /// at <see cref="MaxBlocksPerMessage"/>. When the combined input
+    /// would overflow, drops the tail of <paramref name="blocks"/>,
+    /// appends a <c>context</c> block marking the truncation, then
+    /// appends the <paramref name="requiredTail"/> blocks (which are
+    /// ALWAYS preserved -- callers use this slot for blocks the brief
+    /// pins as MUST-be-rendered, e.g. the expiry context).
     /// </summary>
-    private static object[] EnforceBlockLimit(List<object> blocks)
+    /// <remarks>
+    /// Stage 6.1 evaluator item 2 (iter 5): the expiry context block
+    /// for <see cref="RenderQuestion"/> is passed as
+    /// <paramref name="requiredTail"/> so a high-action payload never
+    /// drops the <c>ExpiresAt</c> deadline. Pre-iter-5 the renderer
+    /// appended the context to the main block list, which meant a
+    /// 250-action question with 53 blocks lost the expiry context
+    /// when EnforceBlockLimit trimmed the tail.
+    /// </remarks>
+    private static object[] EnforceBlockLimit(List<object> blocks, IReadOnlyList<object>? requiredTail)
     {
-        if (blocks.Count <= MaxBlocksPerMessage)
+        int tailCount = requiredTail?.Count ?? 0;
+        int totalCount = blocks.Count + tailCount;
+
+        if (totalCount <= MaxBlocksPerMessage)
         {
-            return blocks.ToArray();
+            object[] combined = new object[totalCount];
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                combined[i] = blocks[i];
+            }
+
+            for (int i = 0; i < tailCount; i++)
+            {
+                combined[blocks.Count + i] = requiredTail![i];
+            }
+
+            return combined;
         }
 
-        // Keep MaxBlocksPerMessage - 1 of the originals and append a
-        // marker block so the total is still <= 50.
+        // Budget = MaxBlocksPerMessage - tailCount - 1 (1 for marker).
+        // Keep that many prefix blocks from `blocks`, then the marker,
+        // then the full requiredTail. tailCount + 1 must be < cap for
+        // this to make sense; defensive clamp at minimum of 0.
+        int prefixBudget = Math.Max(0, MaxBlocksPerMessage - tailCount - 1);
+        int omittedFromPrefix = blocks.Count - prefixBudget;
+
         object[] truncated = new object[MaxBlocksPerMessage];
-        for (int i = 0; i < MaxBlocksPerMessage - 1; i++)
+        for (int i = 0; i < prefixBudget; i++)
         {
             truncated[i] = blocks[i];
         }
 
-        truncated[MaxBlocksPerMessage - 1] = new
+        truncated[prefixBudget] = new
         {
             type = "context",
             block_id = "blocks_truncated",
@@ -692,10 +766,15 @@ internal sealed class DefaultSlackMessageRenderer : ISlackMessageRenderer
                 new
                 {
                     type = "mrkdwn",
-                    text = $":warning: Message truncated -- {blocks.Count - (MaxBlocksPerMessage - 1)} block(s) omitted to stay within Slack's {MaxBlocksPerMessage}-block limit.",
+                    text = $":warning: Message truncated -- {omittedFromPrefix} block(s) omitted to stay within Slack's {MaxBlocksPerMessage}-block limit.",
                 },
             },
         };
+
+        for (int i = 0; i < tailCount; i++)
+        {
+            truncated[prefixBudget + 1 + i] = requiredTail![i];
+        }
 
         return truncated;
     }

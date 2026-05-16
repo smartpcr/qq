@@ -595,18 +595,22 @@ public sealed class SlackInteractionHandlerTests
     }
 
     // -----------------------------------------------------------------
-    // Stage 5.3 iter-4 evaluator item #3 (STRUCTURAL fix). The escalate
-    // modal renders text-only inputs (target + reason) with no
-    // static_select, so the view-submission handler cannot read a
-    // verdict from view.state.values. The renderer therefore MUST pin
-    // actionValue in private_metadata so the handler's pinned-metadata
-    // precedence branch produces a clean HumanDecisionEvent rather
-    // than falling back to a raw text-input value (which is the bug
-    // the evaluator flagged). The handler ALSO drops the
-    // FirstStaticSelectValueFallback branch from its actionValue
-    // resolution chain so the only paths to a published decision are
-    // (a) pinned metadata.ActionValue, or (b) a real static_select in
-    // view.state.values; everything else is discarded.
+    // Stage 5.3 iter-4 evaluator item #3 (STRUCTURAL fix), refreshed
+    // for Stage 6.1 iter 5 per evaluator item 4. The escalate modal
+    // renders a severity static_select (escalate_severity) PLUS one
+    // plain_text_input (the reason); no longer a text-only target +
+    // reason layout. The renderer pins actionValue = "escalate" in
+    // private_metadata so the handler's pinned-metadata precedence
+    // branch produces a clean HumanDecisionEvent. The Stage 5.3
+    // handler then composes the published ActionValue as
+    // "escalate:<severity>" using the severity static_select's
+    // selected_option (see SEVERITY PROPAGATION comments in
+    // DefaultSlackMessageRenderer.RenderEscalateModal). The handler
+    // ALSO drops the FirstStaticSelectValueFallback branch from its
+    // actionValue resolution chain so the only paths to a published
+    // decision are (a) pinned metadata.ActionValue (optionally
+    // composed with the severity suffix), or (b) a real static_select
+    // in view.state.values; everything else is discarded.
     // -----------------------------------------------------------------
     [Fact]
     public void DefaultSlackMessageRenderer_escalate_modal_private_metadata_pins_actionValue_escalate()

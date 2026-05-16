@@ -273,6 +273,111 @@ public sealed class DefaultSlackMessageRendererTests
     }
 
     // -----------------------------------------------------------------
+    // Stage 6.1 iter 5 evaluator item 1: RenderQuestion MUST preserve
+    // caller-supplied AllowedActions order. The previous iter grouped
+    // by RequiresComment, which reordered approve / reject-with-comment
+    // / defer into approve / defer / reject-with-comment. Adjacent-
+    // grouping (only split when the flag flips OR the chunk hits its
+    // 5-button cap) is the structural fix.
+    // -----------------------------------------------------------------
+    [Fact]
+    public void RenderQuestion_preserves_caller_order_when_RequiresComment_flag_alternates_across_actions()
+    {
+        // Caller order: approve(no) -> reject-with-comment(yes) ->
+        // defer(no). Expected output: three actions blocks, in
+        // CALLER ORDER, with the flag-change driving the split.
+        // The grouping-by-flag implementation regressed this by
+        // emitting approve+defer first, then reject-with-comment.
+        AgentQuestion question = BuildQuestion(
+            questionId: "Q-order",
+            actions: new[]
+            {
+                new HumanAction("a-approve", "Approve", "approve", RequiresComment: false),
+                new HumanAction("a-reject", "Reject (with comment)", "reject", RequiresComment: true),
+                new HumanAction("a-defer", "Defer", "defer", RequiresComment: false),
+            });
+
+        JsonElement root = Serialize(new DefaultSlackMessageRenderer().RenderQuestion(question));
+        IReadOnlyList<JsonElement> actionsBlocks = BlocksOfType(SingleAttachmentBlocks(root), "actions");
+
+        actionsBlocks.Should().HaveCount(3,
+            "an alternating no/yes/no flag pattern MUST emit THREE adjacent-grouped actions blocks, "
+            + "not two groups that reorder the buttons");
+
+        // Block 1: approve only (no), legacy prefix.
+        actionsBlocks[0].GetProperty("block_id").GetString()
+            .Should().Be("q:Q-order", "first chunk of RequiresComment=false uses the legacy 'q:' prefix");
+        actionsBlocks[0].GetProperty("elements").GetArrayLength().Should().Be(1);
+        actionsBlocks[0].GetProperty("elements")[0].GetProperty("value").GetString().Should().Be("approve");
+
+        // Block 2: reject-with-comment only (yes), legacy prefix.
+        actionsBlocks[1].GetProperty("block_id").GetString()
+            .Should().Be("qc:Q-order", "first chunk of RequiresComment=true uses the legacy 'qc:' prefix");
+        actionsBlocks[1].GetProperty("elements").GetArrayLength().Should().Be(1);
+        actionsBlocks[1].GetProperty("elements")[0].GetProperty("value").GetString().Should().Be("reject");
+
+        // Block 3: defer only (no, SECOND group of false), chunked prefix
+        // with index 1 so the block_id is Slack-unique while still
+        // decoding back to Q-order.
+        actionsBlocks[2].GetProperty("block_id").GetString()
+            .Should().Be("qk:1:Q-order",
+                "the SECOND group of RequiresComment=false MUST use the chunked prefix "
+                + "with chunkIndex=1 so block_ids stay Slack-unique");
+        actionsBlocks[2].GetProperty("elements").GetArrayLength().Should().Be(1);
+        actionsBlocks[2].GetProperty("elements")[0].GetProperty("value").GetString().Should().Be("defer");
+
+        // Flatten to confirm caller order is the LITERAL render order.
+        string[] valuesInRenderOrder = actionsBlocks
+            .SelectMany(b => b.GetProperty("elements").EnumerateArray())
+            .Select(e => e.GetProperty("value").GetString()!)
+            .ToArray();
+        valuesInRenderOrder.Should().Equal(new[] { "approve", "reject", "defer" },
+            "the rendered button order MUST match the caller's AllowedActions order EXACTLY -- "
+            + "the previous GroupBy(RequiresComment) implementation rearranged this to approve/defer/reject");
+
+        // Every chunked block_id MUST round-trip back to Q-order so the
+        // Stage 5.3 handler publishes one HumanDecisionEvent regardless
+        // of which group the human clicked.
+        foreach (JsonElement block in actionsBlocks)
+        {
+            string bid = block.GetProperty("block_id").GetString()!;
+            SlackInteractionEncoding.TryDecodeQuestionBlockId(
+                bid, out string decodedQid, out bool decodedFlag).Should().BeTrue();
+            decodedQid.Should().Be("Q-order");
+
+            // Flag MUST match the kind of button in the block (the
+            // adjacent-group invariant means every button in a block
+            // shares the same RequiresComment value).
+            string firstValue = block.GetProperty("elements")[0].GetProperty("value").GetString()!;
+            decodedFlag.Should().Be(firstValue == "reject",
+                "the block_id's decoded RequiresComment flag MUST match the buttons it carries");
+        }
+    }
+
+    [Fact]
+    public void RenderQuestion_preserves_caller_order_within_a_chunk_when_under_button_cap()
+    {
+        // Belt-and-braces: within a single chunk (all same flag, <=5
+        // buttons) the order MUST be the caller's order, no
+        // alphabetical or stable-sort reshuffling.
+        AgentQuestion question = BuildQuestion(
+            questionId: "Q-within",
+            actions: new[]
+            {
+                new HumanAction("a-z", "Z", "z", RequiresComment: false),
+                new HumanAction("a-a", "A", "a", RequiresComment: false),
+                new HumanAction("a-m", "M", "m", RequiresComment: false),
+            });
+
+        JsonElement root = Serialize(new DefaultSlackMessageRenderer().RenderQuestion(question));
+        JsonElement block = BlocksOfType(SingleAttachmentBlocks(root), "actions").Single();
+        string[] valuesInOrder = block.GetProperty("elements").EnumerateArray()
+            .Select(e => e.GetProperty("value").GetString()!)
+            .ToArray();
+        valuesInOrder.Should().Equal(new[] { "z", "a", "m" });
+    }
+
+    // -----------------------------------------------------------------
     // RenderMessage
     // -----------------------------------------------------------------
 
@@ -573,6 +678,83 @@ public sealed class DefaultSlackMessageRendererTests
     }
 
     // -----------------------------------------------------------------
+    // Stage 6.1 iter 5 evaluator item 3: EncodeQuestionBlockId MUST
+    // enforce Slack's 255-character block_id cap so the renderer never
+    // builds a Block Kit payload that Slack would reject at
+    // chat.postMessage time.
+    // -----------------------------------------------------------------
+
+    [Fact]
+    public void SlackInteractionEncoding_EncodeQuestionBlockId_at_exactly_the_255_char_cap_succeeds()
+    {
+        // Prefix "q:" is 2 chars, so a 253-char QuestionId produces an
+        // encoded block_id of exactly 255 chars (the cap). At the
+        // boundary the encoder MUST succeed.
+        int prefixLen = SlackInteractionEncoding.QuestionBlockPrefix.Length;
+        string qid = new('q', SlackInteractionEncoding.MaxBlockIdLength - prefixLen);
+        string encoded = SlackInteractionEncoding.EncodeQuestionBlockId(qid, requiresComment: false);
+        encoded.Length.Should().Be(SlackInteractionEncoding.MaxBlockIdLength,
+            "a 253-char QuestionId + 'q:' prefix MUST produce an encoded block_id of exactly 255 chars");
+    }
+
+    [Fact]
+    public void SlackInteractionEncoding_EncodeQuestionBlockId_one_char_above_the_255_char_cap_throws_ArgumentException()
+    {
+        // One character past the cap MUST throw -- Slack rejects any
+        // block_id above MaxBlockIdLength. Failing fast at the encoder
+        // surfaces the problem at rendering time rather than as a
+        // surprise 400 from chat.postMessage.
+        int prefixLen = SlackInteractionEncoding.QuestionBlockPrefix.Length;
+        string qid = new('q', SlackInteractionEncoding.MaxBlockIdLength - prefixLen + 1);
+
+        Action act = () => SlackInteractionEncoding.EncodeQuestionBlockId(qid, requiresComment: false);
+        act.Should().Throw<ArgumentException>()
+            .Where(e => e.ParamName == "questionId",
+                "the failing parameter is the QuestionId whose length pushes the encoded block_id over the cap");
+    }
+
+    [Fact]
+    public void SlackInteractionEncoding_EncodeQuestionBlockId_enforces_cap_for_requires_comment_prefix()
+    {
+        // qc: prefix is 3 chars; a 253-char QuestionId would produce
+        // a 256-char encoded block_id (one past the cap) so it MUST
+        // throw, while 252 chars (255 total) MUST succeed.
+        int prefixLen = SlackInteractionEncoding.QuestionRequiresCommentBlockPrefix.Length;
+        string okQid = new('q', SlackInteractionEncoding.MaxBlockIdLength - prefixLen);
+        string overQid = new('q', SlackInteractionEncoding.MaxBlockIdLength - prefixLen + 1);
+
+        SlackInteractionEncoding.EncodeQuestionBlockId(okQid, requiresComment: true)
+            .Length.Should().Be(SlackInteractionEncoding.MaxBlockIdLength);
+
+        Action act = () => SlackInteractionEncoding.EncodeQuestionBlockId(overQid, requiresComment: true);
+        act.Should().Throw<ArgumentException>();
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(10)]
+    [InlineData(99999)]
+    public void SlackInteractionEncoding_EncodeQuestionBlockId_enforces_cap_for_chunked_form_including_chunk_index_digits(int chunkIndex)
+    {
+        // Chunked prefix is "qk:" (3) + digits + ":" + qid, so the
+        // headroom for qid shrinks as chunkIndex grows. The encoder
+        // MUST account for the actual digit width when checking the
+        // cap, not just the prefix length.
+        string digits = chunkIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        int prefixLen = SlackInteractionEncoding.QuestionChunkedBlockPrefix.Length
+            + digits.Length + 1; // +1 for the ':' between digits and qid
+        string okQid = new('q', SlackInteractionEncoding.MaxBlockIdLength - prefixLen);
+        string overQid = new('q', SlackInteractionEncoding.MaxBlockIdLength - prefixLen + 1);
+
+        SlackInteractionEncoding.EncodeQuestionBlockId(okQid, requiresComment: false, chunkIndex)
+            .Length.Should().Be(SlackInteractionEncoding.MaxBlockIdLength);
+
+        Action act = () => SlackInteractionEncoding.EncodeQuestionBlockId(overQid, requiresComment: false, chunkIndex);
+        act.Should().Throw<ArgumentException>(
+            "the cap MUST be checked on the FINAL encoded string so the digit-width of the chunk index counts against the budget");
+    }
+
+    // -----------------------------------------------------------------
     // 50-block hard cap (tech-spec.md §5.2) -- DefaultSlackMessageRenderer
     // MUST guarantee no Block Kit payload exceeds MaxBlocksPerMessage,
     // and when truncation kicks in MUST emit a visible marker so the
@@ -606,12 +788,22 @@ public sealed class DefaultSlackMessageRendererTests
             "Slack hard-caps a Block Kit message at MaxBlocksPerMessage (tech-spec.md §5.2) "
             + "so EnforceBlockLimit MUST drop the overflow and keep the post-cap count at the limit");
 
-        // The marker MUST land at the END of the block array (Slack
-        // renders blocks in order; placing the marker at the tail
-        // keeps the most useful original blocks visible at the top).
+        // Stage 6.1 evaluator item 2 (iter 5): the expiry context block
+        // MUST be preserved on overflow because the brief requires a
+        // context block showing ExpiresAt. The renderer now passes the
+        // expiry context as a required tail to EnforceBlockLimit, so on
+        // overflow the LAST block is the expiry context and the
+        // truncation marker sits IMMEDIATELY BEFORE it.
         JsonElement lastBlock = blocks[blocks.GetArrayLength() - 1];
         lastBlock.GetProperty("type").GetString().Should().Be("context");
         lastBlock.GetProperty("block_id").GetString()
+            .Should().Be("question_expiry",
+                "the expiry context MUST always be the final block so the recipient "
+                + "always sees the ExpiresAt deadline (Stage 6.1 evaluator item 2)");
+
+        JsonElement markerBlock = blocks[blocks.GetArrayLength() - 2];
+        markerBlock.GetProperty("type").GetString().Should().Be("context");
+        markerBlock.GetProperty("block_id").GetString()
             .Should().Be("blocks_truncated",
                 "the truncation marker MUST use a stable block_id so downstream "
                 + "consumers / tests can recognise that content was dropped");
@@ -619,20 +811,68 @@ public sealed class DefaultSlackMessageRendererTests
         // The marker text MUST surface BOTH the omitted-block count
         // and the limit, so an operator reading the message can see
         // exactly how much was lost.
-        string markerText = lastBlock.GetProperty("elements")[0].GetProperty("text").GetString()!;
+        string markerText = markerBlock.GetProperty("elements")[0].GetProperty("text").GetString()!;
         markerText.Should().Contain(
             DefaultSlackMessageRenderer.MaxBlocksPerMessage.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "the marker text MUST reference the 50-block limit");
         markerText.Should().Contain("truncated");
         markerText.Should().Contain("omitted");
 
-        // Sanity check: no other block in the kept tail uses the
+        // Sanity check: no other block in the kept output uses the
         // blocks_truncated block_id (would indicate the marker
         // collided with a real block). Exactly one truncation marker.
         int markerCount = blocks.EnumerateArray()
             .Count(b => b.TryGetProperty("block_id", out JsonElement bid)
                 && bid.GetString() == "blocks_truncated");
         markerCount.Should().Be(1, "exactly one blocks_truncated marker MUST be emitted");
+
+        // Sanity check: exactly one expiry context (never dropped).
+        int expiryCount = blocks.EnumerateArray()
+            .Count(b => b.TryGetProperty("block_id", out JsonElement bid)
+                && bid.GetString() == "question_expiry");
+        expiryCount.Should().Be(1, "the expiry context MUST be preserved exactly once on overflow");
+    }
+
+    [Fact]
+    public void RenderQuestion_overflowing_action_payload_preserves_expiry_context_block()
+    {
+        // Stage 6.1 iter 5 evaluator item 2 (standalone pin): a payload
+        // whose action blocks alone exceed the 50-block cap MUST still
+        // carry the question_expiry context block because the brief
+        // requires "a context block showing ExpiresAt deadline" and
+        // that promise cannot be silently broken just because there
+        // are a lot of buttons. The previous iter appended the context
+        // AFTER the action blocks, then truncated the tail; that
+        // dropped the expiry.
+        int actionCount = DefaultSlackMessageRenderer.MaxButtonsPerActionsBlock
+            * DefaultSlackMessageRenderer.MaxBlocksPerMessage;
+        HumanAction[] tooManyActions = Enumerable.Range(1, actionCount)
+            .Select(i => new HumanAction($"a{i}", $"Label {i}", $"v{i}", RequiresComment: false))
+            .ToArray();
+        DateTimeOffset deadline = new(2030, 6, 1, 12, 30, 45, TimeSpan.Zero);
+        AgentQuestion question = BuildQuestion(
+            questionId: "Q-expiry-survives",
+            actions: tooManyActions,
+            expiresAt: deadline);
+
+        JsonElement root = Serialize(new DefaultSlackMessageRenderer().RenderQuestion(question));
+        JsonElement blocks = SingleAttachmentBlocks(root);
+
+        blocks.GetArrayLength().Should().Be(DefaultSlackMessageRenderer.MaxBlocksPerMessage);
+
+        // Find the expiry context (block_id="question_expiry") and
+        // confirm it carries the deadline text.
+        JsonElement[] expiryBlocks = blocks.EnumerateArray()
+            .Where(b => b.TryGetProperty("block_id", out JsonElement bid)
+                && bid.GetString() == "question_expiry")
+            .ToArray();
+        expiryBlocks.Should().HaveCount(1,
+            "the expiry context MUST be preserved on overflow -- it is the brief-required ExpiresAt deadline display");
+        expiryBlocks[0].GetProperty("type").GetString().Should().Be("context");
+        string expiryText = expiryBlocks[0].GetProperty("elements")[0]
+            .GetProperty("text").GetString()!;
+        expiryText.Should().Contain("2030-06-01 12:30:45 UTC",
+            "the surviving expiry context MUST carry the formatted deadline");
     }
 
     [Fact]
