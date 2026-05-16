@@ -18,7 +18,8 @@ using System.Threading.Tasks;
 /// <c>trigger_id</c> lifetime window. Backed by a
 /// <see cref="ConcurrentDictionary{TKey, TValue}"/> with explicit
 /// expiry timestamps; expired entries are evicted lazily on the next
-/// touch.
+/// touch AND eagerly by a background scavenger so the dictionary
+/// does not grow without bound under steady traffic.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -38,8 +39,23 @@ using System.Threading.Tasks;
 /// <see cref="ISlackModalFastPathHandler"/> that closes over an
 /// alternative implementation.
 /// </para>
+/// <para>
+/// <strong>Eviction.</strong> Every Slack <c>trigger_id</c> is
+/// unique, so without an eager sweep the dictionary would accumulate
+/// one entry per slash-command invocation for the lifetime of the
+/// process. A background scavenger sweeps expired entries at
+/// <see cref="DefaultScavengeInterval"/> cadence using
+/// <see cref="TimeProvider.CreateTimer"/> so test hosts that supply
+/// a fake clock can drive the schedule deterministically. The
+/// store implements <see cref="IDisposable"/> so the singleton DI
+/// registration disposes the timer on container shutdown; tests
+/// that instantiate the store directly may either dispose it or
+/// rely on the GC -- the timer holds the store via a
+/// <see cref="WeakReference{T}"/> so an undisposed instance does
+/// not pin itself in memory.
+/// </para>
 /// </remarks>
-internal sealed class SlackInProcessIdempotencyStore : ISlackFastPathIdempotencyStore
+internal sealed class SlackInProcessIdempotencyStore : ISlackFastPathIdempotencyStore, IDisposable
 {
     /// <summary>
     /// Default lifetime for an acquired idempotency token. Matches
@@ -50,12 +66,56 @@ internal sealed class SlackInProcessIdempotencyStore : ISlackFastPathIdempotency
     /// </summary>
     public static readonly TimeSpan DefaultLifetime = TimeSpan.FromMinutes(15);
 
+    /// <summary>
+    /// Default cadence at which the background scavenger sweeps
+    /// expired entries. One minute is short enough to keep the
+    /// dictionary's residency proportional to the last minute of
+    /// traffic (worst case) and long enough that the sweep cost is
+    /// negligible (one dictionary walk per minute).
+    /// </summary>
+    public static readonly TimeSpan DefaultScavengeInterval = TimeSpan.FromMinutes(1);
+
     private readonly ConcurrentDictionary<string, DateTimeOffset> entries = new(StringComparer.Ordinal);
     private readonly TimeProvider timeProvider;
+    private readonly ITimer? scavengeTimer;
+    private int disposed;
 
     public SlackInProcessIdempotencyStore(TimeProvider? timeProvider = null)
+        : this(timeProvider, DefaultScavengeInterval)
+    {
+    }
+
+    /// <summary>
+    /// Test-friendly constructor. Pass
+    /// <see cref="Timeout.InfiniteTimeSpan"/> or
+    /// <see cref="TimeSpan.Zero"/> to suppress the background
+    /// scavenger entirely (so a fixture can drive
+    /// <see cref="Scavenge"/> manually and observe deterministic
+    /// state).
+    /// </summary>
+    internal SlackInProcessIdempotencyStore(TimeProvider? timeProvider, TimeSpan scavengeInterval)
     {
         this.timeProvider = timeProvider ?? TimeProvider.System;
+
+        if (scavengeInterval > TimeSpan.Zero && scavengeInterval != Timeout.InfiniteTimeSpan)
+        {
+            // The timer state is a WeakReference back to us, NOT a
+            // closure over `this`. That breaks the otherwise-
+            // unbreakable GC root chain
+            //   TimerQueue -> Timer -> callback -> store
+            // so an undisposed instance can still be collected by the
+            // GC, at which point the next tick observes a null target
+            // and short-circuits. Hosts that want prompt teardown of
+            // the timer object itself call Dispose() -- singleton DI
+            // registrations do this automatically on container
+            // disposal.
+            WeakReference<SlackInProcessIdempotencyStore> weakSelf = new(this);
+            this.scavengeTimer = this.timeProvider.CreateTimer(
+                ScavengeTick,
+                weakSelf,
+                scavengeInterval,
+                scavengeInterval);
+        }
     }
 
     /// <summary>
@@ -163,6 +223,22 @@ internal sealed class SlackInProcessIdempotencyStore : ISlackFastPathIdempotency
     }
 
     /// <summary>
+    /// Disposes the background scavenger timer. Safe to call
+    /// multiple times. The dictionary itself is left intact (and
+    /// eligible for GC with the rest of the store) -- no managed
+    /// resources beyond the timer need explicit release.
+    /// </summary>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref this.disposed, 1) != 0)
+        {
+            return;
+        }
+
+        this.scavengeTimer?.Dispose();
+    }
+
+    /// <summary>
     /// Returns the current number of live (non-expired) entries.
     /// Exposed for tests; the production code path never calls it.
     /// </summary>
@@ -181,6 +257,70 @@ internal sealed class SlackInProcessIdempotencyStore : ISlackFastPathIdempotency
             }
 
             return count;
+        }
+    }
+
+    /// <summary>
+    /// Eagerly removes all entries whose TTL has elapsed. Invoked on
+    /// the background scavenger timer and exposed as
+    /// <c>internal</c> so tests can drive the sweep deterministically
+    /// without waiting for the timer cadence.
+    /// </summary>
+    /// <returns>Number of entries actually removed.</returns>
+    internal int Scavenge()
+    {
+        DateTimeOffset now = this.timeProvider.GetUtcNow();
+        int removed = 0;
+        foreach (var kvp in this.entries)
+        {
+            if (kvp.Value <= now)
+            {
+                // ConcurrentDictionary.TryRemove(KeyValuePair) is
+                // CAS-bounded: it only removes the entry when the
+                // current value still equals the snapshot we just
+                // observed, so we never accidentally evict an entry
+                // that was just refreshed by a concurrent
+                // TryAcquireAsync.
+                if (this.entries.TryRemove(kvp))
+                {
+                    removed++;
+                }
+            }
+        }
+
+        return removed;
+    }
+
+    private static void ScavengeTick(object? state)
+    {
+        WeakReference<SlackInProcessIdempotencyStore> weakSelf =
+            (WeakReference<SlackInProcessIdempotencyStore>)state!;
+        if (!weakSelf.TryGetTarget(out SlackInProcessIdempotencyStore? self))
+        {
+            // The store has been collected -- nothing to do. The
+            // timer object itself will be reclaimed when the GC walks
+            // the TimerQueue next; until then this no-op tick is the
+            // only cost.
+            return;
+        }
+
+        if (Volatile.Read(ref self.disposed) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            self.Scavenge();
+        }
+        catch
+        {
+            // The scavenger MUST NOT surface exceptions onto the
+            // timer thread -- unhandled exceptions from a
+            // System.Threading.Timer callback crash the host. Swallow
+            // defensively; the next tick will retry and lazy eviction
+            // inside TryAcquireAsync continues to handle any
+            // individual expired entry that is touched again.
         }
     }
 }
