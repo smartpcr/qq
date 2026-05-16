@@ -84,6 +84,13 @@ public class MessagingDbContext : DbContext
         modelBuilder.Entity<DiscordInteractionRecord>(entity =>
         {
             entity.ToTable("DiscordInteractions");
+
+            // At-most-once delivery (architecture.md Section 4.8) is gated by
+            // this primary key: SQLite materialises the PK as a unique B-tree
+            // on InteractionId, so a duplicate webhook INSERT collides at the
+            // constraint level. No companion unique index is declared --
+            // adding one would force SQLite to maintain two identical B-trees
+            // on every INSERT/UPDATE for zero semantic gain.
             entity.HasKey(x => x.InteractionId);
 
             entity.Property(x => x.InteractionId)
@@ -108,13 +115,6 @@ public class MessagingDbContext : DbContext
 
             entity.Property(x => x.AttemptCount).HasDefaultValue(0).IsRequired();
             entity.Property(x => x.ErrorDetail);
-
-            // Primary key already enforces uniqueness on InteractionId; the
-            // explicit unique index is the canonical at-most-once gate
-            // referenced by architecture.md Section 4.8.
-            entity.HasIndex(x => x.InteractionId)
-                .IsUnique()
-                .HasDatabaseName("IX_DiscordInteractions_InteractionId_Unique");
 
             entity.HasIndex(x => new { x.IdempotencyStatus, x.ReceivedAt })
                 .HasDatabaseName("IX_DiscordInteractions_Status_ReceivedAt");
