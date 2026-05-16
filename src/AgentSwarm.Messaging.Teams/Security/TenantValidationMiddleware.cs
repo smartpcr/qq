@@ -35,6 +35,22 @@ namespace AgentSwarm.Messaging.Teams.Security;
 /// the same payload downstream.
 /// </para>
 /// <para>
+/// <b>Tenant ID casing invariant.</b> The allow-list comparison is performed with
+/// <see cref="StringComparison.OrdinalIgnoreCase"/>. Azure AD tenant IDs are GUIDs whose
+/// textual casing varies by source (Bot Framework activity payloads, Entra ID
+/// <c>tid</c> claims, operator-supplied configuration), so a case-sensitive comparison
+/// here would reject traffic the JWT-layer companion check accepts. The JWT-layer
+/// validator
+/// <see cref="EntraTenantAwareClaimsValidator.ValidateClaimsAsync(System.Collections.Generic.IList{System.Security.Claims.Claim})"/>
+/// already compares tenants with <see cref="StringComparison.OrdinalIgnoreCase"/>; using
+/// the same comparer in this HTTP-layer middleware keeps the two defence-in-depth layers
+/// in sync so a tenant cased differently from the allow-list entry cannot be accepted by
+/// one layer and rejected by the other (or vice versa when
+/// <c>EntraBotFrameworkAuthenticationOptions.RequireTenantClaim</c> is <c>false</c>).
+/// Future changes MUST preserve this symmetry — if one layer's comparer is changed the
+/// other MUST be changed in lockstep.
+/// </para>
+/// <para>
 /// Audit logging at this stage is limited to <see cref="ILogger"/> warnings; Stage 5.1
 /// upgrades this same middleware to emit a <c>SecurityRejection</c> audit entry via
 /// <c>IAuditLogger</c>.
@@ -47,6 +63,17 @@ public sealed class TenantValidationMiddleware : IMiddleware
     /// unset. Matches the Bot Framework convention.
     /// </summary>
     public const string DefaultBotEndpointPath = "/api/messages";
+
+    /// <summary>
+    /// Canonical <see cref="StringComparison"/> used for tenant-ID allow-list lookups.
+    /// MUST stay in lockstep with
+    /// <see cref="EntraTenantAwareClaimsValidator"/>'s comparer (currently
+    /// <see cref="StringComparison.OrdinalIgnoreCase"/>) so the HTTP-layer and JWT-layer
+    /// defence-in-depth checks accept and reject the same set of tenant-ID casings.
+    /// Centralising the constant here makes the cross-layer contract visible to future
+    /// reviewers and prevents a one-sided regression.
+    /// </summary>
+    internal const StringComparison TenantIdComparison = StringComparison.OrdinalIgnoreCase;
 
     private readonly IOptionsMonitor<TeamsMessagingOptions> _options;
     private readonly ILogger<TenantValidationMiddleware> _logger;
@@ -108,7 +135,14 @@ public sealed class TenantValidationMiddleware : IMiddleware
             return;
         }
 
-        if (!allowList.Any(t => string.Equals(t, tenantId, StringComparison.OrdinalIgnoreCase)))
+        // Use TenantIdComparison (OrdinalIgnoreCase) so this HTTP-layer check accepts the
+        // same casing variants that EntraTenantAwareClaimsValidator's JWT-layer check
+        // accepts. Azure AD tenant IDs are GUIDs whose textual casing varies by source;
+        // a case-sensitive comparer here would silently diverge from the JWT layer and
+        // produce mismatched accept/reject decisions across the two defence-in-depth
+        // layers. See the class-level "Tenant ID casing invariant" remarks for the full
+        // contract.
+        if (!allowList.Any(t => string.Equals(t, tenantId, TenantIdComparison)))
         {
             _logger.LogWarning(
                 "TenantValidationMiddleware: tenant '{TenantId}' is not in the allow-list; rejecting with 403.",
