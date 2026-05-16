@@ -25,6 +25,15 @@ namespace AgentSwarm.Messaging.Telegram.Webhook;
 ///   <see cref="IdempotencyStatus.Failed"/> to
 ///   <see cref="IdempotencyStatus.Processing"/> so a parallel sweep
 ///   does not pick the same row twice.</description></item>
+///   <item><description><b>RawPayload deserialization failure</b>
+///   (JsonException or null result) — transitions to
+///   <see cref="IdempotencyStatus.Completed"/> with a diagnostic
+///   <c>HandlerErrorDetail</c>. The persisted payload is immutable, so
+///   this is a deterministic / permanent error per the hybrid retry
+///   contract ("return = terminal"); marking <see cref="IdempotencyStatus.Failed"/>
+///   would cause the sweep to replay the same poison row up to
+///   <c>MaxRetries</c> times before alerting on exhausted retries.
+///   </description></item>
 ///   <item><description><b>Pipeline returns Succeeded=true</b> —
 ///   transitions to <see cref="IdempotencyStatus.Completed"/> with
 ///   <c>HandlerErrorDetail = null</c>.</description></item>
@@ -140,12 +149,20 @@ public sealed class InboundUpdateProcessor
         }
         catch (JsonException ex)
         {
+            // Deserialization failure is deterministic — the persisted
+            // RawPayload is immutable, so a sweep replay would fail
+            // identically. Per the hybrid retry contract
+            // ("return = terminal, throw = retryable") this is a
+            // permanent error, so mark Completed with a diagnostic
+            // detail rather than Failed (which would be retried up to
+            // MaxRetries before exhausting). Mirrors the Succeeded=false
+            // disposition further below.
             _logger.LogError(
                 ex,
-                "Failed to deserialize InboundUpdate.RawPayload. UpdateId={UpdateId} CorrelationId={CorrelationId}",
+                "Failed to deserialize InboundUpdate.RawPayload — marking InboundUpdate Completed (terminal, non-retryable). UpdateId={UpdateId} CorrelationId={CorrelationId}",
                 row.UpdateId,
                 correlationId);
-            await _store.MarkFailedAsync(
+            await _store.MarkCompletedAsync(
                 row.UpdateId,
                 "RawPayload deserialization failed: " + ex.Message,
                 ct).ConfigureAwait(false);
@@ -154,11 +171,13 @@ public sealed class InboundUpdateProcessor
 
         if (update is null)
         {
+            // Same rationale as the JsonException branch: deterministic
+            // and permanent — mark Completed (terminal), not Failed.
             _logger.LogError(
-                "InboundUpdate.RawPayload deserialized to null. UpdateId={UpdateId} CorrelationId={CorrelationId}",
+                "InboundUpdate.RawPayload deserialized to null — marking InboundUpdate Completed (terminal, non-retryable). UpdateId={UpdateId} CorrelationId={CorrelationId}",
                 row.UpdateId,
                 correlationId);
-            await _store.MarkFailedAsync(
+            await _store.MarkCompletedAsync(
                 row.UpdateId,
                 "RawPayload deserialized to null",
                 ct).ConfigureAwait(false);
