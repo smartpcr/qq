@@ -547,6 +547,32 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         return reference;
     }
 
+    /// <summary>
+    /// Inline retry helper used by <see cref="UpdateCardCoreAsync"/> and
+    /// <see cref="DeleteCardAsync"/>. The contract is intentionally narrow so callers
+    /// (and tests like
+    /// <c>UpdateCardAsync_TransientFailureExhaustsRetries_Throws</c>) see deterministic
+    /// behavior:
+    /// <list type="bullet">
+    /// <item><description><b>Success</b> on any attempt → method returns normally.</description></item>
+    /// <item><description><b>Cancellation</b> via <paramref name="ct"/> → original
+    /// <see cref="OperationCanceledException"/> propagates verbatim.</description></item>
+    /// <item><description><b>Transient Bot Connector failure</b> on attempts
+    /// <c>1..(N-1)</c> → log and retry after exponential backoff (or the server-supplied
+    /// <c>Retry-After</c>).</description></item>
+    /// <item><description><b>Anything else</b> — including a transient failure on the
+    /// FINAL attempt and any non-transient exception on any attempt — propagates the
+    /// ORIGINAL exception verbatim. Callers that need to surface the underlying HTTP
+    /// status (<see cref="Microsoft.Bot.Schema.ErrorResponseException.Response"/>) get
+    /// the unwrapped exception, not a generic
+    /// <see cref="InvalidOperationException"/> wrapper.</description></item>
+    /// </list>
+    /// Because the loop body either returns on success or has its exception bubble
+    /// out of the <c>try</c> (the catch filter <c>attempt &lt; totalAttempts</c>
+    /// deliberately stops matching on the final iteration), the loop never exits via
+    /// fall-through. There is therefore no post-loop throw — adding one would be dead
+    /// code AND would mask the underlying exception type the test contract requires.
+    /// </summary>
     private async Task ExecuteWithInlineRetryAsync(
         string operationName,
         string questionId,
@@ -557,7 +583,6 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         var baseDelay = TimeSpan.FromSeconds(Math.Max(1, _options.RetryBaseDelaySeconds));
         var maxDelay = TimeSpan.FromSeconds(60);
 
-        Exception? lastFailure = null;
         for (var attempt = 1; attempt <= totalAttempts; attempt++)
         {
             ct.ThrowIfCancellationRequested();
@@ -573,7 +598,6 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             }
             catch (Exception ex) when (IsTransientBotConnectorFailure(ex) && attempt < totalAttempts)
             {
-                lastFailure = ex;
                 var retryAfter = ExtractRetryAfter(ex);
                 var backoff = retryAfter ?? ComputeExponentialBackoff(attempt, baseDelay, maxDelay);
                 _logger.LogWarning(
@@ -587,10 +611,6 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
                 await Task.Delay(backoff, ct).ConfigureAwait(false);
             }
         }
-
-        throw new InvalidOperationException(
-            $"{operationName} for question '{questionId}' failed after {totalAttempts} attempts.",
-            lastFailure);
     }
 
     private static TimeSpan ComputeExponentialBackoff(int attempt, TimeSpan baseDelay, TimeSpan maxDelay)
