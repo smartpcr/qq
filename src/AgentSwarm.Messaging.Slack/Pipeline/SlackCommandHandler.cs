@@ -29,7 +29,7 @@ using Microsoft.Extensions.Logging;
 /// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>.
 /// Replaces the Stage 4.3 <see cref="NoOpSlackCommandHandler"/> default
 /// (silently ack-and-drop) with the real dispatcher described in
-/// architecture.md §2.7. Supported sub-commands:
+/// architecture.md ┬º2.7. Supported sub-commands:
 /// </para>
 /// <list type="table">
 ///   <listheader>
@@ -113,7 +113,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     /// <summary>
     /// Messenger discriminator stamped on
     /// <see cref="HumanDecisionEvent.Messenger"/> for every decision
-    /// the Slack connector publishes (architecture.md §2.9). Pinned as
+    /// the Slack connector publishes (architecture.md ┬º2.9). Pinned as
     /// a constant so tests assert against the exact value.
     /// </summary>
     public const string MessengerName = "slack";
@@ -385,7 +385,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             sb.AppendLine();
             foreach (AgentTaskStatusEntry entry in entries)
             {
-                sb.Append("• `").Append(entry.TaskId).Append("` -- ").Append(entry.Status);
+                sb.Append("ΓÇó `").Append(entry.TaskId).Append("` -- ").Append(entry.Status);
                 if (!string.IsNullOrEmpty(entry.Description))
                 {
                     sb.Append(" -- ").Append(entry.Description);
@@ -541,7 +541,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             await this.ephemeralResponder
                 .SendEphemeralAsync(
                     payload.ResponseUrl,
-                    $"Could not build the `{subCommand}` modal payload: {ex.Message}.",
+                    $"Could not build the `{subCommand}` modal payload: an internal error occurred.",
                     ct)
                 .ConfigureAwait(false);
             return;
