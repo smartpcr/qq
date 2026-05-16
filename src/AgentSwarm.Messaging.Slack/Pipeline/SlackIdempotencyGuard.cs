@@ -625,6 +625,32 @@ internal sealed class SlackIdempotencyGuard<TContext> : ISlackIdempotencyGuard
     /// another replica got there first (zero rows affected because
     /// the WHERE filter no longer matches).
     /// </summary>
+    /// <remarks>
+    /// In addition to bumping <see cref="SlackInboundRequestRecord.FirstSeenAt"/>
+    /// (the lease-ownership timestamp) and resetting
+    /// <see cref="SlackInboundRequestRecord.CompletedAt"/> to <see langword="null"/>
+    /// (the crashed worker may have stamped it during a partial
+    /// failure path), the reclaim ALSO refreshes
+    /// <see cref="SlackInboundRequestRecord.SourceType"/> to the
+    /// redelivery envelope's transport. This keeps the EF guard's
+    /// contract aligned with
+    /// <see cref="InMemorySlackIdempotencyGuard.TryAcquireAsync"/>:
+    /// the active lease's <c>source_type</c> reflects whichever
+    /// transport ultimately acquired ownership. The contract matters
+    /// for operator triage -- a redelivery that arrives via a
+    /// different transport (e.g. socket-mode retry of an HTTP-
+    /// originated event) would otherwise leave the persisted
+    /// <c>source_type</c> set to the crashed worker's original value
+    /// and mis-classify the row in <c>WHERE source_type = ?</c>
+    /// queries. Stable identifiers
+    /// (<see cref="SlackInboundRequestRecord.TeamId"/>,
+    /// <see cref="SlackInboundRequestRecord.UserId"/>,
+    /// <see cref="SlackInboundRequestRecord.RawPayloadHash"/>) are
+    /// intentionally NOT updated: Slack guarantees the same event /
+    /// command / interaction redelivers with the same team, user, and
+    /// payload, so re-writing them is unnecessary churn and the
+    /// in-memory reference guard does not touch them either.
+    /// </remarks>
     private async Task<bool> TryReclaimStaleLeaseAsync(
         TContext context,
         SlackInboundEnvelope envelope,
@@ -634,6 +660,8 @@ internal sealed class SlackIdempotencyGuard<TContext> : ISlackIdempotencyGuard
     {
         try
         {
+            string reclaimedSourceType = MapSourceType(envelope.SourceType);
+
             int affected = await context.SlackInboundRequestRecords
                 .Where(r => r.IdempotencyKey == envelope.IdempotencyKey
                             && r.ProcessingStatus == SlackInboundRequestProcessingStatus.Processing
@@ -641,7 +669,8 @@ internal sealed class SlackIdempotencyGuard<TContext> : ISlackIdempotencyGuard
                 .ExecuteUpdateAsync(
                     setters => setters
                         .SetProperty(r => r.FirstSeenAt, newFirstSeenAt)
-                        .SetProperty(r => r.CompletedAt, (DateTimeOffset?)null),
+                        .SetProperty(r => r.CompletedAt, (DateTimeOffset?)null)
+                        .SetProperty(r => r.SourceType, reclaimedSourceType),
                     ct)
                 .ConfigureAwait(false);
 
