@@ -29,7 +29,7 @@ using Microsoft.Extensions.Logging;
 /// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>.
 /// Replaces the Stage 4.3 <see cref="NoOpSlackCommandHandler"/> default
 /// (silently ack-and-drop) with the real dispatcher described in
-/// architecture.md ┬º2.7. Supported sub-commands:
+/// architecture.md §2.7. Supported sub-commands:
 /// </para>
 /// <list type="table">
 ///   <listheader>
@@ -113,7 +113,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     /// <summary>
     /// Messenger discriminator stamped on
     /// <see cref="HumanDecisionEvent.Messenger"/> for every decision
-    /// the Slack connector publishes (architecture.md ┬º2.9). Pinned as
+    /// the Slack connector publishes (architecture.md §2.9). Pinned as
     /// a constant so tests assert against the exact value.
     /// </summary>
     public const string MessengerName = "slack";
@@ -144,6 +144,15 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
     private readonly ISlackEphemeralResponder ephemeralResponder;
     private readonly ISlackViewsOpenClient viewsOpenClient;
     private readonly ISlackMessageRenderer messageRenderer;
+
+    // Retained for forward-compatibility with later stages (e.g., scheduling /
+    // expiry timestamps that are not carried on the envelope). Stage 5.1 iter-3
+    // sources the AgentTaskCreationRequest.RequestedAt and
+    // HumanDecisionEvent.ReceivedAt fields from envelope.ReceivedAt instead so
+    // they honour the documented "UTC timestamp at which the connector
+    // observed the request" semantic -- the handler's wall clock can lag the
+    // original observation by seconds or minutes depending on ingestor queue
+    // depth.
     private readonly TimeProvider timeProvider;
     private readonly ILogger<SlackCommandHandler> logger;
 
@@ -308,13 +317,19 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             return;
         }
 
+        // RequestedAt MUST be the time the inbound transport first observed the
+        // Slack request (envelope.ReceivedAt), not the handler's wall clock --
+        // AgentTaskCreationRequest.RequestedAt is documented as "UTC timestamp
+        // at which the connector observed the request". Using GetUtcNow() here
+        // would silently drift by however long the envelope sat in the
+        // ingestor queue.
         AgentTaskCreationRequest request = new(
             Prompt: prompt!,
             Messenger: MessengerName,
             ExternalUserId: envelope.UserId ?? string.Empty,
             ChannelId: envelope.ChannelId,
             CorrelationId: correlationId,
-            RequestedAt: this.timeProvider.GetUtcNow());
+            RequestedAt: envelope.ReceivedAt);
 
         AgentTaskCreationResult result = await this.taskService
             .CreateTaskAsync(request, ct)
@@ -385,7 +400,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             sb.AppendLine();
             foreach (AgentTaskStatusEntry entry in entries)
             {
-                sb.Append("ΓÇó `").Append(entry.TaskId).Append("` -- ").Append(entry.Status);
+                sb.Append("• `").Append(entry.TaskId).Append("` -- ").Append(entry.Status);
                 if (!string.IsNullOrEmpty(entry.Description))
                 {
                     sb.Append(" -- ").Append(entry.Description);
@@ -422,6 +437,11 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             return;
         }
 
+        // ReceivedAt MUST be the original transport observation timestamp
+        // (envelope.ReceivedAt) per the HumanDecisionEvent contract -- using
+        // the handler's wall clock would tag every decision with the dispatch
+        // time, masking ingestor-queue lag from the auditors that downstream
+        // SLO checks rely on.
         HumanDecisionEvent decision = new(
             QuestionId: questionId!,
             ActionValue: actionValue,
@@ -429,7 +449,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             Messenger: MessengerName,
             ExternalUserId: envelope.UserId ?? string.Empty,
             ExternalMessageId: envelope.TriggerId ?? envelope.IdempotencyKey ?? string.Empty,
-            ReceivedAt: this.timeProvider.GetUtcNow(),
+            ReceivedAt: envelope.ReceivedAt,
             CorrelationId: correlationId);
 
         await this.taskService
@@ -541,7 +561,7 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             await this.ephemeralResponder
                 .SendEphemeralAsync(
                     payload.ResponseUrl,
-                    $"Could not build the `{subCommand}` modal payload: an internal error occurred.",
+                    $"Could not build the `{subCommand}` modal payload: {ex.Message}.",
                     ct)
                 .ConfigureAwait(false);
             return;
