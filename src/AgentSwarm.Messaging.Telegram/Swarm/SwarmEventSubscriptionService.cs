@@ -411,6 +411,26 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
 
     private async Task RouteStatusAsync(string tenantId, AgentStatusUpdateEvent ev, CancellationToken ct)
     {
+        // Capture the ingress-receipt timestamp ONCE per inbound event so
+        // every per-operator broadcast copy of this status update shares
+        // the same OccurredAt. Without this, the previous implementation
+        // re-sampled DateTimeOffset.UtcNow inside BuildStatusMessage on
+        // every copy, which (a) broke ordering correlation across a fan
+        // of operators receiving the same event and (b) drifted the
+        // stamped time by milliseconds per recipient.
+        //
+        // The canonical fix — adding a producer-stamped Timestamp /
+        // OccurredAt property to AgentStatusUpdateEvent itself (mirroring
+        // AgentAlertEvent.Timestamp) — touches the
+        // AgentSwarm.Messaging.Abstractions contract and every status
+        // producer/test fixture and is therefore tracked as a follow-up
+        // refactor that ships on its own PR. Until then, ingress-receipt
+        // time is a monotonically-increasing approximation: the per-tenant
+        // SubscribeAsync stream is drained sequentially by await foreach,
+        // so events captured here preserve the bus-ordering of the agent
+        // emissions.
+        var occurredAt = DateTimeOffset.UtcNow;
+
         var oversight = await _taskOversight
             .GetByTaskIdAsync(ev.TaskId, ct)
             .ConfigureAwait(false);
@@ -436,7 +456,7 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
                 return;
             }
 
-            var directed = BuildStatusMessage(ev, match.TelegramChatId);
+            var directed = BuildStatusMessage(ev, match.TelegramChatId, occurredAt);
             _logger.LogInformation(
                 "SwarmEventSubscriptionService routing AgentStatusUpdateEvent to oversight operator. Tenant={TenantId} TaskId={TaskId} AgentId={AgentId} ChatId={ChatId} CorrelationId={CorrelationId}",
                 tenantId,
@@ -481,7 +501,7 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
             var target = active[i];
             if (!seenChats.Add(target.TelegramChatId)) { continue; }
 
-            var perOperator = BuildStatusMessage(ev, target.TelegramChatId, suffix: i);
+            var perOperator = BuildStatusMessage(ev, target.TelegramChatId, occurredAt, suffix: i);
             await _connector.SendMessageAsync(perOperator, ct).ConfigureAwait(false);
         }
     }
@@ -575,6 +595,23 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
     /// <see cref="MessengerMessage"/> with
     /// <see cref="MessageSeverity.Normal"/> and the resolved chat id.
     /// </summary>
+    /// <param name="ev">The inbound status event.</param>
+    /// <param name="chatId">Resolved Telegram chat id.</param>
+    /// <param name="occurredAt">
+    /// Ingress-receipt timestamp captured ONCE by the caller for the
+    /// inbound event. Used as the <see cref="MessengerMessage.Timestamp"/>
+    /// so that every per-operator broadcast copy of the same source event
+    /// shares one wall-clock value. This preserves downstream ordering
+    /// correlation (e.g. a status update emitted before an alert lands
+    /// before that alert in operator chats) and avoids the millisecond
+    /// drift produced by re-sampling <c>DateTimeOffset.UtcNow</c> per copy.
+    /// <para>
+    /// This is a stopgap until <c>AgentStatusUpdateEvent</c> carries its
+    /// own producer-stamped <c>Timestamp</c> (a contract change tracked
+    /// in a follow-up refactor against <c>AgentSwarm.Messaging.Abstractions</c>);
+    /// once that lands, callers will pass <c>ev.Timestamp</c> here.
+    /// </para>
+    /// </param>
     /// <param name="suffix">
     /// Disambiguates the
     /// <see cref="MessengerMessage.MessageId"/> when broadcasting a single
@@ -584,6 +621,7 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
     private static MessengerMessage BuildStatusMessage(
         AgentStatusUpdateEvent ev,
         long chatId,
+        DateTimeOffset occurredAt,
         int suffix = -1)
     {
         var messageId = suffix < 0
@@ -597,7 +635,7 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
             ConversationId = ev.TaskId,
             AgentId = ev.AgentId,
             TaskId = ev.TaskId,
-            Timestamp = DateTimeOffset.UtcNow,
+            Timestamp = occurredAt,
             Text = ev.StatusText,
             Severity = MessageSeverity.Normal,
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
