@@ -26,7 +26,7 @@ using Microsoft.EntityFrameworkCore;
 /// schema to exercise against SQLite (in-memory or file-backed).
 /// </para>
 /// </remarks>
-public sealed class SlackTestDbContext : DbContext
+public sealed class SlackTestDbContext : DbContext, ISlackInboundRequestRecordDbContext
 {
     /// <summary>
     /// Initialises a new <see cref="SlackTestDbContext"/> with the
@@ -51,6 +51,9 @@ public sealed class SlackTestDbContext : DbContext
 
     /// <summary>Audit entries.</summary>
     public DbSet<SlackAuditEntry> AuditEntries => Set<SlackAuditEntry>();
+
+    /// <inheritdoc cref="ISlackInboundRequestRecordDbContext.SlackInboundRequestRecords" />
+    public DbSet<SlackInboundRequestRecord> SlackInboundRequestRecords => Set<SlackInboundRequestRecord>();
 
     /// <inheritdoc />
     /// <remarks>
