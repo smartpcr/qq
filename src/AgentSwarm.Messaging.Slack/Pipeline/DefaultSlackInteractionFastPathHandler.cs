@@ -10,6 +10,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Slack.Entities;
+using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Rendering;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.AspNetCore.Http;
@@ -369,10 +370,16 @@ internal sealed class DefaultSlackInteractionFastPathHandler : ISlackInteraction
             // and convert a user-successful request into a 5xx -- a
             // missing audit row is recoverable via the structured log
             // line above, a 5xx is not.
+            //
+            // Stage 7.1 evaluator iter-1 item 3: stamp the serialised
+            // comment-modal view JSON onto the audit row's
+            // ResponsePayload so successful interactions persist the
+            // story-required "response payload" field, not just errors.
             try
             {
+                string? serialisedView = SlackAuditPayloadSerializer.Serialize(viewPayload);
                 await this.auditRecorder
-                    .RecordSuccessAsync(envelope, AuditSubCommand, CancellationToken.None)
+                    .RecordSuccessAsync(envelope, AuditSubCommand, CancellationToken.None, serialisedView)
                     .ConfigureAwait(false);
             }
             catch (Exception auditEx)

@@ -532,6 +532,17 @@ internal sealed class SlackDirectApiClient : ISlackViewsOpenClient
             ? null
             : $"/agent {modal.SubCommand}";
 
+        // Stage 7.1 evaluator iter-1 item 3 (story "Audit" field
+        // list): on success persist the serialised Slack view JSON
+        // that was sent to views.open so the audit row carries the
+        // canonical response payload. On error the diagnostic wins
+        // because the view tree is rarely the interesting failure
+        // signal. The serialiser bounds the payload at 16 KiB so
+        // pathologically large modals cannot bloat the audit table.
+        string? responsePayload = result.IsSuccess
+            ? SlackAuditPayloadSerializer.Serialize(modal.View)
+            : errorDetail;
+
         SlackAuditEntry entry = new()
         {
             Id = id,
@@ -547,7 +558,7 @@ internal sealed class SlackDirectApiClient : ISlackViewsOpenClient
             MessageTs = null,
             UserId = string.IsNullOrEmpty(modal.UserId) ? null : modal.UserId,
             CommandText = commandText,
-            ResponsePayload = errorDetail,
+            ResponsePayload = responsePayload,
             Outcome = outcome,
             ErrorDetail = errorDetail,
             Timestamp = now,

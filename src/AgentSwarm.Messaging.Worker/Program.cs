@@ -62,6 +62,25 @@ public class Program
         // this call signature-rejection audit rows are lost on restart.
         AddSlackAuditPersistence(builder);
 
+        // Stage 7.1 (workstream:
+        // ws-qq-slack-messenger-supp-phase-observability-and-operations-stage-audit-logging-and-retention):
+        // replace the bare EF audit writer with the broader
+        // SlackAuditLogger<TContext>. The logger implements BOTH
+        // ISlackAuditLogger (LogAsync + QueryAsync per architecture
+        // §4.6) and ISlackAuditEntryWriter (the Stage 3.1 append seam)
+        // so every existing pipeline call site -- signature validation,
+        // authorization, idempotency, command dispatch, interaction
+        // handling, modal open, outbound dispatch, thread manager,
+        // and the DirectApiClient -- automatically routes through
+        // LogAsync via the explicit AppendAsync forwarder on the
+        // logger. The same extension also registers the
+        // SlackRetentionCleanupService BackgroundService that purges
+        // slack_audit_entry and slack_inbound_request_record rows
+        // older than 30 days per tech-spec §2.7 / resolved OQ-2.
+        // Bind Slack:Retention from appsettings so operators can tune
+        // the cadence and retention window without rebuilding.
+        builder.Services.AddSlackAuditLogger<SlackPersistenceDbContext>(builder.Configuration);
+
         // Stage 3.1 (evaluator iter-3 item 1): register the EF-backed
         // ISlackWorkspaceConfigStore so a restarted Worker can resolve
         // SlackWorkspaceConfig.SigningSecretRef directly from the
