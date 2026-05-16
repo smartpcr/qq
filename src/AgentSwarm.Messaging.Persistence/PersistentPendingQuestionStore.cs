@@ -66,54 +66,21 @@ using Microsoft.Extensions.Logging;
 /// row are no-ops so a crash mid-sweep does not double-apply.
 /// </para>
 /// <para>
-/// <b>Non-terminal status guard on operator-decision transitions.</b>
-/// <see cref="MarkAnsweredAsync"/> and
-/// <see cref="MarkAwaitingCommentAsync"/> use the same
-/// atomic-conditional-UPDATE primitive (EF Core 8
-/// <c>ExecuteUpdateAsync</c> with a
-/// <c>WHERE Status IN (Pending, AwaitingComment)</c> clause) as
-/// <see cref="MarkTimedOutAsync"/>. This closes the
-/// <i>state-clobber half</i> of the cross-process race between the
-/// callback handler and <c>QuestionTimeoutService</c>: if the sweep
-/// already won the atomic <see cref="MarkTimedOutAsync"/> claim and
-/// flipped the row to <see cref="PendingQuestionStatus.TimedOut"/>,
-/// a late <see cref="MarkAnsweredAsync"/> from the callback handler
-/// no longer overwrites it back to
-/// <see cref="PendingQuestionStatus.Answered"/>; the durable row
-/// faithfully reflects which side won. The disambiguation step
-/// (re-query when <c>rowsAffected == 0</c>) preserves the existing
-/// <see cref="KeyNotFoundException"/> contract for truly-missing
-/// rows so callers that depend on the exception (
-/// <c>CallbackQueryHandler</c>'s release-on-throw dedup scope,
-/// <c>DecisionCommandHandlers</c>) continue to behave identically.
-/// </para>
-/// <para>
-/// <b>Out-of-scope follow-up (the publish-side half of the race).</b>
-/// The atomic guard above prevents the DB from being clobbered but
-/// it does NOT, by itself, prevent a double
-/// <c>HumanDecisionEvent</c> publish on the wire: today the
-/// callback handler publishes BEFORE calling
-/// <see cref="MarkAnsweredAsync"/>, mirroring the deliberate "
-/// transition after publish so a transient publish failure leaves
-/// the row re-deliverable" property documented in
-/// <c>CallbackQueryHandler</c> and
-/// <c>DecisionCommandHandlers</c>. Fully closing the double-publish
-/// race additionally requires (a) changing
-/// <see cref="IPendingQuestionStore.MarkAnsweredAsync"/> /
-/// <see cref="IPendingQuestionStore.MarkAwaitingCommentAsync"/> to
-/// return <see cref="bool"/> so the caller can detect a lost claim,
-/// (b) reordering the three callers (
-/// <c>CallbackQueryHandler.ProcessCallbackInsideReservationAsync</c>,
-/// <c>CallbackQueryHandler.HandleCommentReplyAsync</c>,
-/// <c>DecisionCommandHandlerBase.HandleAsync</c>) to claim-first /
-/// publish-second, and (c) adding a
-/// <c>TryRevertAnsweredClaimAsync</c> compensation primitive
-/// analogous to <see cref="TryRevertTimedOutClaimAsync"/> so that a
-/// post-claim publish failure does NOT permanently strand the
-/// operator decision (the iter-2 evaluator item 5 concern already
-/// addressed for the timeout flow). That cross-cutting change is
-/// tracked as a follow-up — keeping this stage's commit a pure
-/// persistence-layer invariant tightening.
+/// <b>Atomic state transitions.</b> <see cref="MarkAnsweredAsync"/>,
+/// <see cref="MarkAwaitingCommentAsync"/>, and
+/// <see cref="MarkTimedOutAsync"/> all use EF Core 8's atomic
+/// <c>ExecuteUpdateAsync</c> with a <c>WHERE</c>-clause status
+/// precondition so the callback handler and the timeout sweep can
+/// safely race against each other across processes. Each method
+/// returns <c>bool</c> indicating whether the conditional UPDATE
+/// affected a row, giving the caller a definitive "I won the race
+/// vs. someone else terminal-d this question first" signal so it
+/// can decide whether to emit the downstream
+/// <c>HumanDecisionEvent</c>. Without this guard a callback
+/// arriving microseconds after a sweep claim would silently
+/// overwrite <see cref="PendingQuestionStatus.TimedOut"/> with
+/// <see cref="PendingQuestionStatus.Answered"/> and the system
+/// would publish two events for the same QuestionId.
 /// </para>
 /// <para>
 /// <b>Bounded sweep batch.</b> <see cref="GetExpiredAsync"/> caps
@@ -359,25 +326,45 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
         return row is null ? null : ToDto(row);
     }
 
-    public async Task MarkAnsweredAsync(string questionId, CancellationToken ct)
+    /// <summary>
+    /// Atomically transition a pending question to
+    /// <see cref="PendingQuestionStatus.Answered"/> iff the row is
+    /// still in a non-terminal state
+    /// (<see cref="PendingQuestionStatus.Pending"/> or
+    /// <see cref="PendingQuestionStatus.AwaitingComment"/>).
+    /// Returns <c>true</c> when this caller won the claim and
+    /// <c>false</c> when the row was missing or had already been
+    /// transitioned to a terminal state (typically
+    /// <see cref="PendingQuestionStatus.TimedOut"/> by a concurrent
+    /// <see cref="QuestionTimeoutService"/> sweep, or
+    /// <see cref="PendingQuestionStatus.Answered"/> by a duplicate
+    /// callback delivery from Telegram). The callback handler MUST
+    /// branch on the returned bool and skip its
+    /// <c>HumanDecisionEvent</c> publish when this returns
+    /// <c>false</c> — otherwise the system double-publishes for the
+    /// same <c>QuestionId</c>.
+    /// </summary>
+    public async Task<bool> MarkAnsweredAsync(string questionId, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(questionId);
 
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
 
-        // Atomic conditional UPDATE — mirrors the
-        // MarkTimedOutAsync primitive. The WHERE clause only matches
-        // rows still in a NON-terminal status (Pending or
-        // AwaitingComment) so a late callback-handler call cannot
-        // overwrite a row that QuestionTimeoutService has already
-        // claimed as TimedOut, and it cannot clobber a prior
-        // Answered/TimedOut row back to Answered. The single
-        // statement is row-level atomic under SQLite, PostgreSQL,
-        // and SQL Server alike (EF Core 8 ExecuteUpdateAsync
-        // translates to a provider-native UPDATE), so the
-        // cross-process state-clobber race the iter / reviewer
-        // flagged is closed here.
+        // Atomic cross-process claim — same pattern as
+        // MarkTimedOutAsync. The WHERE filter on
+        // (Status == Pending || Status == AwaitingComment) is what
+        // closes the callback-vs-sweep race: a callback that arrives
+        // microseconds AFTER QuestionTimeoutService has already
+        // claimed the row (Status = TimedOut) will see rowsAffected
+        // == 0 here and return false, letting the callback handler
+        // skip its HumanDecisionEvent emit. Without this guard the
+        // previous load-then-set-then-save would silently overwrite
+        // TimedOut → Answered, producing TWO HumanDecisionEvent
+        // publishes for the same QuestionId. Implemented via EF
+        // Core 8's ExecuteUpdateAsync so the single provider-native
+        // UPDATE is atomic at row-level under SQLite, PostgreSQL,
+        // and SQL Server alike.
         var rowsAffected = await db.PendingQuestions
             .Where(x => x.QuestionId == questionId
                      && (x.Status == PendingQuestionStatus.Pending
@@ -387,85 +374,49 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
                 ct)
             .ConfigureAwait(false);
 
-        if (rowsAffected > 0)
-        {
-            return;
-        }
-
-        // Disambiguate the zero-rows-affected case so we preserve
-        // the existing KeyNotFoundException-for-missing-row contract
-        // that CallbackQueryHandler's release-on-throw dedup scope
-        // and DecisionCommandHandlers depend on. A second roundtrip
-        // is acceptable here because this branch is rare (only hit
-        // when the row is genuinely missing OR is already in a
-        // terminal state — the very losing-race case the guard was
-        // added to detect).
-        var stillExists = await db.PendingQuestions
-            .AsNoTracking()
-            .AnyAsync(x => x.QuestionId == questionId, ct)
-            .ConfigureAwait(false);
-
-        if (!stillExists)
-        {
-            throw new KeyNotFoundException($"PendingQuestion '{questionId}' not found.");
-        }
-
-        // Row exists but is in a terminal status (Answered or
-        // TimedOut). Idempotent no-op — DO NOT clobber the existing
-        // terminal state. The publish-side double-emission caveat
-        // is documented on the class-level remarks (the caller
-        // still publishes because today's signature returns
-        // Task, not Task<bool>; tightening the caller flow is the
-        // tracked follow-up).
-        _logger.LogDebug(
-            "MarkAnsweredAsync({QuestionId}) found the row in a terminal status — leaving it unchanged. The cross-process timeout sweep most likely claimed it via MarkTimedOutAsync between the callback handler's GetAsync and this MarkAnsweredAsync.",
-            questionId);
+        return rowsAffected > 0;
     }
 
-    public async Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
+    /// <summary>
+    /// Atomically transition a pending question to
+    /// <see cref="PendingQuestionStatus.AwaitingComment"/> iff the
+    /// row is still <see cref="PendingQuestionStatus.Pending"/>
+    /// (i.e. neither already-Answered nor already-TimedOut).
+    /// Returns <c>true</c> when this caller won the claim and
+    /// <c>false</c> when the row was missing or had already been
+    /// transitioned (typically to
+    /// <see cref="PendingQuestionStatus.TimedOut"/> by a concurrent
+    /// sweep, or to a terminal state by a duplicate callback). The
+    /// callback handler MUST branch on the returned bool and skip
+    /// its "please send a comment" prompt when this returns
+    /// <c>false</c> so the operator does not get prompted for text
+    /// against a question the system has already defaulted.
+    /// </summary>
+    public async Task<bool> MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(questionId);
 
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
 
-        // Atomic conditional UPDATE — same pattern as
-        // MarkAnsweredAsync / MarkTimedOutAsync. Pending →
-        // AwaitingComment is the primary transition; the
-        // AwaitingComment guard slot makes the call idempotent
-        // (a retried RequiresComment callback that somehow slipped
-        // past the dedup gate is a self-update no-op) while still
-        // refusing to overwrite a TimedOut or Answered row that
-        // the timeout sweep / a sibling callback already finalised.
+        // Atomic cross-process claim — Pending is the only legal
+        // source state for the Pending → AwaitingComment transition.
+        // Same race-closing rationale as MarkAnsweredAsync /
+        // MarkTimedOutAsync: a callback that arrives after a
+        // QuestionTimeoutService sweep has already flipped the row
+        // to TimedOut will see rowsAffected == 0 here and return
+        // false, letting the callback handler skip the
+        // awaiting-comment prompt instead of silently restoring a
+        // non-terminal status on top of a terminal one.
         var rowsAffected = await db.PendingQuestions
             .Where(x => x.QuestionId == questionId
-                     && (x.Status == PendingQuestionStatus.Pending
-                      || x.Status == PendingQuestionStatus.AwaitingComment))
+                     && x.Status == PendingQuestionStatus.Pending)
             .ExecuteUpdateAsync(
                 setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.AwaitingComment),
                 ct)
             .ConfigureAwait(false);
 
-        if (rowsAffected > 0)
-        {
-            return;
-        }
-
-        // Disambiguate as in MarkAnsweredAsync — preserve the
-        // KeyNotFoundException-for-missing-row contract.
-        var stillExists = await db.PendingQuestions
-            .AsNoTracking()
-            .AnyAsync(x => x.QuestionId == questionId, ct)
-            .ConfigureAwait(false);
-
-        if (!stillExists)
-        {
-            throw new KeyNotFoundException($"PendingQuestion '{questionId}' not found.");
-        }
-
-        _logger.LogDebug(
-            "MarkAwaitingCommentAsync({QuestionId}) found the row in a terminal status — leaving it unchanged. The cross-process timeout sweep most likely claimed it via MarkTimedOutAsync between the callback handler's GetAsync and this MarkAwaitingCommentAsync.",
-            questionId);
+        return rowsAffected > 0;
     }
 
     public async Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
