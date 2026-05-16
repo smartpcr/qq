@@ -100,7 +100,13 @@ public sealed class TenantValidationMiddleware : IMiddleware
         context.Request.Body.Position = 0;
 
         var allowed = _options.CurrentValue.AllowedTenantIds ?? new List<string>();
-        if (string.IsNullOrEmpty(tenantId) || !allowed.Contains(tenantId, StringComparer.Ordinal))
+        // Reject whitespace-only tenant IDs (defence-in-depth — ExtractTenantIdAsync also
+        // treats whitespace as missing) and use StringComparer.Ordinal so the operator-
+        // configured allow-list casing is canonical. The HTTP-layer allow-list is
+        // intentionally stricter than the JWT-layer EntraTenantAwareClaimsValidator
+        // (which uses OrdinalIgnoreCase for the Azure-issued `tid` claim whose casing
+        // varies by issuer surface) — see InvokeAsync_TenantIdCaseMismatch_Rejects.
+        if (string.IsNullOrWhiteSpace(tenantId) || !allowed.Contains(tenantId!, StringComparer.Ordinal))
         {
             await RejectAsync(context, tenantId, allowed.Count).ConfigureAwait(false);
             return;
@@ -137,9 +143,13 @@ public sealed class TenantValidationMiddleware : IMiddleware
                 && idElement.ValueKind == JsonValueKind.String)
             {
                 var fromChannelData = idElement.GetString();
-                if (!string.IsNullOrEmpty(fromChannelData))
+                // Treat whitespace-only tenant IDs as missing so the conversation.tenantId
+                // fallback path runs; Trim() so stray padding cannot defeat the
+                // case-sensitive (StringComparer.Ordinal) allow-list comparison in
+                // InvokeAsync.
+                if (!string.IsNullOrWhiteSpace(fromChannelData))
                 {
-                    return fromChannelData;
+                    return fromChannelData!.Trim();
                 }
             }
 
@@ -148,7 +158,15 @@ public sealed class TenantValidationMiddleware : IMiddleware
                 && conversation.TryGetProperty("tenantId", out var tenantIdElement)
                 && tenantIdElement.ValueKind == JsonValueKind.String)
             {
-                return tenantIdElement.GetString();
+                var fromConversation = tenantIdElement.GetString();
+                // Mirror the channelData branch: whitespace-only conversation.tenantId is
+                // treated as "no tenant claim present" and short-circuits to rejection
+                // with a missing-tenant audit payload rather than a misleading
+                // empty-string allow-list miss.
+                if (!string.IsNullOrWhiteSpace(fromConversation))
+                {
+                    return fromConversation!.Trim();
+                }
             }
 
             return null;

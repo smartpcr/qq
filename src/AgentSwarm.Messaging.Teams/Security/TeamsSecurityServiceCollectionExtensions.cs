@@ -320,6 +320,31 @@ public static class TeamsSecurityServiceCollectionExtensions
     /// the BF SDK's default factory which lacks the tenant / caller restriction) so
     /// downstream <c>CloudAdapter</c> resolutions pick up the hardened authentication.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Hot-reload contract — Stage 5.1 iter-8 evaluator feedback.</b> The
+    /// <see cref="EntraBotFrameworkAuthenticationOptions.AllowedCallers"/> and
+    /// <see cref="EntraBotFrameworkAuthenticationOptions.AllowedTenantIds"/> allow-lists
+    /// are read by the registered claims validator on EVERY inbound activity (via
+    /// <see cref="IOptionsMonitor{TOptions}.CurrentValue"/>) — see
+    /// <see cref="HotReloadEntraTenantAwareClaimsValidator"/>. This keeps the JWT-layer
+    /// validator in lockstep with the HTTP-layer <see cref="TenantValidationMiddleware"/>,
+    /// which also reads <see cref="IOptionsMonitor{TOptions}.CurrentValue"/> per request,
+    /// so an operator-supplied allow-list update takes effect at both defence-in-depth
+    /// layers without a host restart.
+    /// </para>
+    /// <para>
+    /// <b>What does NOT hot-reload (by design):</b>
+    /// <see cref="TeamsMessagingOptions.MicrosoftAppId"/>,
+    /// <see cref="TeamsMessagingOptions.MicrosoftAppPassword"/>,
+    /// <see cref="TeamsMessagingOptions.MicrosoftAppTenantId"/>,
+    /// <see cref="EntraBotFrameworkAuthenticationOptions.ChannelService"/>, and
+    /// <see cref="EntraBotFrameworkAuthenticationOptions.ValidateAuthority"/> are baked
+    /// into the <see cref="BotFrameworkAuthentication"/> singleton at first resolution
+    /// because <c>BotFrameworkAuthenticationFactory.Create</c> does not expose a refresh
+    /// hook for them. Operators changing those fields MUST restart the host.
+    /// </para>
+    /// </remarks>
     /// <param name="services">The service collection to mutate.</param>
     /// <param name="configure">Optional configuration delegate for <see cref="EntraBotFrameworkAuthenticationOptions"/>.</param>
     /// <returns>The same <paramref name="services"/> instance (fluent).</returns>
@@ -339,7 +364,31 @@ public static class TeamsSecurityServiceCollectionExtensions
         services.RemoveAll<BotFrameworkAuthentication>();
         services.AddSingleton<BotFrameworkAuthentication>(sp =>
         {
-            var authOptions = sp.GetRequiredService<IOptionsMonitor<EntraBotFrameworkAuthenticationOptions>>().CurrentValue;
+            // Stage 5.1 iter-8 evaluator feedback item — close the hot-reload asymmetry
+            // between the HTTP-layer TenantValidationMiddleware (which reads
+            // _options.CurrentValue per request and observes IConfiguration reloads
+            // immediately) and the JWT-layer claims validator (which previously
+            // snapshotted AllowedTenantIds / AllowedCallers here at singleton
+            // construction time, leaving the JWT layer enforcing the stale list after a
+            // configuration reload). HotReloadEntraTenantAwareClaimsValidator below
+            // resolves the option monitors on EVERY ValidateClaimsAsync call, so an
+            // operator allow-list edit takes effect at both defence-in-depth layers in
+            // lockstep without a host restart.
+            //
+            // The fields below that ARE snapshotted (credentials, channel service,
+            // validate-authority bool) cannot hot-reload because
+            // BotFrameworkAuthenticationFactory.Create bakes them into the returned
+            // singleton — the BF SDK does not expose a refresh hook. The XML-doc
+            // remarks on AddEntraBotFrameworkAuthentication state this contract
+            // explicitly for operators.
+            var authOptionsMonitor = sp.GetRequiredService<IOptionsMonitor<EntraBotFrameworkAuthenticationOptions>>();
+            var messagingOptionsMonitor = sp.GetService<IOptionsMonitor<TeamsMessagingOptions>>();
+            var messagingSingletonAccessor = new Func<TeamsMessagingOptions?>(() => sp.GetService<TeamsMessagingOptions>());
+
+            // Snapshot used ONLY for the BF-SDK factory inputs below that cannot
+            // hot-reload (credentials, channel service, validate-authority). The
+            // allow-lists are NOT read here — the validator reads them per-request.
+            var authOptions = authOptionsMonitor.CurrentValue;
 
             // Stage 5.1 iter-5 evaluator feedback item 3 — resolve TeamsMessagingOptions
             // by trying the concrete singleton FIRST and only falling back to
@@ -351,18 +400,14 @@ public static class TeamsSecurityServiceCollectionExtensions
             // projects instance-registered singletons into the monitor chain, so this
             // double-lookup is belt-and-braces — singleton wins when present, monitor
             // covers the IOptions.Configure-only wiring style.
-            var messagingOptions = sp.GetService<TeamsMessagingOptions>()
-                ?? sp.GetService<IOptionsMonitor<TeamsMessagingOptions>>()?.CurrentValue
+            var messagingOptions = messagingSingletonAccessor()
+                ?? messagingOptionsMonitor?.CurrentValue
                 ?? new TeamsMessagingOptions();
 
-            var allowedTenants = authOptions.AllowedTenantIds is { Count: > 0 }
-                ? authOptions.AllowedTenantIds
-                : messagingOptions.AllowedTenantIds ?? new List<string>();
-
-            var validator = new EntraTenantAwareClaimsValidator(
-                allowedCallers: authOptions.AllowedCallers ?? new List<string>(),
-                allowedTenantIds: allowedTenants,
-                requireTenantClaim: authOptions.RequireTenantClaim,
+            var validator = new HotReloadEntraTenantAwareClaimsValidator(
+                authOptionsMonitor: authOptionsMonitor,
+                messagingOptionsMonitor: messagingOptionsMonitor,
+                messagingSingletonAccessor: messagingSingletonAccessor,
                 logger: sp.GetService<ILogger<EntraTenantAwareClaimsValidator>>());
 
             var authConfig = new AuthenticationConfiguration
@@ -397,5 +442,91 @@ public static class TeamsSecurityServiceCollectionExtensions
         });
 
         return services;
+    }
+}
+
+/// <summary>
+/// Claims-validator adapter that resolves <see cref="EntraBotFrameworkAuthenticationOptions"/>
+/// and <see cref="TeamsMessagingOptions"/> on EVERY
+/// <see cref="ValidateClaimsAsync(System.Collections.Generic.IList{System.Security.Claims.Claim})"/>
+/// call (via the injected <see cref="IOptionsMonitor{TOptions}"/> instances) and
+/// constructs a fresh <see cref="EntraTenantAwareClaimsValidator"/> per request from the
+/// current allow-lists.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Why this wrapper exists — Stage 5.1 iter-8 evaluator feedback.</b> The
+/// <see cref="TenantValidationMiddleware"/> reads
+/// <see cref="IOptionsMonitor{TOptions}.CurrentValue"/> on every request and therefore
+/// observes runtime configuration reloads immediately. If the JWT-layer claims
+/// validator snapshotted <see cref="EntraBotFrameworkAuthenticationOptions.AllowedTenantIds"/>
+/// and <see cref="EntraBotFrameworkAuthenticationOptions.AllowedCallers"/> at
+/// <see cref="BotFrameworkAuthentication"/>-singleton construction time, an operator
+/// allow-list edit would leave the JWT layer enforcing the stale lists while the HTTP
+/// layer enforced the new lists — silently divergent defence-in-depth posture. This
+/// adapter resolves the monitors on every claims-validation call so both layers track
+/// configuration changes in lockstep.
+/// </para>
+/// <para>
+/// <b>Why composition (not subclassing).</b> Constructing a fresh
+/// <see cref="EntraTenantAwareClaimsValidator"/> per request — rather than reimplementing
+/// the validation logic — keeps the validation semantics (including the
+/// <see cref="System.StringComparison.OrdinalIgnoreCase"/> tenant comparison that mirrors
+/// <see cref="TenantValidationMiddleware"/>'s <c>TenantIdComparison</c>) in a single
+/// source of truth. A change to one comparer can no longer drift away from the other.
+/// </para>
+/// <para>
+/// <b>Cost.</b> Each call allocates a single
+/// <see cref="EntraTenantAwareClaimsValidator"/> plus its internal short list copy of
+/// the allow-lists. This is negligible compared to the JWT-issuer / signature work the
+/// Bot Framework SDK already performs around this validation hook.
+/// </para>
+/// </remarks>
+internal sealed class HotReloadEntraTenantAwareClaimsValidator : ClaimsValidator
+{
+    private readonly IOptionsMonitor<EntraBotFrameworkAuthenticationOptions> _authOptionsMonitor;
+    private readonly IOptionsMonitor<TeamsMessagingOptions>? _messagingOptionsMonitor;
+    private readonly Func<TeamsMessagingOptions?> _messagingSingletonAccessor;
+    private readonly ILogger<EntraTenantAwareClaimsValidator>? _logger;
+
+    /// <summary>Construct a new <see cref="HotReloadEntraTenantAwareClaimsValidator"/>.</summary>
+    /// <param name="authOptionsMonitor">Monitor for the Entra auth options whose allow-lists drive validation. REQUIRED.</param>
+    /// <param name="messagingOptionsMonitor">Monitor for <see cref="TeamsMessagingOptions"/> used to populate <see cref="EntraBotFrameworkAuthenticationOptions.AllowedTenantIds"/> when the Entra options list is empty. Optional — null when the host does not wire IOptionsMonitor for TeamsMessagingOptions.</param>
+    /// <param name="messagingSingletonAccessor">Per-call accessor that returns the host's concrete <see cref="TeamsMessagingOptions"/> singleton when one is registered (takes precedence over the monitor — matches the connector/notifier resolution order). REQUIRED.</param>
+    /// <param name="logger">Optional logger forwarded to the inner <see cref="EntraTenantAwareClaimsValidator"/>.</param>
+    public HotReloadEntraTenantAwareClaimsValidator(
+        IOptionsMonitor<EntraBotFrameworkAuthenticationOptions> authOptionsMonitor,
+        IOptionsMonitor<TeamsMessagingOptions>? messagingOptionsMonitor,
+        Func<TeamsMessagingOptions?> messagingSingletonAccessor,
+        ILogger<EntraTenantAwareClaimsValidator>? logger)
+    {
+        _authOptionsMonitor = authOptionsMonitor ?? throw new ArgumentNullException(nameof(authOptionsMonitor));
+        _messagingSingletonAccessor = messagingSingletonAccessor ?? throw new ArgumentNullException(nameof(messagingSingletonAccessor));
+        _messagingOptionsMonitor = messagingOptionsMonitor;
+        _logger = logger;
+    }
+
+    /// <inheritdoc />
+    public override Task ValidateClaimsAsync(IList<System.Security.Claims.Claim> claims)
+    {
+        if (claims is null) throw new ArgumentNullException(nameof(claims));
+
+        var authOptions = _authOptionsMonitor.CurrentValue;
+        var messagingOptions = _messagingSingletonAccessor()
+            ?? _messagingOptionsMonitor?.CurrentValue
+            ?? new TeamsMessagingOptions();
+
+        var allowedTenants = authOptions.AllowedTenantIds is { Count: > 0 }
+            ? authOptions.AllowedTenantIds
+            : messagingOptions.AllowedTenantIds ?? new List<string>();
+        var allowedCallers = authOptions.AllowedCallers ?? new List<string>();
+
+        var inner = new EntraTenantAwareClaimsValidator(
+            allowedCallers: allowedCallers,
+            allowedTenantIds: allowedTenants,
+            requireTenantClaim: authOptions.RequireTenantClaim,
+            logger: _logger);
+
+        return inner.ValidateClaimsAsync(claims);
     }
 }
