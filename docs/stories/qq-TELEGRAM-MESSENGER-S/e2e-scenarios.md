@@ -111,9 +111,9 @@ Feature: Agent blocking question delivered to Telegram
     And the Telegram connector reads ProposedDefaultActionId "act-1" from the envelope and creates a PendingQuestionRecord with DefaultActionId "act-1" and DefaultActionValue "approve" (resolved from HumanAction.Value where ActionId matches ProposedDefaultActionId, per architecture.md §3.1)
     And no human responds within 2 minutes
     When ExpiresAt is reached
-    Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionValue "approve" (the HumanAction.Value resolved and denormalized at send time)
-    And publishes a HumanDecisionEvent with ActionValue "approve" (consistent with the interactive button-tap path where HumanAction.Value is always the canonical ActionValue — no IDistributedCache lookup; per architecture.md §10.3)
-    And the Telegram message is updated to show "⏱️ Timed out – default applied"
+    Then the QuestionTimeoutService reads PendingQuestionRecord.DefaultActionId "act-1" (the HumanAction.ActionId denormalized at send time, per architecture.md §10.3)
+    And publishes a HumanDecisionEvent with ActionValue "act-1" (the DefaultActionId string verbatim — the consuming agent resolves the full HumanAction.Value semantics from its own AllowedActions list; no IDistributedCache lookup; per architecture.md §10.3)
+    And the Telegram message is updated to show "⏰ Timed out — default action applied: act-1"
 
   Scenario: Question timeout with no default action
     Given agent "arch-agent-7" publishes an agent question with ExpiresAt 2 minutes from now

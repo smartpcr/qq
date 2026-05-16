@@ -283,9 +283,9 @@ public sealed class TelegramMessageSender : IMessageSender
         // Cache the HumanActions BEFORE the send. The cache is the hot
         // path for CallbackQueryHandler (Stage 3.3); writing it before
         // the Telegram round-trip guarantees that a callback arriving
-        // in the narrow window between the send completing and the
-        // OutboundQueueProcessor's post-send hook running can still
-        // resolve.
+        // in the narrow window between the send completing and our
+        // own post-send IPendingQuestionStore.StoreAsync call (below)
+        // can still resolve.
         await TelegramQuestionRenderer
             .CacheActionsAsync(envelope.Question, _cache, _timeProvider, ct)
             .ConfigureAwait(false);
@@ -335,12 +335,15 @@ public sealed class TelegramMessageSender : IMessageSender
         // load-bearing for the callback handler and the timeout
         // sweep, so a missing row would mean the operator's tap
         // resolves as "unknown question" and the agent waits forever
-        // for a default that never fires. A wrapped
-        // PendingQuestionPersistenceException surfaces to the
-        // outbound queue's retry / dead-letter machinery; that
-        // machinery's idempotent StoreAsync upsert path on retry
-        // means the second attempt fills the missing row without
-        // re-sending Telegram.
+        // for a default that never fires. Per evaluator iter-3
+        // item 4 the wrapped PendingQuestionPersistenceException is
+        // a SPECIALIZED recovery signal — Stage 4.1's
+        // OutboundQueueProcessor pattern-matches it and calls
+        // IPendingQuestionStore.StoreAsync directly with the
+        // recovered envelope (NOT a generic SendQuestionAsync retry,
+        // which would re-send the message to Telegram). See
+        // architecture.md §3.1 / §5.2 invariant 1 and
+        // implementation-plan.md Stage 3.5 step 5 for the contract.
         await PersistPendingQuestionAsync(envelope, chatId, lastMessageId, ct)
             .ConfigureAwait(false);
 
@@ -663,17 +666,33 @@ public sealed class TelegramMessageSender : IMessageSender
         }
         catch (Exception ex)
         {
-            // Log the failure with the same correlation fields the
-            // dead-letter store / audit logger will need for triage,
-            // THEN re-throw so the caller surfaces the failure to the
-            // outbound queue retry loop. The Telegram message has
-            // already been sent — a retry from the queue will hit
-            // PersistentPendingQuestionStore.StoreAsync's upsert path
-            // (idempotent on QuestionId) so it will NOT double-send;
-            // the second StoreAsync just fills the missing row.
+            // Iter-3 evaluator item 4 — the prior comment claimed a
+            // generic queue retry "will NOT double-send" because
+            // StoreAsync is idempotent. That was wrong: the obvious
+            // retry mechanism for SendQuestionAsync is to RE-RUN
+            // SendQuestionAsync, which calls _bot.SendMessage(...)
+            // again BEFORE reaching StoreAsync — Telegram has no
+            // idempotency on outbound sends, so the operator would
+            // see two question messages. The actual recovery
+            // contract (architecture.md §3.1 / §5.2 invariant 1;
+            // implementation-plan.md Stage 3.5 step 5) is that this
+            // throw surfaces a TYPED PendingQuestionPersistenceException
+            // carrying every key the recovery side needs (QuestionId,
+            // TelegramChatId, TelegramMessageId, CorrelationId), and
+            // the Stage 4.1 OutboundQueueProcessor pattern-matches
+            // that exception to take a SPECIALIZED recovery path —
+            // it calls IPendingQuestionStore.StoreAsync DIRECTLY with
+            // the recovered envelope, bypassing SendQuestionAsync
+            // entirely so the Telegram message is NOT re-sent. Until
+            // Stage 4.1 lands the OutboundQueueProcessor, callers
+            // MUST NOT re-invoke SendQuestionAsync on this exception
+            // type (doing so would re-send to Telegram); any sender
+            // catch-all that auto-retries on Exception should add an
+            // explicit `when (ex is not PendingQuestionPersistenceException)`
+            // clause.
             _logger.LogError(
                 ex,
-                "PersistPendingQuestionAsync failed AFTER a successful Telegram send. The pending question is REQUIRED by the callback handler and the timeout sweep, so the exception is being propagated to the caller for retry / dead-letter handling. QuestionId={QuestionId} TelegramMessageId={TelegramMessageId} CorrelationId={CorrelationId}",
+                "PersistPendingQuestionAsync failed AFTER a successful Telegram send. Propagating as PendingQuestionPersistenceException so the Stage 4.1 OutboundQueueProcessor takes the specialized 'StoreAsync-only' recovery path (NOT a generic SendQuestionAsync retry, which would re-send to Telegram). QuestionId={QuestionId} TelegramMessageId={TelegramMessageId} CorrelationId={CorrelationId}",
                 envelope.Question.QuestionId,
                 lastMessageId,
                 envelope.Question.CorrelationId);

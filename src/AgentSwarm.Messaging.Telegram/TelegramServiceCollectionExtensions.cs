@@ -295,13 +295,25 @@ public static class TelegramServiceCollectionExtensions
             sp.GetRequiredService<SwarmEventSubscriptionService>());
 
         // Stage 3.5 — pending-question timeout sweeper. Polls
-        // IPendingQuestionStore.GetExpiredAsync, publishes a
-        // HumanDecisionEvent with the denormalised default-action
-        // (or "__timeout__" sentinel), edits the original Telegram
-        // message, writes a HumanResponseAuditEntry, and marks the
-        // row TimedOut. Options are bound from
-        // Telegram:QuestionTimeout — registered with default
-        // PollInterval=30s if the section is missing.
+        // IPendingQuestionStore.GetExpiredAsync, atomically claims
+        // each expired row via MarkTimedOutAsync, then publishes a
+        // HumanDecisionEvent whose ActionValue is the
+        // PendingQuestionRecord.DefaultActionId string verbatim (the
+        // consuming agent resolves the full HumanAction.Value
+        // semantics from its own AllowedActions list per
+        // architecture.md §10.3) — when DefaultActionId is null the
+        // service falls back to the "__timeout__" sentinel. The
+        // sweeper deliberately does NOT read
+        // PendingQuestionRecord.DefaultActionValue (that column is
+        // owned by the callback / RequiresComment text-reply path's
+        // cache-miss fallback — §5.2 invariant 3). On publish failure
+        // the claim is reverted via TryRevertTimedOutClaimAsync so
+        // the next sweep retries (at-least-once delivery). The
+        // service then edits the original Telegram message, writes a
+        // HumanResponseAuditEntry, and leaves the row TimedOut.
+        // Options are bound from Telegram:QuestionTimeout —
+        // registered with default PollInterval=30s if the section is
+        // missing.
         services.AddOptions<QuestionTimeoutOptions>()
             .Bind(configuration.GetSection(TelegramOptions.SectionName)
                 .GetSection(QuestionTimeoutOptions.SectionName));

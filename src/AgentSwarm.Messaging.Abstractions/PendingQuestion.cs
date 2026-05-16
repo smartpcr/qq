@@ -69,9 +69,14 @@ public sealed record PendingQuestion
 
     /// <summary>
     /// The <see cref="HumanAction.Value"/> of the proposed default,
-    /// denormalized at <see cref="IPendingQuestionStore.StoreAsync"/> time
-    /// so <c>QuestionTimeoutService</c> can emit a
-    /// <see cref="HumanDecisionEvent"/> without a cache lookup.
+    /// denormalized at <see cref="IPendingQuestionStore.StoreAsync"/> time.
+    /// Used by <c>CallbackQueryHandler</c> and comment-fallback paths
+    /// when the <c>IDistributedCache</c> entry has been evicted, and
+    /// as audit/display data. <c>QuestionTimeoutService</c> does NOT
+    /// read this field — the timeout path reads
+    /// <see cref="DefaultActionId"/> only and publishes that string
+    /// verbatim as the <see cref="HumanDecisionEvent"/>'s
+    /// <c>ActionValue</c>, per architecture.md §10.3.
     /// </summary>
     public string? DefaultActionValue { get; init; }
 

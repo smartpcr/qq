@@ -120,32 +120,18 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
 
         var json = JsonSerializer.Serialize(question, JsonOptions);
 
-        if (existing is null)
+        if (existing is not null)
         {
-            db.PendingQuestions.Add(new PendingQuestionRecord
-            {
-                QuestionId = question.QuestionId,
-                AgentQuestionJson = json,
-                TelegramChatId = telegramChatId,
-                TelegramMessageId = telegramMessageId,
-                ExpiresAt = question.ExpiresAt,
-                StoredAt = now,
-                DefaultActionId = envelope.ProposedDefaultActionId,
-                DefaultActionValue = defaultActionValue,
-                Status = PendingQuestionStatus.Pending,
-                CorrelationId = question.CorrelationId,
-            });
-        }
-        else
-        {
-            // Retry of an already-persisted send (the sender's
-            // StoreAsync invocation is wrapped in a try/log/swallow so
-            // a transient persistence failure does not undo a
-            // successful Telegram delivery; the next retry will see
-            // the row from the original attempt). Refresh the
-            // non-selection columns; preserve any selection state that
-            // a concurrent callback may have written between the
-            // failed store and this retry.
+            // UPDATE path. A retry of an already-persisted send (the
+            // sender's StoreAsync may be invoked twice if the first
+            // attempt threw a transient exception after the row was
+            // committed). Refresh the non-selection columns; preserve
+            // any selection state that a concurrent callback may have
+            // written between the first store and this retry. No
+            // try/catch needed — UPDATE cannot collide with a
+            // duplicate-primary-key insert; a real schema/permission
+            // failure here propagates directly to the caller (Stage
+            // 3.5 evaluator iter-2 item 6 contract).
             existing.AgentQuestionJson = json;
             existing.TelegramChatId = telegramChatId;
             existing.TelegramMessageId = telegramMessageId;
@@ -158,7 +144,28 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
             // RespondentUserId are deliberately NOT overwritten —
             // the callback handler is the source of truth for those
             // fields after the first successful StoreAsync.
+
+            await db.SaveChangesAsync(ct).ConfigureAwait(false);
+            return;
         }
+
+        // INSERT path. Only this branch is exposed to a possible
+        // duplicate-primary-key race against a concurrent writer
+        // (another retry of the same send running in parallel).
+        var inserted = new PendingQuestionRecord
+        {
+            QuestionId = question.QuestionId,
+            AgentQuestionJson = json,
+            TelegramChatId = telegramChatId,
+            TelegramMessageId = telegramMessageId,
+            ExpiresAt = question.ExpiresAt,
+            StoredAt = now,
+            DefaultActionId = envelope.ProposedDefaultActionId,
+            DefaultActionValue = defaultActionValue,
+            Status = PendingQuestionStatus.Pending,
+            CorrelationId = question.CorrelationId,
+        };
+        db.PendingQuestions.Add(inserted);
 
         try
         {
@@ -166,27 +173,48 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
         }
         catch (DbUpdateException ex)
         {
-            // Provider-neutral concurrency handling. A
-            // DbUpdateException here almost always means a concurrent
-            // retry inserted the same QuestionId between our
-            // FirstOrDefaultAsync above and SaveChangesAsync; both
-            // attempts wrote the SAME envelope (idempotent send),
-            // so the durable contract is satisfied either way. SQLite
-            // surfaces this as SqliteException.SqliteErrorCode == 19,
-            // PostgreSQL as Npgsql's 23505 unique_violation, SQL
-            // Server as 2627 — catching the EF-level abstraction
-            // (DbUpdateException) is provider-agnostic and matches
-            // the pattern used by PersistentOutboundMessageIdIndex.
-            //
-            // The retry path is bounded — Stage 4.1's outbound queue
-            // processor will NOT keep retrying past the configured
-            // max attempts — so an actual schema/permission failure
-            // surfaces via the per-row logger below and is not
-            // silently masked.
+            // Per Stage 3.5 evaluator iter-3 item 2 — a blanket
+            // "swallow every DbUpdateException as a benign duplicate"
+            // mask hides real schema / permission / FK violations and
+            // suppresses the PendingQuestionPersistenceException that
+            // TelegramMessageSender now relies on. Disambiguate by
+            // RE-QUERYING the table: if a row now exists for our
+            // QuestionId, the DbUpdateException WAS a duplicate-key
+            // race (another writer committed between our SELECT and
+            // our INSERT) and the durable contract is satisfied —
+            // detach our losing entity, mutate the winner, and save
+            // the refresh. If still no row, the DbUpdateException was
+            // a REAL failure (e.g. a CHECK constraint, a permission
+            // denial, an FK violation) — propagate it unchanged so
+            // the sender's catch can wrap it in
+            // PendingQuestionPersistenceException.
+            db.Entry(inserted).State = EntityState.Detached;
+
+            var afterRace = await db.PendingQuestions
+                .FindAsync(new object[] { question.QuestionId }, ct)
+                .ConfigureAwait(false);
+            if (afterRace is null)
+            {
+                _logger.LogError(
+                    ex,
+                    "Pending question {QuestionId} StoreAsync failed with a non-benign DbUpdateException (no row exists after the failed save — this is NOT a duplicate-key race); propagating so TelegramMessageSender can surface PendingQuestionPersistenceException to the outbound queue processor.",
+                    question.QuestionId);
+                throw;
+            }
+
             _logger.LogDebug(
-                ex,
-                "Pending question {QuestionId} StoreAsync hit a DbUpdateException (likely a concurrent insert from a retry); treating as benign because the durable contract is satisfied by the row that won the race.",
+                "Pending question {QuestionId} StoreAsync hit a duplicate-key DbUpdateException; another writer committed the same QuestionId first — applying the envelope as an UPDATE against the winning row.",
                 question.QuestionId);
+
+            afterRace.AgentQuestionJson = json;
+            afterRace.TelegramChatId = telegramChatId;
+            afterRace.TelegramMessageId = telegramMessageId;
+            afterRace.ExpiresAt = question.ExpiresAt;
+            afterRace.StoredAt = now;
+            afterRace.DefaultActionId = envelope.ProposedDefaultActionId;
+            afterRace.DefaultActionValue = defaultActionValue;
+            afterRace.CorrelationId = question.CorrelationId;
+            await db.SaveChangesAsync(ct).ConfigureAwait(false);
         }
     }
 
@@ -288,6 +316,42 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
                       || x.Status == PendingQuestionStatus.AwaitingComment))
             .ExecuteUpdateAsync(
                 setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.TimedOut),
+                ct)
+            .ConfigureAwait(false);
+
+        return rowsAffected > 0;
+    }
+
+    public async Task<bool> TryRevertTimedOutClaimAsync(
+        string questionId,
+        PendingQuestionStatus revertTo,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(questionId);
+        if (revertTo != PendingQuestionStatus.Pending &&
+            revertTo != PendingQuestionStatus.AwaitingComment)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(revertTo),
+                revertTo,
+                "revertTo must be a non-terminal pre-claim status (Pending or AwaitingComment).");
+        }
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
+
+        // Conditional UPDATE — the WHERE clause filters on the
+        // post-claim TimedOut state, so this revert is itself atomic
+        // and will not overwrite a row that the operator has since
+        // resolved (e.g. via late callback). Implemented via EF Core
+        // 8's ExecuteUpdateAsync so the revert is provider-neutral
+        // (SQLite / PostgreSQL / SQL Server) and matches the atomic
+        // primitive used by MarkTimedOutAsync.
+        var rowsAffected = await db.PendingQuestions
+            .Where(x => x.QuestionId == questionId
+                     && x.Status == PendingQuestionStatus.TimedOut)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(x => x.Status, revertTo),
                 ct)
             .ConfigureAwait(false);
 

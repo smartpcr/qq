@@ -114,6 +114,41 @@ internal sealed class InMemoryPendingQuestionStore : IPendingQuestionStore
         return Task.FromResult(claimed);
     }
 
+    public Task<bool> TryRevertTimedOutClaimAsync(
+        string questionId,
+        PendingQuestionStatus revertTo,
+        CancellationToken ct)
+    {
+        if (revertTo != PendingQuestionStatus.Pending &&
+            revertTo != PendingQuestionStatus.AwaitingComment)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(revertTo),
+                revertTo,
+                "revertTo must be a non-terminal pre-claim status (Pending or AwaitingComment).");
+        }
+
+        // Compare-and-swap mirror of the EF
+        // ExecuteUpdateAsync(WHERE Status == TimedOut) — only revert
+        // when the row is still in the TimedOut state we claimed.
+        // Two concurrent reverts therefore see exactly ONE true; the
+        // loser sees false and skips. Mirrors the atomic-claim CAS
+        // semantics of MarkTimedOutAsync above.
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.TimedOut)
+        {
+            return Task.FromResult(false);
+        }
+
+        var reverted = current with { Status = revertTo };
+        var success = _byQuestionId.TryUpdate(questionId, reverted, current);
+        return Task.FromResult(success);
+    }
+
     public Task RecordSelectionAsync(
         string questionId,
         string selectedActionId,

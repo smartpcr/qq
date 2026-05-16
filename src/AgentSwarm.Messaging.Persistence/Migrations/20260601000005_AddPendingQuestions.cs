@@ -16,8 +16,14 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
     ///
     /// See architecture.md §3.1 (lines 240–280 for the schema and
     /// constraints) and §10.3 for the <c>QuestionTimeoutService</c>
-    /// semantics that read <c>DefaultActionValue</c> directly from
-    /// this table (no <c>IDistributedCache</c> dependency).
+    /// semantics that read <c>DefaultActionId</c> directly from this
+    /// table and publish that string verbatim as the
+    /// <c>HumanDecisionEvent.ActionValue</c> (no
+    /// <c>IDistributedCache</c> dependency). The denormalised
+    /// <c>DefaultActionValue</c> column is retained because the
+    /// callback / RequiresComment text-reply path resolves the
+    /// canonical <c>HumanAction.Value</c> from durable storage when
+    /// the volatile cache entry has been evicted.
     /// </summary>
     public partial class AddPendingQuestions : Migration
     {

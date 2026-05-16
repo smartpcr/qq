@@ -65,6 +65,10 @@ namespace AgentSwarm.Messaging.Telegram;
 /// <para>
 /// <b>Sweep ordering.</b>
 /// <list type="number">
+///   <item><description><b>Capture</b> the row's prior status
+///   (<see cref="PendingQuestionStatus.Pending"/> or
+///   <see cref="PendingQuestionStatus.AwaitingComment"/>) from the
+///   <see cref="GetExpiredAsync"/> snapshot.</description></item>
 ///   <item><description><b>Atomic claim</b> via
 ///   <see cref="IPendingQuestionStore.MarkTimedOutAsync"/>. If the
 ///   call returns <see langword="false"/> (another worker / a
@@ -74,22 +78,26 @@ namespace AgentSwarm.Messaging.Telegram;
 ///   <see cref="ISwarmCommandBus.PublishHumanDecisionAsync"/> with
 ///   <see cref="HumanDecisionEvent.ActionValue"/> = the
 ///   <see cref="PendingQuestion.DefaultActionId"/> string verbatim
-///   (or <c>"__timeout__"</c> when no default was proposed).</description></item>
+///   (or <c>"__timeout__"</c> when no default was proposed). If
+///   publish throws, revert the claim via
+///   <see cref="IPendingQuestionStore.TryRevertTimedOutClaimAsync"/>
+///   so the row is sweep-eligible again on the next iteration —
+///   gives at-least-once delivery of the timeout decision per
+///   architecture.md §10.3.</description></item>
 ///   <item><description>Edit the Telegram message (best-effort
 ///   cosmetic).</description></item>
 ///   <item><description>Write the audit entry (best-effort
 ///   observability).</description></item>
 /// </list>
-/// The trade is at-most-once-from-sweeper semantics: if the process
-/// dies between the claim and the publish, the row is already
-/// terminal and the next sweep will not retry. Recovery tooling can
-/// query the audit table for <see cref="PendingQuestionStatus.TimedOut"/>
-/// rows that lack a matching <see cref="HumanResponseAuditEntry"/>
-/// for the <see cref="HumanResponseAuditEntry.QuestionId"/>. This is
-/// preferable to the alternative (publish-first, claim-last) where
-/// every retried sweep re-publishes the same decision and forces the
-/// consuming agents to be unconditionally idempotent against
-/// duplicates — see architecture.md §10.3.
+/// The combined guarantee is at-least-once delivery (the revert
+/// recovers from transient publish failures by re-arming the row)
+/// AND single-claimant cross-process atomicity (the conditional
+/// UPDATE in <see cref="IPendingQuestionStore.MarkTimedOutAsync"/>
+/// guarantees only ONE sweeper publishes per row at a time, even
+/// when both reverts and retries race). Per architecture.md §10.3
+/// the consuming agent dedupes on
+/// <see cref="HumanDecisionEvent.QuestionId"/>, so the bounded
+/// duplicate-publish risk from a retry-after-revert is benign.
 /// </para>
 /// <para>
 /// <b>Failure handling.</b> A failure in ANY single record's
@@ -241,6 +249,30 @@ public sealed class QuestionTimeoutService : BackgroundService
         // §10.3 — the consuming agent dedupes on QuestionId, but
         // closing the race at the source eliminates the dedupe burden
         // and avoids spurious audit-log duplicates).
+        //
+        // We CAPTURE pending.Status BEFORE the claim so that, if
+        // step 1 (publish) throws, we can call
+        // TryRevertTimedOutClaimAsync(priorStatus) — putting the row
+        // back into the sweep-eligible set so the next iteration
+        // retries. This closes the "claim-first → publish-fails →
+        // permanent data loss" gap flagged by Stage 3.5 evaluator
+        // iter-3 item 1.
+        var priorStatus = pending.Status;
+        if (priorStatus != PendingQuestionStatus.Pending &&
+            priorStatus != PendingQuestionStatus.AwaitingComment)
+        {
+            // Snapshot from GetExpiredAsync is stale — another caller
+            // already terminated this row between the poll and our
+            // turn in the loop. Skip silently (the GetExpiredAsync
+            // filter SHOULD have excluded it, but we defend against
+            // a snapshot/processing skew anyway).
+            _logger.LogDebug(
+                "QuestionTimeoutService: snapshot for QuestionId={QuestionId} shows terminal Status={Status}; skipping (cannot revert to an invalid prior state if publish fails).",
+                pending.QuestionId,
+                priorStatus);
+            return;
+        }
+
         var claimed = await _pendingQuestionStore
             .MarkTimedOutAsync(pending.QuestionId, ct)
             .ConfigureAwait(false);
@@ -266,14 +298,12 @@ public sealed class QuestionTimeoutService : BackgroundService
         // ----- Step 1: publish the HumanDecisionEvent. -----
         // Performed AFTER the atomic claim so the cross-process race
         // is closed before any side-effect runs. If publish throws
-        // here, the row is already TimedOut and the next sweep will
-        // skip it; the resulting "claimed but never published" gap is
-        // recoverable by querying the audit table for TimedOut rows
-        // with no corresponding HumanResponseAuditEntry. This is the
-        // intentional trade for at-most-once-from-sweeper semantics:
-        // duplicate publishes are worse than rare gaps because the
-        // consuming agents are not unconditionally idempotent against
-        // multiple HumanDecisionEvents for the same QuestionId.
+        // here, the row is reverted to its prior status via
+        // TryRevertTimedOutClaimAsync(priorStatus) so the NEXT sweep
+        // re-finds it via GetExpiredAsync and retries — this gives
+        // at-least-once delivery of the timeout decision per
+        // architecture.md §10.3, while the atomic claim still
+        // protects against the cross-process double-publish race.
         var decision = new HumanDecisionEvent
         {
             QuestionId = pending.QuestionId,
@@ -290,7 +320,32 @@ public sealed class QuestionTimeoutService : BackgroundService
             ReceivedAt = now,
             CorrelationId = pending.CorrelationId,
         };
-        await _commandBus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
+
+        try
+        {
+            await _commandBus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
+        }
+        catch (Exception publishEx) when (publishEx is not OperationCanceledException)
+        {
+            // Publish failed AFTER we claimed the row. Revert the
+            // claim so the next sweep picks it up again. The revert
+            // is itself an atomic conditional UPDATE on Status ==
+            // TimedOut, so an interleaved callback that's already
+            // moved the row elsewhere (extremely unlikely given we
+            // just claimed it microseconds ago) will be safely
+            // ignored — we'd see reverted=false and just log + throw.
+            var reverted = await _pendingQuestionStore
+                .TryRevertTimedOutClaimAsync(pending.QuestionId, priorStatus, ct)
+                .ConfigureAwait(false);
+            _logger.LogError(
+                publishEx,
+                "QuestionTimeoutService: publish failed for QuestionId={QuestionId} CorrelationId={CorrelationId}; reverted={Reverted} back to {PriorStatus} so the next sweep retries. Cross-process atomicity preserved by the conditional revert.",
+                pending.QuestionId,
+                pending.CorrelationId,
+                reverted,
+                priorStatus);
+            throw;
+        }
 
         // ----- Step 2: edit the Telegram message (best-effort). -----
         await EditTelegramMessageAsync(pending, ct).ConfigureAwait(false);

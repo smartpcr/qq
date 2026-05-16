@@ -9,6 +9,7 @@ using AgentSwarm.Messaging.Persistence;
 using FluentAssertions;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
@@ -100,7 +101,7 @@ public sealed class PersistentPendingQuestionStoreTests : IAsyncLifetime
         roundTrip.TelegramMessageId.Should().Be(1001);
         roundTrip.DefaultActionId.Should().Be("skip");
         roundTrip.DefaultActionValue.Should().Be("skip_v",
-            "the store must denormalise the matching HumanAction.Value at persist time so QuestionTimeoutService never needs IDistributedCache");
+            "the store must denormalise the matching HumanAction.Value at persist time so the callback / RequiresComment text-reply path has a durable fallback when the IDistributedCache entry is evicted (timeout itself reads DefaultActionId, NOT DefaultActionValue, per architecture.md §10.3)");
         roundTrip.Status.Should().Be(PendingQuestionStatus.Pending);
         roundTrip.CorrelationId.Should().Be("trace-1");
         roundTrip.StoredAt.Should().Be(_time.GetUtcNow());
@@ -225,6 +226,260 @@ public sealed class PersistentPendingQuestionStoreTests : IAsyncLifetime
         var row = await _store.GetAsync("q-1", default);
         row!.Status.Should().Be(PendingQuestionStatus.Answered,
             "the row must remain Answered — the operator's decision wins over a late sweep");
+    }
+
+    [Fact]
+    public async Task TryRevertTimedOutClaimAsync_FromTimedOut_WinsAndRestoresPriorStatus()
+    {
+        // Iter-3 evaluator item 1 fix — the new compensating action
+        // for the at-least-once timeout-delivery contract. When the
+        // QuestionTimeoutService's publish fails after the atomic
+        // claim, it calls TryRevertTimedOutClaimAsync(priorStatus) to
+        // re-arm the row for the next sweep.
+        await _store.StoreAsync(new AgentQuestionEnvelope { Question = BuildQuestion() }, 42, 1, default);
+        (await _store.MarkTimedOutAsync("q-1", default)).Should().BeTrue();
+
+        var reverted = await _store.TryRevertTimedOutClaimAsync("q-1", PendingQuestionStatus.Pending, default);
+        reverted.Should().BeTrue("the row was TimedOut; the conditional UPDATE matches and the revert wins");
+
+        var row = await _store.GetAsync("q-1", default);
+        row!.Status.Should().Be(PendingQuestionStatus.Pending,
+            "the revert must put the row back to its pre-claim status so the next GetExpiredAsync re-finds it");
+    }
+
+    [Fact]
+    public async Task TryRevertTimedOutClaimAsync_OnPendingRow_LosesTheRevert()
+    {
+        // The conditional UPDATE filters on Status == TimedOut, so a
+        // revert against any non-TimedOut row must return false
+        // without mutating state — guards against a stale revert that
+        // would race with an unrelated callback.
+        await _store.StoreAsync(new AgentQuestionEnvelope { Question = BuildQuestion() }, 42, 1, default);
+
+        var reverted = await _store.TryRevertTimedOutClaimAsync("q-1", PendingQuestionStatus.Pending, default);
+        reverted.Should().BeFalse("the row is Pending, not TimedOut; the conditional UPDATE matches zero rows");
+
+        var row = await _store.GetAsync("q-1", default);
+        row!.Status.Should().Be(PendingQuestionStatus.Pending,
+            "state must be untouched on a lost revert");
+    }
+
+    [Fact]
+    public async Task TryRevertTimedOutClaimAsync_OnAnsweredRow_LosesTheRevert()
+    {
+        // Defends the operator's decision against a late mis-revert
+        // — Answered is terminal so the revert must NOT undo it.
+        await _store.StoreAsync(new AgentQuestionEnvelope { Question = BuildQuestion() }, 42, 1, default);
+        await _store.MarkAnsweredAsync("q-1", default);
+
+        var reverted = await _store.TryRevertTimedOutClaimAsync("q-1", PendingQuestionStatus.Pending, default);
+        reverted.Should().BeFalse("Answered is not TimedOut; the conditional UPDATE matches zero rows and the operator's decision is preserved");
+
+        var row = await _store.GetAsync("q-1", default);
+        row!.Status.Should().Be(PendingQuestionStatus.Answered);
+    }
+
+    [Fact]
+    public async Task TryRevertTimedOutClaimAsync_InvalidRevertTo_ThrowsArgumentException()
+    {
+        // The interface contract restricts revertTo to non-terminal
+        // pre-claim values; a revert to TimedOut would be a no-op
+        // self-loop and a revert to Answered would silently flip
+        // semantics — both must throw.
+        await _store.StoreAsync(new AgentQuestionEnvelope { Question = BuildQuestion() }, 42, 1, default);
+        await _store.MarkTimedOutAsync("q-1", default);
+
+        var act1 = async () => await _store.TryRevertTimedOutClaimAsync("q-1", PendingQuestionStatus.TimedOut, default);
+        await act1.Should().ThrowAsync<ArgumentOutOfRangeException>();
+
+        var act2 = async () => await _store.TryRevertTimedOutClaimAsync("q-1", PendingQuestionStatus.Answered, default);
+        await act2.Should().ThrowAsync<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public async Task StoreAsync_DbUpdateException_NonDuplicateFailure_PropagatesToCaller()
+    {
+        // Iter-3 evaluator item 2 + iter-4 evaluator item 4 — the
+        // narrowed catch in StoreAsync's INSERT branch must rethrow
+        // when the DbUpdateException is NOT a duplicate-key race
+        // (i.e. the re-query inside the catch returns null). A
+        // dedicated SaveChangesInterceptor injects a synthetic
+        // DbUpdateException at the SAVE boundary so the failure path
+        // runs against the real production code (no SaveChanges ever
+        // commits → the re-query inside the catch finds nothing →
+        // the exception must propagate so TelegramMessageSender can
+        // wrap it in PendingQuestionPersistenceException).
+        var injector = new ThrowOnSaveInterceptor("q-real-failure");
+        await using var failingConnection = new SqliteConnection("Filename=:memory:");
+        await failingConnection.OpenAsync();
+        var failingServices = new ServiceCollection();
+        failingServices.AddDbContext<MessagingDbContext>(o => o
+            .UseSqlite(failingConnection)
+            .AddInterceptors(injector));
+        await using var failingProvider = failingServices.BuildServiceProvider();
+        await using (var scope = failingProvider.CreateAsyncScope())
+        {
+            var ctx = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
+            await ctx.Database.EnsureCreatedAsync();
+        }
+        var failingStore = new PersistentPendingQuestionStore(
+            failingProvider.GetRequiredService<IServiceScopeFactory>(),
+            _time,
+            NullLogger<PersistentPendingQuestionStore>.Instance);
+
+        var envelope = new AgentQuestionEnvelope { Question = BuildQuestion("q-real-failure") };
+
+        var act = async () => await failingStore.StoreAsync(envelope, 42, 5001, default);
+
+        // The synthetic DbUpdateException must surface — NOT be
+        // swallowed as a benign duplicate — because the re-query
+        // returns null (no row was ever committed).
+        await act.Should().ThrowAsync<DbUpdateException>()
+            .WithMessage("*synthetic non-duplicate failure*");
+
+        // Sanity check: the row truly is not in the table. This is
+        // what makes the failure non-recoverable at the store
+        // boundary and forces the caller to wrap.
+        var roundTrip = await failingStore.GetAsync("q-real-failure", default);
+        roundTrip.Should().BeNull(
+            "the synthetic failure prevented any commit; the re-query inside StoreAsync's catch sees the same and must rethrow");
+    }
+
+    [Fact]
+    public async Task StoreAsync_DbUpdateException_DuplicateKeyRace_RecoversViaReQueryAndUpdate()
+    {
+        // The complementary path: a DbUpdateException ON THE INSERT
+        // BRANCH where the re-query DOES find a row must NOT throw
+        // (the durable contract is satisfied — another writer
+        // committed first). We simulate the race by inserting the
+        // row directly via a separate scope BEFORE the store's
+        // SaveChanges runs.
+        var injector = new RacingInserter("q-raced", _time.GetUtcNow());
+        await using var racedConnection = new SqliteConnection("Filename=:memory:");
+        await racedConnection.OpenAsync();
+        var racedServices = new ServiceCollection();
+        racedServices.AddDbContext<MessagingDbContext>(o => o
+            .UseSqlite(racedConnection)
+            .AddInterceptors(injector));
+        await using var racedProvider = racedServices.BuildServiceProvider();
+        await using (var scope = racedProvider.CreateAsyncScope())
+        {
+            var ctx = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
+            await ctx.Database.EnsureCreatedAsync();
+        }
+        injector.ScopeFactory = racedProvider.GetRequiredService<IServiceScopeFactory>();
+
+        var racedStore = new PersistentPendingQuestionStore(
+            racedProvider.GetRequiredService<IServiceScopeFactory>(),
+            _time,
+            NullLogger<PersistentPendingQuestionStore>.Instance);
+
+        var envelope = new AgentQuestionEnvelope { Question = BuildQuestion("q-raced") };
+
+        var act = async () => await racedStore.StoreAsync(envelope, 42, 7777, default);
+
+        await act.Should().NotThrowAsync(
+            "the duplicate-key race must be recovered silently via re-query + UPDATE — only NON-duplicate failures rethrow");
+
+        var row = await racedStore.GetAsync("q-raced", default);
+        row.Should().NotBeNull();
+        row!.TelegramMessageId.Should().Be(7777,
+            "the catch's re-query + UPDATE branch must have refreshed the winner with our incoming envelope");
+    }
+
+    private sealed class ThrowOnSaveInterceptor : SaveChangesInterceptor
+    {
+        private readonly string _failOnQuestionId;
+
+        public ThrowOnSaveInterceptor(string failOnQuestionId)
+        {
+            _failOnQuestionId = failOnQuestionId;
+        }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            var ctx = eventData.Context;
+            if (ctx is not null)
+            {
+                foreach (var entry in ctx.ChangeTracker.Entries<PendingQuestionRecord>())
+                {
+                    if (entry.State == EntityState.Added &&
+                        entry.Entity.QuestionId == _failOnQuestionId)
+                    {
+                        throw new DbUpdateException(
+                            "synthetic non-duplicate failure (e.g. CHECK / FK / permission)",
+                            new InvalidOperationException("injected by ThrowOnSaveInterceptor"));
+                    }
+                }
+            }
+
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    private sealed class RacingInserter : SaveChangesInterceptor
+    {
+        private readonly string _raceOnQuestionId;
+        private readonly DateTimeOffset _now;
+        private bool _hasInjected;
+
+        public RacingInserter(string raceOnQuestionId, DateTimeOffset now)
+        {
+            _raceOnQuestionId = raceOnQuestionId;
+            _now = now;
+        }
+
+        public IServiceScopeFactory? ScopeFactory { get; set; }
+
+        public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            var ctx = eventData.Context;
+            if (!_hasInjected && ctx is not null && ScopeFactory is not null)
+            {
+                foreach (var entry in ctx.ChangeTracker.Entries<PendingQuestionRecord>())
+                {
+                    if (entry.State == EntityState.Added &&
+                        entry.Entity.QuestionId == _raceOnQuestionId)
+                    {
+                        _hasInjected = true;
+
+                        // Insert the racing row via a separate scope
+                        // BEFORE our SaveChanges runs. SQLite's PK
+                        // constraint will then trigger a real
+                        // DbUpdateException on our SaveChanges below.
+                        using (var raceScope = ScopeFactory.CreateScope())
+                        {
+                            var raceCtx = raceScope.ServiceProvider
+                                .GetRequiredService<MessagingDbContext>();
+                            raceCtx.PendingQuestions.Add(new PendingQuestionRecord
+                            {
+                                QuestionId = entry.Entity.QuestionId,
+                                AgentQuestionJson = "{}",
+                                TelegramChatId = 99,
+                                TelegramMessageId = 1,
+                                StoredAt = _now,
+                                ExpiresAt = _now.AddMinutes(15),
+                                Status = PendingQuestionStatus.Pending,
+                                CorrelationId = "race-winner",
+                            });
+                            await raceCtx.SaveChangesAsync(cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+
+                        break;
+                    }
+                }
+            }
+
+            return await base.SavingChangesAsync(eventData, result, cancellationToken)
+                .ConfigureAwait(false);
+        }
     }
 
     [Fact]

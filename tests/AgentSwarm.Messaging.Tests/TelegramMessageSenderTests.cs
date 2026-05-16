@@ -193,7 +193,7 @@ public sealed class TelegramMessageSenderTests
         stored.QuestionId.Should().Be("q-001");
         stored.DefaultActionId.Should().Be("reject");
         stored.DefaultActionValue.Should().Be("reject",
-            "the store denormalises the matching HumanAction.Value at persist time so QuestionTimeoutService never needs IDistributedCache");
+            "the store denormalises the matching HumanAction.Value at persist time so the callback / RequiresComment text-reply path has a durable fallback when the IDistributedCache entry is evicted (timeout itself reads DefaultActionId, NOT DefaultActionValue, per architecture.md §10.3)");
     }
 
     [Fact]
@@ -256,6 +256,9 @@ public sealed class TelegramMessageSenderTests
         public Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct) => Task.CompletedTask;
 
         public Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
+            => Task.FromResult(false);
+
+        public Task<bool> TryRevertTimedOutClaimAsync(string questionId, PendingQuestionStatus revertTo, CancellationToken ct)
             => Task.FromResult(false);
 
         public Task RecordSelectionAsync(string questionId, string selectedActionId, string selectedActionValue, long respondentUserId, CancellationToken ct)

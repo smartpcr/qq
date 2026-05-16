@@ -219,9 +219,14 @@ public static class ServiceCollectionExtensions
         // denormalised hot-path columns (DefaultActionId /
         // DefaultActionValue / ExpiresAt / Status) is required by
         // architecture.md §3.1 and §10.3 — the timeout service reads
-        // DefaultActionValue directly from this row and never touches
-        // IDistributedCache (whose entries are likely evicted by the
-        // time the timeout fires).
+        // DefaultActionId directly from this row and publishes that
+        // string verbatim as HumanDecisionEvent.ActionValue (the
+        // consuming agent resolves the full HumanAction semantics from
+        // its own AllowedActions list); DefaultActionValue is retained
+        // because the callback / RequiresComment text-reply path
+        // resolves it from durable storage when the volatile
+        // IDistributedCache entry has expired. Neither path touches
+        // IDistributedCache at timeout.
         services.Replace(ServiceDescriptor.Singleton<IPendingQuestionStore, PersistentPendingQuestionStore>());
 
         return services;

@@ -46,15 +46,21 @@ using AgentSwarm.Messaging.Abstractions;
 /// <para>
 /// <b>Default-action denormalisation.</b>
 /// <see cref="DefaultActionId"/> mirrors
-/// <see cref="AgentQuestionEnvelope.ProposedDefaultActionId"/>; the
-/// resolved <see cref="HumanAction.Value"/> is denormalised into
-/// <see cref="DefaultActionValue"/> at <c>StoreAsync</c> time so
-/// <see cref="Telegram.QuestionTimeoutService"/> can emit a
-/// <see cref="HumanDecisionEvent"/> with the canonical
-/// <c>ActionValue</c> WITHOUT consulting <c>IDistributedCache</c>
-/// (the cache entry expires at <c>AgentQuestion.ExpiresAt + 5 min</c>
-/// and is likely evicted by the time the timeout fires — see
-/// architecture.md §10.3).
+/// <see cref="AgentQuestionEnvelope.ProposedDefaultActionId"/> and is
+/// the column <see cref="Telegram.QuestionTimeoutService"/> reads at
+/// timeout — the service publishes that string verbatim as
+/// <see cref="HumanDecisionEvent.ActionValue"/>; the consuming agent
+/// resolves the full <see cref="HumanAction"/> semantics from its own
+/// <see cref="AgentQuestion.AllowedActions"/> list (architecture.md
+/// §10.3). The resolved <see cref="HumanAction.Value"/> is ALSO
+/// denormalised into <see cref="DefaultActionValue"/> at
+/// <c>StoreAsync</c> time because the callback / RequiresComment
+/// text-reply path needs the canonical action value from durable
+/// storage when the volatile <c>IDistributedCache</c> entry has
+/// already expired (architecture.md §5.2 invariant 3). Neither path
+/// consults <c>IDistributedCache</c> at timeout — the cache entry
+/// expires at <c>AgentQuestion.ExpiresAt + 5 min</c> and is likely
+/// evicted by then.
 /// </para>
 /// </remarks>
 public sealed class PendingQuestionRecord
@@ -108,10 +114,12 @@ public sealed class PendingQuestionRecord
     /// action — resolved by looking up the <see cref="HumanAction"/>
     /// in <see cref="AgentQuestion.AllowedActions"/> whose
     /// <see cref="HumanAction.ActionId"/> matches
-    /// <see cref="DefaultActionId"/>. Read directly by
-    /// <see cref="Telegram.QuestionTimeoutService"/> at timeout to
-    /// emit <see cref="HumanDecisionEvent.ActionValue"/> without a
-    /// cache lookup (architecture.md §10.3).
+    /// <see cref="DefaultActionId"/>. Read by the callback /
+    /// RequiresComment text-reply path on cache miss (architecture.md
+    /// §5.2 invariant 3). <see cref="Telegram.QuestionTimeoutService"/>
+    /// does NOT read this column — it publishes
+    /// <see cref="DefaultActionId"/> verbatim, leaving the action-value
+    /// resolution to the consuming agent (architecture.md §10.3).
     /// </summary>
     public string? DefaultActionValue { get; set; }
 
