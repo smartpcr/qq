@@ -47,20 +47,34 @@ public static class TelegramServiceCollectionExtensions
     /// same instance.
     /// </para>
     /// <para>
-    /// <b>Stage 2.2 stubs.</b> Concrete implementations of
-    /// <see cref="ICommandParser"/>, <see cref="ICommandRouter"/>,
-    /// <see cref="ICallbackHandler"/>, <see cref="IDeduplicationService"/>,
+    /// <b>Stage 2.2 stubs (with Stage 3.1 production swap).</b>
+    /// <see cref="ICommandRouter"/>, <see cref="ICallbackHandler"/>,
+    /// <see cref="IDeduplicationService"/>,
     /// <see cref="IPendingQuestionStore"/>, and
     /// <see cref="IPendingDisambiguationStore"/> are intentionally
-    /// <i>stubs</i> here — they let the inbound pipeline run end-to-end
-    /// before Phase 3 (command processing, including the
-    /// <c>CallbackQueryHandler</c> that consumes
-    /// <see cref="IPendingDisambiguationStore.TakeAsync"/> for workspace
-    /// disambiguation) and Phase 4 (deduplication) register the
-    /// production replacements via additional <c>services.AddXxx()</c>
-    /// calls. Re-registering an interface in a later phase replaces
-    /// the stub via standard <see cref="IServiceCollection"/> last-wins
-    /// semantics.
+    /// registered with their <i>stub</i> implementations here — they
+    /// let the inbound pipeline run end-to-end before Phase 3
+    /// (command processing, including the <c>CallbackQueryHandler</c>
+    /// that consumes <see cref="IPendingDisambiguationStore.TakeAsync"/>
+    /// for workspace disambiguation) and Phase 4 (deduplication)
+    /// register the production replacements via additional
+    /// <c>services.AddXxx()</c> calls. Re-registering an interface in
+    /// a later phase replaces the stub via standard
+    /// <see cref="IServiceCollection"/> last-wins semantics.
+    /// </para>
+    /// <para>
+    /// <see cref="ICommandParser"/> is NO LONGER on the stub list —
+    /// Stage 3.1 ships <see cref="Pipeline.TelegramCommandParser"/> as
+    /// the production implementation, and the registration below
+    /// points directly at it. The <see cref="Pipeline.Stubs.StubCommandParser"/>
+    /// type still exists in the assembly but is no longer wired by
+    /// <c>AddTelegram</c>; it is retained only as a reference shape
+    /// (and to avoid breaking any third-party harness that may have
+    /// instantiated it manually). Pinned by
+    /// <c>TelegramPipelineRegistrationTests.AddTelegram_RegistersStage22Service</c>
+    /// (the <c>ICommandParser → TelegramCommandParser</c> row) and the
+    /// pipeline-level regression tests in
+    /// <c>TelegramCommandParserTests</c>.
     /// </para>
     /// <para>
     /// <b><see cref="TimeProvider"/>.</b> Registered via
@@ -110,7 +124,10 @@ public static class TelegramServiceCollectionExtensions
         services.AddSingleton<IDeduplicationService, InMemoryDeduplicationService>();
         services.AddSingleton<IPendingQuestionStore, InMemoryPendingQuestionStore>();
         services.AddSingleton<IPendingDisambiguationStore, InMemoryPendingDisambiguationStore>();
-        services.AddSingleton<ICommandParser, StubCommandParser>();
+        // Stage 3.1: production TelegramCommandParser replaces the
+        // Stage 2.2 StubCommandParser at registration time. Singleton
+        // lifetime because the parser is stateless.
+        services.AddSingleton<ICommandParser, TelegramCommandParser>();
         services.AddSingleton<ICommandRouter, StubCommandRouter>();
         services.AddSingleton<ICallbackHandler, StubCallbackHandler>();
         // TimeProvider.System is the production default; tests register a
