@@ -9,6 +9,7 @@ namespace AgentSwarm.Messaging.Slack.Transport;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Persistence;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -283,10 +284,16 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
             // CancellationToken.None and wrap in try/catch so the
             // success path is fully cancellation-safe: a missing audit
             // row is recoverable via log mining, a 5xx is not.
+            //
+            // Stage 7.1 evaluator iter-1 item 3: the serialised view
+            // payload is stamped onto the audit row's
+            // ResponsePayload so the story "Audit" field list is met
+            // for successful modal opens (not just errors).
             try
             {
+                string? serialisedView = SlackAuditPayloadSerializer.Serialize(viewPayload);
                 await this.auditRecorder
-                    .RecordSuccessAsync(envelope, payload.SubCommand!, CancellationToken.None)
+                    .RecordSuccessAsync(envelope, payload.SubCommand!, CancellationToken.None, serialisedView)
                     .ConfigureAwait(false);
             }
             catch (Exception auditEx)
