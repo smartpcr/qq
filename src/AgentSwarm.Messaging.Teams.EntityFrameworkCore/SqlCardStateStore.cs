@@ -1,3 +1,4 @@
+using System.Data;
 using AgentSwarm.Messaging.Teams;
 using Microsoft.EntityFrameworkCore;
 
@@ -20,10 +21,14 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// surface is intentionally narrow to preserve the architecture contract.
 /// </para>
 /// <para>
-/// <b>Save semantics</b>: <see cref="SaveAsync"/> performs an upsert by removing any
-/// existing row for the question and adding a fresh one. This is intentional — a
-/// proactive resend should overwrite the stale <c>ActivityId</c>/<c>ConversationReferenceJson</c>
-/// captured by the previous send.
+/// <b>Save semantics</b>: <see cref="SaveAsync"/> performs an atomic upsert — any row
+/// already present for the question is deleted and a fresh one is inserted, all inside a
+/// <see cref="IsolationLevel.Serializable"/> transaction. The overwrite is intentional
+/// (a proactive resend must replace the stale <c>ActivityId</c>/<c>ConversationReferenceJson</c>
+/// captured by the previous send), and the SERIALIZABLE isolation level is what makes the
+/// delete-then-insert pair safe against concurrent <see cref="SaveAsync"/> callers for the
+/// same <c>QuestionId</c>: the database serialises the writers so the second caller cannot
+/// race past the first and produce a duplicate primary-key violation.
 /// </para>
 /// </remarks>
 public sealed class SqlCardStateStore : ICardStateStore
@@ -72,17 +77,6 @@ public sealed class SqlCardStateStore : ICardStateStore
                 nameof(state));
         }
 
-        await using var ctx = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
-
-        var existing = await ctx.CardStates
-            .FirstOrDefaultAsync(e => e.QuestionId == state.QuestionId, ct)
-            .ConfigureAwait(false);
-
-        if (existing is not null)
-        {
-            ctx.CardStates.Remove(existing);
-        }
-
         var now = _timeProvider.GetUtcNow();
         var entity = new CardStateEntity
         {
@@ -96,8 +90,35 @@ public sealed class SqlCardStateStore : ICardStateStore
             UpdatedAt = state.UpdatedAt == default ? now : state.UpdatedAt,
         };
 
+        await using var ctx = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
+
+        // Atomic upsert. The previous implementation read the row, called Remove on the
+        // tracked entity, then Add on a fresh one, and committed the pair with a single
+        // SaveChangesAsync. That sequence was a race: two callers writing the same
+        // QuestionId could both observe the row, both schedule a Remove, both schedule an
+        // Add, and one of the SaveChangesAsync calls would surface a DbUpdateException on
+        // the duplicate PK insert.
+        //
+        // The fix is to perform the delete directly at the database (ExecuteDeleteAsync)
+        // and bracket it with the insert inside a SERIALIZABLE transaction. Under
+        // SERIALIZABLE isolation the DELETE acquires a key/range lock for the QuestionId;
+        // a concurrent SaveAsync for the same QuestionId blocks until this transaction
+        // commits, then its DELETE sees and removes the freshly-written row before its
+        // own INSERT proceeds. The net result is a "last writer wins" upsert with no
+        // duplicate-PK race and no application-level retry loop.
+        await using var tx = await ctx.Database
+            .BeginTransactionAsync(IsolationLevel.Serializable, ct)
+            .ConfigureAwait(false);
+
+        await ctx.CardStates
+            .Where(e => e.QuestionId == state.QuestionId)
+            .ExecuteDeleteAsync(ct)
+            .ConfigureAwait(false);
+
         ctx.CardStates.Add(entity);
         await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+
+        await tx.CommitAsync(ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
