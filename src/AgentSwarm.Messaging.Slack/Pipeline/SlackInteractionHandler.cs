@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Slack.Entities;
+using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Rendering;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.Logging;
@@ -544,8 +545,14 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
         {
             try
             {
+                // Stage 7.1 evaluator iter-1 item 3: serialise the
+                // rendered comment-modal view JSON onto the audit
+                // row's ResponsePayload so the success audit trail
+                // satisfies the story "Audit" field list (not just
+                // the error trail).
+                string? serialisedView = SlackAuditPayloadSerializer.Serialize(viewPayload);
                 await this.modalAuditRecorder
-                    .RecordSuccessAsync(envelope, DefaultSlackInteractionFastPathHandler.AuditSubCommand, CancellationToken.None)
+                    .RecordSuccessAsync(envelope, DefaultSlackInteractionFastPathHandler.AuditSubCommand, CancellationToken.None, serialisedView)
                     .ConfigureAwait(false);
             }
             catch (Exception auditEx)

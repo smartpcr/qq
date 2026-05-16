@@ -66,15 +66,29 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
         // Arrange / Act
         WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());
 
-        // Assert -- the canonical ISlackAuditEntryWriter MUST be the EF
-        // writer, NOT the InMemorySlackAuditEntryWriter fallback. If a
-        // future refactor reorders the DI extensions in Program.BuildApp,
-        // this assertion fires before the host can ship.
+        // Assert -- the canonical ISlackAuditEntryWriter MUST be a
+        // durably-persisted implementation, NOT the
+        // InMemorySlackAuditEntryWriter fallback. Stage 7.1 promoted
+        // the binding to SlackAuditLogger<SlackPersistenceDbContext>
+        // (which also implements ISlackAuditEntryWriter and writes
+        // through EF Core) so the Stage 3.1 durability contract is
+        // preserved through the post-3.1 wiring swap.
         ISlackAuditEntryWriter writer = app.Services.GetRequiredService<ISlackAuditEntryWriter>();
         writer.Should()
-            .BeOfType<EntityFrameworkSlackAuditEntryWriter<SlackPersistenceDbContext>>(
+            .NotBeOfType<InMemorySlackAuditEntryWriter>(
                 "Stage 3.1 requires signature rejection audit rows to be durably persisted; "
                 + "falling back to InMemorySlackAuditEntryWriter would lose them on process restart");
+
+        // Specifically, Stage 7.1 expects the SlackAuditLogger to win
+        // the binding so every existing audit seam (signature,
+        // authorization, idempotency, command, interaction, modal,
+        // outbound, thread, DirectApiClient) auto-routes through
+        // SlackAuditLogger.LogAsync without per-call-site edits.
+        writer.Should()
+            .BeOfType<SlackAuditLogger<SlackPersistenceDbContext>>(
+                "Stage 7.1 AddSlackAuditLogger<SlackPersistenceDbContext>(IConfiguration) registers the "
+                + "logger as the canonical ISlackAuditEntryWriter so the dual-interface route subsumes "
+                + "the Stage 3.1 EntityFrameworkSlackAuditEntryWriter binding");
     }
 
     [Fact]

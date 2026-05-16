@@ -75,13 +75,30 @@ internal sealed class SlackModalAuditRecorder
     }
 
     /// <summary>
-    /// Records a successful modal_open invocation.
+    /// Records a successful modal_open invocation. The serialised
+    /// Slack <c>view</c> payload that was sent to the
+    /// <c>views.open</c> Web API call is captured in
+    /// <see cref="SlackAuditEntry.ResponsePayload"/> when supplied,
+    /// fulfilling the story "Audit" requirement that the response
+    /// payload be persisted alongside the team / channel / thread /
+    /// user / command fields.
     /// </summary>
+    /// <param name="envelope">Inbound envelope that triggered the modal.</param>
+    /// <param name="subCommand">Lower-case sub-command name.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="responsePayload">
+    /// Serialised Slack <c>view</c> JSON (optionally bounded to a
+    /// reasonable size by the caller via
+    /// <see cref="SlackAuditPayloadSerializer.Serialize"/>). May be
+    /// <see langword="null"/> if the caller has no access to the
+    /// payload (legacy call sites).
+    /// </param>
     public Task RecordSuccessAsync(
         SlackInboundEnvelope envelope,
         string subCommand,
-        CancellationToken ct)
-        => this.AppendAsync(envelope, subCommand, OutcomeSuccess, errorDetail: null, ct);
+        CancellationToken ct,
+        string? responsePayload = null)
+        => this.AppendAsync(envelope, subCommand, OutcomeSuccess, errorDetail: null, responsePayload, ct);
 
     /// <summary>
     /// Records a duplicate fast-path invocation (idempotency guard
@@ -91,8 +108,9 @@ internal sealed class SlackModalAuditRecorder
         SlackInboundEnvelope envelope,
         string subCommand,
         string diagnostic,
-        CancellationToken ct)
-        => this.AppendAsync(envelope, subCommand, OutcomeDuplicate, diagnostic, ct);
+        CancellationToken ct,
+        string? responsePayload = null)
+        => this.AppendAsync(envelope, subCommand, OutcomeDuplicate, diagnostic, responsePayload, ct);
 
     /// <summary>
     /// Records a failed modal_open invocation (Slack error, network
@@ -103,19 +121,31 @@ internal sealed class SlackModalAuditRecorder
         string subCommand,
         string errorDetail,
         CancellationToken ct)
-        => this.AppendAsync(envelope, subCommand, OutcomeError, errorDetail, ct);
+        => this.AppendAsync(envelope, subCommand, OutcomeError, errorDetail, responsePayload: null, ct);
 
     private async Task AppendAsync(
         SlackInboundEnvelope envelope,
         string subCommand,
         string outcome,
         string? errorDetail,
+        string? responsePayload,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(envelope);
 
         DateTimeOffset now = this.timeProvider.GetUtcNow();
         string id = Ulid.NewUlid(now);
+
+        // Stage 7.1 evaluator iter-1 item 3: on success the
+        // ResponsePayload must carry the serialised Slack view JSON
+        // (story "Audit" field list). On error, errorDetail wins so
+        // the audit row remains diagnosable. On duplicate, prefer
+        // the payload when supplied, otherwise fall back to the
+        // diagnostic so the row still records "why".
+        string? payloadForRow = string.Equals(outcome, OutcomeError, StringComparison.Ordinal)
+            ? errorDetail
+            : (responsePayload ?? errorDetail);
+
         SlackAuditEntry entry = new()
         {
             Id = id,
@@ -131,7 +161,7 @@ internal sealed class SlackModalAuditRecorder
             MessageTs = null,
             UserId = string.IsNullOrEmpty(envelope.UserId) ? null : envelope.UserId,
             CommandText = $"/agent {subCommand}",
-            ResponsePayload = errorDetail,
+            ResponsePayload = payloadForRow,
             Outcome = outcome,
             ErrorDetail = string.Equals(outcome, OutcomeError, StringComparison.Ordinal) ? errorDetail : null,
             Timestamp = now,
