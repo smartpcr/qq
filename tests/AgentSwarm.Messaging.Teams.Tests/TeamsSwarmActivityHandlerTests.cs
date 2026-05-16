@@ -674,5 +674,59 @@ public sealed class TeamsSwarmActivityHandlerTests
         var sent = Assert.Single(harness.Adapter.Sent);
         Assert.Single(sent.Attachments);
     }
+
+    /// <summary>
+    /// Stage 3.2 §Test Scenarios row "@mention stripped before dispatch" — End-to-end
+    /// regression that wires the real <see cref="AgentSwarm.Messaging.Teams.Commands.CommandDispatcher"/>
+    /// + every concrete <see cref="AgentSwarm.Messaging.Abstractions.ICommandHandler"/> via
+    /// <see cref="HandlerFactory.BuildE2E"/>. Given a channel message containing
+    /// <c>&lt;at&gt;AgentBot&lt;/at&gt; agent status</c>, <c>OnMessageActivityAsync</c>
+    /// (Stage 2.2) must strip the mention text via <c>Activity.RemoveRecipientMention</c>
+    /// before invoking <see cref="AgentSwarm.Messaging.Abstractions.ICommandDispatcher.DispatchAsync"/>,
+    /// so the dispatcher receives <c>"agent status"</c> as
+    /// <see cref="AgentSwarm.Messaging.Abstractions.CommandContext.NormalizedText"/>, the
+    /// dispatcher routes to <see cref="AgentSwarm.Messaging.Teams.Commands.StatusCommandHandler"/>,
+    /// and the handler emits a <see cref="AgentSwarm.Messaging.Abstractions.CommandEvent"/>
+    /// with the canonical <see cref="AgentSwarm.Messaging.Abstractions.MessengerEventTypes.Command"/>
+    /// discriminator. The dispatcher itself MUST NOT perform any further mention stripping
+    /// (impl-plan §3.2 step 6) — this test asserts the contract end-to-end so a regression
+    /// in either component (mention-stripping in Stage 2.2 OR keyword matching in Stage 3.2)
+    /// fails the build.
+    /// </summary>
+    [Fact]
+    public async Task OnMessageActivityAsync_ChannelMentionStrippedAgentStatus_RoutesToStatusHandlerEndToEnd()
+    {
+        var recording = new TestDoubles.RecordingInboundEventPublisher();
+        var harness = BuildE2E(recording);
+        MapDave(harness.IdentityResolver, "aad-obj-bob-002");
+
+        var activity = NewChannelMentionMessage("<at>AgentBot</at> agent status");
+        await ProcessE2EAsync(harness, activity);
+
+        // Exactly one event must be published — the status handler's CommandEvent.
+        // If the dispatcher had failed to recognise the mention-stripped text, the
+        // unknown-input path would have published a TextEvent instead.
+        var published = Assert.Single(recording.Published);
+        var commandEvent = Assert.IsType<AgentSwarm.Messaging.Abstractions.CommandEvent>(published);
+        Assert.Equal(AgentSwarm.Messaging.Abstractions.MessengerEventTypes.Command, commandEvent.EventType);
+        Assert.Equal(AgentSwarm.Messaging.Teams.Commands.CommandNames.AgentStatus, commandEvent.Payload.CommandType);
+        Assert.Equal("Teams", commandEvent.Messenger);
+        Assert.Equal("aad-obj-bob-002", commandEvent.ExternalUserId);
+        // Channel origination must be preserved on Source — proof that the dispatcher
+        // ran ResolveEventSource against the real channel turn context.
+        Assert.Equal(AgentSwarm.Messaging.Abstractions.MessengerEventSources.TeamChannel, commandEvent.Source);
+        // The CommandEvent payload body MUST be the empty string, not "<at>AgentBot</at>"
+        // or any mention artefact — this is the contract that "@mention stripped before
+        // dispatch" enforces. The Payload field on ParsedCommand carries the trimmed
+        // CommandArguments which the dispatcher computed from the mention-stripped
+        // NormalizedText.
+        Assert.Equal(string.Empty, commandEvent.Payload.Payload);
+
+        // StatusCommandHandler responds with the "no active agents" empty-status card
+        // (NullAgentSwarmStatusProvider returns an empty list in the E2E harness). The
+        // presence of a reply attachment proves the handler actually ran end-to-end.
+        var sent = Assert.Single(harness.Adapter.Sent);
+        Assert.Single(sent.Attachments);
+    }
 }
 
