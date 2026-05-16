@@ -59,6 +59,12 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Create `IDeduplicationService` interface in Abstractions with methods: `TryReserveAsync(string eventId)`, `IsProcessedAsync(string eventId)`, `MarkProcessedAsync(string eventId)` -- three-method contract per architecture.md Section 4.11
 - [ ] Create `IPendingQuestionStore` interface in Abstractions with methods: `StoreAsync`, `GetAsync(string questionId)`, `MarkAnsweredAsync`, `MarkAwaitingCommentAsync`, `RecordSelectionAsync`, `GetExpiredAsync` -- per architecture.md Section 4.7
 - [ ] Create `ISwarmCommandBus` interface in Abstractions with methods: `PublishCommandAsync(SwarmCommand, CancellationToken)`, `PublishHumanDecisionAsync(HumanDecisionEvent, CancellationToken)`, `QueryStatusAsync(SwarmStatusQuery, CancellationToken)`, `QueryAgentsAsync(SwarmAgentsQuery, CancellationToken)`, `SubscribeAsync(string tenantId, CancellationToken)` returning IAsyncEnumerable of SwarmEvent -- per architecture.md Section 4.6
+- [ ] Create `SendResult` record in Core with properties: `Success` (bool), `PlatformMessageId` (long?), `ErrorMessage` (string?) -- return type for IMessageSender methods per architecture.md Section 4.9
+- [ ] Create `AuthorizationResult` record in Core with properties: `IsAllowed` (bool), `DenialReason` (string?), `ResolvedBinding` (GuildBinding?) -- return type for IUserAuthorizationService per architecture.md Section 4.5
+- [ ] Create `IUserAuthorizationService` interface in Core with method: `AuthorizeAsync(string externalUserId, string chatId, string commandName, CancellationToken)` returning `AuthorizationResult` -- per architecture.md Section 4.5; Discord-specific implementation resolves GuildBinding and validates roles
+- [ ] Create ISwarmCommandBus supporting DTOs in Abstractions: `SwarmStatusQuery` (TenantId, AgentId filter), `SwarmAgentsQuery` (TenantId, RoleFilter), `SwarmStatusSummary` (TotalAgents, ActiveTasks, BlockedCount), `AgentInfo` (AgentId, Role, CurrentTask, ConfidenceScore, BlockingQuestion), `SwarmEvent` (EventType, AgentId, Payload, CorrelationId, Timestamp) -- all referenced by ISwarmCommandBus methods
+- [ ] Add batch support methods to `IOutboundQueue`: `CountPendingAsync(MessageSeverity severity, CancellationToken)` returning int, and `DequeueBatchAsync(MessageSeverity severity, int maxCount, CancellationToken)` returning `IReadOnlyList<OutboundMessage>` -- required for low-priority batching per architecture.md Section 10.4
+- [ ] Add batch send method to `IMessageSender`: `SendBatchAsync(long channelId, IReadOnlyList<OutboundMessage> messages, CancellationToken)` returning `SendResult` -- combines multiple Low-severity status updates into a single summary embed per architecture.md Section 10.4
 
 ### Dependencies
 - phase-solution-scaffolding-and-shared-abstractions/stage-shared-data-models
@@ -82,7 +88,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Create `AuditLogEntry` entity in Persistence with `Platform` (string), `ExternalUserId` (string), `MessageId` (string), `Details` (string, JSON for Discord-specific GuildId/ChannelId/InteractionId/ThreadId), `Timestamp` (DateTimeOffset), `CorrelationId` (string)
 - [ ] Create `DeadLetterMessage` entity in Persistence with columns: `Id` (Guid PK), `OriginalMessageId` (Guid), `ChatId` (long), `Payload` (string), `ErrorReason` (string), `FailedAt` (DateTimeOffset), `AttemptCount` (int)
 - [ ] Create `MessagingDbContext` class in Persistence inheriting DbContext with DbSet properties for all entity types and Fluent API configurations in `OnModelCreating`
-- [ ] Generate initial EF Core migration `InitialCreate` via `dotnet ef migrations add InitialCreate` (prefix Discord-specific migrations with `Discord_`)
+- [ ] Generate initial EF Core migration `Discord_InitialCreate` via `dotnet ef migrations add Discord_InitialCreate` -- all Discord-specific migrations use the `Discord_` prefix
 
 ### Dependencies
 - _none -- start stage_
@@ -100,7 +106,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Implement `PersistentPendingQuestionStore` class in Persistence implementing IPendingQuestionStore, backed by MessagingDbContext
 - [ ] Implement `PersistentAuditLogger` class in Persistence implementing IAuditLogger with Platform="Discord" and Discord-specific IDs stored in Details JSON
 - [ ] Implement sliding-window in-memory `IDeduplicationService` backed by ConcurrentDictionary with configurable TTL (default 1 hour) for fast-path duplicate suppression; database UNIQUE constraint on DiscordInteractionRecord provides cross-restart protection as second layer
-- [ ] Implement `PersistentOutboundQueue` class in Persistence implementing IOutboundQueue; DequeueAsync returns highest-Severity pending message oldest-first within each severity level
+- [ ] Implement `PersistentOutboundQueue` class in Persistence implementing IOutboundQueue; DequeueAsync returns highest-Severity pending message oldest-first within each severity level; CountPendingAsync filters by severity for batch threshold checks; DequeueBatchAsync collects up to N messages of a given severity
 
 ### Dependencies
 - phase-persistence-and-data-access/stage-database-context-and-entity-configuration
@@ -116,7 +122,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Implement severity-ordered dequeue in PersistentOutboundQueue: Critical (0) dequeued before High (1) before Normal (2) before Low (3), oldest-first within each severity
 - [ ] Implement MarkSentAsync to update OutboundMessage Status to Sent and store the PlatformMessageId (Discord message snowflake cast to long)
 - [ ] Implement MarkFailedAsync to increment AttemptCount, set ErrorDetail, compute NextRetryAt with exponential backoff; when AttemptCount >= MaxAttempts (default 5), call DeadLetterAsync
-- [ ] Implement DeadLetterAsync to move the OutboundMessage to DeadLetterMessage table with full error history
+- [ ] Implement DeadLetterAsync: set OutboundMessage.Status to DeadLettered (the row is retained in the outbound table) AND create a linked `DeadLetterMessage` record via `OriginalMessageId` FK with full error history -- per architecture.md Section 3.2 entity relationship `DeadLetterMessage 1--1 OutboundMessage`
 - [ ] Implement IdempotencyKey enforcement: UNIQUE constraint on OutboundMessage.IdempotencyKey prevents duplicate enqueues for the same question/alert/status/ack
 
 ### Dependencies
@@ -124,7 +130,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 
 ### Test Scenarios
 - [ ] Scenario: Priority-ordered dequeue -- Given outbound messages with Critical, Normal, and Low severities enqueued, When DequeueAsync is called repeatedly, Then messages are returned Critical first then Normal then Low
-- [ ] Scenario: Dead letter on max attempts -- Given an OutboundMessage that has failed 4 times (AttemptCount=4), When MarkFailedAsync is called a fifth time, Then AttemptCount reaches MaxAttempts (5), DeadLetterAsync is called, and the message is moved to DeadLetterMessage table
+- [ ] Scenario: Dead letter on max attempts -- Given an OutboundMessage that has failed 4 times (AttemptCount=4), When MarkFailedAsync is called a fifth time, Then AttemptCount reaches MaxAttempts (5), DeadLetterAsync is called, OutboundMessage.Status becomes DeadLettered, and a linked DeadLetterMessage record is created
 
 # Phase 3: Discord Inbound Pipeline
 
@@ -148,6 +154,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 
 ### Test Scenarios
 - [ ] Scenario: Non-recoverable close code stops service -- Given a Disconnected event with close code 4014 (Disallowed Intents), When the handler executes, Then the service logs Critical and stops permanently without retrying
+- [ ] Scenario: Recoverable disconnect triggers auto-reconnect -- Given a Disconnected event with close code 4000 (Unknown Error), When the handler executes, Then Discord.Net auto-reconnects with exponential backoff, the Connected event fires, `discord.gateway.reconnect` counter increments by 1, and slash commands are re-registered if session was not resumed -- per architecture.md Section 5.3 (AC-3)
 - [ ] Scenario: Slash commands registered on Ready -- Given the bot connects to a guild, When the Ready event fires, Then BulkOverwriteGuildApplicationCommandsAsync is called with exactly 7 slash command definitions for ask, status, approve, reject, assign, pause, resume
 - [ ] Scenario: Missing permissions prevents startup -- Given the bot lacks SendMessages permission, When Ready fires and permissions are checked, Then the service throws a fatal exception and stops
 
@@ -220,7 +227,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Implement SendQuestionAsync: build Discord Embed with author section (agent name, role), fields (task ID, confidence score as ASCII progress bar e.g. "[####-] 80%", blocking question, severity indicator, expiration time, proposed default action); use color-coded sidebar (red=Critical, orange=High, blue=Normal, gray=Low)
 - [ ] Implement button rendering: build ComponentBuilder with action buttons using custom_id format `q:{QuestionId}:{ActionId}`; when AllowedActions.Length > 5, use a select menu instead of buttons per Discord's 5-button-per-row limit
 - [ ] Implement thread management: create threads for Workstream channel questions using task ID as thread name; set AutoArchiveDuration to 1440 minutes (24 hours, configurable) per resolved decision OQ-2; reuse existing threads by name when posting follow-up messages for the same task
-- [ ] After successful question send, persist PendingQuestionRecord via IPendingQuestionStore.StoreAsync with the returned Discord message snowflake ID (cast to long) and channel ID; store full AgentQuestionEnvelope in SourceEnvelopeJson for crash recovery
+- [ ] Return `SendResult` with `PlatformMessageId` (Discord message snowflake cast to long) from both SendQuestionAsync and SendTextAsync; the caller (OutboundQueueProcessor) is responsible for PendingQuestionRecord persistence via IPendingQuestionStore.StoreAsync -- rendering boundary ends at the REST send
 - [ ] Implement SendTextAsync: send pre-rendered embed JSON from OutboundMessage.Payload for non-question messages (alerts, status updates, command acks)
 - [ ] For Critical severity alerts routed to alert channel, include @here mention to notify online guild members
 
@@ -238,8 +245,9 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Create `OutboundQueueProcessor` as a BackgroundService in Worker project (shared component) that calls IOutboundQueue.DequeueAsync in a loop with configurable poll interval (default 1 second)
 - [ ] Implement severity-aware processing: DequeueAsync returns highest-Severity pending message, oldest-first within a severity; Critical and High messages are never batched and always sent individually
 - [ ] For each dequeued message, dispatch to IMessageSender.SendTextAsync or SendQuestionAsync based on SourceType; pass the channel ID (ChatId cast to ulong) and the Payload or SourceEnvelopeJson
-- [ ] On successful send, call IOutboundQueue.MarkSentAsync with the messageId and platformMessageId (Discord message snowflake cast to long); for Question SourceType, call IPendingQuestionStore.StoreAsync as a post-send hook
+- [ ] On successful send, call IOutboundQueue.MarkSentAsync with the messageId and SendResult.PlatformMessageId; for Question SourceType, call IPendingQuestionStore.StoreAsync with the envelope from SourceEnvelopeJson, channelId, and platformMessageId as the post-send hook -- per architecture.md Section 5.1 sequence (markSent then persist PQ)
 - [ ] On failure (Discord API exception or timeout), call IOutboundQueue.MarkFailedAsync; when AttemptCount >= MaxAttempts (default 5), call IOutboundQueue.DeadLetterAsync to move to dead letter store
+- [ ] Implement Low-severity batch path: before dequeuing Low messages, call IOutboundQueue.CountPendingAsync(MessageSeverity.Low); when count exceeds batching threshold (default 50), call IOutboundQueue.DequeueBatchAsync(MessageSeverity.Low, maxCount: 10) and pass the batch to IMessageSender.SendBatchAsync which combines them into a single summary embed -- per architecture.md Section 10.4
 - [ ] During Gateway disconnect window, REST API failures cause messages to retry with exponential backoff; no messages are lost due to durable outbox pattern
 
 ### Dependencies
@@ -247,7 +255,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 
 ### Test Scenarios
 - [ ] Scenario: Critical messages sent before low priority -- Given 3 queued messages (Low, Critical, Normal), When processor dequeues, Then Critical message is processed first
-- [ ] Scenario: Max retry moves to dead letter -- Given an OutboundMessage that fails on every send attempt, When AttemptCount reaches MaxAttempts (5), Then DeadLetterAsync is called and the message is moved to dead letter store
+- [ ] Scenario: Max retry dead-letters with linked record -- Given an OutboundMessage that fails on every send attempt, When AttemptCount reaches MaxAttempts (5), Then DeadLetterAsync is called, OutboundMessage.Status becomes DeadLettered, and a linked DeadLetterMessage record is created
 - [ ] Scenario: PendingQuestionRecord created after question send -- Given a Question-type OutboundMessage, When sent successfully, Then IPendingQuestionStore.StoreAsync is called with the returned Discord message ID
 
 ## Stage 4.3: Rate Limit Aware Batching
@@ -256,7 +264,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Create `RateLimitTracker` class in Discord project maintaining per-route token bucket state from Discord REST rate limit headers (X-RateLimit-Remaining, X-RateLimit-Reset)
 - [ ] Implement `WaitForCapacityAsync(string route, CancellationToken ct)` that delays until the token bucket for the given route has available capacity
 - [ ] Integrate RateLimitTracker into DiscordMessageSender: await WaitForCapacityAsync before each REST call, then update bucket state from response headers
-- [ ] Implement low-priority batching: when pending low-priority messages exceed threshold of 50 (per tech-spec), consolidate into summary embeds instead of individual messages
+- [ ] Implement low-priority batching in DiscordMessageSender.SendBatchAsync: receive up to 10 Low-severity OutboundMessages, combine them into a single Discord embed containing an agent status table (one row per agent with name, task, confidence, status), and send as one REST call -- per architecture.md Section 10.4
 - [ ] Layer rate limiting: Discord.Net built-in handler as first layer, RateLimitTracker as second proactive layer for visibility and metrics
 - [ ] Emit metrics: increment `discord.ratelimit.hits` counter (tagged by route) on each throttle event and update `discord.outbound.queue_depth` gauge (tagged by severity) on each dequeue cycle -- per architecture.md Section 9
 
@@ -265,7 +273,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 
 ### Test Scenarios
 - [ ] Scenario: Rate limiter delays when bucket empty -- Given a route with 0 remaining capacity and reset in 2 seconds, When WaitForCapacityAsync is called, Then it delays approximately 2 seconds before returning
-- [ ] Scenario: Low priority batching consolidates above threshold -- Given 60 low-priority status messages in queue, When processor runs, Then messages are consolidated into a summary embed rather than 60 individual sends
+- [ ] Scenario: Low priority batching consolidates above threshold -- Given 60 Low-severity status messages in queue (CountPendingAsync returns 60), When OutboundQueueProcessor runs, Then DequeueBatchAsync(Low, 10) is called and SendBatchAsync combines 10 messages into a single summary embed
 
 # Phase 5: Security and Reliability
 
@@ -327,7 +335,7 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 
 ### Implementation Steps
 - [ ] Create `DeadLetterProcessor` class in Discord project with methods: `ReviewAsync()` returning list of dead-lettered OutboundMessages (Status=DeadLettered), `RetryAsync(Guid outboundMessageId)` resetting AttemptCount and Status, `PurgeAsync(DateTimeOffset olderThan)`
-- [ ] Implement retry: retrieve dead-lettered OutboundMessage by IdempotencyKey, reset AttemptCount=0, Status=Pending, and re-enqueue it into IOutboundQueue; increment `discord.send.retry_count` metric
+- [ ] Implement retry: look up the OutboundMessage by outboundMessageId (Status=DeadLettered); reset AttemptCount=0, Status=Pending, clear ErrorDetail and NextRetryAt; delete the linked DeadLetterMessage record; the message re-enters the outbound queue on next DequeueAsync cycle
 - [ ] Implement automatic purge: dead letters older than 7 days are purged by a sweep on each QuestionRecoverySweep cycle
 - [ ] Add optional `/agent admin dead-letters` diagnostic slash command restricted to admin roles that lists recent dead-lettered messages with IdempotencyKey, error detail, and CreatedAt
 
@@ -391,9 +399,9 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 - [ ] Write test: duplicate interaction ID causes PersistAsync to return false, DeferAsync is never called, and processing is skipped entirely
 - [ ] Write test: unauthorized user (wrong role) receives ephemeral follow-up denial, original deferred response is deleted via DeleteOriginalResponseAsync, and an AuditEntry is persisted
 - [ ] Write test: outbound message with Critical severity is dequeued and sent before a Normal severity message enqueued earlier
-- [ ] Write test: message exceeding MaxAttempts (5) is dead-lettered via DeadLetterAsync and discord.send.dead_lettered counter increments
+- [ ] Write test: message exceeding MaxAttempts (5) is dead-lettered via DeadLetterAsync -- OutboundMessage.Status becomes DeadLettered, a linked DeadLetterMessage record is created, and discord.send.dead_lettered counter increments
 - [ ] Write test: PendingQuestionRecord past ExpiresAt is set to TimedOut by QuestionTimeoutService and Discord message buttons are disabled
-- [ ] Write test: 100 concurrent agent status updates are enqueued as Low severity; when queue depth exceeds 50, OutboundQueueProcessor consolidates them into summary embeds via batching
+- [ ] Write test: 100 concurrent agent status updates are enqueued as Low severity; when CountPendingAsync(Low) exceeds 50, OutboundQueueProcessor calls DequeueBatchAsync and SendBatchAsync to consolidate into summary embeds
 - [ ] Write test: question with >5 AllowedActions renders a select menu instead of buttons
 
 ### Dependencies
@@ -402,4 +410,4 @@ storyId: "qq:DISCORD-MESSENGER-SU"
 ### Test Scenarios
 - [ ] Scenario: Full ask-to-question flow -- Given a fully wired test fixture, When `/agent ask architect design cache strategy` is simulated, Then SwarmCommand is published to ISwarmCommandBus and an outbound question embed with action buttons is enqueued in IOutboundQueue
 - [ ] Scenario: Full approve-to-decision flow -- Given a pending question in the database, When a button click with custom_id "q:Q-42:approve" is simulated, Then HumanDecisionEvent is published with correct ExternalUserId and the PendingQuestionRecord status changes to Answered
-- [ ] Scenario: Concurrent agent load handling -- Given 100 agent status updates enqueued as Low severity, When the outbound processor runs to completion, Then all messages are eventually sent and low-priority batching activates above threshold 50
+- [ ] Scenario: Concurrent agent load handling -- Given 100 agent status updates enqueued as Low severity, When the outbound processor runs to completion, Then CountPendingAsync(Low) triggers batch path, DequeueBatchAsync collects up to 10 at a time, SendBatchAsync sends each batch as a single embed, and all messages are eventually sent
