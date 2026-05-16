@@ -22,14 +22,33 @@ using AgentSwarm.Messaging.Abstractions;
 /// <c>PersistentOutboundDeadLetterStore</c> via
 /// <c>AddMessagingPersistence</c>'s <c>Replace</c> call.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Backed by a <see cref="ConcurrentDictionary{TKey,TValue}"/> keyed
+/// on <see cref="OutboundDeadLetterRecord.DeadLetterId"/>. The
+/// dictionary key + <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/>
+/// enforces the idempotency contract documented on
+/// <see cref="IOutboundDeadLetterStore"/> (a second
+/// <see cref="RecordAsync"/> call with the same
+/// <c>DeadLetterId</c> is a no-op) so unit tests that exercise the
+/// sender's retry-of-<c>RecordAsync</c> path produce the same
+/// observable outcome here as they do against the EF Core-backed
+/// <c>PersistentOutboundDeadLetterStore</c>, which enforces the same
+/// contract via <c>FindAsync</c>-then-skip plus a SQLite unique-key
+/// catch. A <see cref="ConcurrentBag{T}"/> was rejected for this
+/// reason: it would silently accept duplicate records and let
+/// in-memory tests pass against a regression that drops the
+/// duplicate-check in the persistent store (or vice versa).
+/// </para>
+/// </remarks>
 internal sealed class InMemoryOutboundDeadLetterStore : IOutboundDeadLetterStore
 {
-    private readonly ConcurrentBag<OutboundDeadLetterRecord> _store = new();
+    private readonly ConcurrentDictionary<Guid, OutboundDeadLetterRecord> _store = new();
 
     public Task RecordAsync(OutboundDeadLetterRecord record, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(record);
-        _store.Add(record);
+        _store.TryAdd(record.DeadLetterId, record);
         return Task.CompletedTask;
     }
 
@@ -38,7 +57,7 @@ internal sealed class InMemoryOutboundDeadLetterStore : IOutboundDeadLetterStore
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
-        IReadOnlyList<OutboundDeadLetterRecord> matches = _store
+        IReadOnlyList<OutboundDeadLetterRecord> matches = _store.Values
             .Where(r => r.CorrelationId == correlationId)
             .OrderBy(r => r.FailedAt)
             .ToList();

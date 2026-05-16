@@ -33,7 +33,7 @@ namespace AgentSwarm.Messaging.Telegram.Sending;
 /// messages (<c>Alert</c>, <c>StatusUpdate</c>, <c>CommandAck</c>),
 /// rendering is performed earlier by <c>TelegramMessengerConnector</c>
 /// at enqueue time. <see cref="SendTextAsync"/> therefore <i>passes the
-/// supplied text through</i> to the Telegram API without re-escaping ΓÇö
+/// supplied text through</i> to the Telegram API without re-escaping —
 /// re-escaping a pre-rendered MarkdownV2 payload would double-escape
 /// every backslash and corrupt every reserved character the connector
 /// intentionally formatted. Questions are different: the
@@ -42,7 +42,7 @@ namespace AgentSwarm.Messaging.Telegram.Sending;
 /// it concatenates into the body.
 /// </para>
 /// <para>
-/// <b>Trace footer ΓÇö unconditional (architecture.md ┬º10.1 "renderer
+/// <b>Trace footer — unconditional (architecture.md ┬º10.1 "renderer
 /// invariant outbound", iter-3 evaluator item 2).</b> Every outbound
 /// message carries its correlation / trace id without exception.
 /// <see cref="PrepareOutbound"/> resolves the id in this priority
@@ -82,11 +82,11 @@ namespace AgentSwarm.Messaging.Telegram.Sending;
 /// transient retry budget.
 /// </para>
 /// <para>
-/// <b>Long-message split ΓÇö text and question (iter-3 evaluator
+/// <b>Long-message split — text and question (iter-3 evaluator
 /// item 4 + iter-4 evaluator items 2 + 3 + iter-5 evaluator item 5).</b>
 /// Telegram caps a single message body at 4 096 UTF-16 characters.
 /// <see cref="SendTextAsync"/> splits the already-prepared payload
-/// into Γëñ 4 096-char chunks at line / paragraph boundaries where
+/// into ≤ 4 096-char chunks at line / paragraph boundaries where
 /// possible, and re-appends the trace footer to every chunk so no
 /// chunk is trace-less. <see cref="SendQuestionAsync"/> applies the
 /// same per-chunk-footer split to the rendered question body via
@@ -104,9 +104,9 @@ namespace AgentSwarm.Messaging.Telegram.Sending;
 /// </para>
 /// <para>
 /// <b>Permanent 4xx failures (iter-5 evaluator item 1).</b> Non-429
-/// 4xx <see cref="ApiRequestException"/>s ΓÇö malformed MarkdownV2
+/// 4xx <see cref="ApiRequestException"/>s — malformed MarkdownV2
 /// (HTTP 400 "can't parse entities"), chat-not-found (HTTP 400),
-/// bot-blocked-by-user (HTTP 403), token-revoked (HTTP 401) ΓÇö are
+/// bot-blocked-by-user (HTTP 403), token-revoked (HTTP 401) — are
 /// routed through the same dead-letter ledger + alert + typed
 /// exception path as transient and 429 exhaustion, tagged with
 /// <see cref="OutboundFailureCategory.Permanent"/> so Stage 4.1's
@@ -125,7 +125,7 @@ namespace AgentSwarm.Messaging.Telegram.Sending;
 /// records <c>(TelegramMessageId, ChatId, CorrelationId, SentAt)</c>
 /// so an inbound reply that references the Telegram message id
 /// re-enters the swarm under the same trace as the originating agent
-/// send ΓÇö even after a worker restart or cache flush.
+/// send — even after a worker restart or cache flush.
 /// </para>
 /// </remarks>
 public sealed class TelegramMessageSender : IMessageSender
@@ -167,10 +167,10 @@ public sealed class TelegramMessageSender : IMessageSender
 
     /// <summary>
     /// <see cref="IDistributedCache"/> key prefix for the Telegram
-    /// <c>message_id</c> ΓåÆ <c>CorrelationId</c> reverse index written
+    /// <c>message_id</c> → <c>CorrelationId</c> reverse index written
     /// after every successful send. The key shape is
-    /// <c>outbound:msgid:{chatId}:{telegramMessageId}</c> ΓÇö iter-4
-    /// evaluator item 1 ΓÇö Telegram <c>message_id</c> values are only
+    /// <c>outbound:msgid:{chatId}:{telegramMessageId}</c> — iter-4
+    /// evaluator item 1 — Telegram <c>message_id</c> values are only
     /// unique within a chat, so the cache key MUST include the chat
     /// id or two chats with a colliding numeric message id would
     /// alias to the same cache entry and the second send would
@@ -181,7 +181,7 @@ public sealed class TelegramMessageSender : IMessageSender
     public const string MessageIdCacheKeyPrefix = "outbound:msgid:";
 
     /// <summary>
-    /// TTL for the message-id ΓåÆ correlation cache mirror. Bounded so
+    /// TTL for the message-id → correlation cache mirror. Bounded so
     /// the cache cannot accumulate state indefinitely. 24 hours covers
     /// the typical operator reply latency; the durable
     /// <see cref="IOutboundMessageIdIndex"/> row outlives the cache
@@ -236,7 +236,7 @@ public sealed class TelegramMessageSender : IMessageSender
             throw new ArgumentNullException(nameof(text));
         }
 
-        // Iter-4 evaluator items 2 + 3 ΓÇö every emitted chunk MUST
+        // Iter-4 evaluator items 2 + 3 — every emitted chunk MUST
         // carry the trace footer AND every chunk's message-id MUST
         // be persisted to the durable index. PrepareOutboundChunks
         // does the chunk-aware split that guarantees both: the
@@ -256,8 +256,8 @@ public sealed class TelegramMessageSender : IMessageSender
                 ct).ConfigureAwait(false);
             lastMessageId = sent.MessageId;
 
-            // Iter-4 evaluator item 3 ΓÇö persist EVERY chunk's
-            // message-id ΓåÆ CorrelationId mapping, not just the last.
+            // Iter-4 evaluator item 3 — persist EVERY chunk's
+            // message-id → CorrelationId mapping, not just the last.
             // An operator reply targeting chunk N of a 3-chunk
             // outbound message must still resolve back to the
             // originating trace; persisting only the last chunk
@@ -291,7 +291,7 @@ public sealed class TelegramMessageSender : IMessageSender
         var keyboard = TelegramQuestionRenderer.BuildInlineKeyboard(envelope.Question);
         var correlationId = envelope.Question.CorrelationId;
 
-        // Iter-4 evaluator items 2 + 3 ΓÇö chunk-aware split with
+        // Iter-4 evaluator items 2 + 3 — chunk-aware split with
         // per-chunk footer. The renderer's body already ends with the
         // trace footer once; SplitForTelegramWithFooter strips that
         // trailing footer (if present), splits the remaining body,
@@ -314,8 +314,8 @@ public sealed class TelegramMessageSender : IMessageSender
                 ct).ConfigureAwait(false);
             lastMessageId = sent.MessageId;
 
-            // Iter-4 evaluator item 3 ΓÇö persist EVERY chunk's
-            // message-id ΓåÆ CorrelationId mapping. The previous
+            // Iter-4 evaluator item 3 — persist EVERY chunk's
+            // message-id → CorrelationId mapping. The previous
             // behaviour only persisted the keyboard chunk's id, so a
             // reply that quoted an earlier body chunk resolved as
             // "unknown send" and the swarm dropped the human turn on
@@ -328,7 +328,7 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Iter-4 evaluator items 2 + 3 ΓÇö chunk-aware variant of
+    /// Iter-4 evaluator items 2 + 3 — chunk-aware variant of
     /// <see cref="PrepareOutbound"/> that ensures every emitted chunk
     /// carries the trace footer (not just the message as a whole) and
     /// keeps each chunk's on-wire length within
@@ -340,7 +340,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// </summary>
     /// <returns>
     /// A tuple of the per-chunk MarkdownV2 strings and the resolved
-    /// <c>CorrelationId</c> ΓÇö the same id appears in every chunk's
+    /// <c>CorrelationId</c> — the same id appears in every chunk's
     /// footer AND in the durable index row written for each chunk.
     /// </returns>
     internal static (IReadOnlyList<string> Chunks, string CorrelationId)
@@ -355,14 +355,14 @@ public sealed class TelegramMessageSender : IMessageSender
     /// Backward-compatible single-chunk preparation kept for any
     /// callers that have not yet adopted
     /// <see cref="PrepareOutboundChunks"/>. Internally delegates to
-    /// the chunked path and joins the result ΓÇö equivalent to a 1-chunk
+    /// the chunked path and joins the result — equivalent to a 1-chunk
     /// send when <paramref name="text"/> fits in
     /// <see cref="MaxMessageLength"/>.
     /// </summary>
     internal static (string PreparedText, string CorrelationId) PrepareOutbound(string text)
     {
         var (chunks, correlationId) = PrepareOutboundChunks(text);
-        // The single-chunk callers always passed bodies Γëñ MaxMessageLength,
+        // The single-chunk callers always passed bodies ≤ MaxMessageLength,
         // so this Join is conceptually a no-op for them. Multi-chunk
         // callers should call PrepareOutboundChunks directly.
         return (string.Join("\n\n", chunks), correlationId);
@@ -384,7 +384,7 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Iter-4 evaluator item 1 ΓÇö resolves the trace correlation id
+    /// Iter-4 evaluator item 1 — resolves the trace correlation id
     /// for <paramref name="text"/> AND returns the literal footer text
     /// to be re-attached per chunk. When the caller supplied their
     /// own footer the original escape form is preserved verbatim so a
@@ -396,7 +396,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// 32-char hex id.
     /// </summary>
     /// <remarks>
-    /// Iter-5 evaluator item 2 ΓÇö the marker is recognised as the
+    /// Iter-5 evaluator item 2 — the marker is recognised as the
     /// footer ONLY when it is the final line of the message (after
     /// stripping trailing whitespace). A body that quotes a trace
     /// line earlier in the message (e.g. an agent log that contains
@@ -413,7 +413,7 @@ public sealed class TelegramMessageSender : IMessageSender
         var match = TryMatchTrailingTraceFooter(text);
         if (match is { } m)
         {
-            // The marker is on the LAST line of the text ΓÇö treat it
+            // The marker is on the LAST line of the text — treat it
             // as the footer. Preserve the LITERAL escape form so the
             // pass-through contract is honoured (re-escaping the
             // caller's id would mutate "connector-trace" into
@@ -448,7 +448,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// <summary>
     /// Removes the trailing trace footer from <paramref name="text"/>.
     /// Returns the original text unchanged when no footer is found.
-    /// Iter-5 evaluator item 2 ΓÇö only strips when the marker is on
+    /// Iter-5 evaluator item 2 — only strips when the marker is on
     /// the LAST line of the text (after trimming trailing whitespace).
     /// A body that quotes a trace line earlier in the message text is
     /// returned unchanged so the body content is not silently
@@ -473,7 +473,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// <see cref="TraceFooterPrefix"/> marker, with MarkdownV2 escapes
     /// stripped so the cached id matches the original plain-text
     /// value. Returns <c>null</c> when no marker is present at the
-    /// tail of the text (iter-5 evaluator item 2 ΓÇö markers inside the
+    /// tail of the text (iter-5 evaluator item 2 — markers inside the
     /// body do NOT count as footers).
     /// </summary>
     internal static string? TryExtractTraceFooter(string text)
@@ -487,7 +487,7 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Iter-5 evaluator item 2 ΓÇö locates the trailing trace footer
+    /// Iter-5 evaluator item 2 — locates the trailing trace footer
     /// in <paramref name="text"/> and returns its (line-start,
     /// id-start, id-end) offsets, or <see langword="null"/> when
     /// there is no trailing footer.
@@ -496,8 +496,8 @@ public sealed class TelegramMessageSender : IMessageSender
     /// whitespace from the end of the text, the LAST line (the slice
     /// after the final '\n', or the entire text when there is none)
     /// must START with <see cref="TraceFooterPrefix"/>. Any
-    /// occurrence of the marker INSIDE the body ΓÇö e.g. an agent log
-    /// snippet that quotes a previous send's footer ΓÇö does not match,
+    /// occurrence of the marker INSIDE the body — e.g. an agent log
+    /// snippet that quotes a previous send's footer — does not match,
     /// so <see cref="StripTrailingTraceFooter"/> and
     /// <see cref="ResolveCorrelationIdAndFooter"/> cannot silently
     /// truncate the body or pick the wrong correlation id.
@@ -535,7 +535,7 @@ public sealed class TelegramMessageSender : IMessageSender
 
         // Identify the start of the LAST line. LastIndexOf with
         // (start, count) signature where start is the inclusive
-        // upper bound ΓÇö we search backward from endTrimmed-1 over
+        // upper bound — we search backward from endTrimmed-1 over
         // endTrimmed characters of the text.
         var lastNewline = text.LastIndexOf('\n', endTrimmed - 1, endTrimmed);
         var lineStart = lastNewline < 0 ? 0 : lastNewline + 1;
@@ -547,7 +547,7 @@ public sealed class TelegramMessageSender : IMessageSender
 
         var idStart = lineStart + TraceFooterPrefix.Length;
         var idEnd = endTrimmed;
-        // Trim any whitespace between the prefix and the id (defensive ΓÇö
+        // Trim any whitespace between the prefix and the id (defensive —
         // a caller-rendered footer with extra padding still resolves).
         while (idStart < idEnd && text[idStart] == ' ')
         {
@@ -560,7 +560,7 @@ public sealed class TelegramMessageSender : IMessageSender
         if (idStart >= idEnd)
         {
             // A footer marker with no id payload is treated as
-            // missing ΓÇö the operator pivot needs a non-blank id.
+            // missing — the operator pivot needs a non-blank id.
             return null;
         }
         return (lineStart, idStart, idEnd);
@@ -569,7 +569,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// <summary>
     /// Inverse of <see cref="MarkdownV2.Escape"/> for the narrow
     /// purpose of recovering the original correlation id from a
-    /// rendered footer. Only strips backslash-escapes ΓÇö adequate for
+    /// rendered footer. Only strips backslash-escapes — adequate for
     /// trace ids which are restricted to printable ASCII by
     /// <see cref="CorrelationIdValidation"/>.
     /// </summary>
@@ -612,7 +612,7 @@ public sealed class TelegramMessageSender : IMessageSender
             return;
         }
 
-        // Iter-3 evaluator item 3 ΓÇö durable persistence is the
+        // Iter-3 evaluator item 3 — durable persistence is the
         // load-bearing path. The cache mirror is a fast-lookup
         // optimization; the index row is the contract.
         var mapping = new OutboundMessageIdMapping
@@ -630,7 +630,7 @@ public sealed class TelegramMessageSender : IMessageSender
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // A persistence failure here is logged but NOT thrown
-            // past the successful send ΓÇö the Telegram API has already
+            // past the successful send — the Telegram API has already
             // acknowledged the message and re-throwing would force
             // the caller to retry an already-delivered send, causing
             // duplicate operator notifications. The Stage 4.1
@@ -644,9 +644,9 @@ public sealed class TelegramMessageSender : IMessageSender
                 correlationId);
         }
 
-        // Cache mirror ΓÇö best-effort fast lookup. Failures are logged
+        // Cache mirror — best-effort fast lookup. Failures are logged
         // and swallowed; the durable index above is the source of
-        // truth. Iter-4 evaluator item 1 ΓÇö the cache key embeds the
+        // truth. Iter-4 evaluator item 1 — the cache key embeds the
         // chat id so two chats with a colliding Telegram message id
         // (Telegram's message_id is only unique within a single chat)
         // cannot alias to the same cache entry.
@@ -732,7 +732,7 @@ public sealed class TelegramMessageSender : IMessageSender
             }
             catch (ApiRequestException ex) when (IsTelegramRateLimit(ex))
             {
-                // Iter-4 evaluator item 5 ΓÇö exhausted the 429
+                // Iter-4 evaluator item 5 — exhausted the 429
                 // flood-control budget. Symmetric to the transient
                 // exhaustion path below: invoke the IAlertService and
                 // throw the typed TelegramSendFailedException so
@@ -779,7 +779,7 @@ public sealed class TelegramMessageSender : IMessageSender
             }
             catch (Exception ex) when (IsTransientTransportError(ex))
             {
-                // Exhausted the transient retry budget ΓÇö dead-letter
+                // Exhausted the transient retry budget — dead-letter
                 // path. Invoke the IAlertService when one is wired so
                 // the operator gets an out-of-band notification even
                 // before Stage 4.1's outbox lands; throw a typed
@@ -805,7 +805,7 @@ public sealed class TelegramMessageSender : IMessageSender
             }
             catch (ApiRequestException ex)
             {
-                // Iter-5 evaluator item 1 ΓÇö PERMANENT failure path.
+                // Iter-5 evaluator item 1 — PERMANENT failure path.
                 // Reached when the Bot API returned a 4xx that is
                 // neither 429 (handled by the rate-limit catches
                 // above) nor 5xx (handled by the transient catches
@@ -813,7 +813,7 @@ public sealed class TelegramMessageSender : IMessageSender
                 // for 5xx ApiRequestException). The most common
                 // shapes that land here:
                 //   * 400 "can't parse entities: ..."  (malformed
-                //     MarkdownV2 ΓÇö connector / renderer bug)
+                //     MarkdownV2 — connector / renderer bug)
                 //   * 400 "chat not found"             (stale chat id
                 //     in the operator allowlist)
                 //   * 403 "bot was blocked by the user" (user
@@ -822,7 +822,7 @@ public sealed class TelegramMessageSender : IMessageSender
                 //   * 404 "Not Found"
                 //   * 401 "Unauthorized" (token revoked / rotated
                 //     without a redeploy)
-                // Retrying is hopeless for ALL of these ΓÇö the only
+                // Retrying is hopeless for ALL of these — the only
                 // remediation is content / configuration. Route
                 // straight through the dead-letter ledger + alert +
                 // typed exception so the operator sees the failure
@@ -851,8 +851,8 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Heuristic: an exception is "transient" ΓÇö i.e. eligible for the
-    /// iter-3 evaluator item 5 retry-then-DLQ path ΓÇö when it is one
+    /// Heuristic: an exception is "transient" — i.e. eligible for the
+    /// iter-3 evaluator item 5 retry-then-DLQ path — when it is one
     /// of the recognized HTTP transport / Telegram 5xx shapes. We
     /// deliberately do NOT retry <see cref="OperationCanceledException"/>
     /// (caller cancelled, do not honour) nor 4xx Bot API errors
@@ -879,14 +879,14 @@ public sealed class TelegramMessageSender : IMessageSender
 
     /// <summary>
     /// Exponential backoff schedule for the transient-error retry
-    /// budget: attempt 1 ΓåÆ ~1 s, attempt 2 ΓåÆ ~2 s, attempt 3 ΓåÆ ~4 s.
+    /// budget: attempt 1 → ~1 s, attempt 2 → ~2 s, attempt 3 → ~4 s.
     /// Adds ┬▒20% jitter so concurrent senders hitting the same wedged
     /// backend do not all retry in lockstep.
     /// </summary>
     /// <remarks>
     /// Uses <see cref="Random.Shared"/> for the jitter source so each
-    /// invocation ΓÇö including concurrent invocations from different
-    /// sender instances retrying the same attempt index ΓÇö draws an
+    /// invocation — including concurrent invocations from different
+    /// sender instances retrying the same attempt index — draws an
     /// INDEPENDENT jitter factor. A previous implementation seeded
     /// jitter purely from <paramref name="attempt"/>, which produced
     /// identical wait values for every concurrent sender at the same
@@ -909,7 +909,7 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Iter-5 evaluator item 4 ΓÇö number of attempts the dead-letter
+    /// Iter-5 evaluator item 4 — number of attempts the dead-letter
     /// ledger write is given before the sender escalates to the alert
     /// channel with an explicit DLQ-persistence-failed subject. The
     /// retry loop uses the same backoff schedule as the transient
@@ -919,7 +919,7 @@ public sealed class TelegramMessageSender : IMessageSender
     internal const int MaxDeadLetterPersistRetries = 3;
 
     /// <summary>
-    /// Iter-4 evaluator items 4 + 5 ΓÇö unified dead-letter sink.
+    /// Iter-4 evaluator items 4 + 5 — unified dead-letter sink.
     /// Persists a durable <see cref="OutboundDeadLetterRecord"/> row
     /// to <see cref="IOutboundDeadLetterStore"/> (the ledger is the
     /// answer to "If Telegram send fails, message is retried and
@@ -932,7 +932,7 @@ public sealed class TelegramMessageSender : IMessageSender
     /// gave up.
     /// </summary>
     /// <remarks>
-    /// <b>Iter-5 evaluator item 4 ΓÇö durable persistence is
+    /// <b>Iter-5 evaluator item 4 — durable persistence is
     /// load-bearing.</b> The previous implementation logged and
     /// swallowed the first <see cref="IOutboundDeadLetterStore.RecordAsync"/>
     /// failure, meaning a transient DB outage could exhaust the
@@ -964,7 +964,7 @@ public sealed class TelegramMessageSender : IMessageSender
         CancellationToken ct)
     {
         // Step 1: durable ledger row WITH RETRY. This survives a
-        // worker restart and is the operator's audit anchor ΓÇö even if
+        // worker restart and is the operator's audit anchor — even if
         // the alert channel is down, the row is queryable from the
         // database. Iter-5 evaluator item 4: the previous swallow-
         // and-log behaviour made the durable contract unreliable; the
@@ -994,7 +994,7 @@ public sealed class TelegramMessageSender : IMessageSender
             }
             catch (OperationCanceledException)
             {
-                // Caller cancelled ΓÇö propagate so we do not pretend
+                // Caller cancelled — propagate so we do not pretend
                 // the row was persisted. The typed-exception throw
                 // site below is skipped because OCE unwinds first.
                 throw;
@@ -1025,7 +1025,7 @@ public sealed class TelegramMessageSender : IMessageSender
         if (!persisted)
         {
             // All retries exhausted. The durability promise was
-            // broken ΓÇö escalate this LOUDLY so the operator knows to
+            // broken — escalate this LOUDLY so the operator knows to
             // reconstruct the row from the alert payload below. This
             // is a strictly worse outcome than a normal dead-letter,
             // hence the distinct alert subject and CRITICAL log
@@ -1062,7 +1062,7 @@ public sealed class TelegramMessageSender : IMessageSender
 
         var subject = persisted
             ? $"Outbound Telegram send dead-lettered ({failureCategory})"
-            : $"Outbound Telegram send dead-lettered AND DLQ persistence FAILED ({failureCategory}) ΓÇö RECONSTRUCT AUDIT ROW FROM THIS ALERT";
+            : $"Outbound Telegram send dead-lettered AND DLQ persistence FAILED ({failureCategory}) — RECONSTRUCT AUDIT ROW FROM THIS ALERT";
         var detail = persisted
             ? $"ChatId={chatId}; CorrelationId={correlationId}; AttemptCount={attemptCount}; FailureCategory={failureCategory}; DeadLetterId={record.DeadLetterId:D}; FailedAt={record.FailedAt:O}; LastError={finalError.GetType().Name}: {finalError.Message}"
             : $"ChatId={chatId}; CorrelationId={correlationId}; AttemptCount={attemptCount}; FailureCategory={failureCategory}; DeadLetterId={record.DeadLetterId:D} (NOT PERSISTED); FailedAt={record.FailedAt:O}; LastError={finalError.GetType().Name}: {finalError.Message}; DlqStoreError={lastStoreError?.GetType().Name}: {lastStoreError?.Message}";
@@ -1074,7 +1074,7 @@ public sealed class TelegramMessageSender : IMessageSender
         catch (Exception alertEx) when (alertEx is not OperationCanceledException)
         {
             // The alert path itself failed (e.g. Slack down too).
-            // Log critically and continue ΓÇö we still throw the typed
+            // Log critically and continue — we still throw the typed
             // exception so the upstream caller knows the send
             // ultimately failed, even if the secondary alert path
             // is also wedged.
@@ -1114,14 +1114,14 @@ public sealed class TelegramMessageSender : IMessageSender
         SplitForTelegram(text, MaxMessageLength);
 
     /// <summary>
-    /// Iter-4 evaluator item 4 ΓÇö escape-aware variant of
+    /// Iter-4 evaluator item 4 — escape-aware variant of
     /// <see cref="SplitForTelegram(string)"/>. Lets the caller pass a
     /// per-chunk budget that is smaller than
     /// <see cref="MaxMessageLength"/> (used by
     /// <see cref="SplitForTelegramWithFooter"/> so chunk + footer
     /// still fits the wire ceiling) and guarantees the chosen split
     /// point never lands between a MarkdownV2 escape character
-    /// (<c>'\'</c>) and the reserved character it is protecting ΓÇö a
+    /// (<c>'\'</c>) and the reserved character it is protecting — a
     /// cut at <c>"...foo\" + ".bar..."</c> would emit a chunk that
     /// ends with a dangling backslash, which Telegram rejects as
     /// invalid MarkdownV2.
@@ -1145,7 +1145,7 @@ public sealed class TelegramMessageSender : IMessageSender
             var sliceLength = perChunkBudget;
             // Prefer a paragraph break, fall back to a line break,
             // fall back to the hard char limit. Searching backward
-            // within the budget keeps each emitted chunk Γëñ the limit.
+            // within the budget keeps each emitted chunk ≤ the limit.
             var splitAt = remaining.LastIndexOf("\n\n", sliceLength, sliceLength, StringComparison.Ordinal);
             if (splitAt <= 0)
             {
@@ -1156,7 +1156,7 @@ public sealed class TelegramMessageSender : IMessageSender
                 splitAt = sliceLength;
             }
 
-            // Iter-4 evaluator item 4 + iter-5 evaluator item 3 ΓÇö
+            // Iter-4 evaluator item 4 + iter-5 evaluator item 3 —
             // escape-aware safety walk that NEVER violates the
             // per-chunk wire-length cap. We attempt to walk the cut
             // backward past any unpaired trailing backslash so the
@@ -1164,7 +1164,7 @@ public sealed class TelegramMessageSender : IMessageSender
             // escape sigil. If the backward walk would land at 0
             // (pathological all-backslash prefix that no in-budget
             // cut can split safely), the SAFETY enhancement is
-            // skipped ΓÇö we accept the original budget-position cut
+            // skipped — we accept the original budget-position cut
             // rather than emitting an over-budget chunk via a
             // forward walk. The resulting chunk may be slightly
             // malformed MarkdownV2 (Telegram returns HTTP 400
@@ -1196,14 +1196,14 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Iter-5 evaluator item 5 ΓÇö companion to
+    /// Iter-5 evaluator item 5 — companion to
     /// <see cref="AdjustForMarkdownV2Escape"/>. When the backward
     /// walk lands at 0 (pathological all-backslash prefix), this
     /// helper walks FORWARD from <paramref name="startAt"/> past the
     /// run of consecutive backslashes until the next position whose
     /// preceding char is NOT an unpaired backslash. Returns 0 if no
     /// safe forward position exists within
-    /// <paramref name="text"/> ΓÇö caller falls back to emitting the
+    /// <paramref name="text"/> — caller falls back to emitting the
     /// entire remainder so the splitter still terminates.
     /// </summary>
     internal static int AdvanceToSafeForwardCut(string text, int startAt)
@@ -1226,7 +1226,7 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Iter-4 evaluator item 4 ΓÇö walks <paramref name="splitAt"/>
+    /// Iter-4 evaluator item 4 — walks <paramref name="splitAt"/>
     /// backward until the character immediately before the cut is not
     /// an unpaired MarkdownV2 escape backslash. A backslash that is
     /// itself escaped (preceded by another backslash) is fine; a
@@ -1266,9 +1266,9 @@ public sealed class TelegramMessageSender : IMessageSender
     }
 
     /// <summary>
-    /// Iter-4 evaluator items 2 + 3 ΓÇö splits <paramref name="body"/>
+    /// Iter-4 evaluator items 2 + 3 — splits <paramref name="body"/>
     /// (with any trailing footer already stripped by the caller) into
-    /// chunks of (<see cref="MaxMessageLength"/> ΓêÆ footer length ΓêÆ
+    /// chunks of (<see cref="MaxMessageLength"/> − footer length −
     /// separator) characters each, then re-appends the same
     /// <paramref name="footer"/> to every chunk. Guarantees that
     /// every emitted chunk:
@@ -1298,7 +1298,7 @@ public sealed class TelegramMessageSender : IMessageSender
         {
             // Defensive: an oversized footer (operator misconfigured
             // the trace prefix?) would zero out the budget. Send a
-            // single combined chunk and let Telegram reject it ΓÇö the
+            // single combined chunk and let Telegram reject it — the
             // operator sees a clean ApiRequestException rather than a
             // silent split that loses content.
             return new List<string>(1) { body + sep + footer };
