@@ -68,6 +68,22 @@ public class MessagingDbContext : DbContext
     /// </summary>
     public DbSet<OperatorBinding> OperatorBindings => Set<OperatorBinding>();
 
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the durable pending-question
+    /// store (Stage 3.5). One row per question successfully sent to
+    /// Telegram and awaiting an operator response; lifecycle tracked
+    /// via <see cref="PendingQuestionRecord.Status"/>
+    /// (<see cref="Abstractions.PendingQuestionStatus.Pending"/> →
+    /// <see cref="Abstractions.PendingQuestionStatus.AwaitingComment"/>
+    /// → <see cref="Abstractions.PendingQuestionStatus.Answered"/> /
+    /// <see cref="Abstractions.PendingQuestionStatus.TimedOut"/>).
+    /// Queried by <see cref="PersistentPendingQuestionStore"/> and
+    /// polled by <c>QuestionTimeoutService</c> via the
+    /// <c>(Status, ExpiresAt)</c> index. Configured via
+    /// <see cref="PendingQuestionRecordConfiguration"/>.
+    /// </summary>
+    public DbSet<PendingQuestionRecord> PendingQuestions => Set<PendingQuestionRecord>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

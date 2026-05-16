@@ -297,6 +297,78 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.ToTable("audit_log_entries", (string)null);
                 });
+
+            modelBuilder.Entity("AgentSwarm.Messaging.Persistence.PendingQuestionRecord", b =>
+                {
+                    b.Property<string>("QuestionId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("AgentQuestionJson")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CorrelationId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DefaultActionId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DefaultActionValue")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("ExpiresAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("RespondentUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SelectedActionId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SelectedActionValue")
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("StoredAt")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramChatId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("TelegramMessageId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("QuestionId");
+
+                    b.HasIndex("QuestionId")
+                        .IsUnique()
+                        .HasDatabaseName("ux_pending_questions_question_id");
+
+                    b.HasIndex("DefaultActionId")
+                        .HasDatabaseName("ix_pending_questions_default_action_id");
+
+                    b.HasIndex("TelegramChatId", "TelegramMessageId")
+                        .HasDatabaseName("ix_pending_questions_chat_message");
+
+                    b.HasIndex("Status", "ExpiresAt")
+                        .HasDatabaseName("ix_pending_questions_status_expires_at");
+
+                    b.HasIndex("TelegramChatId", "RespondentUserId", "Status")
+                        .HasDatabaseName("ix_pending_questions_chat_user_status");
+
+                    b.ToTable("pending_questions", (string)null);
+                });
 #pragma warning restore 612, 618
         }
     }

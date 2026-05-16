@@ -42,9 +42,15 @@ namespace AgentSwarm.Messaging.Telegram.Sending;
 /// <b>Default-action display vs. denormalisation.</b> The renderer
 /// reads <see cref="AgentQuestionEnvelope.ProposedDefaultActionId"/>
 /// purely for display ("Default action if no response: …"). It does
-/// NOT denormalise into <c>PendingQuestionRecord.DefaultActionValue</c>;
-/// that is the <c>OutboundQueueProcessor</c>'s post-send hook into
-/// <see cref="IPendingQuestionStore.StoreAsync"/>.
+/// NOT itself persist <c>PendingQuestionRecord.DefaultActionId</c> —
+/// per Stage 3.5, the enclosing <c>TelegramMessageSender</c> calls
+/// <see cref="IPendingQuestionStore.StoreAsync"/> directly after a
+/// successful Telegram send, and the store denormalises
+/// <see cref="AgentQuestionEnvelope.ProposedDefaultActionId"/> into
+/// both <c>PendingQuestionRecord.DefaultActionId</c> (primary timeout
+/// source) and <c>PendingQuestionRecord.DefaultActionValue</c>
+/// (callback / RequiresComment text-reply fallback) at persistence
+/// time (architecture.md §5.2 invariant 1).
 /// </para>
 /// </remarks>
 internal static class TelegramQuestionRenderer

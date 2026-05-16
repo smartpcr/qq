@@ -86,6 +86,69 @@ internal sealed class InMemoryPendingQuestionStore : IPendingQuestionStore
         return Task.CompletedTask;
     }
 
+    public Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
+    {
+        // Atomic claim via ConcurrentDictionary.TryUpdate — the
+        // (key, newValue, comparisonValue) overload performs a
+        // compare-and-swap, succeeding only when the current value
+        // still equals comparisonValue. Two concurrent sweepers
+        // both calling MarkTimedOutAsync therefore see exactly ONE
+        // true result; the loser sees false. Mirrors the
+        // ExecuteUpdateAsync-based atomic claim in
+        // PersistentPendingQuestionStore.MarkTimedOutAsync.
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.Pending &&
+            current.Status != PendingQuestionStatus.AwaitingComment)
+        {
+            // Already terminal (TimedOut or Answered) — another
+            // sweeper / a callback won the claim before us.
+            return Task.FromResult(false);
+        }
+
+        var updated = current with { Status = PendingQuestionStatus.TimedOut };
+        var claimed = _byQuestionId.TryUpdate(questionId, updated, current);
+        return Task.FromResult(claimed);
+    }
+
+    public Task<bool> TryRevertTimedOutClaimAsync(
+        string questionId,
+        PendingQuestionStatus revertTo,
+        CancellationToken ct)
+    {
+        if (revertTo != PendingQuestionStatus.Pending &&
+            revertTo != PendingQuestionStatus.AwaitingComment)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(revertTo),
+                revertTo,
+                "revertTo must be a non-terminal pre-claim status (Pending or AwaitingComment).");
+        }
+
+        // Compare-and-swap mirror of the EF
+        // ExecuteUpdateAsync(WHERE Status == TimedOut) — only revert
+        // when the row is still in the TimedOut state we claimed.
+        // Two concurrent reverts therefore see exactly ONE true; the
+        // loser sees false and skips. Mirrors the atomic-claim CAS
+        // semantics of MarkTimedOutAsync above.
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.TimedOut)
+        {
+            return Task.FromResult(false);
+        }
+
+        var reverted = current with { Status = revertTo };
+        var success = _byQuestionId.TryUpdate(questionId, reverted, current);
+        return Task.FromResult(success);
+    }
+
     public Task RecordSelectionAsync(
         string questionId,
         string selectedActionId,

@@ -195,6 +195,7 @@ public sealed class TelegramMessageSender : IMessageSender
     private readonly IDistributedCache _cache;
     private readonly IOutboundMessageIdIndex _messageIdIndex;
     private readonly IOutboundDeadLetterStore _deadLetterStore;
+    private readonly IPendingQuestionStore _pendingQuestionStore;
     private readonly IAlertService? _alertService;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<TelegramMessageSender> _logger;
@@ -206,6 +207,7 @@ public sealed class TelegramMessageSender : IMessageSender
         IDistributedCache cache,
         IOutboundMessageIdIndex messageIdIndex,
         IOutboundDeadLetterStore deadLetterStore,
+        IPendingQuestionStore pendingQuestionStore,
         TimeProvider timeProvider,
         ILogger<TelegramMessageSender> logger,
         IAlertService? alertService = null,
@@ -216,6 +218,7 @@ public sealed class TelegramMessageSender : IMessageSender
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
         _messageIdIndex = messageIdIndex ?? throw new ArgumentNullException(nameof(messageIdIndex));
         _deadLetterStore = deadLetterStore ?? throw new ArgumentNullException(nameof(deadLetterStore));
+        _pendingQuestionStore = pendingQuestionStore ?? throw new ArgumentNullException(nameof(pendingQuestionStore));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _alertService = alertService;
@@ -280,9 +283,9 @@ public sealed class TelegramMessageSender : IMessageSender
         // Cache the HumanActions BEFORE the send. The cache is the hot
         // path for CallbackQueryHandler (Stage 3.3); writing it before
         // the Telegram round-trip guarantees that a callback arriving
-        // in the narrow window between the send completing and the
-        // OutboundQueueProcessor's post-send hook running can still
-        // resolve.
+        // in the narrow window between the send completing and our
+        // own post-send IPendingQuestionStore.StoreAsync call (below)
+        // can still resolve.
         await TelegramQuestionRenderer
             .CacheActionsAsync(envelope.Question, _cache, _timeProvider, ct)
             .ConfigureAwait(false);
@@ -323,6 +326,26 @@ public sealed class TelegramMessageSender : IMessageSender
             await PersistMessageIdMappingAsync(sent.MessageId, chatId, correlationId, ct)
                 .ConfigureAwait(false);
         }
+
+        // Stage 3.5 — persist the pending question with the LAST
+        // chunk's message id (the chunk that carries the inline
+        // keyboard, so callback resolution lines up with the row).
+        // Per evaluator iter-1 item 6 this call PROPAGATES failures
+        // instead of swallowing them: the pending-question row is
+        // load-bearing for the callback handler and the timeout
+        // sweep, so a missing row would mean the operator's tap
+        // resolves as "unknown question" and the agent waits forever
+        // for a default that never fires. Per evaluator iter-3
+        // item 4 the wrapped PendingQuestionPersistenceException is
+        // a SPECIALIZED recovery signal — Stage 4.1's
+        // OutboundQueueProcessor pattern-matches it and calls
+        // IPendingQuestionStore.StoreAsync directly with the
+        // recovered envelope (NOT a generic SendQuestionAsync retry,
+        // which would re-send the message to Telegram). See
+        // architecture.md §3.1 / §5.2 invariant 1 and
+        // implementation-plan.md Stage 3.5 step 5 for the contract.
+        await PersistPendingQuestionAsync(envelope, chatId, lastMessageId, ct)
+            .ConfigureAwait(false);
 
         return new SendResult(lastMessageId);
     }
@@ -594,6 +617,92 @@ public sealed class TelegramMessageSender : IMessageSender
             }
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Stage 3.5 — persist the pending question record after a
+    /// successful Telegram send so callback resolution, awaiting-
+    /// comment correlation, and the timeout default-action sweep have
+    /// a durable row to consult. Unlike
+    /// <see cref="PersistMessageIdMappingAsync"/> (where the mapping
+    /// is a cache-friendly fast-lookup index and a missing entry only
+    /// degrades reply correlation), the pending-question row is
+    /// LOAD-BEARING for the entire callback/timeout pipeline — a
+    /// missing row means the operator's button tap cannot be resolved
+    /// and the timeout sweep cannot fire the default action, so the
+    /// agent waits forever. Per evaluator item 6 iter-1 this method
+    /// therefore propagates persistence failures instead of swallowing
+    /// them: the caller (a command handler or
+    /// <c>OutboundQueueProcessor</c>) sees the exception, re-throws
+    /// from <see cref="SendQuestionAsync"/>, and the durable outbound
+    /// queue's retry / dead-letter machinery picks up the recovery.
+    /// </summary>
+    private async Task PersistPendingQuestionAsync(
+        AgentQuestionEnvelope envelope,
+        long chatId,
+        long lastMessageId,
+        CancellationToken ct)
+    {
+        if (lastMessageId == 0)
+        {
+            // Same guard as PersistMessageIdMappingAsync — a 0 id
+            // here means the chunk loop never completed a single
+            // round-trip; the send path would have thrown already.
+            return;
+        }
+
+        try
+        {
+            await _pendingQuestionStore
+                .StoreAsync(envelope, chatId, lastMessageId, ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cooperative cancellation is not a persistence failure;
+            // bubble the OCE so the caller observes the host-shutdown
+            // signal unchanged.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Iter-3 evaluator item 4 — the prior comment claimed a
+            // generic queue retry "will NOT double-send" because
+            // StoreAsync is idempotent. That was wrong: the obvious
+            // retry mechanism for SendQuestionAsync is to RE-RUN
+            // SendQuestionAsync, which calls _bot.SendMessage(...)
+            // again BEFORE reaching StoreAsync — Telegram has no
+            // idempotency on outbound sends, so the operator would
+            // see two question messages. The actual recovery
+            // contract (architecture.md §3.1 / §5.2 invariant 1;
+            // implementation-plan.md Stage 3.5 step 5) is that this
+            // throw surfaces a TYPED PendingQuestionPersistenceException
+            // carrying every key the recovery side needs (QuestionId,
+            // TelegramChatId, TelegramMessageId, CorrelationId), and
+            // the Stage 4.1 OutboundQueueProcessor pattern-matches
+            // that exception to take a SPECIALIZED recovery path —
+            // it calls IPendingQuestionStore.StoreAsync DIRECTLY with
+            // the recovered envelope, bypassing SendQuestionAsync
+            // entirely so the Telegram message is NOT re-sent. Until
+            // Stage 4.1 lands the OutboundQueueProcessor, callers
+            // MUST NOT re-invoke SendQuestionAsync on this exception
+            // type (doing so would re-send to Telegram); any sender
+            // catch-all that auto-retries on Exception should add an
+            // explicit `when (ex is not PendingQuestionPersistenceException)`
+            // clause.
+            _logger.LogError(
+                ex,
+                "PersistPendingQuestionAsync failed AFTER a successful Telegram send. Propagating as PendingQuestionPersistenceException so the Stage 4.1 OutboundQueueProcessor takes the specialized 'StoreAsync-only' recovery path (NOT a generic SendQuestionAsync retry, which would re-send to Telegram). QuestionId={QuestionId} TelegramMessageId={TelegramMessageId} CorrelationId={CorrelationId}",
+                envelope.Question.QuestionId,
+                lastMessageId,
+                envelope.Question.CorrelationId);
+            throw new PendingQuestionPersistenceException(
+                envelope.Question.QuestionId,
+                chatId,
+                lastMessageId,
+                envelope.Question.CorrelationId,
+                ex);
+        }
     }
 
     private async Task PersistMessageIdMappingAsync(
