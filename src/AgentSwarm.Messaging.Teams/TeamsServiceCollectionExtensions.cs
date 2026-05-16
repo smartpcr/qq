@@ -1,9 +1,10 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Extensions;
 using AgentSwarm.Messaging.Teams.Lifecycle;
-using AgentSwarm.Messaging.Teams.Security;
+using AgentSwarm.Messaging.Teams.Outbox;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -392,4 +393,20 @@ public static class TeamsServiceCollectionExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Keyed-service key under which the un-decorated <see cref="TeamsProactiveNotifier"/>
+    /// is registered as <see cref="IProactiveNotifier"/> for resolution by
+    /// <see cref="Outbox.TeamsOutboxDispatcher"/>. Public so tests can resolve the inner
+    /// notifier without picking up the outbox decorator.
+    /// </summary>
+    public const string InnerProactiveNotifierKey = "teams.inner";
+
+    /// <summary>
+    /// Keyed-service key under which the un-decorated <see cref="TeamsMessengerConnector"/>
+    /// is registered as <see cref="IMessengerConnector"/> for resolution by
+    /// <see cref="Outbox.TeamsOutboxDispatcher"/>. Public so tests can resolve the inner
+    /// connector without picking up the outbox decorator.
+    /// </summary>
+    public const string InnerMessengerConnectorKey = "teams.inner";
 }

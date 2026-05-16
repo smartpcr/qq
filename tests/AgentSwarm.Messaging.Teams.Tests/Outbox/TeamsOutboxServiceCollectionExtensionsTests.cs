@@ -1,0 +1,422 @@
+using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Outbox;
+using Microsoft.Bot.Builder.Integration.AspNet.Core;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace AgentSwarm.Messaging.Teams.Tests.Outbox;
+
+/// <summary>
+/// DI registration tests for <see cref="TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/>.
+/// Validates that the decorator wiring (a) replaces the public
+/// <see cref="IProactiveNotifier"/> / <see cref="IMessengerConnector"/> registrations with
+/// the outbox-backed wrappers, (b) re-exposes the original implementations under the
+/// <see cref="IInnerTeamsProactiveNotifier"/> / <see cref="IInnerTeamsMessengerConnector"/>
+/// marker interfaces, (c) registers <see cref="IOutboxDispatcher"/> as
+/// <see cref="TeamsOutboxDispatcher"/>, (d) honours the <see cref="OutboxOptions"/>
+/// configure callback, (e) registers <see cref="OutboxRetryEngine"/> as a hosted service,
+/// (f) fails fast when the inner notifier/connector are not yet registered, and
+/// (g) works with the canonical <see cref="TeamsServiceCollectionExtensions.AddTeamsMessengerConnector"/>
+/// + <see cref="TeamsServiceCollectionExtensions.AddTeamsProactiveNotifier"/> composition —
+/// the iter-1 evaluator regression where the keyed-only "teams" connector registration was
+/// bypassing the outbox.
+/// </summary>
+public sealed class TeamsOutboxServiceCollectionExtensionsTests
+{
+    [Fact]
+    public void AddTeamsOutboxEngine_PublicNotifierAndConnectorAreOutboxBackedDecorators()
+    {
+        var services = SeedBaseServices();
+
+        services.AddTeamsOutboxEngine();
+
+        using var provider = services.BuildServiceProvider();
+
+        Assert.IsType<OutboxBackedProactiveNotifier>(provider.GetRequiredService<IProactiveNotifier>());
+        Assert.IsType<OutboxBackedMessengerConnector>(provider.GetRequiredService<IMessengerConnector>());
+    }
+
+    [Fact]
+    public void AddTeamsOutboxEngine_InnerMarkersExposeOriginalImplementations()
+    {
+        var originalNotifier = new RecordingProactiveNotifier();
+        var originalConnector = new RecordingMessengerConnector();
+
+        var services = SeedBaseServices(originalNotifier, originalConnector);
+
+        services.AddTeamsOutboxEngine();
+
+        using var provider = services.BuildServiceProvider();
+
+        Assert.Same(originalNotifier, provider.GetRequiredService<IInnerTeamsProactiveNotifier>().Inner);
+        Assert.Same(originalConnector, provider.GetRequiredService<IInnerTeamsMessengerConnector>().Inner);
+    }
+
+    [Fact]
+    public void AddTeamsOutboxEngine_RegistersDispatcherAsTeamsOutboxDispatcher()
+    {
+        var services = SeedBaseServices();
+
+        services.AddTeamsOutboxEngine();
+
+        var descriptor = Assert.Single(services, d => d.ServiceType == typeof(IOutboxDispatcher));
+        Assert.Equal(typeof(TeamsOutboxDispatcher), descriptor.ImplementationType);
+    }
+
+    [Fact]
+    public void AddTeamsOutboxEngine_RegistersRetryEngineAsHostedService()
+    {
+        var services = SeedBaseServices();
+
+        services.AddTeamsOutboxEngine();
+
+        Assert.Contains(services,
+            d => d.ServiceType == typeof(IHostedService)
+                 && d.ImplementationType == typeof(OutboxRetryEngine));
+    }
+
+    [Fact]
+    public void AddTeamsOutboxEngine_ConfigureCallbackOverridesOptions()
+    {
+        var services = SeedBaseServices();
+
+        services.AddTeamsOutboxEngine(o =>
+        {
+            o.PollingIntervalMs = 250;
+            o.BatchSize = 7;
+            o.MaxAttempts = 9;
+            o.RateLimitPerSecond = 13;
+        });
+
+        using var provider = services.BuildServiceProvider();
+        var options = provider.GetRequiredService<OutboxOptions>();
+
+        Assert.Equal(250, options.PollingIntervalMs);
+        Assert.Equal(7, options.BatchSize);
+        Assert.Equal(9, options.MaxAttempts);
+        Assert.Equal(13, options.RateLimitPerSecond);
+    }
+
+    [Fact]
+    public void AddTeamsOutboxEngine_IsIdempotentForMarkerRegistration()
+    {
+        var originalNotifier = new RecordingProactiveNotifier();
+        var originalConnector = new RecordingMessengerConnector();
+        var services = SeedBaseServices(originalNotifier, originalConnector);
+
+        services.AddTeamsOutboxEngine();
+        services.AddTeamsOutboxEngine();
+
+        using var provider = services.BuildServiceProvider();
+
+        // Second call must NOT re-wrap (i.e. inner must still be the original, not the
+        // first-iteration decorator that the second call would have captured otherwise).
+        Assert.Same(originalNotifier, provider.GetRequiredService<IInnerTeamsProactiveNotifier>().Inner);
+        Assert.Same(originalConnector, provider.GetRequiredService<IInnerTeamsMessengerConnector>().Inner);
+    }
+
+    [Fact]
+    public void AddTeamsOutboxEngine_ThrowsWhenInnerProactiveNotifierMissing()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IMessengerConnector>(new RecordingMessengerConnector());
+        services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
+        var store = new RecordingConversationReferenceStore();
+        services.AddSingleton<IConversationReferenceStore>(store);
+        services.AddSingleton<IConversationReferenceRouter>(store);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => services.AddTeamsOutboxEngine());
+        Assert.Contains("IProactiveNotifier", ex.Message);
+    }
+
+    [Fact]
+    public void AddTeamsOutboxEngine_ThrowsWhenInnerMessengerConnectorMissing()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IProactiveNotifier>(new RecordingProactiveNotifier());
+        services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
+        var store = new RecordingConversationReferenceStore();
+        services.AddSingleton<IConversationReferenceStore>(store);
+        services.AddSingleton<IConversationReferenceRouter>(store);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => services.AddTeamsOutboxEngine());
+        Assert.Contains("IMessengerConnector", ex.Message);
+    }
+
+    private static IServiceCollection SeedBaseServices(
+        RecordingProactiveNotifier? notifier = null,
+        RecordingMessengerConnector? connector = null)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+
+        services.AddSingleton<IProactiveNotifier>(notifier ?? new RecordingProactiveNotifier());
+        services.AddSingleton<IMessengerConnector>(connector ?? new RecordingMessengerConnector());
+
+        var store = new RecordingConversationReferenceStore();
+        services.AddSingleton<IConversationReferenceStore>(store);
+        services.AddSingleton<IConversationReferenceRouter>(store);
+
+        services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
+
+        return services;
+    }
+
+    // -------------------------------------------------------------------------------------
+    // iter-2 regression tests — the iter-1 evaluator found that AddTeamsOutboxEngine threw
+    // on the canonical composition (AddTeamsMessengerConnector registers IMessengerConnector
+    // ONLY as a keyed "teams" service) and that even with a host-supplied unkeyed
+    // registration the keyed alias bypassed the outbox. The tests below pin both
+    // regressions: (1) the canonical composition resolves end-to-end without throwing, and
+    // (2) BOTH the keyed and unkeyed IMessengerConnector contracts resolve to the same
+    // OutboxBackedMessengerConnector singleton so every send path goes through the outbox.
+    // -------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Iter-2 evaluator regression — the canonical Teams composition
+    /// (<c>AddTeamsMessengerConnector</c> + <c>AddTeamsProactiveNotifier</c> +
+    /// <c>AddTeamsOutboxEngine</c>) must wire end-to-end. The iter-1 implementation threw
+    /// because <c>AddTeamsMessengerConnector</c> only registered the keyed alias and the
+    /// decorator was searching for an unkeyed descriptor.
+    /// </summary>
+    [Fact]
+    public void AddTeamsOutboxEngine_CanonicalTeamsComposition_BothKeyedAndUnkeyedConnectorResolveToOutboxWrapper()
+    {
+        var services = BuildCanonicalTeamsHost();
+
+        services.AddTeamsOutboxEngine();
+
+        using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        var unkeyed = provider.GetRequiredService<IMessengerConnector>();
+        var keyed = provider.GetRequiredKeyedService<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey);
+
+        Assert.IsType<OutboxBackedMessengerConnector>(unkeyed);
+        Assert.IsType<OutboxBackedMessengerConnector>(keyed);
+        // Same singleton — both resolution paths go through the same wrapper instance so a
+        // single outbox enqueue is performed regardless of which contract the caller used.
+        Assert.Same(unkeyed, keyed);
+
+        // The IProactiveNotifier contract is decorated too.
+        Assert.IsType<OutboxBackedProactiveNotifier>(provider.GetRequiredService<IProactiveNotifier>());
+
+        // The pre-decoration TeamsMessengerConnector singleton is reachable via the inner
+        // marker — the dispatcher (and tests that pin underlying delivery semantics) use
+        // this contract to reach the un-decorated implementation.
+        var inner = provider.GetRequiredService<IInnerTeamsMessengerConnector>().Inner;
+        Assert.IsType<TeamsMessengerConnector>(inner);
+        Assert.Same(provider.GetRequiredService<TeamsMessengerConnector>(), inner);
+    }
+
+    /// <summary>
+    /// Iter-2 evaluator regression — focused descriptor-level assertion that the keyed
+    /// "teams" registration is REPLACED by the outbox decorator rather than left pointing
+    /// at the pre-decoration <see cref="TeamsMessengerConnector"/>. Without this
+    /// rebind, callers using
+    /// <see cref="Microsoft.Extensions.DependencyInjection.ServiceProviderKeyedServiceExtensions.GetRequiredKeyedService{T}(IServiceProvider, object?)"/>
+    /// would silently bypass the outbox even though the unkeyed contract was wrapped.
+    /// </summary>
+    [Fact]
+    public void AddTeamsOutboxEngine_CanonicalTeamsComposition_KeyedTeamsDescriptorIsRebound()
+    {
+        var services = BuildCanonicalTeamsHost();
+
+        // Pre-condition: exactly one keyed "teams" descriptor exists, pointing at the
+        // concrete TeamsMessengerConnector.
+        Assert.Single(services, IsKeyedTeamsMessengerConnectorDescriptor);
+
+        services.AddTeamsOutboxEngine();
+
+        // Post-condition: exactly one keyed "teams" descriptor still exists (no
+        // duplication), but its factory now resolves to the wrapper.
+        Assert.Single(services, IsKeyedTeamsMessengerConnectorDescriptor);
+
+        using var provider = services.BuildServiceProvider(validateScopes: true);
+        var keyed = provider.GetRequiredKeyedService<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey);
+        Assert.IsType<OutboxBackedMessengerConnector>(keyed);
+    }
+
+    /// <summary>
+    /// Iter-2 evaluator regression — covers the keyed-only branch of
+    /// <c>DecorateMessengerConnector</c> (host registers only the keyed alias without
+    /// also exposing the concrete <see cref="TeamsMessengerConnector"/> singleton). The
+    /// decorator must materialize the inner from the keyed descriptor's factory, remove
+    /// the original keyed descriptor to avoid a self-referential cycle, and register the
+    /// wrapper under both the keyed and unkeyed contracts.
+    /// </summary>
+    [Fact]
+    public void AddTeamsOutboxEngine_KeyedOnlyConnector_DecoratesBothKeyedAndUnkeyed()
+    {
+        var originalConnector = new RecordingMessengerConnector();
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IProactiveNotifier>(new RecordingProactiveNotifier());
+        services.AddKeyedSingleton<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey,
+            (_, _) => originalConnector);
+
+        var store = new RecordingConversationReferenceStore();
+        services.AddSingleton<IConversationReferenceStore>(store);
+        services.AddSingleton<IConversationReferenceRouter>(store);
+        services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
+
+        services.AddTeamsOutboxEngine();
+
+        using var provider = services.BuildServiceProvider();
+
+        var unkeyed = provider.GetRequiredService<IMessengerConnector>();
+        var keyed = provider.GetRequiredKeyedService<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey);
+
+        Assert.IsType<OutboxBackedMessengerConnector>(unkeyed);
+        Assert.IsType<OutboxBackedMessengerConnector>(keyed);
+        Assert.Same(unkeyed, keyed);
+
+        // The recording connector — captured from the keyed descriptor — is reachable
+        // through the inner marker so the dispatcher can dispatch through it.
+        Assert.Same(originalConnector, provider.GetRequiredService<IInnerTeamsMessengerConnector>().Inner);
+    }
+
+    /// <summary>
+    /// Iter-2 evaluator regression — idempotency under the canonical composition. Calling
+    /// <c>AddTeamsOutboxEngine</c> twice on a graph that already includes the keyed
+    /// "teams" alias must not stack additional keyed descriptors (the marker guard
+    /// short-circuits the second invocation) and the keyed resolution must still hit the
+    /// wrapper from the first invocation.
+    /// </summary>
+    [Fact]
+    public void AddTeamsOutboxEngine_CanonicalComposition_IsIdempotentForKeyedRebind()
+    {
+        var services = BuildCanonicalTeamsHost();
+
+        services.AddTeamsOutboxEngine();
+        services.AddTeamsOutboxEngine();
+
+        // The keyed descriptor count is still one — the second invocation is a no-op.
+        Assert.Single(services, IsKeyedTeamsMessengerConnectorDescriptor);
+        // Only one unkeyed wrapper descriptor too.
+        Assert.Single(services, d => d.ServiceType == typeof(IMessengerConnector) && !d.IsKeyedService);
+        // Inner marker still appears exactly once.
+        Assert.Single(services, d => d.ServiceType == typeof(IInnerTeamsMessengerConnector));
+
+        using var provider = services.BuildServiceProvider(validateScopes: true);
+        Assert.IsType<OutboxBackedMessengerConnector>(
+            provider.GetRequiredKeyedService<IMessengerConnector>(TeamsServiceCollectionExtensions.MessengerKey));
+    }
+
+    /// <summary>
+    /// When the host pre-registers BOTH the keyed alias and an explicit unkeyed
+    /// <see cref="IMessengerConnector"/> (e.g. a hybrid wiring scenario), the decorator
+    /// must rebind BOTH contracts so neither resolution path bypasses the outbox.
+    /// </summary>
+    [Fact]
+    public void AddTeamsOutboxEngine_KeyedAndUnkeyedBothPresent_RebindsBothToWrapper()
+    {
+        var unkeyedInner = new RecordingMessengerConnector();
+        var keyedInner = new RecordingMessengerConnector();
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IProactiveNotifier>(new RecordingProactiveNotifier());
+        services.AddSingleton<IMessengerConnector>(unkeyedInner);
+        services.AddKeyedSingleton<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey,
+            (_, _) => keyedInner);
+
+        var store = new RecordingConversationReferenceStore();
+        services.AddSingleton<IConversationReferenceStore>(store);
+        services.AddSingleton<IConversationReferenceRouter>(store);
+        services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
+
+        services.AddTeamsOutboxEngine();
+
+        using var provider = services.BuildServiceProvider();
+
+        var unkeyed = provider.GetRequiredService<IMessengerConnector>();
+        var keyed = provider.GetRequiredKeyedService<IMessengerConnector>(
+            TeamsServiceCollectionExtensions.MessengerKey);
+
+        Assert.IsType<OutboxBackedMessengerConnector>(unkeyed);
+        Assert.IsType<OutboxBackedMessengerConnector>(keyed);
+        Assert.Same(unkeyed, keyed);
+
+        // Inner is the unkeyed descriptor (the documented preference order) — the keyed
+        // descriptor's recording instance is no longer reachable because the keyed alias
+        // is rebound to the unkeyed wrapper.
+        Assert.Same(unkeyedInner, provider.GetRequiredService<IInnerTeamsMessengerConnector>().Inner);
+    }
+
+    /// <summary>
+    /// When the keyed "teams" alias is NOT present (host registered only an unkeyed
+    /// <see cref="IMessengerConnector"/> via the legacy/manual pattern), the decorator
+    /// must NOT synthesise a new keyed registration — preserving the host's wiring
+    /// shape. Only the unkeyed contract is rebound to the wrapper.
+    /// </summary>
+    [Fact]
+    public void AddTeamsOutboxEngine_UnkeyedOnly_DoesNotSynthesiseKeyedAlias()
+    {
+        var services = SeedBaseServices();
+
+        Assert.DoesNotContain(services, IsKeyedTeamsMessengerConnectorDescriptor);
+
+        services.AddTeamsOutboxEngine();
+
+        // No keyed "teams" descriptor was created — the helper does not impose a wiring
+        // shape that the host did not opt into.
+        Assert.DoesNotContain(services, IsKeyedTeamsMessengerConnectorDescriptor);
+
+        using var provider = services.BuildServiceProvider();
+        Assert.IsType<OutboxBackedMessengerConnector>(provider.GetRequiredService<IMessengerConnector>());
+        Assert.Throws<InvalidOperationException>(
+            () => provider.GetRequiredKeyedService<IMessengerConnector>(TeamsServiceCollectionExtensions.MessengerKey));
+    }
+
+    private static bool IsKeyedTeamsMessengerConnectorDescriptor(ServiceDescriptor d) =>
+        d.ServiceType == typeof(IMessengerConnector)
+        && d.IsKeyedService
+        && Equals(d.ServiceKey, TeamsServiceCollectionExtensions.MessengerKey);
+
+    /// <summary>
+    /// Build a host graph that mirrors the canonical production composition documented in
+    /// <see cref="TeamsServiceCollectionExtensions.AddTeamsMessengerConnector"/> /
+    /// <see cref="TeamsServiceCollectionExtensions.AddTeamsProactiveNotifier"/>: register
+    /// every collaborator the connector + notifier need (CloudAdapter,
+    /// TeamsMessagingOptions, store, router, question store, card-state store, logger),
+    /// register the canonical Teams DI helpers (which expose IMessengerConnector ONLY as
+    /// the keyed "teams" alias), and add a recording <see cref="IMessageOutbox"/> so the
+    /// outbox decorator can build.
+    /// </summary>
+    private static ServiceCollection BuildCanonicalTeamsHost()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+
+        services.AddSingleton<CloudAdapter>(_ => new TeamsMessengerConnectorTests.RecordingCloudAdapter());
+        services.AddSingleton(new TeamsMessagingOptions { MicrosoftAppId = "app-id" });
+        services.AddSingleton<IConversationReferenceStore, TeamsMessengerConnectorTests.ConnectorRecordingConversationReferenceStore>();
+        services.AddSingleton<IConversationReferenceRouter, TestDoubles.RecordingConversationReferenceRouter>();
+        services.AddSingleton<IAgentQuestionStore, TeamsMessengerConnectorTests.RecordingAgentQuestionStore>();
+        services.AddSingleton<ICardStateStore, TeamsMessengerConnectorTests.RecordingCardStateStore>();
+        services.AddSingleton(typeof(Microsoft.Extensions.Logging.ILogger<>), typeof(NullLogger<>));
+
+        // Canonical Teams wiring — registers TeamsMessengerConnector (concrete), the keyed
+        // "teams" IMessengerConnector alias, and TeamsProactiveNotifier under
+        // IProactiveNotifier. NO unkeyed IMessengerConnector is registered.
+        services.AddTeamsProactiveNotifier();
+
+        // Outbox infrastructure — the production EF Core helper would register
+        // IMessageOutbox via AddSqlMessageOutbox; for DI tests a recording double is
+        // sufficient because the wrapper only calls EnqueueAsync.
+        services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
+
+        return services;
+    }
+}
