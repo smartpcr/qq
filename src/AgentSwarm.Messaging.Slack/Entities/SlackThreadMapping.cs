@@ -1,5 +1,3 @@
-using Microsoft.EntityFrameworkCore;
-
 namespace AgentSwarm.Messaging.Slack.Entities;
 
 /// <summary>
@@ -13,21 +11,14 @@ namespace AgentSwarm.Messaging.Slack.Entities;
 /// list is the canonical surface specified by architecture.md section 3.2.
 /// </para>
 /// <para>
-/// A unique constraint on the tuple <c>(TeamId, ChannelId, ThreadTs)</c>
-/// is declared at the entity level via the EF Core
-/// <see cref="IndexAttribute"/> annotation below, so the constraint is
-/// part of the entity contract even before Stage 2.2 wires up the
-/// <c>IEntityTypeConfiguration&lt;SlackThreadMapping&gt;</c> /
-/// migration. The annotation ensures the database schema enforces:
-/// the same Slack thread cannot be mapped to two different tasks.
+/// The unique constraint on the tuple <c>(TeamId, ChannelId, ThreadTs)</c>
+/// required by architecture.md section 3.2 (so the same Slack thread cannot
+/// be claimed by two different agent tasks) is declared in
+/// <c>AgentSwarm.Messaging.Slack.Persistence.SlackThreadMappingConfiguration</c>
+/// (Stage 2.2). The entity itself stays free of mapping annotations so the
+/// schema definition lives entirely in one place.
 /// </para>
 /// </remarks>
-[Index(
-    nameof(TeamId),
-    nameof(ChannelId),
-    nameof(ThreadTs),
-    IsUnique = true,
-    Name = "IX_SlackThreadMapping_TeamId_ChannelId_ThreadTs")]
 public sealed class SlackThreadMapping
 {
     /// <summary>

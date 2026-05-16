@@ -30,7 +30,7 @@ public static class SlackConnectorServiceCollectionExtensions
     /// <param name="services">The service collection to register against.</param>
     /// <param name="configuration">The application configuration root.</param>
     /// <returns>The same <paramref name="services"/> instance for chaining.</returns>
-    public static IServiceCollection AddSlackConnector(
+    public static IServiceCollection AddSlackConnectorOptions(
         this IServiceCollection services,
         IConfiguration configuration)
     {
