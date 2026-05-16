@@ -366,6 +366,23 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
             // worse than no onboarding because subsequent commands
             // would route to a subset of workspaces with no
             // operator-visible signal.
+            //
+            // Iter-6 reviewer security fix — the DenialReason flows
+            // into the operator-facing AuthorizationResult and is
+            // documented in AuthorizationResult.cs as a "human-
+            // readable rejection reason"; defence-in-depth dictates
+            // that we never embed the raw ex.Message in it because
+            // an EF Core / DB-provider exception can surface
+            // constraint names ("IX_OperatorBindings_OperatorAlias_TenantId"),
+            // column / table identifiers, SQL state, and (for some
+            // providers) connection-string fragments. The full
+            // exception is already attached to the structured log
+            // line above via _logger.LogError(ex, ...) so on-call
+            // can correlate by (TelegramUserId, TelegramChatId);
+            // the operator-visible denial keeps only the safe
+            // structural hints (atomic rollback + alias-uniqueness
+            // common cause) and points the operator at the server
+            // logs for the underlying diagnostic.
             _logger.LogError(
                 ex,
                 "/start denied — RegisterManyAsync failed for user {TelegramUserId} chat {TelegramChatId} after staging {BindingCount} workspace binding(s); transaction rolled back, no rows persisted.",
@@ -373,10 +390,11 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
                 chatIdValue,
                 registrations.Count);
             return Deny(
-                $"User {userId} onboarding failed: {ex.Message}. "
-                + "All workspace bindings were rolled back atomically; no rows were persisted. "
-                + "Common cause: a (OperatorAlias, TenantId) collision with another operator's binding "
-                + "(per architecture.md lines 116-119 alias uniqueness).");
+                $"User {userId} onboarding failed and all workspace bindings were rolled back "
+                + "atomically; no rows were persisted. Common cause: a (OperatorAlias, TenantId) "
+                + "collision with another operator's binding (per architecture.md lines 116-119 "
+                + "alias uniqueness). See server logs (correlate by Telegram user/chat id) for "
+                + "the underlying registry exception.");
         }
 
         // Re-query to return the persistent records (with their real
