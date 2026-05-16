@@ -7,6 +7,7 @@
 namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -87,6 +88,21 @@ using SlackNet;
 /// the durable outbound queue, NOT this client (architecture.md §2.15,
 /// implementation-plan Stage 6.4 step 5).
 /// </para>
+/// <para>
+/// The production factory built by
+/// <see cref="BuildCachingApiClientFactory"/> reuses a single
+/// <see cref="SlackApiClient"/> (and its internally-allocated
+/// <see cref="System.Net.Http.HttpClient"/>) per bot OAuth token via a
+/// <see cref="ConcurrentDictionary{TKey, TValue}"/>. Without this
+/// cache, every <c>views.open</c> invocation would allocate a fresh
+/// <see cref="System.Net.Http.HttpClient"/>, which is the classic
+/// socket-exhaustion anti-pattern under sustained modal-open load
+/// (concurrent reviewers clicking buttons during a deployment).
+/// Workspace bot tokens are long-lived and the set is small, so the
+/// per-instance cache stays bounded without an eviction policy and
+/// each cached <see cref="SlackApiClient"/> can safely be shared
+/// across concurrent calls (SlackNet's client is thread-safe).
+/// </para>
 /// </remarks>
 internal sealed class SlackDirectApiClient : ISlackViewsOpenClient
 {
@@ -139,9 +155,14 @@ internal sealed class SlackDirectApiClient : ISlackViewsOpenClient
     private readonly TimeSpan triggerIdDeadline;
 
     /// <summary>
-    /// Production constructor: builds a fresh SlackNet
-    /// <see cref="SlackApiClient"/> per call using the resolved
-    /// workspace bot token.
+    /// Production constructor: reuses a single SlackNet
+    /// <see cref="SlackApiClient"/> per bot OAuth token via a per-
+    /// instance <see cref="ConcurrentDictionary{TKey, TValue}"/>
+    /// built by <see cref="BuildCachingApiClientFactory"/>. The cache
+    /// avoids the socket-exhaustion failure mode that would arise
+    /// from allocating a new <see cref="System.Net.Http.HttpClient"/>
+    /// on every <c>views.open</c> call under sustained modal-open
+    /// load.
     /// </summary>
     public SlackDirectApiClient(
         ISlackWorkspaceConfigStore workspaceStore,
@@ -155,7 +176,7 @@ internal sealed class SlackDirectApiClient : ISlackViewsOpenClient
             rateLimiter,
             auditWriter,
             logger,
-            apiClientFactory: static token => new SlackApiClient(token),
+            apiClientFactory: BuildCachingApiClientFactory(),
             timeProvider: TimeProvider.System)
     {
     }
@@ -249,6 +270,46 @@ internal sealed class SlackDirectApiClient : ISlackViewsOpenClient
         }
 
         return SlackDirectApiResult.Failure(result.Kind, result.Error, BuildEphemeralMessage(result));
+    }
+
+    /// <summary>
+    /// Builds the production <see cref="ISlackApiClient"/> factory
+    /// used by the parameterless constructor. The returned delegate
+    /// closes over a private
+    /// <see cref="ConcurrentDictionary{TKey, TValue}"/> that reuses a
+    /// single <see cref="SlackApiClient"/> (and its internally-
+    /// allocated <see cref="System.Net.Http.HttpClient"/>) per bot
+    /// OAuth token, preventing the socket-exhaustion anti-pattern
+    /// that would otherwise occur under sustained modal-open load
+    /// (e.g., many concurrent reviewers clicking buttons during a
+    /// deployment).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Workspace bot tokens are long-lived (they only rotate via an
+    /// explicit OAuth re-install) and the set is bounded by the
+    /// number of registered workspaces, so the per-instance cache
+    /// stays small without an eviction policy. SlackNet's
+    /// <see cref="SlackApiClient"/> is documented to be thread-safe
+    /// and is the standard SlackNet usage pattern for long-lived
+    /// reuse.
+    /// </para>
+    /// <para>
+    /// The cache is intentionally <b>per instance</b> rather than
+    /// <c>static</c> so a future DI lifetime change (e.g., scoped
+    /// per-tenant container) does not silently leak
+    /// <see cref="SlackApiClient"/> instances across composition
+    /// roots, and so test harnesses that new up multiple connector
+    /// instances do not see cross-test interference.
+    /// </para>
+    /// </remarks>
+    private static Func<string, ISlackApiClient> BuildCachingApiClientFactory()
+    {
+        // OAuth tokens are case-sensitive opaque strings, so use
+        // Ordinal comparison rather than the default invariant-
+        // culture comparer.
+        ConcurrentDictionary<string, ISlackApiClient> cache = new(StringComparer.Ordinal);
+        return token => cache.GetOrAdd(token, static t => new SlackApiClient(t));
     }
 
     /// <summary>
@@ -361,6 +422,11 @@ internal sealed class SlackDirectApiClient : ISlackViewsOpenClient
 
             try
             {
+                // The production factory caches one ISlackApiClient
+                // (and its internal HttpClient) per bot token, so
+                // repeated invocations reuse the same connection pool
+                // instead of allocating a fresh HttpClient per call.
+                // See BuildCachingApiClientFactory remarks.
                 ISlackApiClient apiClient = this.apiClientFactory(botToken);
                 Dictionary<string, object> args = new(StringComparer.Ordinal)
                 {
