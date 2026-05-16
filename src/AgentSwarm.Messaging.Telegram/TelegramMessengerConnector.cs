@@ -79,6 +79,22 @@ namespace AgentSwarm.Messaging.Telegram;
 /// observers (audit, metrics) may consume.
 /// </para>
 /// <para>
+/// <b>Inbound — per-call batch cap.</b> Each <see cref="ReceiveAsync"/>
+/// invocation drains at most <see cref="MaxDrainBatchSize"/> events
+/// before returning, even if more are buffered. The story-level
+/// requirement is "burst alerts from 100+ agents without message loss"
+/// (functional requirements / Performance row), and the upstream
+/// <see cref="ProcessedMessengerEventChannel"/> is unbounded precisely
+/// so the producer side never drops — but on the consumer side, a
+/// single drain returning thousands of events in one
+/// <see cref="IReadOnlyList{T}"/> allocation creates a latency spike
+/// and GC pressure for the agent-swarm event loop. Capping per call
+/// preserves the no-loss guarantee (the residue stays buffered for the
+/// next poll) while bounding the worst-case allocation; this fits the
+/// existing poll-based contract because callers already loop on
+/// <see cref="ReceiveAsync"/>.
+/// </para>
+/// <para>
 /// <b>Lifecycle.</b> Registered as a singleton in
 /// <see cref="TelegramServiceCollectionExtensions.AddTelegram"/>: the
 /// connector is stateless beyond its injected dependencies and the
@@ -122,6 +138,29 @@ public sealed class TelegramMessengerConnector : IMessengerConnector
     /// <c>alert:{AgentId}:{AlertId}</c> is well-formed.
     /// </summary>
     public const string AlertIdMetadataKey = "AlertId";
+
+    /// <summary>
+    /// Maximum number of <see cref="MessengerEvent"/> instances drained
+    /// by a single <see cref="ReceiveAsync"/> invocation. Bounds the
+    /// worst-case <see cref="List{T}"/> allocation and per-call latency
+    /// when the upstream <see cref="ProcessedMessengerEventChannel"/>
+    /// has buffered a large burst (e.g. the 100+ agent scenario in the
+    /// story functional requirements). Any residue stays in the
+    /// channel for the next poll; the consumer contract is already
+    /// loop-based, so capping per call does not regress the
+    /// "no message loss" guarantee — it only changes how many polls
+    /// the consumer needs to fully drain a burst.
+    /// </summary>
+    /// <remarks>
+    /// 500 is sized for the documented 100+ agent burst: even when 100
+    /// agents each enqueue ~5 events between drain ticks the entire
+    /// burst fits in a single call. Choosing a hard cap rather than a
+    /// constructor / per-call parameter keeps the
+    /// <see cref="IMessengerConnector"/> abstraction stable; tuning is
+    /// available as a follow-up if real-world telemetry shows the cap
+    /// is too tight for a specific deployment.
+    /// </remarks>
+    internal const int MaxDrainBatchSize = 500;
 
     private static readonly JsonSerializerOptions EnvelopeJsonOptions = new()
     {
@@ -261,13 +300,22 @@ public sealed class TelegramMessengerConnector : IMessengerConnector
     public Task<IReadOnlyList<MessengerEvent>> ReceiveAsync(CancellationToken ct)
     {
         // Poll-based contract: drain whatever the channel currently
-        // buffers and return immediately. TryRead never blocks; a
-        // channel with no pending items returns an empty list. The
-        // CancellationToken is honoured by an early exit if a caller
-        // races shutdown with a long drain, but draining itself is a
-        // non-blocking operation so cancellation rarely fires mid-loop.
+        // buffers (up to MaxDrainBatchSize) and return immediately.
+        // TryRead never blocks; a channel with no pending items returns
+        // an empty list. The cap bounds the worst-case allocation /
+        // latency when a 100+ agent burst has queued thousands of
+        // events between ticks (story functional requirements:
+        // "burst alerts from 100+ agents without message loss"); the
+        // residue stays in the unbounded ProcessedMessengerEventChannel
+        // and is delivered on the next poll, so the no-loss guarantee
+        // is preserved. The CancellationToken is honoured by an early
+        // exit if a caller races shutdown with a long drain, but
+        // draining itself is a non-blocking operation so cancellation
+        // rarely fires mid-loop.
         var drained = new List<MessengerEvent>();
-        while (!ct.IsCancellationRequested && _processedEventChannel.Reader.TryRead(out var ev))
+        while (drained.Count < MaxDrainBatchSize
+               && !ct.IsCancellationRequested
+               && _processedEventChannel.Reader.TryRead(out var ev))
         {
             drained.Add(ev);
         }
