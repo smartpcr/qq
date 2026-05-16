@@ -8,6 +8,7 @@ namespace AgentSwarm.Messaging.Core.Secrets;
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Options;
@@ -40,12 +41,27 @@ using Microsoft.Extensions.Options;
 /// provider directly.
 /// </para>
 /// <para>
+/// Cache slots hold <c>Lazy&lt;Task&lt;CacheEntry&gt;&gt;</c> rather than
+/// the raw <see cref="CacheEntry"/> so concurrent callers de-duplicate
+/// onto a single in-flight backend round-trip. Without this, N parallel
+/// readers arriving at TTL expiry would each observe the stale entry,
+/// each call the backend, and each race to overwrite the cache slot —
+/// turning every refresh into a thundering herd against Key Vault (PR
+/// #66 review thread on this file, line 126). The <see cref="Lazy{T}"/>
+/// is installed atomically via
+/// <see cref="ConcurrentDictionary{TKey, TValue}.GetOrAdd(TKey, TValue)"/>
+/// (cold miss) or
+/// <see cref="ConcurrentDictionary{TKey, TValue}.TryUpdate(TKey, TValue, TValue)"/>
+/// (TTL refresh): only the thread that wins the install triggers the
+/// inner call; everyone else awaits the same <see cref="Task{TResult}"/>.
+/// </para>
+/// <para>
 /// Cached secret values are tagged with
 /// <see cref="LogPropertyIgnoreAttribute"/> and the holding
 /// <see cref="CacheEntry"/> overrides <see cref="object.ToString"/> via
 /// <see cref="SecretScrubber.Scrub"/> so a careless
 /// <c>logger.LogInformation("entry={Entry}", entry)</c> emits the
-/// scrubbed placeholder instead of the raw secret material -- closing
+/// scrubbed placeholder instead of the raw secret material — closing
 /// the FR-022 / architecture.md §7.3 "never logged" requirement at the
 /// cache boundary.
 /// </para>
@@ -55,7 +71,7 @@ public sealed class CompositeSecretProvider : ISecretProvider
     private readonly ISecretProvider inner;
     private readonly TimeProvider timeProvider;
     private readonly TimeSpan refreshInterval;
-    private readonly ConcurrentDictionary<string, CacheEntry> cache;
+    private readonly ConcurrentDictionary<string, Lazy<Task<CacheEntry>>> cache;
 
     /// <summary>
     /// DI-friendly constructor that selects a backend based on
@@ -121,7 +137,7 @@ public sealed class CompositeSecretProvider : ISecretProvider
         this.inner = Select(resolved, environmentProvider, inMemoryProvider, kubernetesProvider, keyVaultProvider);
         this.timeProvider = timeProvider;
         this.refreshInterval = ResolveRefreshInterval(resolved.RefreshIntervalMinutes);
-        this.cache = new ConcurrentDictionary<string, CacheEntry>(StringComparer.Ordinal);
+        this.cache = new ConcurrentDictionary<string, Lazy<Task<CacheEntry>>>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -142,7 +158,7 @@ public sealed class CompositeSecretProvider : ISecretProvider
         this.inner = inner;
         this.timeProvider = timeProvider;
         this.refreshInterval = refreshInterval < TimeSpan.Zero ? TimeSpan.Zero : refreshInterval;
-        this.cache = new ConcurrentDictionary<string, CacheEntry>(StringComparer.Ordinal);
+        this.cache = new ConcurrentDictionary<string, Lazy<Task<CacheEntry>>>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -163,6 +179,17 @@ public sealed class CompositeSecretProvider : ISecretProvider
     /// <see cref="StringComparer.Ordinal"/> for the key. Failures
     /// (<see cref="SecretNotFoundException"/> and friends) are NOT
     /// cached so a transient outage does not poison the cache.
+    /// <para>
+    /// Concurrent callers that arrive while a refresh is in flight (or
+    /// arrive simultaneously on a cold miss) share the SAME inner
+    /// round-trip via the per-key <see cref="Lazy{T}"/>: this closes
+    /// the cache-stampede window that an unguarded
+    /// check-then-set pattern would open at TTL expiry under load.
+    /// The inner call is dispatched with <see cref="CancellationToken.None"/>
+    /// so a single caller cancelling does NOT abort the refresh for
+    /// the other waiters; each caller honours their own
+    /// <paramref name="ct"/> through <see cref="TaskAsyncExtensions.WaitAsync{TResult}(Task{TResult}, CancellationToken)"/>.
+    /// </para>
     /// </remarks>
     public async Task<string> GetSecretAsync(string secretRef, CancellationToken ct)
     {
@@ -179,16 +206,91 @@ public sealed class CompositeSecretProvider : ISecretProvider
             return await this.inner.GetSecretAsync(secretRef, ct).ConfigureAwait(false);
         }
 
-        DateTimeOffset now = this.timeProvider.GetUtcNow();
-        if (this.cache.TryGetValue(secretRef, out CacheEntry? cached)
-            && (now - cached.ResolvedAt) < this.refreshInterval)
+        // Bounded by the number of times a stampeded refresh slot can be
+        // re-installed between iterations; in practice this resolves in
+        // one or two passes even under heavy contention.
+        while (true)
         {
-            return cached.Value;
-        }
+            Lazy<Task<CacheEntry>> selected;
 
-        string value = await this.inner.GetSecretAsync(secretRef, ct).ConfigureAwait(false);
-        this.cache[secretRef] = new CacheEntry(value, now);
-        return value;
+            if (this.cache.TryGetValue(secretRef, out Lazy<Task<CacheEntry>>? existing))
+            {
+                // Fast path: a completed, still-fresh entry serves
+                // without touching the inner backend or the Lazy state
+                // machine.
+                if (existing.IsValueCreated)
+                {
+                    Task<CacheEntry> existingTask = existing.Value;
+
+                    if (existingTask.IsCompletedSuccessfully)
+                    {
+                        CacheEntry cached = existingTask.Result;
+                        if ((this.timeProvider.GetUtcNow() - cached.ResolvedAt) < this.refreshInterval)
+                        {
+                            return cached.Value;
+                        }
+
+                        // TTL has elapsed: try to atomically swap in a
+                        // fresh Lazy. TryUpdate only succeeds for the
+                        // single thread whose comparison value is still
+                        // the slot's current Lazy reference; everyone
+                        // else loops and joins the winner's task.
+                        Lazy<Task<CacheEntry>> refresh = this.CreateLazy(secretRef);
+                        if (this.cache.TryUpdate(secretRef, refresh, existing))
+                        {
+                            selected = refresh;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                    }
+                    else if (existingTask.IsFaulted || existingTask.IsCanceled)
+                    {
+                        // A previous attempt left a faulted Lazy behind
+                        // (e.g., the originating caller's catch handler
+                        // could not evict because the dictionary slot
+                        // had already been replaced and then this Lazy
+                        // was re-installed by yet another thread). Try
+                        // to evict and install a fresh attempt.
+                        Lazy<Task<CacheEntry>> refresh = this.CreateLazy(secretRef);
+                        if (this.cache.TryUpdate(secretRef, refresh, existing))
+                        {
+                            selected = refresh;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        // Inner call is in flight: join it instead of
+                        // issuing a parallel backend round-trip.
+                        selected = existing;
+                    }
+                }
+                else
+                {
+                    // The Lazy exists but its factory has not been
+                    // invoked yet (vanishingly small window between
+                    // GetOrAdd and the winning thread's .Value access).
+                    // Joining it triggers the factory under the
+                    // ExecutionAndPublication safety mode, so we still
+                    // de-duplicate.
+                    selected = existing;
+                }
+            }
+            else
+            {
+                // Cold miss: try to install our Lazy. If a competing
+                // thread beat us, GetOrAdd returns theirs and we join.
+                Lazy<Task<CacheEntry>> ours = this.CreateLazy(secretRef);
+                selected = this.cache.GetOrAdd(secretRef, ours);
+            }
+
+            return await this.AwaitAndHandleAsync(secretRef, selected, ct).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -245,6 +347,67 @@ public sealed class CompositeSecretProvider : ISecretProvider
             + "to be passed to CompositeSecretProvider. Use AddSecretProvider(IConfiguration) "
             + "which auto-registers all backends, or supply the backend explicitly via the test-only constructor overload.";
         return new InvalidOperationException(message);
+    }
+
+    private Lazy<Task<CacheEntry>> CreateLazy(string secretRef)
+    {
+        // ExecutionAndPublication guarantees the factory runs ONCE no
+        // matter how many threads race onto .Value, so even if two
+        // refresh attempts both succeed at TryUpdate against different
+        // prior snapshots, each individual Lazy still issues at most
+        // one inner call.
+        return new Lazy<Task<CacheEntry>>(
+            () => this.LoadAsync(secretRef),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+    }
+
+    private async Task<CacheEntry> LoadAsync(string secretRef)
+    {
+        // Capture the timestamp BEFORE the network call so the cache
+        // freshness window starts at the moment the refresh was kicked
+        // off, matching the pre-stampede-fix behaviour.
+        DateTimeOffset startedAt = this.timeProvider.GetUtcNow();
+
+        // Detach from any individual caller's CancellationToken: this
+        // task is shared across every awaiter that joined the same
+        // Lazy, so cancelling it would cancel the refresh for ALL of
+        // them. Per-caller cancellation is honoured separately in
+        // AwaitAndHandleAsync via Task.WaitAsync(ct).
+        string value = await this.inner.GetSecretAsync(secretRef, CancellationToken.None).ConfigureAwait(false);
+        return new CacheEntry(value, startedAt);
+    }
+
+    private async Task<string> AwaitAndHandleAsync(
+        string secretRef,
+        Lazy<Task<CacheEntry>> lazy,
+        CancellationToken ct)
+    {
+        try
+        {
+            CacheEntry entry = await lazy.Value.WaitAsync(ct).ConfigureAwait(false);
+            return entry.Value;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // The caller cancelled their wait. The shared inner task
+            // may still complete (it runs with CancellationToken.None)
+            // and serve concurrent / subsequent waiters, so we leave
+            // the Lazy in place.
+            throw;
+        }
+        catch
+        {
+            // The shared inner call faulted (SecretNotFoundException,
+            // transport failure, etc.). Evict the Lazy — but only if
+            // it is still the one occupying the slot — so the next
+            // caller retries against the backend instead of replaying
+            // the cached failure. This preserves the
+            // "failures must NOT poison the cache" contract enforced
+            // by CompositeSecretProviderCachingTests.
+            this.cache.TryRemove(
+                new KeyValuePair<string, Lazy<Task<CacheEntry>>>(secretRef, lazy));
+            throw;
+        }
     }
 
     /// <summary>
