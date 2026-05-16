@@ -31,6 +31,15 @@ using System.Text.Json;
 /// 4.3 <c>SlackIdempotencyGuard</c> sees the same key shape regardless
 /// of which transport delivered the payload.
 /// </para>
+/// <para>
+/// Hash fallbacks are computed over <see cref="SlackSocketModeFrame.Payload"/>
+/// (the inner Slack payload) rather than the outer
+/// <see cref="SlackSocketModeFrame.RawFrameJson"/> envelope. Slack
+/// reissues retried frames with a fresh <c>envelope_id</c>, so hashing
+/// the envelope would produce a different idempotency key on every
+/// retry and defeat duplicate suppression for payloads that lack a
+/// stable identifier (e.g. events without <c>event_id</c>).
+/// </para>
 /// </remarks>
 internal static class SlackSocketModePayloadNormalizer
 {
@@ -69,7 +78,7 @@ internal static class SlackSocketModePayloadNormalizer
         SlackEventPayload payload = SlackInboundPayloadParser.ParseEvent(frame.Payload);
         string idempotencyKey = !string.IsNullOrEmpty(payload.EventId)
             ? EventKeyPrefix + payload.EventId
-            : EventKeyPrefix + HashFallback(frame.RawFrameJson);
+            : EventKeyPrefix + HashFallback(frame.Payload);
 
         return new SlackInboundEnvelope(
             IdempotencyKey: idempotencyKey,
@@ -92,7 +101,7 @@ internal static class SlackSocketModePayloadNormalizer
         string team = payload.TeamId ?? string.Empty;
         string user = payload.UserId ?? string.Empty;
         string cmd = payload.Command ?? string.Empty;
-        string trigger = payload.TriggerId ?? HashFallback(frame.RawFrameJson);
+        string trigger = payload.TriggerId ?? HashFallback(frame.Payload);
         string idempotencyKey = string.Format(
             CultureInfo.InvariantCulture,
             "{0}{1}:{2}:{3}:{4}",
@@ -123,7 +132,7 @@ internal static class SlackSocketModePayloadNormalizer
 
         string team = payload.TeamId ?? string.Empty;
         string user = payload.UserId ?? string.Empty;
-        string actionOrView = payload.ActionOrViewId ?? HashFallback(frame.RawFrameJson);
+        string actionOrView = payload.ActionOrViewId ?? HashFallback(frame.Payload);
         string trigger = payload.TriggerId ?? actionOrView;
         string idempotencyKey = string.Format(
             CultureInfo.InvariantCulture,
