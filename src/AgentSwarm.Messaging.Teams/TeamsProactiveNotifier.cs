@@ -273,19 +273,86 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
                 $"AgentQuestion '{question.QuestionId}' is invalid: {string.Join("; ", validationErrors)}");
         }
 
-        // Step 1 (iter-3 evaluator feedback #1) — persist a SANITIZED copy with
-        // ConversationId forced to null BEFORE the lookup / send. Two reasons:
-        //   * UpdateConversationIdAsync (Step 4 below) is a no-op when the row is
-        //     missing, so without the up-front Save the post-send ConversationId stamp
-        //     would silently disappear and CardActionHandler.GetByIdAsync would reject
-        //     subsequent Adaptive Card actions with QuestionNotFound.
-        //   * Forcing ConversationId = null avoids letting a caller-supplied stale value
-        //     poison bare approve/reject text-command resolution that joins on
-        //     ConversationId.
-        // Reference equality is unchanged for callers that already passed a null
-        // ConversationId — the `with` expression returns the same effective record.
+        // Step 1a (iter-4 evaluator feedback #1 — outbox-retry idempotency).
+        // The Phase 6 outbox engine may replay a proactive send after the first attempt
+        // succeeded at the network layer but the worker died before acking, or after a
+        // transient delivery failure. If a TeamsCardState row already exists for this
+        // QuestionId, the previous attempt already delivered the card — re-sending would
+        // produce a duplicate Adaptive Card in Teams (and would overwrite the stored
+        // ActivityId/ConversationReferenceJson, orphaning the first card to the user).
+        // Short-circuit here so retries are safe to call as many times as the outbox
+        // wants.
+        var existingCardState = await _cardStateStore.GetByQuestionIdAsync(question.QuestionId, ct).ConfigureAwait(false);
+        if (existingCardState is not null)
+        {
+            _logger.LogInformation(
+                "Skipping proactive AgentQuestion {QuestionId} (correlation {CorrelationId}) to {Target} in tenant {TenantId}: TeamsCardState already present (ActivityId {ActivityId}, ConversationId {ConversationId}); treating as already delivered.",
+                question.QuestionId,
+                question.CorrelationId,
+                targetDescription,
+                tenantId,
+                existingCardState.ActivityId,
+                existingCardState.ConversationId);
+            return;
+        }
+
+        // Step 1b (iter-4 evaluator feedback #1 — duplicate-PK protection).
+        // SqlAgentQuestionStore.SaveAsync is insert-only (ctx.AgentQuestions.Add(entity))
+        // and would throw a unique-PK DbUpdateException on a naive retry where the prior
+        // attempt persisted the question but threw ConversationReferenceNotFoundException
+        // before card delivery. Check existence first; only SaveAsync if absent.
+        //
+        // When an existing row is found, enforce two invariants before continuing:
+        //   (i) Status MUST be Open — sending a card for a Resolved/Expired question
+        //       would produce a stale approval prompt the user could not actually
+        //       interact with (CardActionHandler.HandleAsync would reject the action
+        //       as AlreadyResolved or Expired). Throw InvalidOperationException so the
+        //       outbox stops retrying this entry.
+        //   (ii) The incoming question's identity / routing / payload fields MUST match
+        //       the stored row. A mismatched retry means the orchestrator mutated the
+        //       question after enqueuing it — that is "card update" semantics, not retry,
+        //       and is not supported by Stage 4.2. Throw so the orchestrator surfaces
+        //       the mismatch rather than silently shipping a card that drifts from the
+        //       row CardActionHandler will load.
+        //
+        // Note: this check-then-save sequence is best-effort race resilience — two truly
+        // concurrent retries with the same QuestionId could both see null and both call
+        // SaveAsync, in which case one will still throw DbUpdateException. The
+        // orchestrator owns single-flight semantics; defending against that scenario
+        // here would require a store-level atomic TryCreateAsync (out of scope for
+        // Stage 4.2).
         var sanitizedQuestion = question with { ConversationId = null };
-        await _agentQuestionStore.SaveAsync(sanitizedQuestion, ct).ConfigureAwait(false);
+        var existingQuestion = await _agentQuestionStore.GetByIdAsync(question.QuestionId, ct).ConfigureAwait(false);
+        if (existingQuestion is null)
+        {
+            // Step 2 (iter-3 evaluator feedback #1) — persist a SANITIZED copy with
+            // ConversationId forced to null BEFORE the lookup / send. Two reasons:
+            //   * UpdateConversationIdAsync (later step) is a no-op when the row is
+            //     missing, so without the up-front Save the post-send ConversationId
+            //     stamp would silently disappear and CardActionHandler.GetByIdAsync
+            //     would reject subsequent Adaptive Card actions with QuestionNotFound.
+            //   * Forcing ConversationId = null avoids letting a caller-supplied stale
+            //     value poison bare approve/reject text-command resolution that joins
+            //     on ConversationId.
+            // Reference equality is unchanged for callers that already passed a null
+            // ConversationId — the `with` expression returns the same effective record.
+            await _agentQuestionStore.SaveAsync(sanitizedQuestion, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            EnsureRetryMatchesStoredQuestion(question, existingQuestion);
+
+            if (!string.Equals(existingQuestion.Status, AgentQuestionStatuses.Open, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"AgentQuestion '{question.QuestionId}' already exists with terminal status '{existingQuestion.Status}'; refusing to deliver a stale Adaptive Card. The outbox should not retry resolved or expired questions.");
+            }
+
+            _logger.LogInformation(
+                "Proactive AgentQuestion {QuestionId} (correlation {CorrelationId}) row already present in IAgentQuestionStore with Status=Open; skipping duplicate SaveAsync and proceeding with lookup/send (outbox retry).",
+                question.QuestionId,
+                question.CorrelationId);
+        }
 
         var stored = await lookupAsync(ct).ConfigureAwait(false)
             ?? throw notFoundFactory();
@@ -469,6 +536,108 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
                 $"TargetChannelId '{question.TargetChannelId}'. Refusing to deliver an approval " +
                 $"ask to a channel other than the one named on the question.",
                 nameof(channelId));
+        }
+    }
+
+    /// <summary>
+    /// Iter-4 evaluator feedback #1 / rubber-duck non-blocking #2 — when an outbox
+    /// retry finds an existing <see cref="AgentQuestion"/> row, every identity / routing
+    /// / payload field on the incoming question MUST match the stored row. Otherwise the
+    /// orchestrator has mutated the question after enqueuing it, which is "card update"
+    /// semantics (not retry) and is not supported by Stage 4.2 — the card delivered to
+    /// Teams would then drift from the row <see cref="Cards.CardActionHandler"/> later
+    /// loads via <see cref="IAgentQuestionStore.GetByIdAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// Fields compared:
+    ///   <list type="bullet">
+    ///     <item><description>Identity: <c>TenantId</c>, <c>AgentId</c>, <c>TaskId</c>, <c>CorrelationId</c>.</description></item>
+    ///     <item><description>Routing: <c>TargetUserId</c>, <c>TargetChannelId</c>.</description></item>
+    ///     <item><description>Payload: <c>Title</c>, <c>Body</c>, <c>Severity</c>, <c>ExpiresAt</c>, and the <c>AllowedActions</c> list (count + each element's <c>ActionId</c> / <c>Label</c> / <c>Value</c> / <c>RequiresComment</c>).</description></item>
+    ///   </list>
+    /// <c>QuestionId</c> equality is guaranteed because the lookup was keyed by it.
+    /// <c>ConversationId</c>, <c>Status</c>, <c>CreatedAt</c>, and <c>ResolvedAt</c> are
+    /// store-owned lifecycle fields and are NOT compared.
+    /// </remarks>
+    private static void EnsureRetryMatchesStoredQuestion(AgentQuestion incoming, AgentQuestion stored)
+    {
+        static string Norm(string? s) => s ?? string.Empty;
+
+        var mismatches = new List<string>();
+        if (!string.Equals(incoming.TenantId, stored.TenantId, StringComparison.Ordinal))
+        {
+            mismatches.Add($"TenantId (incoming='{incoming.TenantId}', stored='{stored.TenantId}')");
+        }
+
+        if (!string.Equals(incoming.AgentId, stored.AgentId, StringComparison.Ordinal))
+        {
+            mismatches.Add($"AgentId (incoming='{incoming.AgentId}', stored='{stored.AgentId}')");
+        }
+
+        if (!string.Equals(incoming.TaskId, stored.TaskId, StringComparison.Ordinal))
+        {
+            mismatches.Add($"TaskId (incoming='{incoming.TaskId}', stored='{stored.TaskId}')");
+        }
+
+        if (!string.Equals(incoming.CorrelationId, stored.CorrelationId, StringComparison.Ordinal))
+        {
+            mismatches.Add($"CorrelationId (incoming='{incoming.CorrelationId}', stored='{stored.CorrelationId}')");
+        }
+
+        if (!string.Equals(Norm(incoming.TargetUserId), Norm(stored.TargetUserId), StringComparison.Ordinal))
+        {
+            mismatches.Add($"TargetUserId (incoming='{incoming.TargetUserId}', stored='{stored.TargetUserId}')");
+        }
+
+        if (!string.Equals(Norm(incoming.TargetChannelId), Norm(stored.TargetChannelId), StringComparison.Ordinal))
+        {
+            mismatches.Add($"TargetChannelId (incoming='{incoming.TargetChannelId}', stored='{stored.TargetChannelId}')");
+        }
+
+        if (!string.Equals(incoming.Title, stored.Title, StringComparison.Ordinal))
+        {
+            mismatches.Add("Title");
+        }
+
+        if (!string.Equals(incoming.Body, stored.Body, StringComparison.Ordinal))
+        {
+            mismatches.Add("Body");
+        }
+
+        if (!string.Equals(incoming.Severity, stored.Severity, StringComparison.Ordinal))
+        {
+            mismatches.Add($"Severity (incoming='{incoming.Severity}', stored='{stored.Severity}')");
+        }
+
+        if (incoming.ExpiresAt != stored.ExpiresAt)
+        {
+            mismatches.Add($"ExpiresAt (incoming='{incoming.ExpiresAt:o}', stored='{stored.ExpiresAt:o}')");
+        }
+
+        if (incoming.AllowedActions.Count != stored.AllowedActions.Count)
+        {
+            mismatches.Add($"AllowedActions.Count (incoming={incoming.AllowedActions.Count}, stored={stored.AllowedActions.Count})");
+        }
+        else
+        {
+            for (var i = 0; i < incoming.AllowedActions.Count; i++)
+            {
+                var a = incoming.AllowedActions[i];
+                var b = stored.AllowedActions[i];
+                if (!string.Equals(a.ActionId, b.ActionId, StringComparison.Ordinal)
+                    || !string.Equals(a.Label, b.Label, StringComparison.Ordinal)
+                    || !string.Equals(a.Value, b.Value, StringComparison.Ordinal)
+                    || a.RequiresComment != b.RequiresComment)
+                {
+                    mismatches.Add($"AllowedActions[{i}]");
+                }
+            }
+        }
+
+        if (mismatches.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"AgentQuestion '{incoming.QuestionId}' was already persisted with different metadata than the incoming retry; refusing to send a card whose payload diverges from the stored row that CardActionHandler will load on reply. Mismatched fields: {string.Join(", ", mismatches)}. Stage 4.2 does not support mutating an in-flight question — either preserve the original payload on retry or assign a new QuestionId.");
         }
     }
 

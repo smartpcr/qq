@@ -121,7 +121,8 @@ public sealed class CardActionHandlerTests
                     publisher,
                     audit,
                     NullLogger<CardActionHandler>.Instance,
-                    timeProvider);
+                    timeProvider,
+                    TimeSpan.FromMinutes(5));
 
             return new HandlerHarness
             {

@@ -129,7 +129,7 @@ public sealed class CardActionHandler : ICardActionHandler
     /// resolve the public 6-arg constructor via DI; unit tests opt in to this overload
     /// to advance the dedupe clock without sleeping.
     /// </summary>
-    internal CardActionHandler(
+    public CardActionHandler(
         IAgentQuestionStore questionStore,
         ICardStateStore cardStateStore,
         ITeamsCardManager cardManager,
@@ -331,7 +331,45 @@ public sealed class CardActionHandler : ICardActionHandler
                 correlationId,
                 receivedAt,
                 ct).ConfigureAwait(false);
+            // Iter-3 evaluator feedback #3 (re-applied iter-4 after the review-comment
+            // commit reverted the original split) ΓÇö emit a distinct "Expired" rejection
+            // message when the durable status is Expired, so operators and the Teams
+            // client can distinguish lifecycle-expired questions from user-resolved ones.
+            if (string.Equals(question.Status, AgentQuestionStatuses.Expired, StringComparison.Ordinal))
+            {
+                return Reject($"Question '{payload.QuestionId}' has Expired and can no longer accept decisions.");
+            }
+
             return Reject($"Decision for question '{payload.QuestionId}' has already been recorded.");
+        }
+
+        // Iter-3 evaluator feedback #3 (re-applied iter-4) ΓÇö between the moment
+        // ExpiresAt elapses and the moment QuestionExpiryProcessor's next sweep flips
+        // Status to Expired, there is a window where Status is still Open but the
+        // deadline has passed. Reject explicitly with the Expired message so the same
+        // outcome the worker produces is also produced here. Strict less-than matches
+        // SqlAgentQuestionStore.GetOpenExpiredAsync (`e.ExpiresAt < cutoff`) and
+        // QuestionExpiryProcessor's cutoff semantics ΓÇö diverging here would create
+        // boundary mismatches between the handler and the worker.
+        if (question.ExpiresAt < _timeProvider.GetUtcNow())
+        {
+            _logger.LogInformation(
+                "Card action {ActionValue} for question {QuestionId} rejected ΓÇö ExpiresAt {ExpiresAt} has passed (Open-but-stale).",
+                payload.ActionValue,
+                payload.QuestionId,
+                question.ExpiresAt);
+            var sanitized = await BuildSanitizedPayloadJsonAsync(payload, question.AgentId, ct).ConfigureAwait(false);
+            await WriteAuditAsync(
+                outcome: AuditOutcomes.Rejected,
+                actorAad,
+                tenantId,
+                agentId: question.AgentId,
+                action: payload.ActionValue,
+                payloadJson: sanitized,
+                correlationId,
+                receivedAt,
+                ct).ConfigureAwait(false);
+            return Reject($"Question '{payload.QuestionId}' has Expired and can no longer accept decisions.");
         }
 
         var transitioned = await _questionStore

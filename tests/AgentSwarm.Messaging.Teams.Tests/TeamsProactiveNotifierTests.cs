@@ -425,6 +425,197 @@ public sealed class TeamsProactiveNotifierTests
     }
 
     /// <summary>
+    /// Iter-4 evaluator feedback #1 / #2 — outbox-retry idempotency for the user-scope
+    /// proactive question path. The first attempt fails at the reference-lookup step
+    /// (no stored reference), so the question row IS persisted but the card is NOT
+    /// delivered. After the reference becomes available, a second attempt with the
+    /// SAME <see cref="AgentQuestion"/> must:
+    /// <list type="bullet">
+    ///   <item><description>Detect the preexisting row via <see cref="IAgentQuestionStore.GetByIdAsync"/> and skip the duplicate <see cref="IAgentQuestionStore.SaveAsync"/> (otherwise <c>SqlAgentQuestionStore.SaveAsync</c>'s insert-only <c>Add(entity)</c> would throw a unique-PK <c>DbUpdateException</c>).</description></item>
+    ///   <item><description>Still resolve the reference, deliver the card, and stamp the conversation ID on the existing row.</description></item>
+    ///   <item><description>Persist exactly ONE card-state row keyed by <c>QuestionId</c>.</description></item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task SendProactiveQuestionAsync_RetryAfterMissingReference_DeliversWithoutDoubleSave()
+    {
+        var harness = NotifierHarness.Build();
+        var question = NewQuestion("Q-retry-user", targetUserId: "user-retry");
+
+        // First attempt — no reference yet. Question row is persisted; throws.
+        await Assert.ThrowsAsync<ConversationReferenceNotFoundException>(() =>
+            harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-retry", question, CancellationToken.None));
+        Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.CardStateStore.Saved);
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+
+        // Reference becomes available (user installed the app, etc.).
+        var stored = NewPersonalReference("ref-retry", aadObjectId: "aad-retry", internalUserId: "user-retry");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-retry")] = stored;
+
+        // Second attempt — same question. Must succeed and must NOT double-save.
+        await harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-retry", question, CancellationToken.None);
+
+        // Question row is still the single original one (no duplicate insert attempted).
+        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-retry-user", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
+
+        // Card was delivered, ConversationId stamped, and card-state persisted.
+        Assert.Single(harness.Adapter.ContinueCalls);
+        Assert.Single(harness.Adapter.Sent);
+        var update = Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Equal("Q-retry-user", update.QuestionId);
+        Assert.Equal(stored.ConversationId, update.ConversationId);
+        var cardState = Assert.Single(harness.CardStateStore.Saved);
+        Assert.Equal("Q-retry-user", cardState.QuestionId);
+    }
+
+    /// <summary>
+    /// Iter-4 evaluator feedback #1 / #2 — channel-scope mirror of the retry-idempotency
+    /// test. Documents that <see cref="TeamsProactiveNotifier.SendQuestionToChannelAsync"/>
+    /// also tolerates a preexisting <see cref="AgentQuestion"/> row.
+    /// </summary>
+    [Fact]
+    public async Task SendQuestionToChannelAsync_RetryAfterMissingReference_DeliversWithoutDoubleSave()
+    {
+        var harness = NotifierHarness.Build();
+        var question = NewQuestion("Q-retry-chan", targetChannelId: "channel-retry");
+
+        await Assert.ThrowsAsync<ConversationReferenceNotFoundException>(() =>
+            harness.Notifier.SendQuestionToChannelAsync(TenantId, "channel-retry", question, CancellationToken.None));
+        Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.CardStateStore.Saved);
+
+        var stored = NewChannelReference("ref-retry-chan", channelId: "channel-retry");
+        harness.ConversationReferenceStore.PreloadByChannelId[(TenantId, "channel-retry")] = stored;
+
+        await harness.Notifier.SendQuestionToChannelAsync(TenantId, "channel-retry", question, CancellationToken.None);
+
+        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-retry-chan", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
+
+        Assert.Single(harness.Adapter.ContinueCalls);
+        Assert.Single(harness.Adapter.Sent);
+        Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
+        var cardState = Assert.Single(harness.CardStateStore.Saved);
+        Assert.Equal("Q-retry-chan", cardState.QuestionId);
+    }
+
+    /// <summary>
+    /// Iter-4 rubber-duck blocking #1 — when a <see cref="TeamsCardState"/> row already
+    /// exists for the question ID, the previous attempt already delivered the card and a
+    /// re-send would produce a duplicate Adaptive Card in Teams (plus overwrite the
+    /// stored <c>ActivityId</c>/<c>ConversationReferenceJson</c>, orphaning the first
+    /// card). The notifier must short-circuit and not touch the network.
+    /// </summary>
+    [Fact]
+    public async Task SendProactiveQuestionAsync_CardStateAlreadyPresent_SkipsResendEntirely()
+    {
+        var harness = NotifierHarness.Build();
+        var stored = NewPersonalReference("ref-idem", aadObjectId: "aad-idem", internalUserId: "user-idem");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-idem")] = stored;
+        var question = NewQuestion("Q-card-state-present", targetUserId: "user-idem");
+
+        // Seed a card-state row as if the previous attempt already delivered.
+        var preexisting = new TeamsCardState
+        {
+            QuestionId = "Q-card-state-present",
+            ConversationId = stored.ConversationId,
+            ActivityId = "act-prior-delivery",
+            ConversationReferenceJson = "{}",
+            Status = TeamsCardStatuses.Pending,
+            CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+        };
+        await harness.CardStateStore.SaveAsync(preexisting, CancellationToken.None);
+        Assert.Single(harness.CardStateStore.Saved);
+
+        await harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-idem", question, CancellationToken.None);
+
+        // No network call, no new save, no ConversationId update — pure idempotent no-op.
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.Adapter.Sent);
+        Assert.Empty(harness.AgentQuestionStore.Saved);
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Empty(harness.ConversationReferenceStore.InternalUserLookups);
+        Assert.Single(harness.CardStateStore.Saved); // unchanged
+    }
+
+    /// <summary>
+    /// Iter-4 rubber-duck blocking #2 — when the preexisting <see cref="AgentQuestion"/>
+    /// row has a terminal status (<c>Resolved</c> / <c>Expired</c>), sending another
+    /// Adaptive Card would produce a stale approval prompt the user could not actually
+    /// interact with (<see cref="Cards.CardActionHandler"/> rejects with
+    /// <c>AlreadyResolved</c> / <c>Expired</c>). The notifier throws so the outbox
+    /// surfaces the orchestrator bug rather than silently delivering a dead card.
+    /// </summary>
+    [Theory]
+    [InlineData(AgentQuestionStatuses.Resolved)]
+    [InlineData(AgentQuestionStatuses.Expired)]
+    public async Task SendProactiveQuestionAsync_ExistingTerminalStatus_ThrowsAndDoesNotSend(string terminalStatus)
+    {
+        var harness = NotifierHarness.Build();
+        var stored = NewPersonalReference("ref-term", aadObjectId: "aad-term", internalUserId: "user-term");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-term")] = stored;
+        var question = NewQuestion("Q-terminal", targetUserId: "user-term");
+        // Seed a preexisting question row already in a terminal status.
+        var seeded = question with { Status = terminalStatus, ConversationId = null };
+        await harness.AgentQuestionStore.SaveAsync(seeded, CancellationToken.None);
+        var savedCountBefore = harness.AgentQuestionStore.Saved.Count;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-term", question, CancellationToken.None));
+        Assert.Contains(terminalStatus, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Q-terminal", ex.Message, StringComparison.Ordinal);
+
+        // No additional save, no network call, no ConversationId stamp, no card-state row.
+        Assert.Equal(savedCountBefore, harness.AgentQuestionStore.Saved.Count);
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.Adapter.Sent);
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Empty(harness.CardStateStore.Saved);
+    }
+
+    /// <summary>
+    /// Iter-4 rubber-duck non-blocking #2 — if the orchestrator retries a proactive
+    /// send with a question whose immutable identity/payload fields differ from the
+    /// stored row, the card delivered to Teams would diverge from the row that
+    /// <see cref="Cards.CardActionHandler"/> later loads via
+    /// <see cref="IAgentQuestionStore.GetByIdAsync"/>. The notifier rejects this rather
+    /// than silently sending a card with the new payload but storing the old one.
+    /// </summary>
+    [Fact]
+    public async Task SendProactiveQuestionAsync_PreexistingRowWithDivergentPayload_ThrowsAndDoesNotSend()
+    {
+        var harness = NotifierHarness.Build();
+        var stored = NewPersonalReference("ref-mismatch", aadObjectId: "aad-mismatch", internalUserId: "user-mismatch");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-mismatch")] = stored;
+        var original = NewQuestion("Q-mismatch", targetUserId: "user-mismatch");
+        await harness.AgentQuestionStore.SaveAsync(original with { ConversationId = null }, CancellationToken.None);
+        var savedCountBefore = harness.AgentQuestionStore.Saved.Count;
+
+        // Same QuestionId, but Title and Body changed. This simulates the orchestrator
+        // mutating the in-flight question.
+        var mutated = original with { Title = "TOTALLY DIFFERENT TITLE", Body = "different body too" };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-mismatch", mutated, CancellationToken.None));
+        Assert.Contains("Q-mismatch", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Title", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Body", ex.Message, StringComparison.Ordinal);
+
+        Assert.Equal(savedCountBefore, harness.AgentQuestionStore.Saved.Count);
+        Assert.Empty(harness.Adapter.ContinueCalls);
+        Assert.Empty(harness.Adapter.Sent);
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Empty(harness.CardStateStore.Saved);
+    }
+
+    /// <summary>
     /// Null / blank argument guards exercise every public entry point so DI mis-use
     /// fails loudly at the call site rather than producing a NullReferenceException
     /// inside the notifier.
@@ -929,7 +1120,26 @@ public sealed class TeamsProactiveNotifierTests
             return Task.CompletedTask;
         }
 
-        public Task<AgentQuestion?> GetByIdAsync(string questionId, CancellationToken ct) => Task.FromResult<AgentQuestion?>(null);
+        /// <summary>
+        /// Iter-4: returns the most recently saved question with the matching
+        /// <see cref="AgentQuestion.QuestionId"/>, mirroring the SQL store's read
+        /// semantics so retry-idempotency tests can simulate a preexisting row.
+        /// Returns <c>null</c> when nothing has been saved with that ID.
+        /// </summary>
+        public Task<AgentQuestion?> GetByIdAsync(string questionId, CancellationToken ct)
+        {
+            AgentQuestion? hit = null;
+            for (var i = Saved.Count - 1; i >= 0; i--)
+            {
+                if (string.Equals(Saved[i].QuestionId, questionId, StringComparison.Ordinal))
+                {
+                    hit = Saved[i];
+                    break;
+                }
+            }
+
+            return Task.FromResult(hit);
+        }
         public Task<bool> TryUpdateStatusAsync(string questionId, string expectedStatus, string newStatus, CancellationToken ct) => Task.FromResult(false);
 
         public Task UpdateConversationIdAsync(string questionId, string conversationId, CancellationToken ct)
@@ -963,7 +1173,26 @@ public sealed class TeamsProactiveNotifierTests
             return Task.CompletedTask;
         }
 
-        public Task<TeamsCardState?> GetByQuestionIdAsync(string questionId, CancellationToken ct) => Task.FromResult<TeamsCardState?>(null);
+        /// <summary>
+        /// Iter-4: returns the most recently saved card state with the matching
+        /// <see cref="TeamsCardState.QuestionId"/>, mirroring the SQL store so the
+        /// notifier's outbox-retry idempotency short-circuit can be exercised.
+        /// Returns <c>null</c> when nothing has been saved with that QuestionId.
+        /// </summary>
+        public Task<TeamsCardState?> GetByQuestionIdAsync(string questionId, CancellationToken ct)
+        {
+            TeamsCardState? hit = null;
+            for (var i = Saved.Count - 1; i >= 0; i--)
+            {
+                if (string.Equals(Saved[i].QuestionId, questionId, StringComparison.Ordinal))
+                {
+                    hit = Saved[i];
+                    break;
+                }
+            }
+
+            return Task.FromResult(hit);
+        }
         public Task UpdateStatusAsync(string questionId, string newStatus, CancellationToken ct) => Task.CompletedTask;
     }
 }
