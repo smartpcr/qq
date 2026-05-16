@@ -20,6 +20,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Telegram.Bot.Exceptions;
 
 /// <summary>
 /// Stage 4.1 — drains the durable outbox by dispatching outbound
@@ -757,12 +758,23 @@ public sealed class OutboundQueueProcessor : BackgroundService
         // budget-exhausted branch (the processor calls DispatchTerminalFailureAsync
         // BEFORE invoking MarkFailedAsync), so without this append the
         // terminal attempt's entry would be silently dropped.
+        // Iter-3 review item 2 — forward the Bot API HTTP status onto the
+        // terminal AttemptHistory entry whenever the triggering failure is a
+        // TelegramSendFailedException whose inner ApiRequestException carries
+        // an ErrorCode (e.g. 400 malformed MarkdownV2, 403 chat blocked, 429
+        // rate-limit exhausted). The architecture defines the httpStatus
+        // field on AttemptHistory entries specifically for Telegram
+        // diagnostics; passing null when the status IS knowable from the
+        // exception renders the error-history JSON useless for triage. When
+        // the triggering exception is non-Telegram (catch-all unknown
+        // exception path) the status remains null because none is available.
+        var finalHttpStatus = TryExtractHttpStatus(triggeringException);
         var historyWithFinalEntry = AttemptHistory.Append(
             message.AttemptHistoryJson,
             attempt: finalAttemptCount,
             timestamp: failedAt,
             error: finalError,
-            httpStatus: null);
+            httpStatus: finalHttpStatus);
         var attemptTimestampsJson = AttemptHistory.ProjectTimestamps(historyWithFinalEntry);
         var errorHistoryJson = AttemptHistory.ProjectErrorHistory(historyWithFinalEntry);
 
@@ -911,7 +923,44 @@ public sealed class OutboundQueueProcessor : BackgroundService
 
     private static string BuildErrorDetail(TelegramSendFailedException ex)
     {
-        return $"[{ex.FailureCategory}] {ex.Message}";
+        // Iter-3 review item 2 — surface the Bot API HTTP status in the
+        // ErrorDetail string so the queue's MarkFailedAsync (which has no
+        // typed httpStatus parameter on its current interface) still carries
+        // the diagnostic forward into the persisted per-attempt AttemptHistory
+        // entry that the queue derives from this error string. When the
+        // inner ApiRequestException exposes an ErrorCode we prefix the
+        // detail with "HTTP {code}: " so operators triaging a transient
+        // retry can distinguish e.g. a 429 flood-control from a 502 gateway
+        // error without inspecting the inner exception chain.
+        var httpStatus = TryExtractHttpStatus(ex);
+        return httpStatus is { } status
+            ? $"[{ex.FailureCategory}] HTTP {status}: {ex.Message}"
+            : $"[{ex.FailureCategory}] {ex.Message}";
+    }
+
+    /// <summary>
+    /// Iter-3 review item 2 — extract the Bot API HTTP status code from a
+    /// <see cref="TelegramSendFailedException"/>'s inner
+    /// <see cref="ApiRequestException"/> when present. Returns
+    /// <see langword="null"/> for any other exception shape (including
+    /// network-level <see cref="RequestException"/> without an HTTP
+    /// status, the catch-all unknown-exception path, and a
+    /// <see cref="TelegramSendFailedException"/> whose inner exception is
+    /// a transport-level error rather than a Bot API response). The
+    /// status is sourced from the inner exception rather than a typed
+    /// property because <see cref="TelegramSendFailedException"/> does
+    /// not yet expose <c>HttpStatus</c> directly; routing through the
+    /// inner exception keeps the lookup correct for every category the
+    /// sender produces (Permanent 4xx, RateLimitExhausted 429, plus
+    /// 5xx transports that surface as <see cref="ApiRequestException"/>).
+    /// </summary>
+    private static int? TryExtractHttpStatus(Exception? ex)
+    {
+        if (ex is TelegramSendFailedException tsfe && tsfe.InnerException is ApiRequestException api)
+        {
+            return api.ErrorCode;
+        }
+        return null;
     }
 
     /// <summary>
