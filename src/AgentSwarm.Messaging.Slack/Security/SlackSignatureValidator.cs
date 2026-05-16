@@ -923,6 +923,15 @@ public sealed class SlackSignatureValidator : IMiddleware
 
         public SecretResolutionStatus Status { get; }
 
+        /// <summary>
+        /// Resolved signing-secret value when <see cref="Status"/> is
+        /// <see cref="SecretResolutionStatus.Ok"/>; <see langword="null"/>
+        /// for every other status. Tagged
+        /// <see cref="LogPropertyIgnoreAttribute"/> so any structured
+        /// logger that walks an outcome instance honours the
+        /// architecture.md §7.3 "never logged" requirement.
+        /// </summary>
+        [LogPropertyIgnore]
         public string? Secret { get; }
 
         public string? SecretRef { get; }
@@ -937,6 +946,19 @@ public sealed class SlackSignatureValidator : IMiddleware
 
         public static SecretResolutionOutcome MalformedRef(string? secretRef, string detail)
             => new(SecretResolutionStatus.Malformed, secret: null, secretRef: secretRef, errorDetail: detail);
+
+        /// <summary>
+        /// Returns a diagnostic string produced by
+        /// <see cref="LogPropertyRedactor.RedactToString"/>: the
+        /// <see cref="Secret"/> property is tagged
+        /// <see cref="LogPropertyIgnoreAttribute"/> and therefore
+        /// emitted as <see cref="SecretScrubber.Placeholder"/>. The
+        /// rendering is driven by the attribute itself, not by a
+        /// hand-written string, so the "never logged" guarantee
+        /// survives the addition of new secret-bearing properties
+        /// without requiring a matching update to this method.
+        /// </summary>
+        public override string ToString() => LogPropertyRedactor.RedactToString(this);
     }
 
     private readonly struct SlackSignatureValidationResult
