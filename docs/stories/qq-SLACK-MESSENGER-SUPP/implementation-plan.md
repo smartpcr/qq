@@ -28,42 +28,37 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 - [ ] Scenario: Solution builds -- Given all projects are created with correct references, When `dotnet build` is run on the solution, Then the build succeeds with zero errors
 - [ ] Scenario: Test runner initializes -- Given the test project references the Slack project, When `dotnet test --list-tests` is run, Then the test runner initializes without error
 
-## Stage 1.2: Shared Messaging Abstractions
+## Stage 1.2: Prerequisite Abstraction Compile Stubs
 
 ### Implementation Steps
-- [ ] Define `IMessengerConnector` interface in Abstractions with `SendMessageAsync(MessengerMessage, CancellationToken)`, `SendQuestionAsync(AgentQuestion, CancellationToken)`, and `ReceiveAsync(CancellationToken)` returning `IReadOnlyList<MessengerEvent>`
-- [ ] Define `AgentQuestion` sealed record with fields: `QuestionId`, `AgentId`, `TaskId`, `Title`, `Body`, `Severity`, `AllowedActions` (`IReadOnlyList<HumanAction>`), `ExpiresAt` (`DateTimeOffset`), `CorrelationId`
-- [ ] Define `HumanAction` sealed record with fields: `ActionId`, `Label`, `Value`, `RequiresComment` (`bool`)
-- [ ] Define `HumanDecisionEvent` sealed record with fields: `QuestionId`, `ActionValue`, `Comment` (nullable), `Messenger`, `ExternalUserId`, `ExternalMessageId`, `ReceivedAt` (`DateTimeOffset`), `CorrelationId`
-- [ ] Define `MessengerMessage` sealed record with fields: `MessageId`, `AgentId`, `TaskId`, `Content`, `MessageType` (enum), `CorrelationId`, `Timestamp` (`DateTimeOffset`)
-- [ ] Define `MessageType` enum with values: `StatusUpdate`, `Question`, `Notification`, `Completion`, `Error`
-- [ ] Define `MessengerEvent` abstract record as the base type for inbound events carrying `CorrelationId`, `AgentId`, `TaskId`, `ConversationId`, `Timestamp`
+- [ ] Add compile-target stub for `IMessengerConnector` interface in the Abstractions project with `SendMessageAsync`, `SendQuestionAsync`, and `ReceiveAsync` method signatures (canonical definitions are owned by the upstream Abstractions story; these stubs unblock Slack project compilation)
+- [ ] Add compile-target stubs for shared data records in the Abstractions project: `AgentQuestion`, `HumanAction`, `HumanDecisionEvent`, `MessengerMessage`, `MessengerEvent` base type, and `MessageType` enum, matching the field contracts in architecture.md section 3.6
+- [ ] Add a `README.md` to the Abstractions project documenting that all types are compile stubs to be replaced by the canonical Abstractions story deliverables
+- [ ] Verify that the Slack project compiles against the stub types with `dotnet build`
 
 ### Dependencies
 - phase-solution-scaffolding/stage-project-structure-and-build-configuration
 
 ### Test Scenarios
-- [ ] Scenario: Shared types serialize roundtrip -- Given an `AgentQuestion` instance with all fields populated, When serialized to JSON and deserialized via `System.Text.Json`, Then all field values match the original instance
-- [ ] Scenario: IMessengerConnector is implementable -- Given a mock class implementing `IMessengerConnector`, When all three methods are invoked, Then the mock compiles and executes without runtime error
-- [ ] Scenario: HumanDecisionEvent nullable comment -- Given a `HumanDecisionEvent` with `Comment = null`, When serialized and deserialized, Then `Comment` remains null
+- [ ] Scenario: Slack project compiles against stubs -- Given the Abstractions project contains stub types, When `dotnet build` runs for the Slack project, Then the build succeeds with zero errors
+- [ ] Scenario: Stub types match upstream contract -- Given stub records for `AgentQuestion` and `HumanDecisionEvent`, When their public property names are compared to architecture.md section 3.6 field list, Then all required fields are present
 
-## Stage 1.3: Core Infrastructure Interfaces and Stubs
+## Stage 1.3: Slack-Internal Queue and Retry Contracts
 
 ### Implementation Steps
-- [ ] Define `IDurableQueue<T>` interface in Core with `EnqueueAsync`, `DequeueAsync`, `AcknowledgeAsync`, `NackAsync` methods
-- [ ] Define `IDeadLetterQueue<T>` interface in Core with `EnqueueAsync` and `InspectAsync` methods
-- [ ] Define `IRetryPolicy` interface with `ShouldRetry(int attemptNumber, Exception exception)` and `GetDelay(int attemptNumber)` methods
-- [ ] Implement `ExponentialBackoffRetryPolicy` with configurable initial delay (default 1s), max delay (default 30s), max attempts (default 5), and jitter
-- [ ] Implement `InMemoryDurableQueue<T>` backed by `System.Threading.Channels.Channel<T>` as a development stub for `IDurableQueue<T>`
-- [ ] Implement `InMemoryDeadLetterQueue<T>` backed by `ConcurrentQueue<T>` as a development stub
-- [ ] Create `ServiceCollectionExtensions.AddMessagingCore()` DI registration method that registers retry policy and in-memory queue implementations
+- [ ] Define `ISlackInboundQueue` internal interface in the Slack project with `EnqueueAsync(SlackInboundEnvelope)` and `DequeueAsync(CancellationToken)` methods for buffering validated inbound envelopes
+- [ ] Define `ISlackOutboundQueue` internal interface in the Slack project with `EnqueueAsync(SlackOutboundEnvelope)` and `DequeueAsync(CancellationToken)` methods for buffering outbound Slack API calls
+- [ ] Define `ISlackDeadLetterQueue` internal interface with `EnqueueAsync` and `InspectAsync` for poison messages that exceed retry limits
+- [ ] Define `ISlackRetryPolicy` internal interface with `ShouldRetry(int attemptNumber, Exception exception)` and `GetDelay(int attemptNumber)` methods
+- [ ] Implement `ChannelBasedSlackQueue<T>` backed by `System.Threading.Channels.Channel<T>` as an in-process queue for development and testing (production swaps in durable queue implementations from the upstream Core project when available)
+- [ ] Add XML doc comments on each interface noting that production durable implementations will be provided by `AgentSwarm.Messaging.Core`
 
 ### Dependencies
-- phase-solution-scaffolding/stage-shared-messaging-abstractions
+- phase-solution-scaffolding/stage-prerequisite-abstraction-compile-stubs
 
 ### Test Scenarios
-- [ ] Scenario: Exponential backoff calculation -- Given `ExponentialBackoffRetryPolicy` with initial 1s and max 30s, When `GetDelay` is called for attempts 1 through 10, Then delays increase exponentially and never exceed 30s
-- [ ] Scenario: In-memory queue FIFO ordering -- Given an `InMemoryDurableQueue`, When 3 items are enqueued and then dequeued, Then items are returned in FIFO order
+- [ ] Scenario: Channel queue enqueue-dequeue -- Given a `ChannelBasedSlackQueue<SlackInboundEnvelope>`, When 3 envelopes are enqueued and dequeued, Then envelopes are returned in FIFO order
+- [ ] Scenario: Queue respects cancellation -- Given a `ChannelBasedSlackQueue` with no items, When `DequeueAsync` is called with a cancelled token, Then an `OperationCanceledException` is thrown
 
 
 # Phase 2: Persistence and Data Model
@@ -71,57 +66,55 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 ## Dependencies
 - phase-solution-scaffolding
 
-## Stage 2.1: EF Core DbContext and Repository Foundation
+## Stage 2.1: Slack Entity Model Definitions
 
 ### Implementation Steps
-- [ ] Create `MessagingDbContext` class in Persistence extending `DbContext` with `DbSet` properties for Slack entities (configured in stage 2.2)
-- [ ] Create `IMessagingRepository<T>` generic repository interface with `GetByIdAsync`, `AddAsync`, `UpdateAsync`, `QueryAsync` methods
-- [ ] Implement `EfMessagingRepository<T>` backed by `MessagingDbContext`
-- [ ] Configure SQLite provider for development and testing in `MessagingDbContext.OnConfiguring` (production provider is pluggable via DI)
-- [ ] Create `ServiceCollectionExtensions.AddMessagingPersistence(Action<DbContextOptionsBuilder>)` DI registration that registers DbContext and repositories
-- [ ] Add `Microsoft.EntityFrameworkCore.Sqlite` NuGet package to the test project for integration tests
+- [ ] Define `SlackWorkspaceConfig` entity class in the Slack project with fields per architecture.md section 3.1: `TeamId` (PK), `WorkspaceName`, `BotTokenSecretRef`, `SigningSecretRef`, `AppLevelTokenRef` (nullable), `DefaultChannelId`, `FallbackChannelId` (nullable), `AllowedChannelIds` (string array), `AllowedUserGroupIds` (string array), `Enabled`, `CreatedAt`, `UpdatedAt`
+- [ ] Define `SlackThreadMapping` entity class with fields per architecture.md section 3.2: `TaskId` (PK), `TeamId`, `ChannelId`, `ThreadTs`, `CorrelationId`, `AgentId`, `CreatedAt`, `LastMessageAt`; add unique constraint on `(TeamId, ChannelId, ThreadTs)`
+- [ ] Define `SlackInboundRequestRecord` entity class with fields per architecture.md section 3.3: `IdempotencyKey` (PK), `SourceType`, `TeamId`, `ChannelId` (nullable), `UserId`, `RawPayloadHash`, `ProcessingStatus`, `FirstSeenAt`, `CompletedAt` (nullable)
+- [ ] Define `SlackAuditEntry` entity class with fields per architecture.md section 3.5: `Id` (ULID PK), `CorrelationId`, `AgentId` (nullable), `TaskId` (nullable), `ConversationId` (nullable), `Direction`, `RequestType`, `TeamId`, `ChannelId` (nullable), `ThreadTs` (nullable), `MessageTs` (nullable), `UserId` (nullable), `CommandText` (nullable), `ResponsePayload` (nullable), `Outcome`, `ErrorDetail` (nullable), `Timestamp`
+- [ ] Define `SlackConnectorOptions` POCO class with `MaxWorkspaces` (default 15), retry settings, rate-limit tiers, and membership cache TTL
+- [ ] Register `SlackConnectorOptions` binding from `IConfiguration` section `"Slack"` via `services.Configure<SlackConnectorOptions>()`
 
 ### Dependencies
 - _none -- start stage_
 
 ### Test Scenarios
-- [ ] Scenario: DbContext creates database -- Given `MessagingDbContext` configured with SQLite in-memory, When `EnsureCreated` is called, Then the database is created without errors
-- [ ] Scenario: Repository CRUD operations -- Given an `EfMessagingRepository<SlackWorkspaceConfig>`, When an entity is added and then retrieved by ID, Then the retrieved entity matches the original
-
-## Stage 2.2: Slack Entity Models and Configuration
-
-### Implementation Steps
-- [ ] Define `SlackWorkspaceConfig` entity class with fields per architecture.md section 3.1: `TeamId` (PK), `WorkspaceName`, `BotTokenSecretRef`, `SigningSecretRef`, `AppLevelTokenRef` (nullable), `DefaultChannelId`, `FallbackChannelId` (nullable), `AllowedChannelIds` (string array), `AllowedUserGroupIds` (string array), `Enabled`, `CreatedAt`, `UpdatedAt`
-- [ ] Define `SlackThreadMapping` entity class with fields per architecture.md section 3.2: `TaskId` (PK), `TeamId`, `ChannelId`, `ThreadTs`, `CorrelationId`, `AgentId`, `CreatedAt`, `LastMessageAt`; add unique constraint on `(TeamId, ChannelId, ThreadTs)`
-- [ ] Define `SlackInboundRequestRecord` entity class with fields per architecture.md section 3.3: `IdempotencyKey` (PK), `SourceType`, `TeamId`, `ChannelId` (nullable), `UserId`, `RawPayloadHash`, `ProcessingStatus`, `FirstSeenAt`, `CompletedAt` (nullable)
-- [ ] Define `SlackAuditEntry` entity class with fields per architecture.md section 3.5: `Id` (ULID PK), `CorrelationId`, `AgentId` (nullable), `TaskId` (nullable), `ConversationId` (nullable), `Direction`, `RequestType`, `TeamId`, `ChannelId` (nullable), `ThreadTs` (nullable), `MessageTs` (nullable), `UserId` (nullable), `CommandText` (nullable), `ResponsePayload` (nullable), `Outcome`, `ErrorDetail` (nullable), `Timestamp`
-- [ ] Define `SlackConnectorOptions` POCO class with `MaxWorkspaces` (default 15), retry settings, rate-limit tiers, and membership cache TTL
-- [ ] Create EF Core `IEntityTypeConfiguration<T>` classes for each Slack entity defining column types, indexes, and constraints
-- [ ] Configure `SlackAuditEntry` indexes on: `CorrelationId`, `TaskId`, `AgentId`, composite `(TeamId, ChannelId)`, `UserId`, `Timestamp`
-- [ ] Register `SlackConnectorOptions` binding from `IConfiguration` section `"Slack"` via `services.Configure<SlackConnectorOptions>()`
-
-### Dependencies
-- phase-persistence-and-data-model/stage-ef-core-dbcontext-and-repository-foundation
-
-### Test Scenarios
-- [ ] Scenario: Entity configuration applies indexes -- Given `MessagingDbContext` with entity configurations, When the model is built, Then `SlackAuditEntry` has indexes on `CorrelationId`, `TaskId`, `AgentId`, `UserId`, and `Timestamp`
-- [ ] Scenario: Thread mapping unique constraint -- Given a `SlackThreadMapping` with `(TeamId, ChannelId, ThreadTs)` already persisted, When a duplicate `(TeamId, ChannelId, ThreadTs)` is inserted, Then a `DbUpdateException` is thrown
+- [ ] Scenario: Entity field completeness -- Given `SlackAuditEntry`, When its public properties are reflected, Then all fields from architecture.md section 3.5 are present (Id, CorrelationId, AgentId, TaskId, ConversationId, Direction, RequestType, TeamId, ChannelId, ThreadTs, MessageTs, UserId, CommandText, ResponsePayload, Outcome, ErrorDetail, Timestamp)
 - [ ] Scenario: Options binding -- Given configuration JSON with `Slack:MaxWorkspaces = 10`, When `SlackConnectorOptions` is resolved from DI, Then `MaxWorkspaces` equals 10
 
-## Stage 2.3: Database Migrations and Schema Validation
+## Stage 2.2: Slack Entity Type Configurations and Indexing
 
 ### Implementation Steps
-- [ ] Add `Microsoft.EntityFrameworkCore.Design` package to the Worker project for migration tooling
-- [ ] Create initial EF Core migration `InitialSlackSchema` containing all four Slack tables (`slack_workspace_config`, `slack_thread_mapping`, `slack_inbound_request_record`, `slack_audit_entry`)
-- [ ] Add a migration verification unit test that calls `context.Database.EnsureCreated()` against SQLite in-memory and validates all four tables exist
-- [ ] Add a seed data helper method `SlackDbSeeder.SeedTestWorkspace()` that inserts a sample `SlackWorkspaceConfig` for integration testing
+- [ ] Create EF Core `IEntityTypeConfiguration<SlackWorkspaceConfig>` class defining column types, primary key on `TeamId`, and value conversion for `AllowedChannelIds` and `AllowedUserGroupIds` string arrays
+- [ ] Create EF Core `IEntityTypeConfiguration<SlackThreadMapping>` class with primary key on `TaskId` and unique constraint on `(TeamId, ChannelId, ThreadTs)`
+- [ ] Create EF Core `IEntityTypeConfiguration<SlackInboundRequestRecord>` class with primary key on `IdempotencyKey` and index on `FirstSeenAt` for retention cleanup
+- [ ] Create EF Core `IEntityTypeConfiguration<SlackAuditEntry>` class with primary key on `Id` and indexes on: `CorrelationId`, `TaskId`, `AgentId`, composite `(TeamId, ChannelId)`, `UserId`, `Timestamp`
+- [ ] Create `SlackTestDbContext` test-only `DbContext` subclass in the test project that registers all four Slack entity configurations for isolated schema validation (production uses the upstream `MessagingDbContext` from the Persistence project)
+- [ ] Add `Microsoft.EntityFrameworkCore.Sqlite` NuGet package to the test project for integration tests
 
 ### Dependencies
-- phase-persistence-and-data-model/stage-slack-entity-models-and-configuration
+- phase-persistence-and-data-model/stage-slack-entity-model-definitions
 
 ### Test Scenarios
-- [ ] Scenario: Migration creates all tables -- Given a clean SQLite in-memory database, When the `InitialSlackSchema` migration is applied, Then tables `slack_workspace_config`, `slack_thread_mapping`, `slack_inbound_request_record`, and `slack_audit_entry` all exist
-- [ ] Scenario: Seed workspace loads -- Given a freshly migrated database, When `SlackDbSeeder.SeedTestWorkspace()` is called, Then a `SlackWorkspaceConfig` row is retrievable by its `TeamId`
+- [ ] Scenario: Entity configuration applies indexes -- Given `SlackTestDbContext` with entity configurations, When the model is built, Then `SlackAuditEntry` has indexes on `CorrelationId`, `TaskId`, `AgentId`, `UserId`, and `Timestamp`
+- [ ] Scenario: Thread mapping unique constraint -- Given a `SlackThreadMapping` with `(TeamId, ChannelId, ThreadTs)` already persisted, When a duplicate `(TeamId, ChannelId, ThreadTs)` is inserted, Then a `DbUpdateException` is thrown
+- [ ] Scenario: Workspace config array conversion -- Given a `SlackWorkspaceConfig` with `AllowedChannelIds = ["C1", "C2"]`, When persisted and loaded via `SlackTestDbContext`, Then the array round-trips correctly
+
+## Stage 2.3: Slack Schema Integration Tests
+
+### Implementation Steps
+- [ ] Create EF Core migration contribution `AddSlackEntities` that registers all four Slack entity configurations with the upstream `MessagingDbContext` (the migration is added to the shared migration set in the Persistence project when available)
+- [ ] Add a schema verification integration test using `SlackTestDbContext` with SQLite in-memory that validates all four tables (`slack_workspace_config`, `slack_thread_mapping`, `slack_inbound_request_record`, `slack_audit_entry`) are created correctly
+- [ ] Add a seed data helper method `SlackDbSeeder.SeedTestWorkspace()` that inserts a sample `SlackWorkspaceConfig` for use in downstream integration tests
+- [ ] Verify all Slack entity type configurations are auto-discovered by `SlackTestDbContext` via `ApplyConfigurationsFromAssembly`
+
+### Dependencies
+- phase-persistence-and-data-model/stage-slack-entity-type-configurations-and-indexing
+
+### Test Scenarios
+- [ ] Scenario: Schema creates all tables -- Given a clean SQLite in-memory database, When `SlackTestDbContext.Database.EnsureCreated()` is called, Then tables `slack_workspace_config`, `slack_thread_mapping`, `slack_inbound_request_record`, and `slack_audit_entry` all exist
+- [ ] Scenario: Seed workspace loads -- Given a freshly created database, When `SlackDbSeeder.SeedTestWorkspace()` is called, Then a `SlackWorkspaceConfig` row is retrievable by its `TeamId`
 
 
 # Phase 3: Security Pipeline
@@ -133,7 +126,7 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 
 ### Implementation Steps
 - [ ] Create `SlackSignatureValidator` as ASP.NET Core middleware in the Slack project that reads `X-Slack-Signature` and `X-Slack-Request-Timestamp` headers from inbound HTTP requests
-- [ ] Implement HMAC SHA-256 verification: compute `v0={timestamp}:{body}` hash with the workspace signing secret and compare to the provided signature
+- [ ] Implement HMAC SHA-256 verification: compute `v0:{timestamp}:{body}` hash with the workspace signing secret and compare to the provided signature
 - [ ] Reject requests with missing or invalid signatures by returning HTTP 401 and logging an audit entry with `outcome = rejected_signature`
 - [ ] Reject requests where the timestamp is older than 5 minutes (clock-skew tolerance) to prevent replay attacks
 - [ ] Resolve the signing secret at runtime from the secret provider via `SlackWorkspaceConfig.SigningSecretRef` (use `ISecretProvider` interface defined in this step)
@@ -155,15 +148,15 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 - [ ] Implement channel check: verify `channel_id` is in the workspace's `AllowedChannelIds` list
 - [ ] Implement user-group check via `SlackMembershipResolver`: verify the requesting user belongs to at least one group in `AllowedUserGroupIds`
 - [ ] Create `SlackMembershipResolver` class that calls Slack `usergroups.users.list` via SlackNet, caching results with configurable TTL (default 5 minutes per `SlackConnectorOptions`)
-- [ ] Return HTTP 403 with an ephemeral Slack error message for rejected requests; log audit entry with `outcome = rejected_auth` including `team_id`, `channel_id`, and `user_id`
+- [ ] Return an ephemeral Slack error message for rejected requests (Slack endpoints must return HTTP 200; rejection is communicated in the response body as an ephemeral message); log audit entry with `outcome = rejected_auth` including `team_id`, `channel_id`, and `user_id`
 
 ### Dependencies
 - phase-security-pipeline/stage-request-signature-validation
 
 ### Test Scenarios
 - [ ] Scenario: Authorized request passes -- Given a request from an allowed workspace, allowed channel, and a user in an allowed group, When `SlackAuthorizationFilter` runs, Then the request proceeds
-- [ ] Scenario: Unknown workspace rejected -- Given a request with a `team_id` not in `SlackWorkspaceConfig`, When `SlackAuthorizationFilter` runs, Then HTTP 403 is returned with audit entry `outcome = rejected_auth`
-- [ ] Scenario: Disallowed channel rejected -- Given a valid workspace but `channel_id` not in `AllowedChannelIds`, When `SlackAuthorizationFilter` runs, Then HTTP 403 is returned
+- [ ] Scenario: Unknown workspace rejected -- Given a request with a `team_id` not in `SlackWorkspaceConfig`, When `SlackAuthorizationFilter` runs, Then an ephemeral error message is returned with audit entry `outcome = rejected_auth`
+- [ ] Scenario: Disallowed channel rejected -- Given a valid workspace but `channel_id` not in `AllowedChannelIds`, When `SlackAuthorizationFilter` runs, Then an ephemeral error message is returned
 - [ ] Scenario: Membership cache respects TTL -- Given `SlackMembershipResolver` with a 5-minute TTL, When the same user group is queried twice within TTL, Then the Slack API is called only once
 
 ## Stage 3.3: Secret Provider Integration
@@ -199,7 +192,7 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 - [ ] Create `SlackInteractionsController` with route `POST /api/slack/interactions` that receives interactive payloads (button clicks, modal submissions) and immediately returns HTTP 200
 - [ ] Define `SlackInboundEnvelope` internal record to normalize all inbound payload types (event, command, interaction) into a common envelope carrying `IdempotencyKey`, `SourceType`, `TeamId`, `ChannelId`, `UserId`, `RawPayload`, `TriggerId` (nullable), and `ReceivedAt`
 - [ ] Wire `SlackSignatureValidator` middleware to all three Slack endpoint routes
-- [ ] Enqueue normalized `SlackInboundEnvelope` to `IDurableQueue<SlackInboundEnvelope>` after ACK for async processing
+- [ ] Enqueue normalized `SlackInboundEnvelope` to `ISlackInboundQueue` after ACK for async processing
 - [ ] Implement modal fast-path detection in `SlackCommandsController`: for sub-commands `review` and `escalate`, run auth + idempotency + `views.open` synchronously before returning HTTP 200 (per architecture.md section 2.2.2 and tech-spec section 5.2)
 
 ### Dependencies
@@ -216,7 +209,7 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 - [ ] Create `SlackSocketModeReceiver` implementing `ISlackInboundTransport` with `StartAsync` and `StopAsync` lifecycle methods
 - [ ] Establish WebSocket connection to Slack using the app-level token resolved from `SlackWorkspaceConfig.AppLevelTokenRef` via `ISecretProvider`
 - [ ] Implement envelope acknowledgment: send ACK response over the WebSocket within 5 seconds of receiving each event envelope
-- [ ] Normalize received Socket Mode payloads into `SlackInboundEnvelope` and enqueue to `IDurableQueue<SlackInboundEnvelope>`
+- [ ] Normalize received Socket Mode payloads into `SlackInboundEnvelope` and enqueue to `ISlackInboundQueue`
 - [ ] Implement reconnection with exponential backoff (initial 1s, max 30s) and jitter on WebSocket disconnection
 - [ ] Implement graceful shutdown: on `StopAsync`, close the WebSocket connection and drain pending envelopes
 - [ ] Select transport per workspace based on `SlackWorkspaceConfig.AppLevelTokenRef`: present = Socket Mode, absent = Events API (per architecture.md section 4.2 and tech-spec section 2.1)
@@ -232,12 +225,12 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 ## Stage 4.3: Inbound Ingestor and Deduplication
 
 ### Implementation Steps
-- [ ] Create `SlackInboundIngestor` as a `BackgroundService` that continuously drains `IDurableQueue<SlackInboundEnvelope>` and dispatches envelopes through the processing pipeline
+- [ ] Create `SlackInboundIngestor` as a `BackgroundService` that continuously drains `ISlackInboundQueue` and dispatches envelopes through the processing pipeline
 - [ ] Create `SlackIdempotencyGuard` implementing `ISlackIdempotencyGuard` with `TryAcquireAsync`, `MarkCompletedAsync`, and `MarkFailedAsync` backed by `SlackInboundRequestRecord` persistence
 - [ ] Implement idempotency key derivation per architecture.md section 3.4: `event:{event_id}` for Events API, `cmd:{team_id}:{user_id}:{command}:{trigger_id}` for slash commands, `interact:{team_id}:{user_id}:{action_id or view_id}:{trigger_id}` for interactions
-- [ ] Implement processing pipeline order: idempotency check -> authorization check -> dispatch to appropriate handler (`SlackCommandHandler`, `SlackAppMentionHandler`, or `SlackInteractionHandler`)
+- [ ] Implement processing pipeline order: authorization check -> idempotency check -> dispatch to appropriate handler (`SlackCommandHandler`, `SlackAppMentionHandler`, or `SlackInteractionHandler`); authorization runs first so unauthorized requests are rejected before acquiring idempotency records (per architecture.md sections 574-575)
 - [ ] Route `SlackInboundEnvelope` by `SourceType`: `command` to `SlackCommandHandler`, `event` (with `app_mention` subtype) to `SlackAppMentionHandler`, `interaction` to `SlackInteractionHandler`
-- [ ] On processing failure, apply retry policy; after max retries, move envelope to `IDeadLetterQueue<SlackInboundEnvelope>`
+- [ ] On processing failure, apply retry policy via `ISlackRetryPolicy`; after max retries, move envelope to `ISlackDeadLetterQueue`
 - [ ] Log duplicate events to audit with `outcome = duplicate`
 
 ### Dependencies
@@ -295,8 +288,8 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 
 ### Implementation Steps
 - [ ] Create `SlackInteractionHandler` class that processes Block Kit button clicks and modal `view_submission` payloads
-- [ ] Implement button click handling: extract `action_id`, `value`, `user.id`, `message.ts`, and `trigger_id` from the interactive payload; map to `HumanDecisionEvent` per architecture.md section 2.9 mapping table
-- [ ] Implement modal submission handling: extract form values from `view.state.values`, map selected verdict to `ActionValue` and free-text input to `Comment` in `HumanDecisionEvent`
+- [ ] Implement button click handling: extract `action_id`, `value`, `user.id`, `message.ts`, and `trigger_id` from the interactive payload; extract `QuestionId` from the button's `block_id` where it was encoded during rendering by `SlackMessageRenderer` (per architecture.md sections 630-634); map to `HumanDecisionEvent` per architecture.md section 2.9 mapping table
+- [ ] Implement modal submission handling: extract form values from `view.state.values`, extract `QuestionId` from the modal's `private_metadata` field (set during `views.open`), map selected verdict to `ActionValue` and free-text input to `Comment` in `HumanDecisionEvent`
 - [ ] Resolve `CorrelationId` from `SlackThreadMapping` by looking up the `thread_ts` from the button's parent message
 - [ ] Populate `HumanDecisionEvent` fields: `Messenger = "slack"`, `ExternalUserId = user.id`, `ExternalMessageId = message.ts or view.id`, `ReceivedAt = DateTimeOffset.UtcNow`
 - [ ] Publish the `HumanDecisionEvent` to the orchestrator via `IAgentTaskService.PublishDecisionAsync`
@@ -307,8 +300,8 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 - phase-command-and-interaction-processing/stage-slash-command-dispatch
 
 ### Test Scenarios
-- [ ] Scenario: Button click produces HumanDecisionEvent -- Given a Block Kit button click with `action_id = approve` and `value = approve`, When `SlackInteractionHandler` processes it, Then a `HumanDecisionEvent` with `ActionValue = "approve"` is published and the message buttons are disabled
-- [ ] Scenario: Modal submission includes comment -- Given a modal `view_submission` with verdict `request-changes` and comment text `Add error handling`, When the handler processes it, Then `HumanDecisionEvent` has `ActionValue = "request-changes"` and `Comment = "Add error handling"`
+- [ ] Scenario: Button click produces HumanDecisionEvent with QuestionId -- Given a Block Kit button click where `block_id` encodes `QuestionId = Q-99` and `value = approve`, When `SlackInteractionHandler` processes it, Then a `HumanDecisionEvent` with `QuestionId = "Q-99"` and `ActionValue = "approve"` is published and the message buttons are disabled
+- [ ] Scenario: Modal submission includes QuestionId and comment -- Given a modal `view_submission` with `private_metadata` encoding `QuestionId = Q-55`, verdict `request-changes`, and comment text `Add error handling`, When the handler processes it, Then `HumanDecisionEvent` has `QuestionId = "Q-55"`, `ActionValue = "request-changes"`, and `Comment = "Add error handling"`
 - [ ] Scenario: RequiresComment triggers modal -- Given a button click where the associated `HumanAction.RequiresComment = true`, When `SlackInteractionHandler` processes it, Then a modal with a text input is opened instead of directly submitting
 
 
@@ -358,13 +351,13 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 ## Stage 6.3: Outbound Dispatch and Rate Limiting
 
 ### Implementation Steps
-- [ ] Create `SlackOutboundDispatcher` as a `BackgroundService` that drains `IDurableQueue<SlackOutboundEnvelope>` and sends messages to Slack via the Web API
+- [ ] Create `SlackOutboundDispatcher` as a `BackgroundService` that drains `ISlackOutboundQueue` and sends messages to Slack via the Web API
 - [ ] Define `SlackOutboundEnvelope` internal record carrying `TaskId`, `CorrelationId`, `MessageType` (postMessage, update, viewsUpdate), `BlockKitPayload`, and `ThreadTs`
 - [ ] Implement `SendMessageAsync` on `SlackConnector`: render the `MessengerMessage` via `ISlackMessageRenderer`, resolve thread via `ISlackThreadManager`, wrap in `SlackOutboundEnvelope`, and enqueue to the outbound queue
 - [ ] Implement `SendQuestionAsync` on `SlackConnector`: render the `AgentQuestion` via `ISlackMessageRenderer`, resolve thread, wrap and enqueue
 - [ ] Implement token-bucket rate limiter per Slack API method tier: Tier 2 for `chat.postMessage` (~1 req/s/channel), Tier 4 for `views.update` (shared state with `SlackDirectApiClient` per architecture.md section 2.12)
 - [ ] Handle HTTP 429 responses: pause dispatch for the `Retry-After` header duration
-- [ ] Move messages to `IDeadLetterQueue` after exceeding max retry attempts
+- [ ] Move messages to `ISlackDeadLetterQueue` after exceeding max retry attempts
 - [ ] Log every outbound API call to `SlackAuditLogger` with `direction = outbound`
 
 ### Dependencies
@@ -382,8 +375,7 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 - [ ] Implement `OpenModalAsync(string triggerId, SlackModalPayload modal, CancellationToken)` that calls `views.open` via SlackNet with the provided `trigger_id` and modal view definition
 - [ ] Share the token-bucket rate limiter state with `SlackOutboundDispatcher` so that `views.open` calls respect the same per-tier limits
 - [ ] Log every `views.open` call to `SlackAuditLogger` with `request_type = modal_open`
-- [ ] On `views.open` failure (rate limit, network error, or Slack API error), return an ephemeral error message to the user; do not retry via the outbound queue because the `trigger_id` is already expired (per architecture.md section 2.15)
-- [ ] Implement `UpdateModalAsync(string viewId, SlackModalPayload modal, CancellationToken)` for post-open modal updates (routed through the durable outbound queue via the dispatcher)
+- [ ] On `views.open` failure (rate limit, network error, or Slack API error), return an ephemeral error message to the user; do not retry via the outbound queue because the `trigger_id` is already expired (per architecture.md section 2.15); `views.update` for post-open modal modifications is handled by `SlackOutboundDispatcher` through the durable outbound queue, not by this client
 
 ### Dependencies
 - phase-outbound-messaging/stage-outbound-dispatch-and-rate-limiting
@@ -402,7 +394,7 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 ## Stage 7.1: Audit Logging and Retention
 
 ### Implementation Steps
-- [ ] Create `SlackAuditLogger` implementing `ISlackAuditLogger` with `LogAsync` and `QueryAsync` methods backed by `EfMessagingRepository<SlackAuditEntry>`
+- [ ] Create `SlackAuditLogger` implementing `ISlackAuditLogger` with `LogAsync` and `QueryAsync` methods backed by EF Core persistence (uses the Slack entity configurations registered with the upstream `MessagingDbContext`)
 - [ ] Implement `LogAsync`: persist a `SlackAuditEntry` capturing all required audit fields (team ID, channel ID, thread timestamp, user ID, command text, response payload per story description)
 - [ ] Implement `QueryAsync(SlackAuditQuery)`: support filtering by `correlation_id`, `task_id`, `agent_id`, `team_id`, `channel_id`, `user_id`, `direction`, `outcome`, and time range
 - [ ] Wire `SlackAuditLogger.LogAsync` calls into every inbound and outbound processing path: signature validation, authorization, idempotency, command dispatch, interaction handling, outbound send, and modal open
@@ -464,7 +456,7 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 - [ ] Implement `SendQuestionAsync`: delegate to `SlackMessageRenderer` + `SlackThreadManager` + outbound queue enqueue
 - [ ] Implement `ReceiveAsync`: drain processed inbound events from the inbound pipeline and return as `IReadOnlyList<MessengerEvent>`
 - [ ] Create `ServiceCollectionExtensions.AddSlackMessenger(IConfiguration)` that registers all Slack components in DI: `SlackConnector` as `IMessengerConnector`, all internal handlers, renderers, guards, transports, and the `SlackDirectApiClient`
-- [ ] Wire the Worker project `Program.cs` to call `AddMessagingCore()`, `AddMessagingPersistence()`, `AddSecretProvider()`, and `AddSlackMessenger()` in the correct order
+- [ ] Wire the Worker project `Program.cs` to call `AddSlackMessenger()` and `AddSecretProvider()` for Slack-owned registrations, plus the upstream `AddMessagingCore()` and `AddMessagingPersistence()` DI registrations (provided by the Core and Persistence projects when available)
 - [ ] Configure `appsettings.json` with a documented schema for `Slack` configuration section (workspaces, options, secret provider)
 
 ### Dependencies
@@ -477,13 +469,13 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 ## Stage 8.2: End-to-End Integration Tests
 
 ### Implementation Steps
-- [ ] Create `SlackIntegrationTestFixture` that configures `WebApplicationFactory<Program>` with SQLite in-memory database, `InMemoryDurableQueue`, and mock `IAgentTaskService`
+- [ ] Create `SlackIntegrationTestFixture` that configures `WebApplicationFactory<Program>` with SQLite in-memory database, `ChannelBasedSlackQueue` for inbound/outbound queues, and mock `IAgentTaskService`
 - [ ] Create mock Slack API server using ASP.NET Core `TestServer` to simulate Slack Web API responses (`chat.postMessage`, `chat.update`, `views.open`, `auth.test`, `usergroups.users.list`)
 - [ ] Write integration test for AC-1: POST `/api/slack/commands` with a valid `/agent ask generate implementation plan for persistence failover` payload; verify `IAgentTaskService.CreateTaskAsync` was called, a thread root message was posted, and a `SlackAuditEntry` was persisted
 - [ ] Write integration test for AC-2: simulate orchestrator emitting a status update and an `AgentQuestion`; verify both are posted as threaded replies with correct Block Kit formatting
 - [ ] Write integration test for AC-3: simulate a Block Kit button click on an `AgentQuestion` message; verify a `HumanDecisionEvent` is published and the message buttons are updated to disabled state
 - [ ] Write integration test for AC-4: send the same event payload twice with identical `event_id`; verify only one `IAgentTaskService` call occurs and the second is recorded as `outcome = duplicate`
-- [ ] Write integration test for AC-5: send a slash command from a channel not in `AllowedChannelIds`; verify HTTP 403 is returned and audit records `outcome = rejected_auth`
+- [ ] Write integration test for AC-5: send a slash command from a channel not in `AllowedChannelIds`; verify HTTP 200 ACK is returned to Slack, the request is rejected during async processing with an ephemeral error message to the user, and audit records `outcome = rejected_auth`
 - [ ] Write integration test for AC-6: execute a full ask-question-approve flow and verify all exchanges are queryable by `CorrelationId` via `SlackAuditLogger.QueryAsync`
 
 ### Dependencies
