@@ -35,20 +35,26 @@ namespace AgentSwarm.Messaging.Teams.EntityFrameworkCore;
 /// active working set so it does not regress as the audit table grows.</description></item>
 /// </list>
 /// <para>
-/// <b>Provider note on filtered-index syntax</b>: the <c>HasFilter</c> expressions
-/// below are written for SQL Server (the production target) using ANSI quoted
-/// identifiers — <c>"Status" = 'Open'</c>. SQLite parses the same expression without
-/// error because EF Core's SQLite provider supports partial indexes and SQLite
-/// itself accepts double-quoted identifiers as a backwards-compat fallback. However,
-/// SQLite's well-known double-quote quirk (an unrecognised quoted token silently
-/// falls back to a string literal) means this filter is fragile under SQLite if the
-/// column is ever renamed: the index would compile but match zero rows, silently
-/// disabling the filter rather than producing an error. The CI suite uses SQLite
-/// in-memory and exercises functional correctness only — it does not assert query
-/// plans or selectivity, so filtered-index behaviour is effectively validated only
-/// on the SQL Server production deployment. Future maintainers changing the
-/// <c>Status</c> column or the filter expression should re-verify against SQL
-/// Server and not assume the SQLite test pass implies the filter is exercised.
+/// <b>Filtered-index syntax / provider portability</b>: the <c>HasFilter</c> calls below
+/// emit ANSI quoted-identifier syntax (<c>"Status" = 'Open'</c>) which SQL Server parses
+/// correctly as <c>[Status] = 'Open'</c> in the generated <c>CREATE INDEX</c> statement.
+/// Production targets SQL Server, so the filter <i>is</i> enforced there.
+/// </para>
+/// <para>
+/// <b>SQLite caveat (tests only)</b>: SQLite has a long-standing compatibility quirk
+/// where double-quoted strings inside an expression context — including the WHERE clause
+/// of <c>CREATE INDEX … WHERE …</c> — may be interpreted as string literals rather than
+/// identifiers when the surrounding context allows it (see SQLite's
+/// <c>"double-quoted string literals"</c> behaviour). In that case the filter expression
+/// degenerates to <c>'Status' = 'Open'</c>, which is a constant <c>false</c>, and SQLite
+/// either rejects the partial index or silently builds one that matches no rows. Either
+/// way the in-memory <see cref="Microsoft.EntityFrameworkCore.SqliteDbContextOptionsBuilderExtensions">SQLite</see>
+/// test suite does <b>not</b> validate filtered-index <i>selectivity</i> — it only
+/// validates that the migration applies cleanly. Filtered-index <i>behaviour</i>
+/// (predicate restriction, index hit rate) is exercised solely against SQL Server in
+/// the integration suite. Future maintainers should not assume the SQLite-backed unit
+/// tests cover the <c>WHERE Status = 'Open'</c> predicate; if you change the filter,
+/// also add or update a SQL-Server-targeted integration test.
 /// </para>
 /// </remarks>
 public class TeamsLifecycleDbContext : DbContext
@@ -142,23 +148,19 @@ public class TeamsLifecycleDbContext : DbContext
         builder.Property(e => e.CreatedAt).IsRequired();
         builder.Property(e => e.ResolvedAt);
 
-        // Filtered indexes target SQL Server (the production database). The HasFilter
-        // expression uses ANSI quoted identifiers ("Status" = 'Open'), which SQL
-        // Server treats as a true partial index. SQLite parses the same expression
-        // without error (and EF Core's SQLite provider does emit CREATE INDEX ...
-        // WHERE), but SQLite's double-quote quirk means a renamed column would
-        // silently fall back to a string literal and the index would match zero
-        // rows. The CI suite uses SQLite in-memory and asserts only functional
-        // correctness — it does not validate query plans or selectivity, so the
-        // filtered-index behaviour is effectively exercised only against SQL Server
-        // in production. See the class-level <remarks> for the full rationale.
-
         // Open-by-conversation lookup (Stage 3.2 bare approve/reject disambiguation).
+        // NOTE: HasFilter emits ANSI quoted-identifier syntax. SQL Server enforces this
+        // predicate; SQLite (used only by the in-memory unit tests) may treat
+        // "Status" as a string literal due to its legacy DQS quirk, in which case the
+        // partial index is effectively un-validated by the test suite. See the class
+        // remarks for the full caveat.
         builder.HasIndex(e => new { e.ConversationId, e.Status })
             .HasDatabaseName("IX_AgentQuestions_ConversationId_Status_Open")
             .HasFilter("\"Status\" = 'Open'");
 
         // Expiry scan (Stage 3.3 QuestionExpiryProcessor).
+        // Same SQLite-vs-SQL-Server caveat as the index above — predicate selectivity
+        // is exercised against SQL Server only.
         builder.HasIndex(e => new { e.Status, e.ExpiresAt })
             .HasDatabaseName("IX_AgentQuestions_Status_ExpiresAt_Open")
             .HasFilter("\"Status\" = 'Open'");
