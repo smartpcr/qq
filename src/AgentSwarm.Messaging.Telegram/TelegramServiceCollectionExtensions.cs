@@ -160,7 +160,15 @@ public static class TelegramServiceCollectionExtensions
         // hit the database — last-wins semantics on Replace().
         services.TryAddSingleton<IAuditLogger, NullAuditLogger>();
 
-        services.AddSingleton<ICallbackHandler, StubCallbackHandler>();
+        // Stage 3.3 swapped StubCallbackHandler for the production
+        // CallbackQueryHandler. The handler depends on
+        // IPendingQuestionStore + ISwarmCommandBus + IAuditLogger +
+        // IDeduplicationService + ITelegramBotClient + TimeProvider —
+        // all five already registered above. Last-wins semantics on
+        // AddSingleton means a re-call of AddTelegram (test
+        // bootstraps) keeps the production binding; explicit
+        // overrides must call services.Replace() AFTER AddTelegram.
+        services.AddSingleton<ICallbackHandler, CallbackQueryHandler>();
         // TimeProvider.System is the production default; tests register a
         // FakeTimeProvider via TryAddSingleton-replacement before AddTelegram.
         services.TryAddSingleton(TimeProvider.System);

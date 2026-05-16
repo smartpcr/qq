@@ -144,6 +144,11 @@ public static class TelegramUpdateMapper
                 Timestamp = DateTimeOffset.UtcNow,
                 CorrelationId = correlationId,
                 Payload = callback.Data,
+                // Stage 3.3 — preserve the Telegram callback-query id so
+                // CallbackQueryHandler can echo it back via
+                // AnswerCallbackQueryAsync and use it as the per-callback
+                // idempotency key.
+                CallbackId = callback.Id,
             };
         }
 
