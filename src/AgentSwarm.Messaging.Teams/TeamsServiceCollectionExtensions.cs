@@ -1,8 +1,10 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Extensions;
 using AgentSwarm.Messaging.Teams.Lifecycle;
+using AgentSwarm.Messaging.Teams.Outbox;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -336,4 +338,135 @@ public static class TeamsServiceCollectionExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Wire the Stage 6.1 outbox + retry-engine. Composes the Teams messenger graph (via
+    /// <see cref="AddTeamsProactiveNotifier"/>) and then layers the
+    /// <see cref="Outbox.OutboxBackedProactiveNotifier"/> /
+    /// <see cref="Outbox.OutboxBackedMessengerConnector"/> decorators over the existing
+    /// <see cref="IProactiveNotifier"/> / <see cref="IMessengerConnector"/> registrations so
+    /// every public send call enqueues an <see cref="OutboxEntry"/> rather than invoking
+    /// <c>CloudAdapter.ContinueConversationAsync</c> directly. The <see cref="OutboxRetryEngine"/>
+    /// hosted service then drains the queue and routes each entry through
+    /// <see cref="Outbox.TeamsOutboxDispatcher"/>, which delegates to the un-decorated
+    /// <see cref="TeamsProactiveNotifier"/> / <see cref="TeamsMessengerConnector"/> for the
+    /// actual Bot Framework send.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Required pre-registrations.</b> Hosts MUST register <see cref="IMessageOutbox"/>
+    /// BEFORE calling this helper — typically via the EF Core extension package's
+    /// <c>AddSqlMessageOutbox(...)</c>. The retry engine's
+    /// <see cref="OutboxOptions"/>, <see cref="OutboxMetrics"/>, and
+    /// <see cref="TokenBucketRateLimiter"/> default to the canonical values from
+    /// <c>architecture.md</c> §9 / §10.1; hosts that need to override (e.g. tune
+    /// <see cref="OutboxOptions.RateLimitPerSecond"/>) should register their preferred
+    /// <see cref="OutboxOptions"/> BEFORE calling this helper — <c>TryAddSingleton</c>
+    /// leaves the explicit registration in place.
+    /// </para>
+    /// <para>
+    /// <b>Idempotent</b> — calling this helper multiple times leaves the descriptor count
+    /// unchanged for every service type involved. The <see cref="IProactiveNotifier"/>
+    /// and <see cref="IMessengerConnector"/> bindings use
+    /// <see cref="ServiceCollectionDescriptorExtensions.RemoveAll{T}(IServiceCollection)"/>
+    /// + <see cref="ServiceCollectionServiceExtensions.AddSingleton{TService}(IServiceCollection, Func{IServiceProvider, TService})"/>
+    /// to unconditionally re-bind those interfaces to the outbox-backed decorators —
+    /// the Stage 6.1 brief requires the outbox path to win regardless of composition order.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddTeamsOutbox(this IServiceCollection services)
+    {
+        if (services is null)
+        {
+            throw new ArgumentNullException(nameof(services));
+        }
+
+        // Compose the underlying messenger graph so the concrete TeamsProactiveNotifier
+        // and TeamsMessengerConnector singletons are registered. The OutboxBacked
+        // decorators below intentionally do NOT depend on those concrete types — the
+        // dispatcher resolves them via interface so unit tests can swap fakes.
+        services.AddTeamsProactiveNotifier();
+
+        services.TryAddSingleton<OutboxOptions>();
+        services.TryAddSingleton<OutboxMetrics>();
+        services.TryAddSingleton<TokenBucketRateLimiter>();
+        services.TryAddSingleton<TimeProvider>(TimeProvider.System);
+
+        // Register the underlying TeamsMessengerConnector under the keyed key the
+        // dispatcher uses to look up the inner connector — the outbox-backed wrapper
+        // takes that keyed dependency so it can delegate to the un-decorated send path.
+        // (Concrete TeamsProactiveNotifier was already registered by AddTeamsProactiveNotifier;
+        // the dispatcher constructor accepts IProactiveNotifier and resolves the concrete
+        // singleton through the type registration below — we don't expose it under
+        // IProactiveNotifier because that interface is bound to the decorator.)
+        services.TryAddKeyedSingleton<IProactiveNotifier>(
+            InnerProactiveNotifierKey,
+            (sp, _) => sp.GetRequiredService<TeamsProactiveNotifier>());
+        services.TryAddKeyedSingleton<IMessengerConnector>(
+            InnerMessengerConnectorKey,
+            (sp, _) => sp.GetRequiredService<TeamsMessengerConnector>());
+
+        // Dispatcher owns the Bot Framework send path directly (iter-4 restructure that
+        // addresses the post-send card-state durability bug). The dispatcher captures
+        // the ActivityId/ConversationId and persists them to the outbox row via
+        // IMessageOutbox.RecordSendReceiptAsync BEFORE attempting the downstream
+        // ICardStateStore / IAgentQuestionStore writes — so a transient persistence
+        // failure can return Transient without risking a duplicate card on retry.
+        services.TryAddSingleton<TeamsOutboxDispatcher>(sp => new TeamsOutboxDispatcher(
+            sp.GetRequiredService<Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter>(),
+            sp.GetRequiredService<TeamsMessagingOptions>(),
+            sp.GetRequiredService<IMessageOutbox>(),
+            sp.GetRequiredService<ICardStateStore>(),
+            sp.GetRequiredService<IAgentQuestionStore>(),
+            sp.GetRequiredService<Cards.IAdaptiveCardRenderer>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsOutboxDispatcher>>(),
+            sp.GetService<TimeProvider>()));
+        services.RemoveAll<IOutboxDispatcher>();
+        services.AddSingleton<IOutboxDispatcher>(sp => sp.GetRequiredService<TeamsOutboxDispatcher>());
+
+        // Outbox-backed decorators — these win for public IProactiveNotifier /
+        // IMessengerConnector resolution. RemoveAll+AddSingleton (not TryAddSingleton)
+        // because Stage 6.1 requires the outbox path to replace the direct-send path
+        // regardless of composition order.
+        services.TryAddSingleton<OutboxBackedProactiveNotifier>();
+        services.RemoveAll<IProactiveNotifier>();
+        services.AddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<OutboxBackedProactiveNotifier>());
+
+        services.TryAddSingleton<OutboxBackedMessengerConnector>(sp => new OutboxBackedMessengerConnector(
+            sp.GetRequiredService<TeamsMessengerConnector>(),
+            sp.GetRequiredService<IMessageOutbox>(),
+            sp.GetRequiredService<IConversationReferenceRouter>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<OutboxBackedMessengerConnector>>(),
+            sp.GetService<TimeProvider>()));
+
+        // Re-key the public IMessengerConnector key=teams binding to the decorator so
+        // callers that resolve by key get the outbox path. The un-decorated connector
+        // is still resolvable via the un-keyed concrete-type registration (used by the
+        // dispatcher and by ITeamsCardManager which delegates to it directly).
+        services.RemoveAll<IMessengerConnector>();
+        services.AddKeyedSingleton<IMessengerConnector>(
+            MessengerKey,
+            (sp, _) => sp.GetRequiredService<OutboxBackedMessengerConnector>());
+
+        // Hosted retry engine — drains the outbox at OutboxOptions.PollingIntervalMs cadence.
+        services.AddHostedService<OutboxRetryEngine>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Keyed-service key under which the un-decorated <see cref="TeamsProactiveNotifier"/>
+    /// is registered as <see cref="IProactiveNotifier"/> for resolution by
+    /// <see cref="Outbox.TeamsOutboxDispatcher"/>. Public so tests can resolve the inner
+    /// notifier without picking up the outbox decorator.
+    /// </summary>
+    public const string InnerProactiveNotifierKey = "teams.inner";
+
+    /// <summary>
+    /// Keyed-service key under which the un-decorated <see cref="TeamsMessengerConnector"/>
+    /// is registered as <see cref="IMessengerConnector"/> for resolution by
+    /// <see cref="Outbox.TeamsOutboxDispatcher"/>. Public so tests can resolve the inner
+    /// connector without picking up the outbox decorator.
+    /// </summary>
+    public const string InnerMessengerConnectorKey = "teams.inner";
 }

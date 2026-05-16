@@ -43,7 +43,21 @@ public sealed class NoOpMessageOutbox : IMessageOutbox
     }
 
     /// <inheritdoc />
-    public Task AcknowledgeAsync(string outboxEntryId, CancellationToken ct)
+    public Task AcknowledgeAsync(string outboxEntryId, OutboxDeliveryReceipt receipt, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task RecordSendReceiptAsync(string outboxEntryId, OutboxDeliveryReceipt receipt, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task RescheduleAsync(string outboxEntryId, DateTimeOffset nextRetryAt, string error, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         return Task.CompletedTask;
