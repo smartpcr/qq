@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Discord;
 using AgentSwarm.Messaging.Persistence;
 using FluentAssertions;
 using Microsoft.Data.Sqlite;

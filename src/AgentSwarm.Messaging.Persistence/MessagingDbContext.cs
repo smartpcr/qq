@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Discord;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
@@ -85,13 +86,20 @@ public class MessagingDbContext : DbContext
         {
             entity.ToTable("DiscordInteractions");
 
-            // At-most-once delivery (architecture.md Section 4.8) is gated by
-            // this primary key: SQLite materialises the PK as a unique B-tree
-            // on InteractionId, so a duplicate webhook INSERT collides at the
-            // constraint level. No companion unique index is declared --
-            // adding one would force SQLite to maintain two identical B-trees
-            // on every INSERT/UPDATE for zero semantic gain.
+            // At-most-once delivery (architecture.md §4.8 / §10.2) is gated
+            // by the InteractionId PK plus an explicit UNIQUE companion index:
+            // SQLite materialises the PK as a unique B-tree, and the companion
+            // index is what the generated migration (and Stage 2.1 schema
+            // assertion tests) expect by literal index name. Stage 2.2's
+            // PersistAsync relies on the unique-collision exception to signal
+            // a duplicate webhook replay -- the PK alone is enough at runtime,
+            // but the named index keeps the EF model snapshot, the migration
+            // output, and the schema verification test in lockstep.
             entity.HasKey(x => x.InteractionId);
+
+            entity.HasIndex(x => x.InteractionId)
+                .IsUnique()
+                .HasDatabaseName("IX_DiscordInteractions_InteractionId_Unique");
 
             entity.Property(x => x.InteractionId)
                 .HasConversion(SnowflakeConverter)

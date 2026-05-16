@@ -207,7 +207,7 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                     b.ToTable("DeadLetterMessages", (string)null);
                 });
 
-            modelBuilder.Entity("AgentSwarm.Messaging.Persistence.DiscordInteractionRecord", b =>
+            modelBuilder.Entity("AgentSwarm.Messaging.Discord.DiscordInteractionRecord", b =>
                 {
                     b.Property<long>("InteractionId")
                         .HasColumnType("INTEGER");

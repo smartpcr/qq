@@ -1,4 +1,4 @@
-namespace AgentSwarm.Messaging.Persistence;
+namespace AgentSwarm.Messaging.Discord;
 
 /// <summary>
 /// Classification of an inbound Discord interaction recorded in
