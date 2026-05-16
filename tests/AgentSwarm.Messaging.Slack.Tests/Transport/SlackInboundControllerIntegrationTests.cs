@@ -18,6 +18,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Core.Secrets;
+using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
@@ -338,6 +339,26 @@ public sealed class SlackInboundControllerIntegrationTests : IDisposable
                 StubUserGroupClient stub = new();
                 stub.SetMembers(TestTeamId, TestUserGroupId, TestUserId);
                 services.AddSingleton<ISlackUserGroupClient>(stub);
+
+                // Stage 4.3 (evaluator iter-5 item 5): the Stage 4.3
+                // ingestor is now wired into Program.cs as a hosted
+                // BackgroundService that drains ISlackInboundQueue.
+                // The Stage 4.1 integration tests below assert the
+                // queue's contents *directly* via DequeueAsync to
+                // verify the controller-to-queue handoff, so a
+                // concurrently-running ingestor would race the test
+                // and steal the envelope before the assertion. Remove
+                // the ingestor's IHostedService descriptor here so
+                // these queue-inspection tests stay deterministic;
+                // the ingestor's own behaviour is covered by the
+                // Pipeline/* test suites.
+                System.Collections.Generic.List<ServiceDescriptor> ingestorDescriptors =
+                    services.Where(d => d.ImplementationType == typeof(SlackInboundIngestor))
+                        .ToList();
+                foreach (ServiceDescriptor descriptor in ingestorDescriptors)
+                {
+                    services.Remove(descriptor);
+                }
             });
         }
     }
