@@ -12,6 +12,7 @@ using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.AspNetCore.Http;
@@ -37,11 +38,15 @@ internal static class SlackControllerTestHelpers
     public static SlackTestHttpContext BuildContext(
         string body,
         string contentType,
-        ISlackModalFastPathHandler? overrideFastPath = null)
+        ISlackModalFastPathHandler? overrideFastPath = null,
+        ISlackInteractionFastPathHandler? overrideInteractionFastPath = null)
     {
         ChannelBasedSlackInboundQueue queue = new();
         RecordingModalFastPathHandler fastPath = overrideFastPath as RecordingModalFastPathHandler
             ?? new RecordingModalFastPathHandler();
+        RecordingInteractionFastPathHandler interactionFastPath =
+            overrideInteractionFastPath as RecordingInteractionFastPathHandler
+            ?? new RecordingInteractionFastPathHandler();
         InMemorySlackInboundEnqueueDeadLetterSink deadLetter =
             new(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance);
 
@@ -53,6 +58,8 @@ internal static class SlackControllerTestHelpers
         services.AddSingleton<SlackInboundEnvelopeFactory>();
         services.AddSingleton<ISlackInboundQueue>(queue);
         services.AddSingleton<ISlackModalFastPathHandler>(overrideFastPath ?? fastPath);
+        services.AddSingleton<ISlackInteractionFastPathHandler>(
+            overrideInteractionFastPath ?? interactionFastPath);
         services.AddSingleton<InMemorySlackInboundEnqueueDeadLetterSink>(deadLetter);
         services.AddSingleton<ISlackInboundEnqueueDeadLetterSink>(deadLetter);
 
@@ -72,7 +79,7 @@ internal static class SlackControllerTestHelpers
         stream.Position = 0;
         ctx.Request.Body = stream;
 
-        return new SlackTestHttpContext(ctx, queue, fastPath, responseFeature, deadLetter);
+        return new SlackTestHttpContext(ctx, queue, fastPath, interactionFastPath, responseFeature, deadLetter);
     }
 
     public static async Task<SlackInboundEnvelope> DequeueWithTimeoutAsync(
@@ -94,12 +101,14 @@ internal sealed class SlackTestHttpContext
         DefaultHttpContext context,
         ChannelBasedSlackInboundQueue queue,
         RecordingModalFastPathHandler fastPath,
+        RecordingInteractionFastPathHandler interactionFastPath,
         TestableHttpResponseFeature responseFeature,
         InMemorySlackInboundEnqueueDeadLetterSink deadLetter)
     {
         this.Context = context;
         this.Queue = queue;
         this.FastPath = fastPath;
+        this.InteractionFastPath = interactionFastPath;
         this.ResponseFeature = responseFeature;
         this.DeadLetter = deadLetter;
     }
@@ -109,6 +118,8 @@ internal sealed class SlackTestHttpContext
     public ChannelBasedSlackInboundQueue Queue { get; }
 
     public RecordingModalFastPathHandler FastPath { get; }
+
+    public RecordingInteractionFastPathHandler InteractionFastPath { get; }
 
     public TestableHttpResponseFeature ResponseFeature { get; }
 
@@ -209,6 +220,33 @@ internal sealed class RecordingModalFastPathHandler : ISlackModalFastPathHandler
     public SlackModalFastPathResult Result { get; set; } = SlackModalFastPathResult.AsyncFallback;
 
     public Task<SlackModalFastPathResult> HandleAsync(
+        SlackInboundEnvelope envelope,
+        HttpContext httpContext,
+        CancellationToken ct)
+    {
+        this.InvocationCount++;
+        this.LastEnvelope = envelope;
+        return Task.FromResult(this.Result);
+    }
+}
+
+/// <summary>
+/// Test double for <see cref="ISlackInteractionFastPathHandler"/>
+/// (Stage 5.3 iter-2 evaluator item #2). Records invocations and
+/// returns a caller-specified result. Defaults to
+/// <see cref="SlackInteractionFastPathResult.AsyncFallback"/> so the
+/// Stage 4.1 controller tests that assume the enqueue path still
+/// runs continue to pass without modification.
+/// </summary>
+internal sealed class RecordingInteractionFastPathHandler : ISlackInteractionFastPathHandler
+{
+    public int InvocationCount { get; private set; }
+
+    public SlackInboundEnvelope? LastEnvelope { get; private set; }
+
+    public SlackInteractionFastPathResult Result { get; set; } = SlackInteractionFastPathResult.AsyncFallback;
+
+    public Task<SlackInteractionFastPathResult> HandleAsync(
         SlackInboundEnvelope envelope,
         HttpContext httpContext,
         CancellationToken ct)

@@ -52,6 +52,21 @@ internal interface ISlackMessageRenderer
     /// <c>/agent escalate &lt;task-id&gt;</c> modal.
     /// </summary>
     object RenderEscalateModal(SlackEscalateModalContext context);
+
+    /// <summary>
+    /// Renders the Slack <c>view</c> JSON for the follow-up
+    /// "comment required" modal opened by the Stage 5.3
+    /// <see cref="Pipeline.SlackInteractionHandler"/> when a clicked
+    /// Block Kit button's backing
+    /// <see cref="AgentSwarm.Messaging.Abstractions.HumanAction.RequiresComment"/>
+    /// is <see langword="true"/>. The submitted view is decoded by the
+    /// same handler into a
+    /// <see cref="AgentSwarm.Messaging.Abstractions.HumanDecisionEvent"/>
+    /// whose <c>ActionValue</c> is pinned from the originating button
+    /// (carried through <c>private_metadata</c>) and whose
+    /// <c>Comment</c> is read from the text input.
+    /// </summary>
+    object RenderCommentModal(SlackCommentModalContext context);
 }
 
 /// <summary>
@@ -89,5 +104,50 @@ internal readonly record struct SlackEscalateModalContext(
     string TaskId,
     string TeamId,
     string? ChannelId,
+    string UserId,
+    string CorrelationId);
+
+/// <summary>
+/// Input bundle for <see cref="ISlackMessageRenderer.RenderCommentModal"/>.
+/// </summary>
+/// <param name="QuestionId">Originating
+/// <see cref="AgentSwarm.Messaging.Abstractions.AgentQuestion.QuestionId"/>
+/// carried forward from the clicked button's <c>block_id</c>.</param>
+/// <param name="ActionValue">Machine-readable value of the originating
+/// <see cref="AgentSwarm.Messaging.Abstractions.HumanAction"/>
+/// (the button's <c>value</c>) pinned so the submitted modal can
+/// reconstruct the
+/// <see cref="AgentSwarm.Messaging.Abstractions.HumanDecisionEvent.ActionValue"/>.</param>
+/// <param name="ActionLabel">Display label of the originating action;
+/// used as the modal title to give the human visual confirmation of
+/// what they are commenting on.</param>
+/// <param name="TeamId">Slack workspace id (audit / routing).</param>
+/// <param name="ChannelId">Slack channel id of the parent message
+/// (may be <see langword="null"/> for workspace-level interactions).</param>
+/// <param name="MessageTs">Slack <c>message.ts</c> of the parent
+/// message so the submission can reach the same
+/// <see cref="Entities.SlackThreadMapping"/> when resolving
+/// <c>CorrelationId</c>.</param>
+/// <param name="ThreadTs">Slack <c>message.thread_ts</c> of the
+/// parent message (the root timestamp of the conversation thread
+/// the click landed in). Pinned so the
+/// <see cref="Pipeline.SlackInteractionHandler"/>'s view_submission
+/// path resolves the same <c>SlackThreadMapping</c> row the
+/// originating button click did. <see langword="null"/> when the
+/// click was on the thread's root message (Slack omits
+/// <c>thread_ts</c> in that case and <see cref="MessageTs"/> IS the
+/// root). Stage 5.3 evaluator iter-2 item #1.</param>
+/// <param name="UserId">Slack user id of the human who clicked the
+/// originating button.</param>
+/// <param name="CorrelationId">End-to-end correlation id carried
+/// forward so the eventual decision lands in the same audit row.</param>
+internal readonly record struct SlackCommentModalContext(
+    string QuestionId,
+    string ActionValue,
+    string ActionLabel,
+    string TeamId,
+    string? ChannelId,
+    string MessageTs,
+    string? ThreadTs,
     string UserId,
     string CorrelationId);
