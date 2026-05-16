@@ -126,12 +126,13 @@ public sealed class PersistentDeduplicationService : IDeduplicationService
 
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
-        db.ProcessedEvents.Add(new ProcessedEvent
+        var pending = new ProcessedEvent
         {
             EventId = eventId,
             ReservedAt = now,
             ProcessedAt = null,
-        });
+        };
+        db.ProcessedEvents.Add(pending);
 
         try
         {
@@ -146,6 +147,23 @@ public sealed class PersistentDeduplicationService : IDeduplicationService
             // this event id before returning false — any other category
             // of DB failure (e.g. connection drop) will surface as a
             // genuine missing row and re-throw below.
+            //
+            // EF Core documents that DbContext state is undefined after
+            // SaveChangesAsync throws: the failed Added entity is still
+            // tracked, and continuing to use the context for further
+            // queries risks the read resolving against the residual
+            // tracked entity (identity map) rather than the live row,
+            // or other latent change-tracker corruption. Detach the
+            // failed Added entity and clear the change tracker before
+            // the re-probe so the read sees the live DB state — mirrors
+            // the recovery pattern in MarkProcessedAsync's
+            // DbUpdateException catch block below. (AsNoTracking on the
+            // re-probe avoids identity-map resolution for the query
+            // results themselves, but it does not unwind the change
+            // tracker, so the explicit clear is still required.)
+            db.Entry(pending).State = EntityState.Detached;
+            db.ChangeTracker.Clear();
+
             var exists = await db.ProcessedEvents
                 .AsNoTracking()
                 .AnyAsync(x => x.EventId == eventId, ct)
