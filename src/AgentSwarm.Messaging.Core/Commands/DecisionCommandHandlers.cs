@@ -8,14 +8,25 @@ using Microsoft.Extensions.Logging;
 /// Shared body for <c>/approve</c> and <c>/reject</c>. Both commands have
 /// the same shape — first positional argument is the
 /// <see cref="PendingQuestion.QuestionId"/>, behaviour is to load the
-/// question, emit a <see cref="HumanDecisionEvent"/> with the
-/// command-specific <see cref="HumanDecisionEvent.ActionValue"/>, persist
-/// a strongly-typed <see cref="HumanResponseAuditEntry"/>, and confirm
-/// to the operator — so the two concrete handlers differ only in the
-/// canonical <see cref="HumanDecisionEvent.ActionValue"/> they pass to
-/// the base. Keeping the orchestration in one place makes the
-/// approve-vs-reject contract a single edit away when the project
-/// evolves.
+/// question, validate its <see cref="PendingQuestion.Status"/> and
+/// route (chat + workspace match), emit a
+/// <see cref="HumanDecisionEvent"/> with the command-specific
+/// <see cref="HumanDecisionEvent.ActionValue"/>, persist a strongly-typed
+/// <see cref="HumanResponseAuditEntry"/>, transition the question to
+/// <see cref="PendingQuestionStatus.Answered"/> via
+/// <see cref="IPendingQuestionStore.MarkAnsweredAsync"/>, and confirm to
+/// the operator — so the two concrete handlers differ only in:
+/// <list type="bullet">
+///   <item>the canonical <see cref="HumanDecisionEvent.ActionValue"/>
+///         they pass to the base; and</item>
+///   <item>whether they consume a trailing free-text reason: <c>/reject</c>
+///         carries optional reason text in
+///         <see cref="HumanDecisionEvent.Comment"/> per architecture.md §5
+///         (<c>/reject QUESTION-ID [reason]</c>); <c>/approve</c> does
+///         not.</item>
+/// </list>
+/// Keeping the orchestration in one place makes the approve-vs-reject
+/// contract a single edit away when the project evolves.
 /// </summary>
 public abstract class DecisionCommandHandlerBase : ICommandHandler
 {
@@ -33,6 +44,14 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
     public const string MissingQuestionIdMessage =
         "Usage: `/{0} <questionId>` — supply the id of the question to {0}.";
 
+    /// <summary>
+    /// Surfaced when a question id does not resolve, is not in
+    /// <see cref="PendingQuestionStatus.Pending"/>, or was routed to a
+    /// different chat than the requesting operator. Same template for
+    /// all three so an operator who guesses an id cannot tell whether
+    /// the id exists in another workspace (info-leak resistance per
+    /// architecture.md §4.3).
+    /// </summary>
     public const string QuestionNotFoundTemplate =
         "❌ No pending question found for id `{0}`.";
 
@@ -70,6 +89,17 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
     /// </summary>
     protected abstract string ActionValue { get; }
 
+    /// <summary>
+    /// <c>true</c> when the concrete handler honours an optional trailing
+    /// free-text reason after the question id and propagates it as
+    /// <see cref="HumanDecisionEvent.Comment"/> /
+    /// <see cref="HumanResponseAuditEntry.Comment"/>. Only <c>/reject</c>
+    /// does so today (architecture.md §5
+    /// <c>/reject QUESTION-ID [reason]</c>); <c>/approve</c> overrides
+    /// this to <c>false</c> and any trailing tokens are ignored.
+    /// </summary>
+    protected virtual bool AcceptsReason => false;
+
     /// <inheritdoc />
     public async Task<CommandResult> HandleAsync(
         ParsedCommand command,
@@ -95,25 +125,44 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
         }
 
         var questionId = command.Arguments[0];
+
+        // Optional trailing free-text reason. Joined with single spaces so
+        // a multi-word reason ("not safe right now") survives the
+        // whitespace-tokenized argument list produced by the parser.
+        string? reason = null;
+        if (AcceptsReason && command.Arguments.Count > 1)
+        {
+            var joined = string.Join(' ', command.Arguments.Skip(1)).Trim();
+            if (!string.IsNullOrEmpty(joined))
+            {
+                reason = joined;
+            }
+        }
+
         var pending = await _questions.GetAsync(questionId, ct).ConfigureAwait(false);
         if (pending is null)
         {
-            _logger.LogWarning(
-                "{Command}CommandHandler did not find pending question. QuestionId={QuestionId} OperatorId={OperatorId}",
-                CommandName,
-                questionId,
-                @operator.OperatorId);
+            return NotFound(questionId, @operator, reasonLogged: "question_missing");
+        }
 
-            return new CommandResult
-            {
-                Success = false,
-                ResponseText = string.Format(
-                    CultureInfo.InvariantCulture,
-                    QuestionNotFoundTemplate,
-                    questionId),
-                ErrorCode = $"{CommandName}_question_not_found",
-                CorrelationId = Guid.NewGuid().ToString("N"),
-            };
+        if (pending.Status != PendingQuestionStatus.Pending)
+        {
+            // Already answered, awaiting comment, or timed out — refuse to
+            // re-emit a decision. Architecture.md §5 line 937 requires
+            // Status == Pending before a HumanDecisionEvent fires.
+            return NotFound(questionId, @operator, reasonLogged: $"status={pending.Status}");
+        }
+
+        if (pending.TelegramChatId != @operator.TelegramChatId)
+        {
+            // Cross-chat / cross-route attempt: the question was sent to
+            // a different chat. Architecture.md §5 line 937 / 938
+            // requires the requesting operator's authorized binding
+            // (tenant/workspace via TelegramChatId) to match the
+            // question's originating route before we emit a decision.
+            // Same opaque "not found" surface so a hostile actor cannot
+            // probe for valid question ids in other workspaces.
+            return NotFound(questionId, @operator, reasonLogged: "chat_mismatch");
         }
 
         var receivedAt = _time.GetUtcNow();
@@ -122,6 +171,7 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
         {
             QuestionId = questionId,
             ActionValue = ActionValue,
+            Comment = reason,
             Messenger = "telegram",
             ExternalUserId = telegramUserId,
             ExternalMessageId = CommandOriginatedMessageIdPrefix + CommandName + ":" + questionId,
@@ -140,16 +190,26 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
                 AgentId = pending.AgentId,
                 QuestionId = questionId,
                 ActionValue = ActionValue,
+                Comment = reason,
                 Timestamp = receivedAt,
                 CorrelationId = pending.CorrelationId,
             },
             ct).ConfigureAwait(false);
 
+        // Transition AFTER publish+audit so a transient publish/audit
+        // failure leaves the question Pending and re-deliverable. This
+        // closes the "double-approve" loophole the iter-2 evaluator
+        // flagged (Issue 1): the next /approve|/reject for the same id
+        // takes the !Status.Pending early-return path above and is
+        // surfaced as "no pending question found".
+        await _questions.MarkAnsweredAsync(questionId, ct).ConfigureAwait(false);
+
         _logger.LogInformation(
-            "{Command}CommandHandler emitted HumanDecisionEvent. QuestionId={QuestionId} ActionValue={ActionValue} CorrelationId={CorrelationId}",
+            "{Command}CommandHandler emitted HumanDecisionEvent and marked answered. QuestionId={QuestionId} ActionValue={ActionValue} HasReason={HasReason} CorrelationId={CorrelationId}",
             CommandName,
             questionId,
             ActionValue,
+            reason is not null,
             pending.CorrelationId);
 
         return new CommandResult
@@ -161,6 +221,27 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
                 questionId,
                 CommandName),
             CorrelationId = pending.CorrelationId,
+        };
+    }
+
+    private CommandResult NotFound(string questionId, AuthorizedOperator @operator, string reasonLogged)
+    {
+        _logger.LogWarning(
+            "{Command}CommandHandler refusing decision. QuestionId={QuestionId} OperatorId={OperatorId} Reason={Reason}",
+            CommandName,
+            questionId,
+            @operator.OperatorId,
+            reasonLogged);
+
+        return new CommandResult
+        {
+            Success = false,
+            ResponseText = string.Format(
+                CultureInfo.InvariantCulture,
+                QuestionNotFoundTemplate,
+                questionId),
+            ErrorCode = $"{CommandName}_question_not_found",
+            CorrelationId = Guid.NewGuid().ToString("N"),
         };
     }
 }
@@ -181,7 +262,7 @@ public sealed class ApproveCommandHandler : DecisionCommandHandlerBase
     protected override string ActionValue => SwarmCommandType.Approve;
 }
 
-/// <summary>Handles <c>/reject &lt;questionId&gt;</c>.</summary>
+/// <summary>Handles <c>/reject &lt;questionId&gt; [reason]</c>.</summary>
 public sealed class RejectCommandHandler : DecisionCommandHandlerBase
 {
     public RejectCommandHandler(
@@ -195,4 +276,14 @@ public sealed class RejectCommandHandler : DecisionCommandHandlerBase
     public override string CommandName => TelegramCommands.Reject;
 
     protected override string ActionValue => SwarmCommandType.Reject;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <c>/reject</c> uniquely accepts <c>[reason]</c> per architecture.md
+    /// §5: the optional trailing text is carried verbatim as
+    /// <see cref="HumanDecisionEvent.Comment"/> and
+    /// <see cref="HumanResponseAuditEntry.Comment"/> so the rejecting
+    /// agent and the audit log both retain the operator's stated reason.
+    /// </remarks>
+    protected override bool AcceptsReason => true;
 }

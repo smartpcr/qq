@@ -1,6 +1,7 @@
 namespace AgentSwarm.Messaging.Core.Commands;
 
 using System.Globalization;
+using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
 using Microsoft.Extensions.Logging;
 
@@ -208,14 +209,14 @@ public sealed class HandoffCommandHandler : ICommandHandler
                 Action = AuditAction,
                 Timestamp = now,
                 CorrelationId = correlationId,
-                Details = string.Format(
-                    CultureInfo.InvariantCulture,
-                    "{{\"taskId\":\"{0}\",\"sourceAlias\":\"{1}\",\"targetAlias\":\"{2}\",\"sourceBindingId\":\"{3}\",\"targetBindingId\":\"{4}\"}}",
-                    taskId,
-                    sourceAlias,
-                    targetAlias,
-                    @operator.OperatorId,
-                    target.Id),
+                Details = JsonSerializer.Serialize(
+                    new HandoffAuditDetails(
+                        taskId,
+                        sourceAlias,
+                        targetAlias,
+                        @operator.OperatorId,
+                        target.Id),
+                    HandoffAuditDetailsContext.Default.HandoffAuditDetails),
             },
             ct).ConfigureAwait(false);
 
@@ -237,4 +238,34 @@ public sealed class HandoffCommandHandler : ICommandHandler
             CorrelationId = correlationId,
         };
     }
+}
+
+/// <summary>
+/// Strongly-typed payload behind <see cref="AuditEntry.Details"/> for
+/// <c>handoff.transferred</c> events. Defining the shape as a record and
+/// serialising via <see cref="JsonSerializer"/> guarantees JSON validity
+/// for arbitrary task ids and aliases — quotes, backslashes, newlines,
+/// and control characters are escaped per RFC 8259 by the serializer
+/// rather than concatenated into a hand-built template (iter-2 evaluator
+/// item 5). Pairs with <see cref="HandoffAuditDetailsContext"/> for
+/// source-generated, reflection-free serialization.
+/// </summary>
+internal sealed record HandoffAuditDetails(
+    string TaskId,
+    string SourceAlias,
+    string TargetAlias,
+    Guid SourceBindingId,
+    Guid TargetBindingId);
+
+/// <summary>
+/// System.Text.Json source-generated context for
+/// <see cref="HandoffAuditDetails"/>. Generated metadata avoids the
+/// runtime-reflection path so the serializer is trim/AOT-safe should
+/// the assembly ever be published with those flags.
+/// </summary>
+[System.Text.Json.Serialization.JsonSourceGenerationOptions(
+    PropertyNamingPolicy = System.Text.Json.Serialization.JsonKnownNamingPolicy.CamelCase)]
+[System.Text.Json.Serialization.JsonSerializable(typeof(HandoffAuditDetails))]
+internal sealed partial class HandoffAuditDetailsContext : System.Text.Json.Serialization.JsonSerializerContext
+{
 }
