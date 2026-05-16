@@ -13,18 +13,22 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 /// <summary>
-/// Composition-root wiring for Stage 5.1's slash-command dispatcher.
+/// Composition-root wiring for Stage 5.1's slash-command dispatcher
+/// and Stage 5.2's app-mention handler.
 /// </summary>
 /// <remarks>
 /// <para>
 /// Registers <see cref="SlackCommandHandler"/> as the production
-/// <see cref="ISlackCommandHandler"/> binding consumed by the Stage
+/// <see cref="ISlackCommandHandler"/> binding and
+/// <see cref="SlackAppMentionHandler"/> as the production
+/// <see cref="ISlackAppMentionHandler"/> binding consumed by the Stage
 /// 4.3 <see cref="SlackInboundProcessingPipeline"/>. Hosts that already
-/// registered an alternative <see cref="ISlackCommandHandler"/>
-/// (e.g., the Stage 4.3 dev-stub <see cref="NoOpSlackCommandHandler"/>
-/// for integration tests) MUST call <c>RemoveAll</c> before invoking
-/// this extension; the registrations use unconditional <c>AddSingleton</c>
-/// because Stage 5.1's whole purpose is to replace those stand-ins.
+/// registered alternative implementations (e.g., the Stage 4.3
+/// dev stand-ins <see cref="NoOpSlackCommandHandler"/> /
+/// <see cref="NoOpSlackAppMentionHandler"/> for integration tests)
+/// MUST call <c>RemoveAll</c> before invoking this extension; the
+/// registrations use unconditional <c>AddSingleton</c> because Stage
+/// 5.1 / 5.2's whole purpose is to replace those stand-ins.
 /// </para>
 /// <para>
 /// <b>Iter-2 evaluator item 3 fix:</b> this extension NO LONGER
@@ -73,6 +77,12 @@ public static class SlackCommandDispatchServiceCollectionExtensions
         // so the synchronous modal fast-path resolves the same default.
         services.TryAddSingleton<ISlackMessageRenderer, DefaultSlackMessageRenderer>();
 
+        // Stage 5.2: default threaded-reply poster. NoOp until Stage
+        // 6.x ships the HTTP chat.postMessage client. TryAdd so a host
+        // that has already registered a production poster (e.g. the
+        // Stage 6.x outbound dispatcher) wins.
+        services.TryAddSingleton<ISlackThreadedReplyPoster, NoOpSlackThreadedReplyPoster>();
+
         // Real command handler -- REPLACES any earlier ISlackCommandHandler
         // registration (notably the Stage 4.3 NoOpSlackCommandHandler
         // dev-stub). The Stage 4.3 ingestor extension intentionally
@@ -83,6 +93,21 @@ public static class SlackCommandDispatchServiceCollectionExtensions
         services.RemoveAll<ISlackCommandHandler>();
         services.AddSingleton<SlackCommandHandler>();
         services.AddSingleton<ISlackCommandHandler>(sp => sp.GetRequiredService<SlackCommandHandler>());
+
+        // Stage 5.2 app-mention handler. Same RemoveAll + AddSingleton
+        // pattern as ISlackCommandHandler so the Stage 4.3
+        // NoOpSlackAppMentionHandler dev stand-in (registered by the
+        // explicit AddSlackInboundDevelopmentHandlerStubs opt-in) is
+        // unconditionally replaced. The handler depends on the
+        // concrete SlackCommandHandler (to access the internal
+        // DispatchAsync entry point that takes a per-call responder),
+        // ISlackThreadedReplyPoster (registered above), and the host
+        // logger -- every other Stage 5.1 collaborator is reachable
+        // transitively through SlackCommandHandler so the wiring stays
+        // a single extension call.
+        services.RemoveAll<ISlackAppMentionHandler>();
+        services.AddSingleton<SlackAppMentionHandler>();
+        services.AddSingleton<ISlackAppMentionHandler>(sp => sp.GetRequiredService<SlackAppMentionHandler>());
 
         return services;
     }
