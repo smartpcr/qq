@@ -74,48 +74,39 @@ using Microsoft.Extensions.Options;
 /// calls against the same row).
 /// </para>
 /// <para>
-/// <b>Backpressure (best-effort, not transactional).</b> Per
-/// architecture.md §10.4, when the queue depth (Pending + Sending)
-/// exceeds <see cref="OutboundQueueOptions.MaxQueueDepth"/>
-/// (default 5000), <see cref="MessageSeverity.Low"/>-severity
-/// enqueues are dead-lettered immediately with
-/// <see cref="OutboundQueueOptions.BackpressureDeadLetterReason"/>
-/// and the canonical <c>telegram.messages.backpressure_dlq</c>
-/// counter is incremented.
-/// <see cref="MessageSeverity.Normal"/>,
+/// <b>Backpressure (best-effort, NOT atomic).</b> Per architecture.md
+/// §10.4, when the queue depth (Pending + Sending) exceeds
+/// <see cref="OutboundQueueOptions.MaxQueueDepth"/> (default 5000),
+/// <see cref="MessageSeverity.Low"/>-severity enqueues are
+/// dead-lettered with
+/// <see cref="OutboundQueueOptions.BackpressureDeadLetterReason"/> and
+/// the canonical <c>telegram.messages.backpressure_dlq</c> counter is
+/// incremented. <see cref="MessageSeverity.Normal"/>,
 /// <see cref="MessageSeverity.High"/>, and
 /// <see cref="MessageSeverity.Critical"/> messages are always
 /// accepted regardless of depth.
 /// </para>
 /// <para>
-/// The depth probe (a <c>CountAsync</c>) and the subsequent
-/// <c>INSERT</c> are deliberately NOT wrapped in a serialisable
-/// transaction, so the gate is an approximation rather than a
-/// hard ceiling. Under a concurrent Low-enqueue burst two
-/// observable races exist: (a) N callers each reading the same
-/// pre-INSERT depth all decide the same way (all admit, or all
-/// dead-letter) when a serialised view would have split the
-/// decision, and (b) the depth can drift between our read and
-/// our insert — so a Low row may slip in just over
-/// <c>MaxQueueDepth</c>, or be dead-lettered when a concurrent
-/// drain has already taken depth back under the cap. The drift
-/// is bounded by the concurrent-enqueue fan-in (one extra row
-/// per racing caller per measurement window) and is
-/// intentionally tolerated because: (i) only the Low tier pays
-/// the cost — Normal/High/Critical bypass the guard so the
-/// priority queue still drains urgent traffic during a burst,
-/// (ii) a single conditional <c>INSERT … WHERE
-/// (SELECT COUNT(*) …) &lt;= @cap</c> would require provider-
-/// specific raw SQL incompatible with the SQLite/PostgreSQL/SQL
-/// Server portability surface this class advertises, and (iii)
-/// the recovery / housekeeping sweep is the authoritative
-/// invariant restorer for any Low overflow that slips past the
-/// gate. Callers should treat <c>MaxQueueDepth</c> as a soft
-/// high-water mark, not a transactional ceiling — the canonical
-/// "messages are never lost" contract (story AC #5,
-/// implementation-plan.md PERF002) is upheld by the durable
-/// Pending/Sending/Sent/DeadLettered state machine, not by this
-/// approximate gate.
+/// The depth probe and the subsequent INSERT are intentionally
+/// <i>two separate statements</i>, not a conditional-INSERT — a
+/// portable single-statement form across SQLite/PostgreSQL/SQL
+/// Server would require provider-specific raw SQL and a second
+/// value-converter pass on the Status column, which is not worth
+/// the cost for what the architecture explicitly treats as a soft
+/// water-mark. Two race shapes follow from that choice and are
+/// documented contract, not bugs: (a) under a concurrent burst of
+/// Low-severity enqueues, several callers can each observe depth
+/// at or just above the cap and each independently dead-letter,
+/// briefly inflating the DLQ counter relative to the actual
+/// admission boundary; (b) at the boundary, a Low message can be
+/// admitted when a rival worker's <see cref="DequeueAsync"/>
+/// claim drops the depth between our probe and our write, or
+/// dead-lettered just below the cap when a rival enqueue lands
+/// first. <see cref="OutboundQueueOptions.MaxQueueDepth"/> is
+/// therefore a <i>soft</i> water-mark with single-digit slop under
+/// burst, not a hard ceiling — callers that need an absolute cap
+/// must rate-limit upstream (e.g. at the swarm event ingress)
+/// rather than rely on this guard.
 /// </para>
 /// <para>
 /// <b>Idempotency dedup.</b> The <c>ux_outbox_idempotency_key</c>
@@ -177,49 +168,35 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
             return;
         }
 
-        // Backpressure check (BEST-EFFORT — read-then-insert, not
-        // transactionally atomic). Count the non-terminal outbox
-        // depth (Pending + Sending) and dead-letter Low-severity
-        // enqueues when the depth exceeds the configured threshold.
-        // Per architecture.md §10.4 the guard is severity-asymmetric:
+        // Backpressure check (best-effort, NOT atomic — see the
+        // class-level "Backpressure" remark for the full race
+        // analysis). Count the non-terminal outbox depth
+        // (Pending + Sending) and dead-letter Low-severity enqueues
+        // when the depth exceeds the configured threshold. Per
+        // architecture.md §10.4 the guard is severity-asymmetric:
         // Normal/High/Critical messages bypass the gate so the
         // priority queue still drains the urgent traffic during a
         // burst, only Low-severity status updates / acks pay the
         // cost.
         //
-        // The CountAsync probe and the SaveChangesAsync below are
-        // NOT wrapped in a serialisable transaction. Under a
-        // concurrent Low-enqueue burst two races are observable:
-        //   (a) N callers each reading the same pre-INSERT depth
-        //       all decide the same way (all admit or all dead-
-        //       letter) when a serialised view would have split
-        //       the decision; and
-        //   (b) the depth can drift between our read and our
-        //       insert — so a Low row may slip in just over the
-        //       cap, or be dead-lettered when a concurrent drain
-        //       has already taken depth back under the cap.
-        // We deliberately accept this drift instead of switching to
-        // a serialisable transaction or a raw conditional INSERT
-        // because:
-        //   (i)   only Low pays the cost (Normal/High/Critical
-        //         bypass the guard so urgent traffic never
-        //         starves);
-        //   (ii)  a single conditional-INSERT against the count
-        //         would require provider-specific raw SQL
-        //         incompatible with the SQLite/PostgreSQL/SQL
-        //         Server portability surface advertised on the
-        //         class docstring (each provider spells the
-        //         INSERT … WHERE (SELECT COUNT(*) …) construct
-        //         differently and ExecuteUpdateAsync does not
-        //         model it); and
-        //   (iii) the durable Pending/Sending/Sent/DeadLettered
-        //         state machine + housekeeping sweep is the
-        //         authoritative invariant restorer — the canonical
-        //         "messages are never lost" contract (story AC #5,
-        //         implementation-plan.md PERF002) does not depend
-        //         on this gate being transactionally exact.
-        // Treat MaxQueueDepth as a soft high-water mark, not a hard
-        // ceiling.
+        // The probe + INSERT pair is intentionally two separate
+        // statements, not a conditional INSERT: a portable single-
+        // statement form across SQLite/PostgreSQL/SQL Server would
+        // require provider-specific raw SQL and a second value-
+        // converter pass on the Status column. Two race shapes
+        // follow and are documented contract, not bugs: (a) a
+        // concurrent burst of Low-severity callers can each observe
+        // depth at or just above the cap and each independently
+        // dead-letter, briefly inflating the DLQ counter relative
+        // to the actual admission boundary; (b) at the boundary, a
+        // Low message can be admitted when a rival DequeueAsync
+        // claim drops the depth between this probe and the write
+        // below, or dead-lettered just below the cap when a rival
+        // enqueue lands first. MaxQueueDepth is therefore a soft
+        // water-mark with single-digit slop under burst, not a
+        // hard ceiling — the hard back-stop for absolute capacity
+        // is upstream rate-limiting (swarm event ingress), not
+        // this guard.
         if (message.Severity == MessageSeverity.Low)
         {
             var depth = await db.OutboundMessages
@@ -267,27 +244,12 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
         }
 
         // Normal Pending insert. Use the row as-supplied except for
-        // MaxAttempts — `OutboundMessage.MaxAttempts` is a `required
-        // int` with no initializer, so its uninitialized value is the
-        // CLR default `0`. We treat exactly `0` as the "caller did
-        // not specify a per-message cap" sentinel and bind it to the
-        // host-tunable `OutboundQueue:MaxRetries` so adjusting the
-        // global cap does not require touching every enqueue site.
-        // Any non-zero value (including `1` for "attempt once, no
-        // retries") is honored verbatim; a negative value is
-        // explicitly rejected as nonsense rather than silently
-        // replaced — silently overriding `-1` (or `0` for callers who
-        // happened to mean it literally) would mask programmer error
-        // and was the surprise the iter-2 reviewer flagged.
+        // MaxAttempts — when the caller did not override the record
+        // default (5), bind it to the configured option so a host
+        // tuning the global cap via OutboundQueue:MaxRetries does
+        // not have to touch every enqueue site.
         var pending = message;
-        if (pending.MaxAttempts < 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(message),
-                pending.MaxAttempts,
-                "OutboundMessage.MaxAttempts must be >= 0. Use 0 to accept the configured OutboundQueue:MaxRetries default, or a positive integer to set a per-message cap.");
-        }
-        if (pending.MaxAttempts == 0)
+        if (pending.MaxAttempts <= 0)
         {
             pending = pending with { MaxAttempts = _options.MaxRetries };
         }
