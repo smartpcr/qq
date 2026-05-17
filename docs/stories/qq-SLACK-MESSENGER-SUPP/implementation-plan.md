@@ -411,19 +411,19 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 ## Stage 7.2: OpenTelemetry Traces and Metrics
 
 ### Implementation Steps
-- [ ] Register `ActivitySource` named `AgentSwarm.Messaging.Slack` for distributed tracing in the Slack project's DI registration
-- [ ] Add trace spans to key processing paths: inbound receive, signature validation, authorization check, idempotency check, command dispatch, outbound send, and modal open
-- [ ] Propagate `correlation_id`, `task_id`, `agent_id`, `team_id`, and `channel_id` as span attributes (baggage) per architecture.md section 6.3
-- [ ] Register `System.Diagnostics.Metrics` meter named `AgentSwarm.Messaging.Slack` with counters and histograms: `slack.inbound.count`, `slack.outbound.count`, `slack.outbound.latency_ms`, `slack.idempotency.duplicate_count`, `slack.auth.rejected_count`, `slack.ratelimit.backoff_count`
-- [ ] Ensure structured logs via `ILogger<T>` include `correlation_id`, `task_id`, `agent_id`, `team_id`, `channel_id` in the log scope for all Slack components
+- [x] Register `ActivitySource` named `AgentSwarm.Messaging.Slack` for distributed tracing in the Slack project's DI registration
+- [x] Add trace spans to key processing paths: inbound receive, signature validation, authorization check, idempotency check, command dispatch, outbound send, and modal open
+- [x] Propagate `correlation_id`, `task_id`, `agent_id`, `team_id`, and `channel_id` as span attributes (baggage) per architecture.md section 6.3
+- [x] Register `System.Diagnostics.Metrics` meter named `AgentSwarm.Messaging.Slack` with counters and histograms: `slack.inbound.count`, `slack.outbound.count`, `slack.outbound.latency_ms`, `slack.idempotency.duplicate_count`, `slack.auth.rejected_count`, `slack.ratelimit.backoff_count`
+- [x] Ensure structured logs via `ILogger<T>` include `correlation_id`, `task_id`, `agent_id`, `team_id`, `channel_id` in the log scope for all Slack components
 
 ### Dependencies
 - phase-observability-and-operations/stage-audit-logging-and-retention
 
 ### Test Scenarios
-- [ ] Scenario: Trace spans emitted -- Given a complete slash command processing flow, When an in-memory `ActivityListener` captures activities, Then spans for signature validation, authorization, idempotency, and command dispatch are present with `correlation_id` attribute
-- [ ] Scenario: Metrics increment -- Given 5 inbound commands processed, When the `slack.inbound.count` counter is read, Then its value is 5
-- [ ] Scenario: Duplicate count metric -- Given 3 duplicate events detected by the idempotency guard, When `slack.idempotency.duplicate_count` is read, Then its value is 3
+- [x] Scenario: Trace spans emitted -- Given a complete slash command processing flow, When an in-memory `ActivityListener` captures activities, Then spans for signature validation, authorization, idempotency, and command dispatch are present with `correlation_id` attribute
+- [x] Scenario: Metrics increment -- Given 5 inbound commands processed, When the `slack.inbound.count` counter is read, Then its value is 5
+- [x] Scenario: Duplicate count metric -- Given 3 duplicate events detected by the idempotency guard, When `slack.idempotency.duplicate_count` is read, Then its value is 3
 
 ## Stage 7.3: Health Checks and Diagnostics
 
