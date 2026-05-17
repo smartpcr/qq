@@ -72,6 +72,15 @@ public static class SlackSignatureValidationServiceCollectionExtensions
         services.TryAddSingleton<ISecretProvider, InMemorySecretProvider>();
         services.TryAddSingleton<ISlackWorkspaceConfigStore, InMemorySlackWorkspaceConfigStore>();
 
+        // Stage 3.3: surface every workspace's secret references to the
+        // SecretCacheWarmupHostedService so the composite provider's
+        // cache is populated at host start-up rather than on the first
+        // request (architecture.md §7.3). TryAddEnumerable is used so
+        // multiple ref sources from different connectors can coexist
+        // without overwriting each other.
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<ISecretRefSource, SlackWorkspaceSecretRefSource>());
+
         // Audit pipeline: persist EVERY rejection through the canonical
         // slack_audit_entry table (Stage 2.1 / 2.2). Production hosts
         // register an EntityFrameworkSlackAuditEntryWriter<TContext>

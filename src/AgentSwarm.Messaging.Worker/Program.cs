@@ -1,7 +1,11 @@
 using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Persistence;
+using AgentSwarm.Messaging.Slack.Pipeline;
+using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Security;
+using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
@@ -45,6 +49,20 @@ public class Program
         builder.Services.AddRouting();
         builder.Services.AddSlackConnectorOptions(builder.Configuration);
 
+        // Stage 7.2 (workstream:
+        // ws-qq-slack-messenger-supp-phase-observability-and-operations-stage-opentelemetry-traces-and-metrics):
+        // surface the Slack connector's `ActivitySource` / `Meter`
+        // primitives in DI BEFORE any downstream registration so the
+        // OpenTelemetry .NET SDK (when the host opts in) can resolve
+        // them by injected instance and so any test composition root
+        // sees the same singletons production code emits to. The
+        // call is idempotent -- TryAddSingleton means re-registration
+        // by a sibling composition root never produces a second
+        // instance. The ActivitySource is named
+        // "AgentSwarm.Messaging.Slack" and the Meter shares the same
+        // name (per architecture.md §6.3 / tech-spec.md §2.6).
+        builder.Services.AddSlackTelemetry();
+
         // Stage 3.1: register the secret-provider chain BEFORE the
         // signature middleware so the appsettings
         // SecretProvider.ProviderType selector is honoured. The Slack
@@ -58,6 +76,25 @@ public class Program
         // TryAddSingleton fallback would otherwise register. Without
         // this call signature-rejection audit rows are lost on restart.
         AddSlackAuditPersistence(builder);
+
+        // Stage 7.1 (workstream:
+        // ws-qq-slack-messenger-supp-phase-observability-and-operations-stage-audit-logging-and-retention):
+        // replace the bare EF audit writer with the broader
+        // SlackAuditLogger<TContext>. The logger implements BOTH
+        // ISlackAuditLogger (LogAsync + QueryAsync per architecture
+        // §4.6) and ISlackAuditEntryWriter (the Stage 3.1 append seam)
+        // so every existing pipeline call site -- signature validation,
+        // authorization, idempotency, command dispatch, interaction
+        // handling, modal open, outbound dispatch, thread manager,
+        // and the DirectApiClient -- automatically routes through
+        // LogAsync via the explicit AppendAsync forwarder on the
+        // logger. The same extension also registers the
+        // SlackRetentionCleanupService BackgroundService that purges
+        // slack_audit_entry and slack_inbound_request_record rows
+        // older than 30 days per tech-spec §2.7 / resolved OQ-2.
+        // Bind Slack:Retention from appsettings so operators can tune
+        // the cadence and retention window without rebuilding.
+        builder.Services.AddSlackAuditLogger<SlackPersistenceDbContext>(builder.Configuration);
 
         // Stage 3.1 (evaluator iter-3 item 1): register the EF-backed
         // ISlackWorkspaceConfigStore so a restarted Worker can resolve
