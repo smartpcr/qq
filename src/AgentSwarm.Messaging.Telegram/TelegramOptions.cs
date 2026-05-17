@@ -72,6 +72,54 @@ public sealed class TelegramOptions
     public List<long> AllowedUserIds { get; set; } = new();
 
     /// <summary>
+    /// Stage 3.4 (iter-5 evaluator item 2) — fail-closed policy for an
+    /// empty <see cref="AllowedUserIds"/> on the Tier-1 <c>/start</c>
+    /// onboarding gate. The brief says onboarding "checks the
+    /// allowlist first" — interpreted strictly that means an empty
+    /// allowlist must DENY everyone (fail-closed). Defaults to
+    /// <c>true</c> so production deployments that forget to populate
+    /// the allowlist do not silently authorise every Telegram user
+    /// who DMs the bot.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Set to <c>false</c> in dev / integration-test fixtures that
+    /// rely on the prior open-by-default behaviour (and that pin
+    /// the actual authorisation gate via
+    /// <see cref="UserTenantMappings"/> presence — the onboarding
+    /// path still denies if no mapping exists). The matrix:
+    /// </para>
+    /// <list type="table">
+    ///   <listheader>
+    ///     <term><see cref="RequireAllowlistForOnboarding"/></term>
+    ///     <term><see cref="AllowedUserIds"/> populated?</term>
+    ///     <term><c>/start</c> by user not in list</term>
+    ///   </listheader>
+    ///   <item>
+    ///     <description><c>true</c> (default, production)</description>
+    ///     <description>yes</description>
+    ///     <description>deny</description>
+    ///   </item>
+    ///   <item>
+    ///     <description><c>true</c> (default, production)</description>
+    ///     <description>no (empty)</description>
+    ///     <description>deny (FAIL-CLOSED)</description>
+    ///   </item>
+    ///   <item>
+    ///     <description><c>false</c> (dev opt-in)</description>
+    ///     <description>yes</description>
+    ///     <description>deny</description>
+    ///   </item>
+    ///   <item>
+    ///     <description><c>false</c> (dev opt-in)</description>
+    ///     <description>no (empty)</description>
+    ///     <description>allow through to <see cref="UserTenantMappings"/> lookup</description>
+    ///   </item>
+    /// </list>
+    /// </remarks>
+    public bool RequireAllowlistForOnboarding { get; set; } = true;
+
+    /// <summary>
     /// Per-(user, chat) operator bindings — the structural mapping
     /// required by the story brief's "Validate chat/user allowlist
     /// before accepting commands" + "Map Telegram chat ID to authorized
@@ -87,6 +135,100 @@ public sealed class TelegramOptions
     /// blank tenant/workspace at startup.
     /// </summary>
     public List<TelegramOperatorBindingOptions> OperatorBindings { get; set; } = new();
+
+    /// <summary>
+    /// Dev/test seed used by
+    /// <see cref="Swarm.StubOperatorRegistry"/> (Stage 2.7) to project a
+    /// fixed set of <see cref="Core.OperatorBinding"/> rows without a
+    /// database. Each entry is materialised into an
+    /// <see cref="Core.OperatorBinding"/> with a deterministic
+    /// <see cref="Core.OperatorBinding.Id"/> derived from
+    /// (TenantId, WorkspaceId, TelegramUserId, TelegramChatId) so
+    /// repeated reads yield a stable id usable as a
+    /// <c>TaskOversight.OperatorBindingId</c> foreign key in
+    /// fixture-driven acceptance tests.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Distinct from <see cref="OperatorBindings"/>.</b>
+    /// <see cref="OperatorBindings"/> drives inbound authorization
+    /// (<see cref="Auth.ConfiguredOperatorAuthorizationService"/>) —
+    /// pinning which (user, chat) pairs may issue commands. The
+    /// <see cref="DevOperators"/> list, by contrast, is the
+    /// "directory" the Stage 2.7 swarm-event subscription service
+    /// reads when resolving outbound routing in dev / unit-test /
+    /// integration-test hosts. The two lists may overlap (and
+    /// typically do in fixtures), but they may also legitimately
+    /// diverge — e.g. a dev host wired to receive events for tenants
+    /// that no human is permitted to message back into.
+    /// </para>
+    /// <para>
+    /// Replaced in production by the Stage 3.4
+    /// <c>PersistentOperatorRegistry</c> which reads from the
+    /// <c>operator_bindings</c> table; the production registration
+    /// supersedes <see cref="Swarm.StubOperatorRegistry"/> via the
+    /// <c>TryAddSingleton</c> / <c>AddSingleton</c> last-wins
+    /// pattern. Validator coverage: entries reuse
+    /// <see cref="TelegramOperatorBindingOptions"/> so the existing
+    /// <see cref="TelegramOptionsValidator"/> TenantId/WorkspaceId
+    /// non-blank guard applies (added in Stage 2.7 — see
+    /// <c>TelegramOptionsValidator.Validate</c>).
+    /// </para>
+    /// </remarks>
+    public List<TelegramOperatorBindingOptions> DevOperators { get; set; } = new();
+
+    /// <summary>
+    /// Stage 3.4 — onboarding directory consumed by
+    /// <see cref="Auth.TelegramUserAuthorizationService"/> on
+    /// <c>/start</c>. Each entry maps a Telegram user id (key, as a
+    /// string because JSON object keys are always strings) to an
+    /// array of <see cref="TelegramUserTenantMapping"/> rows — one
+    /// per workspace the operator participates in. The canonical
+    /// shape is fixed by architecture.md §7.1 (lines 1042–1065):
+    /// each user id key maps to a JSON ARRAY (single-workspace
+    /// operators have a one-element array, multi-workspace
+    /// operators have multiple elements). On <c>/start</c>, the
+    /// authorization service builds an
+    /// <see cref="Core.OperatorRegistration"/> from each array
+    /// entry and submits the full batch via
+    /// <see cref="Core.IOperatorRegistry.RegisterManyAsync"/>
+    /// (Stage 3.4 iter-3 atomic upsert — every binding either
+    /// commits together or is rolled back together so a
+    /// <c>(OperatorAlias, TenantId)</c> unique-index collision on
+    /// row N cannot leave rows 1..N-1 partially persisted). Each
+    /// successful registration produces one
+    /// <see cref="Core.OperatorBinding"/> row; subsequent commands
+    /// trigger workspace disambiguation when multiple bindings
+    /// exist for the same (user, chat) pair (architecture.md §4.3).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why a dictionary keyed on the Telegram user id (and not a
+    /// flat list).</b> The <c>/start</c> handler's lookup key is the
+    /// Telegram user id only (the chat id only becomes known when
+    /// the <c>/start</c> Update is received), so a dictionary lookup
+    /// is the natural shape; a flat list would require an O(N) scan
+    /// per <c>/start</c>. The key is a <see cref="string"/> rather
+    /// than a <see cref="long"/> because <c>IConfiguration</c> binds
+    /// JSON object keys as strings and the binder for
+    /// <c>Dictionary&lt;long, T&gt;</c> would silently drop keys
+    /// containing non-numeric characters; surfacing the key as a
+    /// string lets the authorization service validate the format
+    /// once at <c>/start</c> time with a clear error.
+    /// </para>
+    /// <para>
+    /// <b>Distinct from <see cref="OperatorBindings"/>.</b>
+    /// <see cref="OperatorBindings"/> drives the iter-5 binding-aware
+    /// runtime authorization (<see cref="Auth.ConfiguredOperatorAuthorizationService"/>);
+    /// <see cref="UserTenantMappings"/> drives the Stage 3.4
+    /// onboarding flow. The two are kept separate because the
+    /// onboarding source of truth (Tier 1 — who CAN onboard) is
+    /// configuration, and the runtime source of truth (Tier 2 —
+    /// what bindings DO exist) is the persistent
+    /// <see cref="Core.IOperatorRegistry"/>.
+    /// </para>
+    /// </remarks>
+    public Dictionary<string, List<TelegramUserTenantMapping>> UserTenantMappings { get; set; } = new();
 
     /// <summary>
     /// Shared secret echoed by Telegram in the

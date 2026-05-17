@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace AgentSwarm.Messaging.Telegram.Pipeline;
@@ -170,7 +171,17 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
     private readonly IPendingDisambiguationStore _pendingDisambiguations;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<TelegramUpdatePipeline> _logger;
+    private readonly ProcessedMessengerEventChannel? _processedEventSink;
 
+    /// <summary>
+    /// Stage 2.2 constructor kept for backward compatibility with all
+    /// existing direct-construction call sites (the
+    /// <c>TelegramUpdatePipelineTests.Harness</c> wires the pipeline
+    /// without a sink, and the null-argument tests pin the original
+    /// nine-parameter shape). Delegates to the Stage 2.6 ten-parameter
+    /// overload with <c>processedEventSink: null</c> so the pipeline is
+    /// a silent no-op on the sink side when no channel is wired.
+    /// </summary>
     public TelegramUpdatePipeline(
         IDeduplicationService dedup,
         IUserAuthorizationService authz,
@@ -181,6 +192,36 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
         IPendingDisambiguationStore pendingDisambiguations,
         TimeProvider timeProvider,
         ILogger<TelegramUpdatePipeline> logger)
+        : this(dedup, authz, parser, router, callbackHandler, pendingQuestions, pendingDisambiguations, timeProvider, logger, processedEventSink: null)
+    {
+    }
+
+    /// <summary>
+    /// Stage 2.6 constructor that accepts the
+    /// <see cref="ProcessedMessengerEventChannel"/> sink the
+    /// Stage 2.6 <see cref="TelegramMessengerConnector.ReceiveAsync"/>
+    /// drains. Marked <see cref="ActivatorUtilitiesConstructorAttribute"/>
+    /// so the DI container picks this overload when both ctors are
+    /// available — without the attribute the container's "pick the
+    /// constructor with the most parameters all of which can be
+    /// resolved" heuristic would still choose this overload because
+    /// AddTelegram registers <see cref="ProcessedMessengerEventChannel"/>
+    /// as a singleton, but the explicit annotation pins the contract
+    /// against future DI-rule changes and removes any ambiguity for
+    /// reflection-based test harnesses.
+    /// </summary>
+    [ActivatorUtilitiesConstructor]
+    public TelegramUpdatePipeline(
+        IDeduplicationService dedup,
+        IUserAuthorizationService authz,
+        ICommandParser parser,
+        ICommandRouter router,
+        ICallbackHandler callbackHandler,
+        IPendingQuestionStore pendingQuestions,
+        IPendingDisambiguationStore pendingDisambiguations,
+        TimeProvider timeProvider,
+        ILogger<TelegramUpdatePipeline> logger,
+        ProcessedMessengerEventChannel? processedEventSink)
     {
         _dedup = dedup ?? throw new ArgumentNullException(nameof(dedup));
         _authz = authz ?? throw new ArgumentNullException(nameof(authz));
@@ -191,6 +232,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
         _pendingDisambiguations = pendingDisambiguations ?? throw new ArgumentNullException(nameof(pendingDisambiguations));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _processedEventSink = processedEventSink;
     }
 
     /// <inheritdoc />
@@ -198,6 +240,29 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
     {
         ArgumentNullException.ThrowIfNull(messengerEvent);
 
+        // Stage 2.6 connector feed (try/finally so EVERY exit — normal
+        // returns, denials, duplicate short-circuits, handler failures,
+        // AND caught-then-rethrown exceptions — publishes the event to
+        // the ProcessedMessengerEventChannel that
+        // TelegramMessengerConnector.ReceiveAsync drains). The publish
+        // is fire-and-forget TryWrite: a saturated channel logs a
+        // warning and continues without blocking the inbound hot path
+        // (the durable InboundUpdate row remains the recovery primitive
+        // — see ProcessedMessengerEventChannel remarks). When no sink is
+        // wired (the Stage 2.2 nine-arg constructor / unit-test
+        // harnesses), the publish is a silent no-op.
+        try
+        {
+            return await ExecuteAsync(messengerEvent, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            TryPublishProcessedEvent(messengerEvent);
+        }
+    }
+
+    private async Task<PipelineResult> ExecuteAsync(MessengerEvent messengerEvent, CancellationToken ct)
+    {
         // Stage: classify event type. Unknown short-circuits BEFORE dedup
         // and BEFORE authz so that (a) malformed payloads do not consume a
         // reservation slot and (b) the authorization status of the sender
@@ -294,12 +359,36 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             }
 
             // Stage: authorize. commandName drives Tier 1 (start) vs Tier 2 (binding) lookup.
+            //
+            // Stage 3.4 — when the parsed command is /start, invoke the
+            // OnboardAsync entry point so the raw chat-type token from
+            // MessengerEvent.ChatType (populated by TelegramUpdateMapper
+            // from Update.Message.Chat.Type) flows into the new
+            // OperatorBinding. The default-interface-method body in
+            // IUserAuthorizationService forwards to AuthorizeAsync for
+            // back-compat with implementations that have not been
+            // updated to override OnboardAsync (the registered
+            // TelegramUserAuthorizationService overrides it and uses
+            // the chat type to populate OperatorBinding.ChatType).
             LogStage(messengerEvent, "authorize");
-            var authz = await _authz.AuthorizeAsync(
-                messengerEvent.UserId,
-                messengerEvent.ChatId,
-                parsed?.CommandName,
-                ct).ConfigureAwait(false);
+            AuthorizationResult authz;
+            var isStartCommand = parsed is { CommandName: TelegramCommands.Start };
+            if (isStartCommand)
+            {
+                authz = await _authz.OnboardAsync(
+                    messengerEvent.UserId,
+                    messengerEvent.ChatId,
+                    messengerEvent.ChatType,
+                    ct).ConfigureAwait(false);
+            }
+            else
+            {
+                authz = await _authz.AuthorizeAsync(
+                    messengerEvent.UserId,
+                    messengerEvent.ChatId,
+                    parsed?.CommandName,
+                    ct).ConfigureAwait(false);
+            }
 
             // Defense-in-depth: BOTH the IsAuthorized boolean AND a non-empty
             // Bindings list are required. A well-behaved IUserAuthorizationService
@@ -325,9 +414,78 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                 return Denial(messengerEvent, PipelineResponses.Unauthorized);
             }
 
-            // Stage: resolve operator. Multi-workspace prompt is reserved for Command events.
+            // Stage: resolve operator.
+            //
+            // Iter-2 evaluator item 2 (Stage 3.4) — the disambiguation
+            // gate now applies to EVERY multi-binding command except:
+            //
+            //   * `/agents WORKSPACE` (explicit workspace arg)  → fall
+            //                                                      through;
+            //                                                      AgentsCommandHandler
+            //                                                      validates
+            //                                                      the
+            //                                                      explicit
+            //                                                      workspace
+            //                                                      against
+            //                                                      the
+            //                                                      operator's
+            //                                                      bindings.
+            //   * `/start` onboarding                            → fall
+            //                                                      through;
+            //                                                      /start
+            //                                                      just
+            //                                                      created
+            //                                                      the
+            //                                                      bindings —
+            //                                                      surfacing
+            //                                                      a
+            //                                                      "pick
+            //                                                      one"
+            //                                                      prompt
+            //                                                      here
+            //                                                      would
+            //                                                      confuse
+            //                                                      the
+            //                                                      operator
+            //                                                      who
+            //                                                      only
+            //                                                      wanted
+            //                                                      a
+            //                                                      welcome
+            //                                                      message.
+            //   * Non-Command event types (TextReply,            → fall
+            //     CallbackResponse, etc.)                          through;
+            //                                                      those
+            //                                                      paths
+            //                                                      route
+            //                                                      via
+            //                                                      pending-question
+            //                                                      / pending-disambiguation
+            //                                                      lookup,
+            //                                                      not
+            //                                                      via
+            //                                                      workspace
+            //                                                      selection.
+            //
+            // Every other command (/status, /ask, /handoff, /pause,
+            // /resume, /approve, /reject, and /agents-with-no-args)
+            // now prompts for workspace selection when the operator
+            // has more than one active binding. The previous gate
+            // restricted the prompt to /agents only, which let other
+            // commands silently route to authz.Bindings[0] — the
+            // wrong workspace for the multi-workspace operator
+            // (evaluator item 2 + architecture.md §4.3 + brief test
+            // scenario "Multi-workspace bindings returned … so the
+            // pipeline can prompt for workspace disambiguation via
+            // inline keyboard").
             LogStage(messengerEvent, "resolve-operator");
-            if (authz.Bindings.Count > 1 && messengerEvent.EventType == EventType.Command)
+            var hasExplicitWorkspaceArg = parsed is { CommandName: TelegramCommands.Agents }
+                && parsed.Arguments.Count > 0;
+            var needsDisambiguation = authz.Bindings.Count > 1
+                && messengerEvent.EventType == EventType.Command
+                && !isStartCommand
+                && !hasExplicitWorkspaceArg;
+            if (needsDisambiguation)
             {
                 var workspaceIds = authz.Bindings.Select(b => b.WorkspaceId).ToArray();
 
@@ -354,10 +512,11 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
 
                 var buttons = PipelineResponses.MultiWorkspaceButtons(token, workspaceIds);
                 _logger.LogInformation(
-                    "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} WorkspaceCount={Count} DisambiguationToken={Token}",
+                    "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} Command={Command} WorkspaceCount={Count} DisambiguationToken={Token}",
                     messengerEvent.CorrelationId,
                     messengerEvent.EventId,
                     "resolve-prompt",
+                    parsed?.CommandName ?? "(non-command)",
                     workspaceIds.Length,
                     token);
                 return new PipelineResult
@@ -378,6 +537,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                 Roles = binding.Roles,
                 TelegramUserId = binding.TelegramUserId,
                 TelegramChatId = binding.TelegramChatId,
+                OperatorAlias = binding.OperatorAlias,
             };
 
             // Stage: role enforcement. Only commands carry role gates.
@@ -475,6 +635,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                     Handled = true,
                     Succeeded = false,
                     ResponseText = failureText,
+                    ResponseButtons = result.ResponseButtons,
                     ErrorCode = result.ErrorCode,
                     CorrelationId = messengerEvent.CorrelationId,
                 };
@@ -490,6 +651,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                 Handled = true,
                 Succeeded = true,
                 ResponseText = result.ResponseText,
+                ResponseButtons = result.ResponseButtons,
                 CorrelationId = messengerEvent.CorrelationId,
             };
         }
@@ -586,6 +748,59 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             messengerEvent.CorrelationId,
             messengerEvent.EventId,
             stage);
+
+    /// <summary>
+    /// Stage 2.6 connector feed: publishes the pipeline-processed
+    /// <paramref name="messengerEvent"/> to the shared
+    /// <see cref="ProcessedMessengerEventChannel"/> so the Stage 2.6
+    /// <see cref="TelegramMessengerConnector"/> can surface it via
+    /// <see cref="IMessengerConnector.ReceiveAsync"/>. Silent no-op
+    /// when the sink is not wired (the legacy nine-arg constructor
+    /// / unit-test harnesses pass <c>null</c>).
+    /// <para>
+    /// Iter-2 evaluator item 4 — the channel is unbounded so
+    /// <see cref="System.Threading.Channels.ChannelWriter{T}.TryWrite"/>
+    /// only ever returns <c>false</c> if the channel has been
+    /// completed (shutdown); the previous fast-drop-on-full shape
+    /// has been removed because Stage 2.6 requires lossless delivery
+    /// of every processed update to the connector drain (no message
+    /// loss under 100+ agent bursts). A <c>false</c> return is now
+    /// surfaced at <see cref="LogLevel.Warning"/> as a shutdown-race
+    /// diagnostic rather than as an expected backpressure event.
+    /// </para>
+    /// </summary>
+    private void TryPublishProcessedEvent(MessengerEvent messengerEvent)
+    {
+        if (_processedEventSink is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!_processedEventSink.Writer.TryWrite(messengerEvent))
+            {
+                _logger.LogWarning(
+                    "ProcessedMessengerEventChannel rejected write — channel completed (host shutting down). CorrelationId={CorrelationId} EventId={EventId} EventType={EventType}",
+                    messengerEvent.CorrelationId,
+                    messengerEvent.EventId,
+                    messengerEvent.EventType);
+            }
+        }
+        catch (Exception ex)
+        {
+            // The finally block must NEVER mask the in-flight return
+            // / exception from ExecuteAsync. Swallow any publish-side
+            // failure (channel disposed mid-shutdown, observer hook
+            // misbehaving) with a diagnostic log so the original
+            // outcome reaches the caller intact.
+            _logger.LogWarning(
+                ex,
+                "ProcessedMessengerEventChannel publish failed — swallowing so the original ProcessAsync outcome is preserved. CorrelationId={CorrelationId} EventId={EventId}",
+                messengerEvent.CorrelationId,
+                messengerEvent.EventId);
+        }
+    }
 
     /// <summary>
     /// Returns a 12-character lowercase hex token (48 bits of entropy)

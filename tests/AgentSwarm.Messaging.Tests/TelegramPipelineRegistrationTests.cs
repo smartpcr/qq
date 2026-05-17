@@ -1,4 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Core.Commands;
 using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
@@ -19,12 +21,22 @@ public class TelegramPipelineRegistrationTests
     private const string SampleToken = "1234567890:AAH9hyTeleGramSecRetToken_test_value_only";
 
     [Theory]
-    [InlineData(typeof(IDeduplicationService), typeof(InMemoryDeduplicationService))]
+    [InlineData(typeof(IDeduplicationService), typeof(SlidingWindowDeduplicationService))]
     [InlineData(typeof(IPendingQuestionStore), typeof(InMemoryPendingQuestionStore))]
     [InlineData(typeof(IPendingDisambiguationStore), typeof(InMemoryPendingDisambiguationStore))]
-    [InlineData(typeof(ICommandParser), typeof(StubCommandParser))]
-    [InlineData(typeof(ICommandRouter), typeof(StubCommandRouter))]
-    [InlineData(typeof(ICallbackHandler), typeof(StubCallbackHandler))]
+    // Stage 3.1 swapped StubCommandParser for the production
+    // TelegramCommandParser, so the locked-down registration now
+    // points at the real parser type.
+    [InlineData(typeof(ICommandParser), typeof(TelegramCommandParser))]
+    // Stage 3.2 swapped StubCommandRouter for the production
+    // CommandRouter — the dispatch dictionary is built from the nine
+    // ICommandHandler registrations injected via IEnumerable<>.
+    [InlineData(typeof(ICommandRouter), typeof(CommandRouter))]
+    // Stage 3.3 swapped StubCallbackHandler for the production
+    // CallbackQueryHandler — inline-button presses now decode
+    // QuestionId:ActionId payloads, emit HumanDecisionEvent, audit,
+    // and answer the Telegram callback.
+    [InlineData(typeof(ICallbackHandler), typeof(CallbackQueryHandler))]
     [InlineData(typeof(ITelegramUpdatePipeline), typeof(TelegramUpdatePipeline))]
     public void AddTelegram_RegistersStage22Service(Type serviceType, Type implementationType)
     {

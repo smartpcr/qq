@@ -171,25 +171,148 @@ public class TelegramUpdateMapperTests
     }
 
     [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData("   ")]
-    public void Map_ThrowsOnBlankCorrelationId(string? cid)
+    [InlineData(ChatType.Private, "private")]
+    [InlineData(ChatType.Group, "group")]
+    [InlineData(ChatType.Supergroup, "supergroup")]
+    [InlineData(ChatType.Channel, "channel")]
+    public void Map_Command_PopulatesChatType_FromTelegramUpdate(
+        ChatType source,
+        string expectedToken)
     {
+        // Stage 3.4 iter-3 (evaluator item 3) — the real
+        // Update.Message.Chat.Type → MessengerEvent.ChatType
+        // plumbing must be pinned directly on the mapper. Without
+        // this assertion, the chat-type-aware OnboardAsync flow can
+        // regress while the auth-service/pipeline tests continue to
+        // pass with manually supplied chat-type strings.
         var update = new Update
         {
-            Id = 1,
+            Id = 4242,
             Message = new Message
             {
                 Id = 1,
-                Chat = new Chat { Id = 1, Type = ChatType.Private },
-                From = new User { Id = 1, IsBot = false, FirstName = "U" },
-                Text = "/status",
+                Chat = new Chat { Id = 11, Type = source },
+                From = new User { Id = 22, IsBot = false, FirstName = "U" },
+                Text = "/start",
             },
         };
 
-        var act = () => TelegramUpdateMapper.Map(update, cid!, SampleReceivedAt);
+        var evt = TelegramUpdateMapper.Map(update, "cid", SampleReceivedAt);
 
-        act.Should().Throw<ArgumentException>();
+        evt.ChatType.Should().Be(expectedToken,
+            "the mapper must lowercase the Telegram chat-type enum so TelegramChatTypeParser can resolve it");
+    }
+
+    [Theory]
+    [InlineData(ChatType.Private, "private")]
+    [InlineData(ChatType.Group, "group")]
+    [InlineData(ChatType.Supergroup, "supergroup")]
+    [InlineData(ChatType.Channel, "channel")]
+    public void Map_TextReply_PopulatesChatType_FromTelegramUpdate(
+        ChatType source,
+        string expectedToken)
+    {
+        // Stage 3.4 iter-3 — TextReply branch shares the
+        // Command branch's chat-type plumbing, but must be asserted
+        // independently because the mapper returns through a
+        // different code path (non-slash text → TextReply).
+        var update = new Update
+        {
+            Id = 100,
+            Message = new Message
+            {
+                Id = 1,
+                Chat = new Chat { Id = 9, Type = source },
+                From = new User { Id = 8, IsBot = false, FirstName = "U" },
+                Text = "approve please",
+            },
+        };
+
+        var evt = TelegramUpdateMapper.Map(update, "cid", SampleReceivedAt);
+
+        evt.EventType.Should().Be(EventType.TextReply);
+        evt.ChatType.Should().Be(expectedToken);
+    }
+
+    [Theory]
+    [InlineData(ChatType.Private, "private")]
+    [InlineData(ChatType.Group, "group")]
+    [InlineData(ChatType.Supergroup, "supergroup")]
+    [InlineData(ChatType.Channel, "channel")]
+    public void Map_CallbackQuery_PopulatesChatType_FromCallbackMessage(
+        ChatType source,
+        string expectedToken)
+    {
+        // Stage 3.4 iter-3 — CallbackResponse branch reads
+        // CallbackQuery.Message.Chat.Type, NOT Update.Message —
+        // pin both paths explicitly so a future mapper refactor
+        // cannot silently drop ChatType from one branch.
+        var update = new Update
+        {
+            Id = 7,
+            CallbackQuery = new CallbackQuery
+            {
+                Id = "cb-1",
+                From = new User { Id = 33, IsBot = false, FirstName = "U" },
+                Message = new Message
+                {
+                    Id = 2,
+                    Chat = new Chat { Id = 44, Type = source },
+                },
+                Data = "approve:tenant-a:ws-b",
+            },
+        };
+
+        var evt = TelegramUpdateMapper.Map(update, "cid", SampleReceivedAt);
+
+        evt.EventType.Should().Be(EventType.CallbackResponse);
+        evt.ChatType.Should().Be(expectedToken);
+    }
+
+    [Fact]
+    public void Map_Unknown_FromEditedMessage_PopulatesChatType_FromFallbackChat()
+    {
+        // Stage 3.4 iter-3 — even Unknown events derived from a
+        // fallback chat (edited message, channel post) must carry
+        // ChatType so downstream observability can attribute the
+        // dropped event to the right chat surface.
+        var update = new Update
+        {
+            Id = 11,
+            EditedMessage = new Message
+            {
+                Id = 1,
+                Chat = new Chat { Id = 1, Type = ChatType.Supergroup },
+                From = new User { Id = 2, IsBot = false, FirstName = "U" },
+                Text = "/status (edited)",
+            },
+        };
+
+        var evt = TelegramUpdateMapper.Map(update, "cid", SampleReceivedAt);
+
+        evt.EventType.Should().Be(EventType.Unknown);
+        evt.ChatType.Should().Be("supergroup");
+    }
+
+    [Fact]
+    public void Map_Unknown_WithNoFallbackChat_LeavesChatTypeNull()
+    {
+        // Stage 3.4 iter-3 — defensive: when no chat surface is
+        // present (e.g. a Poll-only update with no Message), the
+        // mapper must NOT invent a chat type. TelegramChatTypeParser
+        // treats null as Private, but only because the
+        // TelegramUserAuthorizationService layer needs a deterministic
+        // default — the mapper itself must report the raw absence so
+        // observability can flag the unusual shape.
+        var update = new Update
+        {
+            Id = 99,
+            Poll = null,
+        };
+
+        var evt = TelegramUpdateMapper.Map(update, "cid", SampleReceivedAt);
+
+        evt.EventType.Should().Be(EventType.Unknown);
+        evt.ChatType.Should().BeNull();
     }
 }

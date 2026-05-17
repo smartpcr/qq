@@ -1,9 +1,11 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Core.Commands;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using AgentSwarm.Messaging.Telegram.Polling;
 using AgentSwarm.Messaging.Telegram.Sending;
+using AgentSwarm.Messaging.Telegram.Swarm;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -46,20 +48,34 @@ public static class TelegramServiceCollectionExtensions
     /// same instance.
     /// </para>
     /// <para>
-    /// <b>Stage 2.2 stubs.</b> Concrete implementations of
-    /// <see cref="ICommandParser"/>, <see cref="ICommandRouter"/>,
-    /// <see cref="ICallbackHandler"/>, <see cref="IDeduplicationService"/>,
+    /// <b>Stage 2.2 stubs (with Stage 3.1 production swap).</b>
+    /// <see cref="ICommandRouter"/>, <see cref="ICallbackHandler"/>,
+    /// <see cref="IDeduplicationService"/>,
     /// <see cref="IPendingQuestionStore"/>, and
     /// <see cref="IPendingDisambiguationStore"/> are intentionally
-    /// <i>stubs</i> here — they let the inbound pipeline run end-to-end
-    /// before Phase 3 (command processing, including the
-    /// <c>CallbackQueryHandler</c> that consumes
-    /// <see cref="IPendingDisambiguationStore.TakeAsync"/> for workspace
-    /// disambiguation) and Phase 4 (deduplication) register the
-    /// production replacements via additional <c>services.AddXxx()</c>
-    /// calls. Re-registering an interface in a later phase replaces
-    /// the stub via standard <see cref="IServiceCollection"/> last-wins
-    /// semantics.
+    /// registered with their <i>stub</i> implementations here — they
+    /// let the inbound pipeline run end-to-end before Phase 3
+    /// (command processing, including the <c>CallbackQueryHandler</c>
+    /// that consumes <see cref="IPendingDisambiguationStore.TakeAsync"/>
+    /// for workspace disambiguation) and Phase 4 (deduplication)
+    /// register the production replacements via additional
+    /// <c>services.AddXxx()</c> calls. Re-registering an interface in
+    /// a later phase replaces the stub via standard
+    /// <see cref="IServiceCollection"/> last-wins semantics.
+    /// </para>
+    /// <para>
+    /// <see cref="ICommandParser"/> is NO LONGER on the stub list —
+    /// Stage 3.1 ships <see cref="Pipeline.TelegramCommandParser"/> as
+    /// the production implementation, and the registration below
+    /// points directly at it. The <see cref="Pipeline.Stubs.StubCommandParser"/>
+    /// type still exists in the assembly but is no longer wired by
+    /// <c>AddTelegram</c>; it is retained only as a reference shape
+    /// (and to avoid breaking any third-party harness that may have
+    /// instantiated it manually). Pinned by
+    /// <c>TelegramPipelineRegistrationTests.AddTelegram_RegistersStage22Service</c>
+    /// (the <c>ICommandParser → TelegramCommandParser</c> row) and the
+    /// pipeline-level regression tests in
+    /// <c>TelegramCommandParserTests</c>.
     /// </para>
     /// <para>
     /// <b><see cref="TimeProvider"/>.</b> Registered via
@@ -102,19 +118,127 @@ public static class TelegramServiceCollectionExtensions
         services.AddSingleton<ITelegramBotClient>(sp =>
             sp.GetRequiredService<TelegramBotClientFactory>().Create());
 
-        // Stage 2.2 inbound pipeline + stubs. Stubs are singletons so their
-        // in-memory state (dedup set, pending questions, pending workspace
-        // disambiguations) survives across pipeline invocations within the
-        // same process.
-        services.AddSingleton<IDeduplicationService, InMemoryDeduplicationService>();
-        services.AddSingleton<IPendingQuestionStore, InMemoryPendingQuestionStore>();
+        // Stage 4.3 — IDeduplicationService.
+        //
+        // The dev / local backend is the in-memory sliding-window
+        // implementation (ConcurrentDictionary<string, DateTimeOffset>
+        // + periodic cleanup timer) per implementation-plan.md
+        // Stage 4.3 step 2. Registered via TryAddSingleton so a host
+        // that ALSO wires AddMessagingPersistence wins last-Replace
+        // and gets the EF-backed PersistentDeduplicationService instead
+        // — without that ordering guarantee the in-memory backend
+        // would silently shadow the persistent store in production
+        // (the AddTelegram → AddMessagingPersistence composition path
+        // documented in the Worker's Program.cs).
+        //
+        // The SlidingWindowDeduplicationService ctor takes
+        // IOptions<DeduplicationOptions>, TimeProvider, and
+        // ILogger<SlidingWindowDeduplicationService>. The options
+        // binding and TimeProvider registration below are
+        // TryAdd-guarded so AddMessagingPersistence's own binding
+        // (and a host that registered an alternate TimeProvider for
+        // testing) still wins.
+        services.AddOptions<DeduplicationOptions>()
+            .Configure(opts => configuration.GetSection(DeduplicationOptions.SectionName).Bind(opts));
+        services.TryAddSingleton(TimeProvider.System);
+        services.TryAddSingleton<IDeduplicationService, SlidingWindowDeduplicationService>();
+
+        // Stage 3.5 — IPendingQuestionStore uses TryAddSingleton so a
+        // host that already wired AddMessagingPersistence (which calls
+        // services.Replace<IPendingQuestionStore, PersistentPendingQuestionStore>())
+        // keeps the persistent EF-backed implementation. Plain
+        // AddSingleton here would append a second descriptor that the
+        // default ServiceProvider would resolve last-wins, silently
+        // overriding the persistent store with the in-memory stub. The
+        // other replaceable abstractions (IAuditLogger, IOperatorRegistry,
+        // IOutboundDeadLetterStore, IOutboundMessageIdIndex,
+        // ITaskOversightRepository) already use TryAddSingleton for the
+        // same reason.
+        services.TryAddSingleton<IPendingQuestionStore, InMemoryPendingQuestionStore>();
+
         services.AddSingleton<IPendingDisambiguationStore, InMemoryPendingDisambiguationStore>();
-        services.AddSingleton<ICommandParser, StubCommandParser>();
-        services.AddSingleton<ICommandRouter, StubCommandRouter>();
-        services.AddSingleton<ICallbackHandler, StubCallbackHandler>();
+        // Stage 3.1: production TelegramCommandParser replaces the
+        // Stage 2.2 StubCommandParser at registration time. Singleton
+        // lifetime because the parser is stateless.
+        services.AddSingleton<ICommandParser, TelegramCommandParser>();
+        // Stage 3.2: production CommandRouter replaces the Stage 2.2
+        // StubCommandRouter. The router accepts every
+        // IEnumerable<ICommandHandler> registered below and dispatches
+        // by ICommandHandler.CommandName at the boundary.
+        services.AddSingleton<ICommandRouter, CommandRouter>();
+
+        // Stage 3.2 command handlers. Registered individually so the
+        // CommandRouter constructor receives all nine through
+        // IEnumerable<ICommandHandler> injection. Singleton lifetime —
+        // handlers are stateless beyond their injected dependencies
+        // (ISwarmCommandBus, IPendingQuestionStore, IOperatorRegistry,
+        // ITaskOversightRepository, IAuditLogger, TimeProvider).
+        services.AddSingleton<ICommandHandler, StartCommandHandler>();
+        services.AddSingleton<ICommandHandler, StatusCommandHandler>();
+        services.AddSingleton<ICommandHandler, AgentsCommandHandler>();
+        services.AddSingleton<ICommandHandler, AskCommandHandler>();
+        services.AddSingleton<ICommandHandler, ApproveCommandHandler>();
+        services.AddSingleton<ICommandHandler, RejectCommandHandler>();
+        services.AddSingleton<ICommandHandler, PauseCommandHandler>();
+        services.AddSingleton<ICommandHandler, ResumeCommandHandler>();
+        services.AddSingleton<ICommandHandler, HandoffCommandHandler>();
+
+        // Stage 3.2: no-op audit logger as the TryAdd fallback so the
+        // approve / reject / handoff handlers can take a hard
+        // IAuditLogger dependency in dev / unit-test bootstraps that
+        // skip the persistence module. AddMessagingPersistence
+        // (Stage 3.2 iter-2 evaluator item 5) REPLACES this with
+        // PersistentAuditLogger so production audit writes actually
+        // hit the database — last-wins semantics on Replace().
+        services.TryAddSingleton<IAuditLogger, NullAuditLogger>();
+
+        // Stage 3.3 swapped StubCallbackHandler for the production
+        // CallbackQueryHandler. The handler depends on
+        // IPendingQuestionStore + ISwarmCommandBus + IAuditLogger +
+        // IDeduplicationService + ITelegramBotClient + TimeProvider —
+        // all five already registered above. Last-wins semantics on
+        // AddSingleton means a re-call of AddTelegram (test
+        // bootstraps) keeps the production binding; explicit
+        // overrides must call services.Replace() AFTER AddTelegram.
+        services.AddSingleton<ICallbackHandler, CallbackQueryHandler>();
         // TimeProvider.System is the production default; tests register a
         // FakeTimeProvider via TryAddSingleton-replacement before AddTelegram.
         services.TryAddSingleton(TimeProvider.System);
+
+        // Stage 2.6: unbounded in-process bridge channel between the
+        // inbound pipeline (writer) and the IMessengerConnector.ReceiveAsync
+        // drain (reader). The backing channel is constructed via
+        // Channel.CreateUnbounded<MessengerEvent> (see
+        // ProcessedMessengerEventChannel.ctor) so every processed update
+        // reaches the connector drain losslessly — the Stage 2.6
+        // "burst from 100+ agents without message loss" SLO forbids any
+        // bounded / fast-drop shape on this hop, and unlike the
+        // Webhook/InboundUpdateChannel there is no durable InboundUpdate
+        // backstop row here for replay. Registered as a singleton so
+        // the producer and consumer share ONE in-process buffer, and
+        // registered BEFORE the pipeline so the pipeline's
+        // [ActivatorUtilitiesConstructor] overload can resolve it as
+        // a constructor argument.
+        services.TryAddSingleton<ProcessedMessengerEventChannel>();
+
+        // Stage 2.6: stub IOutboundQueue so TelegramMessengerConnector's
+        // dependency is satisfiable before Stage 4.1 ships the durable
+        // persistent queue. TryAddSingleton — the Stage 4.1 production
+        // registration (AddSingleton<IOutboundQueue, PersistentOutboundQueue>)
+        // wins by last-wins semantics. Mirrors the existing
+        // InMemoryDeduplicationService / InMemoryOutboundMessageIdIndex /
+        // InMemoryOutboundDeadLetterStore replacement pattern.
+        services.TryAddSingleton<IOutboundQueue, InMemoryOutboundQueue>();
+
+        // Stage 4.2 — dev fallback for the outbox-row companion
+        // dead-letter queue. Same TryAdd-fallback + production-replace
+        // pattern as IOutboundQueue / IOutboundDeadLetterStore /
+        // IOutboundMessageIdIndex: the persistence module's
+        // PersistentDeadLetterQueue replaces this registration via
+        // AddMessagingPersistence's Replace() call so production hosts
+        // get the EF-backed durability contract.
+        services.TryAddSingleton<IDeadLetterQueue, InMemoryDeadLetterQueue>();
+
         services.AddSingleton<ITelegramUpdatePipeline, TelegramUpdatePipeline>();
 
         // Stage 2.5: long-polling receiver (development mode).
@@ -162,6 +286,68 @@ public static class TelegramServiceCollectionExtensions
         // Replace pattern as the msg-id index.
         services.TryAddSingleton<IOutboundDeadLetterStore, InMemoryOutboundDeadLetterStore>();
         services.TryAddSingleton<IMessageSender, TelegramMessageSender>();
+
+        // Stage 2.6: the connector is the platform-agnostic facade the
+        // agent swarm uses to send messages / questions and to drain
+        // processed inbound events. Singleton lifetime — the type is
+        // stateless beyond its singleton dependencies (IOutboundQueue,
+        // ProcessedMessengerEventChannel, TimeProvider, ILogger). Concrete
+        // type is also registered so tests / diagnostics can resolve the
+        // implementation without going through the interface.
+        services.TryAddSingleton<TelegramMessengerConnector>();
+        services.TryAddSingleton<IMessengerConnector>(sp =>
+            sp.GetRequiredService<TelegramMessengerConnector>());
+
+        // Stage 2.7: Swarm Event Ingress Service stubs + hosted service.
+        //
+        // The three stubs (StubOperatorRegistry, StubTaskOversightRepository,
+        // StubSwarmCommandBus) are registered via TryAddSingleton so the
+        // production replacements (Stage 3.4 PersistentOperatorRegistry,
+        // Stage 3.2 PersistentTaskOversightRepository, and the concrete
+        // swarm transport adapter — out of scope for this story) win by
+        // AddSingleton last-wins semantics. A Phase 6.3 startup health
+        // check is required to assert that the resolved types are NOT
+        // the stubs when ASPNETCORE_ENVIRONMENT=Production.
+        //
+        // SwarmEventSubscriptionService runs as a hosted background
+        // service that, on startup, calls IOperatorRegistry.GetActiveTenantsAsync
+        // and opens one ISwarmCommandBus.SubscribeAsync stream per tenant.
+        // Events are routed through the connector — questions via
+        // SendQuestionAsync, alerts/status via SendMessageAsync — per
+        // implementation-plan.md Stage 2.7.
+        services.TryAddSingleton<IOperatorRegistry, StubOperatorRegistry>();
+        services.TryAddSingleton<ITaskOversightRepository, StubTaskOversightRepository>();
+        services.TryAddSingleton<ISwarmCommandBus, StubSwarmCommandBus>();
+        services.AddSingleton<SwarmEventSubscriptionService>();
+        services.AddSingleton<IHostedService>(sp =>
+            sp.GetRequiredService<SwarmEventSubscriptionService>());
+
+        // Stage 3.5 — pending-question timeout sweeper. Polls
+        // IPendingQuestionStore.GetExpiredAsync, atomically claims
+        // each expired row via MarkTimedOutAsync, then publishes a
+        // HumanDecisionEvent whose ActionValue is the
+        // PendingQuestionRecord.DefaultActionId string verbatim (the
+        // consuming agent resolves the full HumanAction.Value
+        // semantics from its own AllowedActions list per
+        // architecture.md §10.3) — when DefaultActionId is null the
+        // service falls back to the "__timeout__" sentinel. The
+        // sweeper deliberately does NOT read
+        // PendingQuestionRecord.DefaultActionValue (that column is
+        // owned by the callback / RequiresComment text-reply path's
+        // cache-miss fallback — §5.2 invariant 3). On publish failure
+        // the claim is reverted via TryRevertTimedOutClaimAsync so
+        // the next sweep retries (at-least-once delivery). The
+        // service then edits the original Telegram message, writes a
+        // HumanResponseAuditEntry, and leaves the row TimedOut.
+        // Options are bound from Telegram:QuestionTimeout —
+        // registered with default PollInterval=30s if the section is
+        // missing.
+        services.AddOptions<QuestionTimeoutOptions>()
+            .Bind(configuration.GetSection(TelegramOptions.SectionName)
+                .GetSection(QuestionTimeoutOptions.SectionName));
+        services.AddSingleton<QuestionTimeoutService>();
+        services.AddSingleton<IHostedService>(sp =>
+            sp.GetRequiredService<QuestionTimeoutService>());
 
         var pollingSnapshot = configuration
             .GetSection(TelegramOptions.SectionName)

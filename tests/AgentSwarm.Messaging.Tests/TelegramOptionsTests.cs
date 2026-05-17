@@ -254,6 +254,482 @@ public class TelegramOptionsTests
         result.Succeeded.Should().BeTrue();
     }
 
+    // ============================================================
+    // Stage 3.4 iter-2 evaluator item 3 — UserTenantMappings
+    // ============================================================
+
+    [Fact]
+    public void Validator_Fails_WhenUserTenantMappingEntryHasBlankTenantId()
+    {
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = string.Empty,
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@alice",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue(
+            "an empty TenantId would route the operator into the empty-string tenant and break alias resolution");
+        result.FailureMessage.Should().Contain("Telegram:UserTenantMappings[\"12345\"][0].TenantId");
+    }
+
+    [Fact]
+    public void Validator_Fails_WhenUserTenantMappingEntryHasBlankWorkspaceId()
+    {
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "   ",
+                        OperatorAlias = "@alice",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue();
+        result.FailureMessage.Should().Contain("Telegram:UserTenantMappings[\"12345\"][0].WorkspaceId");
+    }
+
+    [Fact]
+    public void Validator_Fails_WhenUserTenantMappingEntryHasBlankAlias()
+    {
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = string.Empty,
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue(
+            "a blank alias would make the operator unreachable via /handoff @alias");
+        result.FailureMessage.Should().Contain("Telegram:UserTenantMappings[\"12345\"][0].OperatorAlias");
+    }
+
+    [Fact]
+    public void Validator_Fails_WhenUserTenantMappingKeyIsNotNumeric()
+    {
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["not-a-number"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@alice",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue();
+        result.FailureMessage.Should().Contain("not a valid 64-bit Telegram user id");
+    }
+
+    [Fact]
+    public void Validator_Fails_WhenUserTenantMappingHasEmptyEntryList()
+    {
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new(),
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue(
+            "empty arrays cannot onboard the user — surface the misconfiguration at startup");
+        result.FailureMessage.Should().Contain("must contain at least one");
+    }
+
+    [Fact]
+    public void Validator_Succeeds_WhenUserTenantMappingIsComplete()
+    {
+        // Iter-3 evaluator item 1 — operator with multi-workspace
+        // bindings MUST use distinct OperatorAlias values per
+        // workspace because the operator_bindings table has UNIQUE
+        // (OperatorAlias, TenantId). Two rows with the same alias
+        // in the same tenant would crash the second /start on the
+        // unique index. The validator's new duplicate-alias rule
+        // catches that shape at startup.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@alice-alpha",
+                        Roles = new List<string> { "Operator" },
+                    },
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-beta",
+                        OperatorAlias = "@alice-beta",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Succeeded.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Validator_Fails_WhenSameUserHasDuplicateAliasInSameTenant()
+    {
+        // Iter-3 evaluator item 1 — a single Telegram user with two
+        // workspace bindings re-using the SAME (OperatorAlias,
+        // TenantId) is the most common shape of this misconfiguration
+        // (an operator who manages multiple workspaces under one
+        // tenant). The unique index on (OperatorAlias, TenantId)
+        // would let the first /start succeed and crash the second
+        // mid-onboarding; the validator catches it at startup.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@alice",
+                    },
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-beta",
+                        OperatorAlias = "@alice",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue(
+            "two workspace bindings under user 12345 share (TenantId=t-1, OperatorAlias=@alice) — the DB unique index would reject the second /start row");
+        result.FailureMessage.Should().Contain("Duplicate operator alias");
+        result.FailureMessage.Should().Contain("@alice");
+        result.FailureMessage.Should().Contain("t-1");
+        result.FailureMessage.Should().Contain("UNIQUE (OperatorAlias, TenantId)");
+    }
+
+    [Fact]
+    public void Validator_Fails_WhenTwoUsersClaimSameAliasInSameTenant()
+    {
+        // Iter-3 evaluator item 1 — even worse: two DIFFERENT
+        // Telegram users with the SAME alias under the SAME tenant.
+        // The unique index would let the first user's /start
+        // succeed and lock out the second user entirely. Both
+        // entries must be flagged so the operator can pick which
+        // user owns the alias.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@shared",
+                    },
+                },
+                ["67890"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-beta",
+                        OperatorAlias = "@shared",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue();
+        result.FailureMessage.Should().Contain("Duplicate operator alias");
+        result.FailureMessage.Should().Contain("\"12345\"");
+        result.FailureMessage.Should().Contain("\"67890\"");
+    }
+
+    [Fact]
+    public void Validator_Fails_OnAliasCaseInsensitiveCollision()
+    {
+        // Iter-4 doc correction — the prior comment claimed aliases
+        // are case-insensitive "at the persistence layer (default
+        // SQLite string COLLATION)". That was wrong: OperatorAlias
+        // is declared as TEXT(128) with no explicit collation, so
+        // SQLite uses BINARY (case-sensitive) and the unique index
+        // would technically accept "@Alice" and "@alice" as
+        // distinct rows. The validator is intentionally STRICTER
+        // than the DB on this axis as an operator-intent policy:
+        // mixed-case duplicates almost certainly indicate a typo for
+        // the SAME human handle, and silently registering two
+        // distinct bindings would break /handoff @alice (which would
+        // resolve to only one of them). See the rationale block in
+        // TelegramOptionsValidator near the aliasOwners construction.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@Alice",
+                    },
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-beta",
+                        OperatorAlias = "@alice",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue(
+            "the validator catches likely-typo case duplicates even though the DB BINARY collation would accept them — defense-in-depth operator-intent policy, NOT a claim that the DB itself enforces case-insensitive uniqueness");
+        result.FailureMessage.Should().Contain("Duplicate operator alias");
+    }
+
+    [Fact]
+    public void Validator_Succeeds_WhenSameAliasUsedInDifferentTenants()
+    {
+        // Iter-3 evaluator item 1 (negative case) — the unique
+        // index is (OperatorAlias, TenantId), so the SAME alias
+        // under DIFFERENT tenants is fine (architecture.md lines
+        // 116-119: two tenants may independently use the same
+        // alias without collision).
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@alice",
+                    },
+                },
+                ["67890"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-2",
+                        WorkspaceId = "ws-beta",
+                        OperatorAlias = "@alice",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Succeeded.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Validator_Fails_WhenSameUserHasTwoEntriesForSameWorkspace()
+    {
+        // Iter-4 (proactive companion to iter-3 item 2) — the
+        // operator_bindings table also has a UNIQUE index on
+        // (TelegramUserId, TelegramChatId, WorkspaceId). At /start
+        // time TelegramChatId is fixed (the chat the operator typed
+        // /start in), so two mapping entries under the SAME user
+        // that share a WorkspaceId would both try to insert the
+        // same (user, chat, workspace) row. The iter-3
+        // transactional RegisterManyAsync would roll back the
+        // batch; surfacing the misconfiguration at host startup is
+        // strictly better UX than letting /start fail.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-shared",
+                        OperatorAlias = "@alice-primary",
+                    },
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-2",
+                        WorkspaceId = "ws-shared",
+                        OperatorAlias = "@alice-secondary",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue(
+            "two entries under user 12345 share WorkspaceId=ws-shared — the (TelegramUserId, TelegramChatId, WorkspaceId) unique index would reject the second /start row mid-batch");
+        result.FailureMessage.Should().Contain("Duplicate workspace binding");
+        result.FailureMessage.Should().Contain("ws-shared");
+        result.FailureMessage.Should().Contain("12345");
+        result.FailureMessage.Should().Contain("UNIQUE (TelegramUserId, TelegramChatId, WorkspaceId)");
+    }
+
+    [Fact]
+    public void Validator_Succeeds_WhenDifferentUsersShareSameWorkspace()
+    {
+        // Iter-4 (negative case for the duplicate-workspace rule)
+        // — the unique index is per-(user, chat, workspace), so
+        // two DIFFERENT operators in the SAME workspace is the
+        // legitimate multi-operator-per-workspace pattern from
+        // architecture.md §4.3 and must not be flagged.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-shared",
+                        OperatorAlias = "@alice",
+                    },
+                },
+                ["67890"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-shared",
+                        OperatorAlias = "@bob",
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Succeeded.Should().BeTrue(
+            "two different operators can share a workspace — the duplicate-workspace rule is scoped per Telegram user");
+    }
+
+    [Fact]
+    public void Validator_FailureMessage_AggregatesAllInvalidMappingEntries()
+    {
+        // Iter-2 evaluator item 3 — a partially-invalid multi-workspace
+        // mapping must surface EVERY bad field at host startup so the
+        // operator can fix them in a single iteration, not chase
+        // them one-failed-startup-at-a-time.
+        var validator = new TelegramOptionsValidator();
+        var options = new TelegramOptions
+        {
+            BotToken = SampleToken,
+            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
+            {
+                ["12345"] = new()
+                {
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = "t-1",
+                        WorkspaceId = "ws-alpha",
+                        OperatorAlias = "@alice",
+                    },
+                    new TelegramUserTenantMapping
+                    {
+                        TenantId = string.Empty,
+                        WorkspaceId = string.Empty,
+                        OperatorAlias = string.Empty,
+                    },
+                },
+            },
+        };
+
+        var result = validator.Validate(Options.DefaultName, options);
+
+        result.Failed.Should().BeTrue();
+        result.FailureMessage.Should().Contain("[1].TenantId");
+        result.FailureMessage.Should().Contain("[1].WorkspaceId");
+        result.FailureMessage.Should().Contain("[1].OperatorAlias");
+    }
+
     [Fact]
     public async Task Host_StartAsync_ThrowsOptionsValidationException_WhenBotTokenIsMissing()
     {

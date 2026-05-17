@@ -5,7 +5,10 @@ using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Auth;
 using AgentSwarm.Messaging.Telegram.Webhook;
 using AgentSwarm.Messaging.Worker;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 // =============================================================
 // AgentSwarm.Messaging.Worker — production host for the Telegram
@@ -20,16 +23,26 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 //     InboundRecoverySweep).
 //
 //   * AddMessagingPersistence wires MessagingDbContext + the
-//     DatabaseInitializer hosted service.
+//     DatabaseInitializer hosted service, AND replaces the in-memory
+//     stubs with their persistent siblings — including
+//     PersistentOperatorRegistry (Stage 3.4) which becomes the
+//     IOperatorRegistry backing the IUserAuthorizationService below.
 //
-//   * AddTelegram wires TelegramOptions (including OperatorBindings),
-//     the bot client, the inbound pipeline, and the Stage 2.2 stubs.
+//   * AddTelegram wires TelegramOptions (including OperatorBindings,
+//     DevOperators, and UserTenantMappings), the bot client, the
+//     inbound pipeline, and the Stage 2.2 stubs. UserTenantMappings
+//     (architecture.md §7.1 lines 636-650) is the source of truth
+//     for /start onboarding consumed by TelegramUserAuthorizationService.
 //
-//   * The host registers ConfiguredOperatorAuthorizationService
-//     as the IUserAuthorizationService implementation (iter-5
-//     evaluator item 1) — AddTelegram deliberately does not stub
-//     authorization, but the Worker MUST supply a binding-aware
-//     implementation or dispatcher activation throws.
+//   * The host registers TelegramUserAuthorizationService (Stage 3.4)
+//     as the IUserAuthorizationService implementation, superseding
+//     the earlier iter-5 ConfiguredOperatorAuthorizationService that
+//     read static OperatorBindings from configuration. The new
+//     implementation reads from the persistent IOperatorRegistry
+//     for Tier 2 runtime authorization (binding lookup on every
+//     non-/start command) and from Telegram:UserTenantMappings for
+//     Tier 1 /start onboarding (one OperatorBinding row per
+//     configured workspace).
 //
 //   * AddTelegramWebhook wires the channel, processor, endpoint,
 //     secret filter, and the TelegramWebhookRegistrationService that
@@ -62,21 +75,42 @@ builder.Services.AddTelegramWebhook();
 // queue depth, dead-letter depth, database) — for now the bare
 // AddHealthChecks() registration gives us a 200-OK liveness probe
 // without depending on services that don't exist yet.
-builder.Services.AddHealthChecks();
+//
+// Stage 4.2 — `dead_letter_messages` depth check chained onto the
+// canonical AddHealthChecks() registration so the existing /healthz
+// liveness probe upgrades from a static "200 OK" to a live
+// "is the operator drowning in dead-letters?" signal. The check
+// reads IDeadLetterQueue.CountAsync and reports Unhealthy when the
+// count exceeds DeadLetterQueueOptions.UnhealthyThreshold (default
+// 100). IDeadLetterQueue is resolved by DI from the persistent
+// PersistentDeadLetterQueue registered via AddMessagingPersistence
+// above, so by the time the health check runs the EF-backed depth
+// is what surfaces.
+builder.Services.AddHealthChecks()
+    .AddCheck<DeadLetterQueueHealthCheck>(
+        DeadLetterQueueHealthCheck.Name,
+        tags: new[] { "dead_letter", "outbound" });
 
-// IUserAuthorizationService — iter-5 evaluator item 1. AddTelegram
-// intentionally does NOT register one to keep the loud-failure
-// semantic at the library level. The Worker registers
-// ConfiguredOperatorAuthorizationService via TryAddSingleton so any
-// production replacement supplied BEFORE this line wins (last-wins
-// semantics on TryAddSingleton are first-wins; tests can override
-// by registering their own implementation BEFORE WebApplicationFactory
-// triggers Program). Singleton lifetime matches the singleton
-// TelegramUpdatePipeline: ConfiguredOperatorAuthorizationService is
-// stateless (it only reads IOptionsMonitor<TelegramOptions>), so
-// scoping it would create a needless captive-dependency conflict
-// with the singleton pipeline.
-builder.Services.TryAddSingleton<IUserAuthorizationService, ConfiguredOperatorAuthorizationService>();
+// IUserAuthorizationService — iter-5 evaluator item 1 + Stage 3.4
+// onboarding. AddTelegram intentionally does NOT register one to
+// keep the loud-failure semantic at the library level. The Worker
+// registers TelegramUserAuthorizationService (Stage 3.4) via
+// TryAddSingleton so any production replacement supplied BEFORE
+// this line wins (TryAddSingleton is first-wins). Singleton
+// lifetime matches the singleton TelegramUpdatePipeline:
+// TelegramUserAuthorizationService is stateless (it only reads
+// IOptionsMonitor<TelegramOptions> + delegates to the registry's
+// own scope-per-call pattern), so scoping it would create a
+// needless captive-dependency conflict with the singleton pipeline.
+//
+// TelegramUserAuthorizationService supersedes the iter-5
+// ConfiguredOperatorAuthorizationService that read static
+// OperatorBindings from configuration: it now reads from the
+// persistent IOperatorRegistry (PersistentOperatorRegistry from
+// AddMessagingPersistence) for Tier 2 runtime authorization, and
+// from Telegram:UserTenantMappings configuration for Tier 1
+// /start onboarding (per architecture.md §7.1).
+builder.Services.TryAddSingleton<IUserAuthorizationService, TelegramUserAuthorizationService>();
 
 // IAlertService — iter-4 evaluator item 6. The Telegram sender's
 // dead-letter path (TelegramMessageSender.EmitDeadLetterAlertAsync)
@@ -147,6 +181,41 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
         maxRetries,
         TimeSpan.FromSeconds(staleSeconds));
 });
+
+// Stage 4.1 — durable outbox drainer. Spawns
+// OutboundQueue:ProcessorConcurrency (default 10) independent worker
+// tasks that dequeue from the PersistentOutboundQueue replaced into
+// the container by AddMessagingPersistence above, dispatch through
+// the IMessageSender registered by AddTelegram, and emit the
+// canonical latency histograms
+// (telegram.send.first_attempt_latency_ms,
+//  telegram.send.all_attempts_latency_ms,
+//  telegram.send.queue_dwell_ms) plus the backpressure counter
+// telegram.messages.backpressure_dlq via the singleton
+// OutboundQueueMetrics. The processor must be registered AFTER
+// AddMessagingPersistence (binds OutboundQueueOptions + replaces
+// IOutboundQueue with the persistent impl) and AFTER AddTelegram
+// (registers IMessageSender → TelegramMessageSender).
+//
+// Stage 4.2 — explicit factory so the new RetryPolicy options,
+// IDeadLetterQueue, and IAlertService are wired into the processor's
+// long ctor. Without the factory the DI activator would fall back
+// to the legacy 5-arg ctor (Random isn't registered as a DI service)
+// which would silently no-op the new dead-letter ledger and alert
+// routing.
+builder.Services.AddHostedService<OutboundQueueProcessor>(sp =>
+    new OutboundQueueProcessor(
+        sp.GetRequiredService<IServiceScopeFactory>(),
+        sp.GetRequiredService<IOutboundQueue>(),
+        sp.GetRequiredService<IMessageSender>(),
+        sp.GetRequiredService<IOptions<OutboundQueueOptions>>(),
+        sp.GetRequiredService<IOptions<RetryPolicy>>(),
+        sp.GetRequiredService<IDeadLetterQueue>(),
+        sp.GetRequiredService<IAlertService>(),
+        sp.GetRequiredService<OutboundQueueMetrics>(),
+        sp.GetRequiredService<TimeProvider>(),
+        random: null,
+        sp.GetRequiredService<ILogger<OutboundQueueProcessor>>()));
 
 var app = builder.Build();
 

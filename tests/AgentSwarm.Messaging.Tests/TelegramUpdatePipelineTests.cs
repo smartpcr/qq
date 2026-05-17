@@ -804,6 +804,240 @@ public class TelegramUpdatePipelineTests
     }
 
     [Fact]
+    public async Task Pipeline_NonAgentsCommand_WithMultipleBindings_PromptsForDisambiguation()
+    {
+        // Stage 3.4 iter-2 evaluator item 2 (supersedes the Stage 3.2
+        // "/agents-only" scoping) — the multi-workspace disambiguation
+        // prompt MUST cover EVERY multi-binding command (`/ask`,
+        // `/status`, `/pause`, `/handoff`, `/approve`, `/reject`,
+        // `/resume`, and `/agents` with no args). The only fall-through
+        // exceptions are `/agents WORKSPACE` (explicit arg routed to
+        // AgentsCommandHandler) and `/start` (just created the
+        // bindings — see Pipeline_StartCommand_WithMultipleBindings_*
+        // below). This pins the widened gate so a regression that
+        // re-scopes the branch back to /agents-only — silently routing
+        // other commands to authz.Bindings[0] — surfaces immediately.
+        var harness = new Harness();
+        harness.AuthorizeWith(
+            harness.MakeBinding(workspaceId: "factory-1"),
+            harness.MakeBinding(workspaceId: "factory-3"));
+        harness.ParserStub.Setup(p => p.Parse("/ask build release notes"))
+            .Returns(new ParsedCommand
+            {
+                CommandName = TelegramCommands.Ask,
+                Arguments = new[] { "build", "release", "notes" },
+                RawText = "/ask build release notes",
+                IsValid = true,
+            });
+
+        var evt = harness.MakeCommand("/ask build release notes");
+
+        var result = await harness.Pipeline.ProcessAsync(evt, CancellationToken.None);
+
+        result.Handled.Should().BeTrue();
+        result.ResponseText.Should().Match(
+            "You have access to multiple workspaces*",
+            "the widened disambiguation gate now covers /ask (and every non-/start, non-/agents-with-arg command) for multi-binding operators per Stage 3.4 evaluator item 2");
+        result.ResponseButtons.Should().NotBeEmpty(
+            "every multi-binding non-/start non-/agents-with-arg command MUST emit a workspace inline keyboard per architecture.md §4.3");
+        harness.RouterStub.Verify(
+            r => r.RouteAsync(
+                It.IsAny<ParsedCommand>(),
+                It.IsAny<AuthorizedOperator>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never,
+            "router must not run before the operator selects a workspace — that was the iter-1 silent-routing bug");
+    }
+
+    [Fact]
+    public async Task Pipeline_AgentsCommand_WithExplicitWorkspaceArg_AndMultipleBindings_FallsThroughToRouter()
+    {
+        // Stage 3.2 iter-2 evaluator item 1 (sub-case) — the
+        // disambiguation gate also requires Arguments.Count == 0, so
+        // `/agents WORKSPACE` from a multi-binding operator must reach
+        // the router (which delegates to AgentsCommandHandler's
+        // explicit-workspace path) instead of being intercepted by the
+        // pipeline prompt.
+        var harness = new Harness();
+        harness.AuthorizeWith(
+            harness.MakeBinding(workspaceId: "factory-1"),
+            harness.MakeBinding(workspaceId: "factory-3"));
+        harness.ParserStub.Setup(p => p.Parse("/agents factory-3"))
+            .Returns(new ParsedCommand
+            {
+                CommandName = TelegramCommands.Agents,
+                Arguments = new[] { "factory-3" },
+                RawText = "/agents factory-3",
+                IsValid = true,
+            });
+        harness.RouterStub.Setup(r => r.RouteAsync(
+                It.IsAny<ParsedCommand>(),
+                It.IsAny<AuthorizedOperator>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CommandResult
+            {
+                Success = true,
+                ResponseText = "Agents in factory-3",
+                CorrelationId = "router-agents-explicit",
+            });
+
+        var evt = harness.MakeCommand("/agents factory-3");
+
+        var result = await harness.Pipeline.ProcessAsync(evt, CancellationToken.None);
+
+        result.Handled.Should().BeTrue();
+        result.ResponseButtons.Should().BeEmpty(
+            "explicit `/agents WORKSPACE` must bypass the pipeline disambiguation prompt and reach the handler");
+        harness.RouterStub.Verify(
+            r => r.RouteAsync(
+                It.Is<ParsedCommand>(p => p.CommandName == TelegramCommands.Agents && p.Arguments.Count == 1 && p.Arguments[0] == "factory-3"),
+                It.IsAny<AuthorizedOperator>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    // ============================================================
+    // Stage 3.4 iter-2 evaluator item 2 — widened disambig coverage
+    // ============================================================
+
+    [Theory]
+    [InlineData(TelegramCommands.Status, "/status")]
+    [InlineData(TelegramCommands.Handoff, "/handoff @bob")]
+    [InlineData(TelegramCommands.Pause, "/pause")]
+    [InlineData(TelegramCommands.Resume, "/resume")]
+    [InlineData(TelegramCommands.Approve, "/approve")]
+    [InlineData(TelegramCommands.Reject, "/reject")]
+    public async Task Pipeline_AnyMultiBindingCommand_PromptsForDisambiguation(
+        string commandName,
+        string rawCommand)
+    {
+        // Iter-2 evaluator item 2 — the widened gate covers EVERY
+        // command, not just /agents-no-args. /status, /handoff,
+        // /pause, /resume, /approve, /reject from a multi-binding
+        // operator must surface the workspace prompt rather than
+        // silently route to authz.Bindings[0].
+        var harness = new Harness();
+        harness.AuthorizeWith(
+            harness.MakeBinding(workspaceId: "factory-1", roles: new[] { "Operator", "Approver" }),
+            harness.MakeBinding(workspaceId: "factory-3", roles: new[] { "Operator", "Approver" }));
+        harness.ParserStub.Setup(p => p.Parse(rawCommand))
+            .Returns(new ParsedCommand
+            {
+                CommandName = commandName,
+                Arguments = rawCommand.Split(' ').Skip(1).ToArray(),
+                RawText = rawCommand,
+                IsValid = true,
+            });
+
+        var evt = harness.MakeCommand(rawCommand);
+
+        var result = await harness.Pipeline.ProcessAsync(evt, CancellationToken.None);
+
+        result.Handled.Should().BeTrue();
+        result.ResponseText.Should().Match("You have access to multiple workspaces*",
+            $"`{commandName}` with multiple bindings must trigger the disambiguation prompt (iter-2 evaluator item 2)");
+        result.ResponseButtons.Should().NotBeEmpty();
+        harness.RouterStub.Verify(
+            r => r.RouteAsync(
+                It.IsAny<ParsedCommand>(),
+                It.IsAny<AuthorizedOperator>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never,
+            $"router must NOT run for multi-binding `{commandName}` before the operator picks a workspace");
+    }
+
+    [Fact]
+    public async Task Pipeline_StartCommand_RoutesThroughOnboardAsync_WithChatType()
+    {
+        // Iter-2 evaluator item 1 — the pipeline must invoke the new
+        // OnboardAsync entry point (NOT AuthorizeAsync) for /start so
+        // the raw chat-type token carried on MessengerEvent.ChatType
+        // flows into the persisted OperatorBinding.
+        var harness = new Harness();
+        harness.AuthorizeWith(harness.MakeBinding(workspaceId: "ws-1"));
+        harness.ParserStub.Setup(p => p.Parse("/start"))
+            .Returns(new ParsedCommand
+            {
+                CommandName = TelegramCommands.Start,
+                RawText = "/start",
+                IsValid = true,
+            });
+        harness.RouterStub.Setup(r => r.RouteAsync(
+                It.IsAny<ParsedCommand>(),
+                It.IsAny<AuthorizedOperator>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CommandResult
+            {
+                Success = true,
+                ResponseText = "welcome",
+                CorrelationId = "router-start",
+            });
+
+        var evt = new MessengerEvent
+        {
+            EventId = "evt-start-1",
+            EventType = EventType.Command,
+            RawCommand = "/start",
+            UserId = "100",
+            ChatId = "200",
+            ChatType = "supergroup",
+            Timestamp = DateTimeOffset.UtcNow,
+            CorrelationId = "trace-start",
+        };
+
+        var result = await harness.Pipeline.ProcessAsync(evt, CancellationToken.None);
+
+        result.Handled.Should().BeTrue();
+        harness.AuthzStub.Verify(
+            s => s.OnboardAsync("100", "200", "supergroup", It.IsAny<CancellationToken>()),
+            Times.Once,
+            "/start must route through OnboardAsync with the raw chat-type token so the binding's ChatType reflects the real chat kind");
+        harness.AuthzStub.Verify(
+            s => s.AuthorizeAsync(It.IsAny<string>(), It.IsAny<string>(), "start", It.IsAny<CancellationToken>()),
+            Times.Never,
+            "/start must NOT route through AuthorizeAsync(commandName=\"start\") any more — the OnboardAsync entry point carries the chat-type token");
+    }
+
+    [Fact]
+    public async Task Pipeline_StartCommand_WithMultipleBindings_DoesNotPrompt()
+    {
+        // Iter-2 evaluator item 2 (sub-case) — /start onboarding
+        // creates the bindings; the operator hasn't issued a real
+        // command yet, so showing the workspace selector here would
+        // confuse them. Only NON-/start commands trigger the gate.
+        var harness = new Harness();
+        harness.AuthorizeWith(
+            harness.MakeBinding(workspaceId: "factory-1"),
+            harness.MakeBinding(workspaceId: "factory-3"));
+        harness.ParserStub.Setup(p => p.Parse("/start"))
+            .Returns(new ParsedCommand
+            {
+                CommandName = TelegramCommands.Start,
+                RawText = "/start",
+                IsValid = true,
+            });
+        harness.RouterStub.Setup(r => r.RouteAsync(
+                It.IsAny<ParsedCommand>(),
+                It.IsAny<AuthorizedOperator>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CommandResult
+            {
+                Success = true,
+                ResponseText = "welcome",
+                CorrelationId = "router-start-multi",
+            });
+
+        var evt = harness.MakeCommand("/start");
+
+        var result = await harness.Pipeline.ProcessAsync(evt, CancellationToken.None);
+
+        result.Handled.Should().BeTrue();
+        result.ResponseText.Should().Be("welcome",
+            "/start must reach the router even with multiple bindings — the prompt is for subsequent commands");
+        result.ResponseButtons.Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Pipeline_MultiWorkspacePrompt_GeneratesUniqueTokenPerInvocation()
     {
         // Two separate disambiguation prompts must NOT share a token —
@@ -1758,6 +1992,19 @@ public class TelegramUpdatePipelineTests
         public void AuthorizeWith(params OperatorBinding[] bindings)
         {
             AuthzStub.Setup(s => s.AuthorizeAsync(
+                    It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new AuthorizationResult
+                {
+                    IsAuthorized = bindings.Length > 0,
+                    Bindings = bindings,
+                });
+
+            // Stage 3.4 — the pipeline now routes /start through
+            // OnboardAsync. Moq does not invoke the default-interface-
+            // method implementation on a proxied mock; explicitly
+            // stub it so /start pipeline tests get the same bindings
+            // as non-/start tests by default.
+            AuthzStub.Setup(s => s.OnboardAsync(
                     It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new AuthorizationResult
                 {
