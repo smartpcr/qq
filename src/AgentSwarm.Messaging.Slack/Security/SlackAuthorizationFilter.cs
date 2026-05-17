@@ -22,6 +22,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -93,6 +94,29 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
     private const string BodyTeamIdItemKey = "slack.body.team_id";
     private const string BodyChannelIdItemKey = "slack.body.channel_id";
     private const string BodyUserIdItemKey = "slack.body.user_id";
+
+    // -------------------------------------------------------------------------
+    // Log-sanitisation constants
+    // -------------------------------------------------------------------------
+    //
+    // The rejection log surfaces identifiers that -- directly (bodyUserId) or
+    // transitively (channel.ChannelId is looked up under a body-controlled key
+    // and could echo back operator-poisoned data) -- originate outside the
+    // trust boundary. Downstream log sinks vary: file appenders preserve raw
+    // bytes verbatim, Elasticsearch's default text mapping does not escape
+    // control characters, and the SOC's grep-based playbooks parse lines on
+    // CR/LF boundaries. Embedding `\r\n` (or a Unicode line-separator) into a
+    // logged field is therefore enough to forge a synthetic log record below
+    // the real one -- the classic CWE-117 log-injection. We defend by
+    // collapsing any C0/C1 control character to '?' and truncating to a
+    // generous-but-fixed length before the value reaches the logger. Slack
+    // IDs are bounded by Slack itself, so the truncation cap is comfortably
+    // above any legitimate value while still capping the blast radius of a
+    // pathological forged payload.
+    private const int MaxLogIdLength = 64;
+    private const string LogPlaceholderWhenAbsent = "(none)";
+    private const char LogControlReplacement = '?';
+    private const string LogTruncationMarker = "...";
 
     private readonly ISlackWorkspaceStore _workspaceStore;
     private readonly IChannelMembershipResolver _membershipResolver;
@@ -432,13 +456,26 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
                 TimestampUtc: DateTimeOffset.UtcNow),
             cancellationToken).ConfigureAwait(false);
 
+        // Sanitise every identifier before it reaches the logger. teamId comes
+        // from the signature-validated identity or the store, and channelId is
+        // a resolved record from the store -- but `userId` here is the raw
+        // bodyUserId pulled off the inbound request, and the resolved channel
+        // record was looked up under a body-controlled key, so an operator who
+        // ingested a poisoned channel descriptor could still echo CR/LF into
+        // the log. requestId may originate from an X-Slack-Request-Id header
+        // (forwarded by the signature middleware) which is again outside the
+        // trust boundary for log-forging purposes even when the HMAC over the
+        // signed payload was valid. Treat them all as untrusted at the logging
+        // boundary -- SanitizeForLog collapses control chars to '?' and caps
+        // length, mirroring the JSON-escaping discipline used elsewhere in
+        // the pipeline.
         _logger.LogWarning(
             "Slack request denied: reason={Reason} team={TeamId} channel={ChannelId} user={UserId} requestId={RequestId}",
             reason.ToString(),
-            teamId ?? "(none)",
-            channel?.ChannelId ?? "(none)",
-            userId ?? "(none)",
-            requestId);
+            SanitizeForLog(teamId),
+            SanitizeForLog(channel?.ChannelId),
+            SanitizeForLog(userId),
+            SanitizeForLog(requestId));
 
         // Reason code is surfaced on the response so the SOC can correlate
         // synthetic probes with their decisions. The HTTP status itself stays
@@ -450,4 +487,61 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
 
         context.Result = new OkResult();
     }
+
+    /// <summary>
+    /// Renders an identifier for inclusion in a structured log message in a
+    /// shape that cannot be used to forge new log records.
+    /// <para>
+    /// Returns <see cref="LogPlaceholderWhenAbsent"/> for null/empty input.
+    /// Otherwise truncates to <see cref="MaxLogIdLength"/> code units and
+    /// replaces every Unicode control character (categories Cc/Cf, which
+    /// include CR, LF, NEL, and the various line/paragraph separators that
+    /// downstream log parsers split on) with
+    /// <see cref="LogControlReplacement"/>. Truncated values get a trailing
+    /// <see cref="LogTruncationMarker"/> so operators can see the value was
+    /// capped rather than mistakenly believing it was the full identifier.
+    /// </para>
+    /// <para>
+    /// This is intentionally not a general-purpose escape: we want a flat,
+    /// human-grep-friendly rendering, not JSON or URI encoding. The values
+    /// also flow through the structured-logging parameter slot, so the
+    /// formatter still treats them as scalars; sanitisation just guarantees
+    /// the eventual textual rendering is single-line and bounded.
+    /// </para>
+    /// </summary>
+    private static string SanitizeForLog(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return LogPlaceholderWhenAbsent;
+        }
+
+        var truncated = value.Length > MaxLogIdLength;
+        var span = truncated ? value.AsSpan(0, MaxLogIdLength) : value.AsSpan();
+
+        var buffer = new StringBuilder(span.Length + LogTruncationMarker.Length);
+        foreach (var ch in span)
+        {
+            buffer.Append(IsLogUnsafe(ch) ? LogControlReplacement : ch);
+        }
+
+        if (truncated)
+        {
+            buffer.Append(LogTruncationMarker);
+        }
+
+        return buffer.ToString();
+    }
+
+    /// <summary>
+    /// True for any character that can break log-line framing or smuggle a
+    /// new record into the sink. This catches the obvious C0 control set
+    /// (<c>\r</c>, <c>\n</c>, <c>\t</c>, NUL, etc.) via
+    /// <see cref="char.IsControl(char)"/>, plus the Unicode line and
+    /// paragraph separators U+2028/U+2029 which <c>IsControl</c> does not
+    /// flag but which several JSON-line parsers (and a few JS-based log
+    /// viewers) treat as record terminators.
+    /// </summary>
+    private static bool IsLogUnsafe(char ch)
+        => char.IsControl(ch) || ch == '\u2028' || ch == '\u2029';
 }
