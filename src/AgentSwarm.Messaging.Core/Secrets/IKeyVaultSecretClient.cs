@@ -21,6 +21,14 @@ public interface IKeyVaultSecretClient
     /// </summary>
     /// <param name="secretName">The name of the secret to retrieve.</param>
     /// <param name="cancellationToken">A token to observe while waiting for the operation to complete.</param>
-    /// <returns>The plaintext secret value, or <see langword="null"/> when the secret is not present.</returns>
+    /// <returns>
+    /// The plaintext secret value, or <see langword="null"/> when the
+    /// vault has no entry for <paramref name="secretName"/>. Returning
+    /// <see langword="null"/> (rather than throwing) lets
+    /// <see cref="KeyVaultSecretProvider"/> raise a uniform
+    /// <see cref="SecretNotFoundException"/> that carries the original
+    /// reference URI for triage, independent of how each concrete
+    /// client signals "not present".
+    /// </returns>
     Task<string?> GetSecretAsync(string secretName, CancellationToken cancellationToken = default);
 }
