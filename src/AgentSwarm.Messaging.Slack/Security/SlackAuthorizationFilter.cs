@@ -25,12 +25,8 @@ using System.Globalization;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-
-using AgentSwarm.Messaging.Slack.Identity;
-using AgentSwarm.Messaging.Slack.Membership;
-using AgentSwarm.Messaging.Slack.Security.Diagnostics;
-using AgentSwarm.Messaging.Slack.Workspaces;
-
+using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Entities;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
@@ -57,124 +53,65 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
     /// lockstep -- never silently bucket a new condition into an existing
     /// reason.
     /// </summary>
-    public enum AuthorizationReason
-    {
-        Allowed = 0,
-
-        /// <summary>The request did not carry a stamped signature identity.</summary>
-        MissingIdentity = 1,
-
-        /// <summary>No workspace exists for the signature-validated team id.</summary>
-        UnknownWorkspace = 2,
-
-        /// <summary>
-        /// The workspace exists but is administratively disabled. This is a
-        /// distinct outcome from <see cref="UnknownWorkspace"/> -- the SOC
-        /// needs to be able to tell "workspace went away" apart from
-        /// "operator pulled the kill switch" without inspecting the store.
-        /// </summary>
-        DisabledWorkspace = 3,
-
-        /// <summary>
-        /// The body-supplied team id does not match the team id attested by
-        /// the signature. This is a defense-in-depth tripwire for
-        /// payload-substitution attempts: a forged body cannot route us to
-        /// a different workspace than the one whose signing secret signed
-        /// the request.
-        /// </summary>
-        WorkspaceMismatch = 4,
-
-        UnknownChannel = 5,
-        ChannelNotMonitored = 6,
-        UserNotAuthorized = 7,
-        UserNotAMember = 8,
-    }
-
-    private const string SignatureIdentityItemKey = "slack.signature.identity";
-    private const string BodyTeamIdItemKey = "slack.body.team_id";
-    private const string BodyChannelIdItemKey = "slack.body.channel_id";
-    private const string BodyUserIdItemKey = "slack.body.user_id";
-
-    // Maximum length of an identifier value carried into the rejection log.
-    // Real Slack object ids are <=16 characters; we allow a generous slack
-    // of 64 so a near-miss tampered value can still be inspected by SOC
-    // analysts before the "(truncated)" marker kicks in.
-    private const int LogIdMaxLength = 64;
-
-    private readonly ISlackWorkspaceStore _workspaceStore;
-    private readonly IChannelMembershipResolver _membershipResolver;
-    private readonly ISlackSecurityLog _securityLog;
-    private readonly IAuthorizationDecisionSink _decisionSink;
-    private readonly IOptionsMonitor<SlackAuthorizationOptions> _options;
-    private readonly ILogger<SlackAuthorizationFilter> _logger;
-
-    public SlackAuthorizationFilter(
-        ISlackWorkspaceStore workspaceStore,
-        IChannelMembershipResolver membershipResolver,
-        ISlackSecurityLog securityLog,
-        IAuthorizationDecisionSink decisionSink,
-        IOptionsMonitor<SlackAuthorizationOptions> options,
-        ILogger<SlackAuthorizationFilter> logger)
-    {
-        _workspaceStore = workspaceStore ?? throw new ArgumentNullException(nameof(workspaceStore));
-        _membershipResolver = membershipResolver ?? throw new ArgumentNullException(nameof(membershipResolver));
-        _securityLog = securityLog ?? throw new ArgumentNullException(nameof(securityLog));
-        _decisionSink = decisionSink ?? throw new ArgumentNullException(nameof(decisionSink));
-        _options = options ?? throw new ArgumentNullException(nameof(options));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-    }
+    public const string WorkspaceItemKey = SlackSignatureValidator.WorkspaceItemKey;
 
     /// <summary>
-    /// Resolution result produced by the per-stage resolve helpers below.
-    /// Carries the resolved domain object on success and a reason code on
-    /// failure. Keeping the failure reason on the resolution (rather than
-    /// having helpers return null and forcing the caller to guess what
-    /// went wrong) is what made the disabled-workspace conflation bug
-    /// possible in the first place; this type fixes that structurally.
+    /// <see cref="HttpContext.Items"/> key under which the resolved
+    /// Slack <c>channel_id</c> is stamped on success.
     /// </summary>
-    private readonly record struct WorkspaceResolution(
-        AuthorizationReason Reason,
-        SlackWorkspace? Workspace,
-        string? OffendingTeamId)
+    public const string ChannelIdItemKey = "AgentSwarm.Slack.Authorization.ChannelId";
+
+    /// <summary>
+    /// <see cref="HttpContext.Items"/> key under which the resolved
+    /// Slack <c>user_id</c> is stamped on success.
+    /// </summary>
+    public const string UserIdItemKey = "AgentSwarm.Slack.Authorization.UserId";
+
+    /// <summary>
+    /// <see cref="HttpContext.Items"/> key set to <see langword="true"/>
+    /// after the filter has successfully authorized the request. Lets a
+    /// downstream filter or controller short-circuit when the request
+    /// has already been classified, without re-running the ACL.
+    /// </summary>
+    public const string AuthorizedItemKey = "AgentSwarm.Slack.Authorization.Authorized";
+
+    private const string EphemeralResponseContentType = "application/json; charset=utf-8";
+
+    private readonly ISlackWorkspaceConfigStore workspaceStore;
+    private readonly ISlackMembershipResolver membershipResolver;
+    private readonly ISlackAuthorizationAuditSink auditSink;
+    private readonly IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor;
+    private readonly IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor;
+    private readonly ILogger<SlackAuthorizationFilter> logger;
+    private readonly TimeProvider timeProvider;
+
+    /// <summary>
+    /// Initializes a new instance with the supplied dependencies.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="signatureOptionsMonitor"/> is the single source of
+    /// truth for the URL path scope: the filter reads
+    /// <see cref="SlackSignatureOptions.PathPrefix"/> on every request
+    /// so the authorization gate and the upstream HMAC middleware are
+    /// mathematically guaranteed to enforce on the same surface area.
+    /// There is no <c>SlackAuthorizationOptions.PathPrefix</c> by design.
+    /// </remarks>
+    public SlackAuthorizationFilter(
+        ISlackWorkspaceConfigStore workspaceStore,
+        ISlackMembershipResolver membershipResolver,
+        ISlackAuthorizationAuditSink auditSink,
+        IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor,
+        IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor,
+        ILogger<SlackAuthorizationFilter> logger,
+        TimeProvider? timeProvider = null)
     {
-        public bool IsAllowed => Reason == AuthorizationReason.Allowed;
-
-        public static WorkspaceResolution Allowed(SlackWorkspace workspace)
-            => new(AuthorizationReason.Allowed, workspace, null);
-
-        public static WorkspaceResolution Unknown(string teamId)
-            => new(AuthorizationReason.UnknownWorkspace, null, teamId);
-
-        public static WorkspaceResolution Disabled(SlackWorkspace workspace)
-            => new(AuthorizationReason.DisabledWorkspace, workspace, workspace.TeamId);
-
-        public static WorkspaceResolution Mismatch(string stampedTeamId, string? bodyTeamId)
-            => new(AuthorizationReason.WorkspaceMismatch, null, bodyTeamId ?? stampedTeamId);
-    }
-
-    private readonly record struct ChannelResolution(
-        AuthorizationReason Reason,
-        SlackChannel? Channel)
-    {
-        public bool IsAllowed => Reason == AuthorizationReason.Allowed;
-
-        public static ChannelResolution Allowed(SlackChannel channel)
-            => new(AuthorizationReason.Allowed, channel);
-
-        public static ChannelResolution Unknown()
-            => new(AuthorizationReason.UnknownChannel, null);
-
-        public static ChannelResolution NotMonitored(SlackChannel channel)
-            => new(AuthorizationReason.ChannelNotMonitored, channel);
-    }
-
-    private readonly record struct MembershipResolution(AuthorizationReason Reason)
-    {
-        public bool IsAllowed => Reason == AuthorizationReason.Allowed;
-
-        public static MembershipResolution Allowed() => new(AuthorizationReason.Allowed);
-        public static MembershipResolution NotAuthorized() => new(AuthorizationReason.UserNotAuthorized);
-        public static MembershipResolution NotAMember() => new(AuthorizationReason.UserNotAMember);
+        this.workspaceStore = workspaceStore ?? throw new ArgumentNullException(nameof(workspaceStore));
+        this.membershipResolver = membershipResolver ?? throw new ArgumentNullException(nameof(membershipResolver));
+        this.auditSink = auditSink ?? throw new ArgumentNullException(nameof(auditSink));
+        this.optionsMonitor = optionsMonitor ?? throw new ArgumentNullException(nameof(optionsMonitor));
+        this.signatureOptionsMonitor = signatureOptionsMonitor ?? throw new ArgumentNullException(nameof(signatureOptionsMonitor));
+        this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
@@ -202,9 +139,28 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
             return;
         }
 
-        var bodyTeamId = httpContext.Items[BodyTeamIdItemKey] as string;
-        var bodyChannelId = httpContext.Items[BodyChannelIdItemKey] as string;
-        var bodyUserId = httpContext.Items[BodyUserIdItemKey] as string;
+        HttpContext http = context.HttpContext;
+
+        // Path scoping (evaluator iter-2 follow-up): the filter is
+        // mounted as a global MVC filter so future Slack controllers
+        // inherit the gate automatically. The path scope is read from
+        // SlackSignatureOptions.PathPrefix -- the SAME option the
+        // upstream HMAC middleware uses -- so the two layers cannot
+        // drift apart. An operator who moves Slack:Signature:PathPrefix
+        // from /api/slack to /slack-gateway moves BOTH the signature
+        // gate and the authorization gate; there is no separate
+        // Slack:Authorization:PathPrefix to forget. Non-Slack MVC
+        // endpoints (admin APIs, cache-invalidation hooks, future
+        // controllers unrelated to Slack) short-circuit out of the
+        // ACL without parsing the body or looking up the workspace.
+        SlackSignatureOptions signatureOptions = this.signatureOptionsMonitor.CurrentValue;
+        if (!PathInScope(http, signatureOptions))
+        {
+            await next().ConfigureAwait(false);
+            return;
+        }
+
+        CancellationToken ct = http.RequestAborted;
 
         // ----- Stage 2: workspace ----------------------------------------------
         var workspaceResolution =
@@ -259,54 +215,147 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
             return;
         }
 
-        // Authorization succeeded -- attach the resolved entities for downstream
-        // handlers so they don't re-query, and record an "Allowed" decision so
-        // the SOC dashboards can compute approve-rates per workspace/channel.
-        httpContext.Items["slack.authorization.workspace"] = workspace;
-        httpContext.Items["slack.authorization.channel"] = channel;
+        if (string.IsNullOrWhiteSpace(identity.ChannelId)
+            || !IsChannelAllowed(workspace, identity.ChannelId!))
+        {
+            // Stage 4.1 iter-2 evaluator item 1: view_submission
+            // (modal form submission) payloads are NOT channel-scoped
+            // by Slack's design -- the modal lives in
+            // private_metadata, not channel.id. The Stage 3.2 ACL
+            // still enforces workspace + user-group membership, but
+            // the channel allow-list cannot apply when the payload
+            // has no channel context to compare against. Skip the
+            // channel rejection for view_submission so authorized
+            // modal submissions can reach
+            // /api/slack/interactions and be turned into
+            // HumanDecisionEvent in Stage 5.3. Block-action
+            // interactions and slash commands still carry a
+            // channel.id and remain subject to the allow-list.
+            if (IsViewSubmissionPayload(identity))
+            {
+                this.logger.LogDebug(
+                    "Slack authorization filter skipping channel ACL for view_submission payload team={TeamId} user={UserId} (modal submissions are not channel-scoped per architecture.md §5.3).",
+                    identity.TeamId,
+                    identity.UserId);
+            }
+            else
+            {
+                await this
+                    .RejectAsync(context, identity, SlackAuthorizationRejectionReason.DisallowedChannel,
+                        FormattableString.Invariant(
+                            $"channel '{identity.ChannelId ?? "(none)"}' is not in AllowedChannelIds for team '{workspace.TeamId}'."))
+                    .ConfigureAwait(false);
+                return;
+            }
+        }
 
-        await _decisionSink.RecordAsync(
-            new AuthorizationDecision(
-                Reason: AuthorizationReason.Allowed,
-                TeamId: workspace.TeamId,
-                ChannelId: channel.ChannelId,
-                UserId: bodyUserId,
-                RequestId: identity.RequestId,
-                TimestampUtc: DateTimeOffset.UtcNow),
-            cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(identity.UserId))
+        {
+            await this
+                .RejectAsync(context, identity, SlackAuthorizationRejectionReason.UserNotInAllowedGroup,
+                    "user_id is missing from the request body.")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        bool authorized;
+        try
+        {
+            authorized = await this.membershipResolver
+                .IsUserInAnyAllowedGroupAsync(
+                    workspace.TeamId,
+                    identity.UserId!,
+                    workspace.AllowedUserGroupIds ?? Array.Empty<string>(),
+                    ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (SlackMembershipResolutionException ex)
+        {
+            await this
+                .RejectAsync(context, identity, SlackAuthorizationRejectionReason.MembershipResolutionFailed,
+                    FormattableString.Invariant(
+                        $"membership resolution failed for team '{ex.TeamId}' group '{ex.UserGroupId ?? "(unknown)"}': {ex.Message}"))
+                .ConfigureAwait(false);
+            return;
+        }
+        catch (Exception ex)
+        {
+            // Defense-in-depth: SlackMembershipResolver wraps its own
+            // failures, but a custom ISlackMembershipResolver might
+            // not. Fail closed.
+            this.logger.LogError(
+                ex,
+                "Unexpected exception of type {ExceptionType} while resolving Slack user-group membership for team {TeamId} user {UserId}.",
+                ex.GetType().FullName,
+                workspace.TeamId,
+                identity.UserId);
+            await this
+                .RejectAsync(context, identity, SlackAuthorizationRejectionReason.MembershipResolutionFailed,
+                    "membership resolution failed unexpectedly.")
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (!authorized)
+        {
+            await this
+                .RejectAsync(context, identity, SlackAuthorizationRejectionReason.UserNotInAllowedGroup,
+                    FormattableString.Invariant(
+                        $"user '{identity.UserId}' is not a member of any allowed user group in team '{workspace.TeamId}'."))
+                .ConfigureAwait(false);
+            return;
+        }
+
+        // Happy path: stamp resolved identity so downstream stages do
+        // not re-parse the body.
+        http.Items[WorkspaceItemKey] = workspace;
+        if (!string.IsNullOrEmpty(identity.ChannelId))
+        {
+            // view_submission payloads have no channel.id by design;
+            // skip stamping the ChannelIdItemKey so a downstream
+            // consumer that probes Items[ChannelIdItemKey] sees the
+            // absent value rather than an empty string masquerading
+            // as a resolved channel.
+            http.Items[ChannelIdItemKey] = identity.ChannelId!;
+        }
+
+        http.Items[UserIdItemKey] = identity.UserId!;
+        http.Items[AuthorizedItemKey] = true;
 
         await next().ConfigureAwait(false);
     }
 
-    // -------------------------------------------------------------------------
-    // Stage 2: workspace resolution
-    // -------------------------------------------------------------------------
-    //
-    // The signature middleware has already verified the request body's HMAC
-    // against the signing secret of exactly one workspace, and stamped that
-    // workspace (along with its team id) onto the identity. Two failure modes
-    // need to be handled here:
-    //
-    //   (a) The body's team_id disagrees with identity.TeamId. This is a
-    //       payload-substitution attempt -- the body is claiming to come from
-    //       a different workspace than the one whose secret signed it. We
-    //       refuse outright and *do not* fall back to the store; touching the
-    //       store on the body team_id would re-introduce the very bypass we
-    //       are guarding against.
-    //
-    //   (b) The signature middleware ran in passive mode (non-event endpoint)
-    //       and did not attach a stamped workspace. In that case we fall back
-    //       to the store, but keyed strictly on identity.TeamId.
-    //
-    // Disabled-workspace handling is surfaced through its own reason code
-    // (DisabledWorkspace) rather than collapsed to "not found"; conflating the
-    // two would make the upcoming SOC dashboard for kill-switch events
-    // impossible without re-querying the store.
-    // -------------------------------------------------------------------------
-    private async ValueTask<WorkspaceResolution> ResolveWorkspaceAsync(
-        SlackSignatureIdentity identity,
-        string? bodyTeamId,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// True when the inbound identity was extracted from a
+    /// Slack <c>view_submission</c> (modal form submission) payload.
+    /// Slack's view_submission interactive payload is not
+    /// channel-scoped -- the modal's origin is conveyed via
+    /// <c>view.private_metadata</c>, not <c>channel.id</c> -- so the
+    /// authorization filter must skip the channel ACL on this
+    /// surface while still enforcing workspace + user-group ACL.
+    /// </summary>
+    /// <remarks>
+    /// Stage 4.1 iter-2 evaluator item 1. The
+    /// <see cref="SlackInboundIdentityExtractor"/> populates
+    /// <see cref="SlackInboundIdentity.PayloadType"/> from the
+    /// top-level Slack <c>type</c> discriminator on JSON payloads
+    /// (Events API callbacks and interactive payloads), which is
+    /// where Slack surfaces <c>view_submission</c> per the
+    /// Block Kit + modal API docs.
+    /// </remarks>
+    private static bool IsViewSubmissionPayload(SlackInboundIdentity identity)
+    {
+        return string.Equals(
+            identity.PayloadType,
+            "view_submission",
+            StringComparison.Ordinal);
+    }
+
+    private static bool IsChannelAllowed(SlackWorkspaceConfig workspace, string channelId)
     {
         // (a) Body/signature divergence check. This MUST run before any store
         // fallback, otherwise a forged body team_id would silently key the
@@ -334,12 +383,68 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
                 : WorkspaceResolution.Disabled(stamped);
         }
 
-        // (b) No stamped workspace -- fall back to the store. Keyed on the
-        // signature-validated team id; the body team id has at this point
-        // either matched identity.TeamId or been rejected above, so it is
-        // not used here.
-        var resolved =
-            await _workspaceStore.TryGetByTeamIdAsync(identity.TeamId, cancellationToken)
+        return false;
+    }
+
+    private static bool PathInScope(HttpContext http, SlackSignatureOptions signatureOptions)
+    {
+        // SlackSignatureOptions.PathPrefix is the single source of truth
+        // for the URL scope covered by both the HMAC middleware and
+        // this authorization filter. SlackSignatureValidationServiceCollectionExtensions
+        // enforces a non-empty, leading-'/' value at startup, so any
+        // value reaching this point is already a valid PathString.
+        if (string.IsNullOrWhiteSpace(signatureOptions.PathPrefix))
+        {
+            // Defense-in-depth: a custom composition root that bypasses
+            // the validator (e.g., a test) and leaves PathPrefix empty
+            // means "no scope filter" -- enforce on every action.
+            return true;
+        }
+
+        return http.Request.Path.StartsWithSegments(
+            new PathString(signatureOptions.PathPrefix),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<SlackWorkspaceConfig?> ResolveWorkspaceAsync(HttpContext http, string teamId, CancellationToken ct)
+    {
+        // Reuse the workspace stamped by the signature middleware when
+        // it ran for the same team. This avoids a redundant store
+        // lookup on the hot path.
+        if (http.Items.TryGetValue(WorkspaceItemKey, out object? cached)
+            && cached is SlackWorkspaceConfig stamped
+            && string.Equals(stamped.TeamId, teamId, StringComparison.Ordinal))
+        {
+            return stamped.Enabled ? stamped : null;
+        }
+
+        return await this.workspaceStore.GetByTeamIdAsync(teamId, ct).ConfigureAwait(false);
+    }
+
+    private async Task RejectAsync(
+        ActionExecutingContext context,
+        SlackInboundIdentity identity,
+        SlackAuthorizationRejectionReason reason,
+        string errorDetail)
+    {
+        HttpContext http = context.HttpContext;
+        SlackAuthorizationOptions options = this.optionsMonitor.CurrentValue;
+
+        SlackAuthorizationAuditRecord record = new(
+            ReceivedAt: this.timeProvider.GetUtcNow(),
+            Reason: reason,
+            Outcome: SlackAuthorizationAuditRecord.RejectedAuthOutcome,
+            RequestPath: http.Request.Path.Value ?? string.Empty,
+            TeamId: identity.TeamId,
+            ChannelId: identity.ChannelId,
+            UserId: identity.UserId,
+            CommandText: identity.CommandText,
+            ErrorDetail: errorDetail);
+
+        try
+        {
+            await this.auditSink
+                .WriteAsync(record, http.RequestAborted)
                 .ConfigureAwait(false);
 
         if (resolved is null)
@@ -360,7 +465,23 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         string? bodyChannelId,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrEmpty(bodyChannelId))
+        string message = string.IsNullOrWhiteSpace(options.RejectionMessage)
+            ? SlackAuthorizationOptions.DefaultRejectionMessage
+            : options.RejectionMessage;
+
+        // Slack endpoints MUST return HTTP 200 (architecture.md ┬º2.4
+        // and the Stage 3.2 brief). The brief explicitly requires
+        // rejection to be communicated in the response body as an
+        // ephemeral message for every Slack inbound surface
+        // (commands, interactions, AND Events API callbacks). Even
+        // though Slack's Events API does not render
+        // {response_type:"ephemeral",text:...} to end users, emitting
+        // the same shape on every path gives operators, audit
+        // consumers, and Stage 4.x retry logic a uniform body to
+        // parse and keeps the rejection contract honest with the
+        // brief.
+        string body = BuildEphemeralBody(message);
+        return new ContentResult
         {
             return ChannelResolution.Unknown();
         }
