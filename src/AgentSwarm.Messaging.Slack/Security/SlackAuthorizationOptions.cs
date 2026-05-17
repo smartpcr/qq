@@ -12,6 +12,7 @@ namespace AgentSwarm.Messaging.Slack.Security;
 /// <see cref="SlackAuthorizationServiceCollectionExtensions.AddSlackAuthorization"/>.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Defaults follow the implementation-plan brief: every Slack endpoint
 /// must return HTTP 200 even on rejection, with the rejection
 /// communicated to the human caller via an ephemeral Slack message body.
@@ -19,6 +20,18 @@ namespace AgentSwarm.Messaging.Slack.Security;
 /// leak which layer of the three-layer ACL failed (an attacker fishing
 /// for a valid <c>channel_id</c> or workspace gets the same reply as
 /// an in-workspace user typing the wrong sub-command).
+/// </para>
+/// <para>
+/// <strong>Path scope is intentionally NOT configured here.</strong> The
+/// filter derives its URL scope from
+/// <see cref="AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions.PathPrefix"/>
+/// so the HMAC middleware and the authorization gate cover exactly the
+/// same surface area by construction -- there is no separate
+/// <c>Slack:Authorization:PathPrefix</c> that an operator can leave
+/// pointing at the old default while moving the signature middleware to
+/// a new mount point. That class of misconfiguration was a real
+/// authorization-bypass footgun in earlier drafts and is now impossible.
+/// </para>
 /// </remarks>
 public sealed class SlackAuthorizationOptions
 {
@@ -43,23 +56,6 @@ public sealed class SlackAuthorizationOptions
     /// flows; defaults to <see langword="true"/>.
     /// </summary>
     public bool Enabled { get; set; } = true;
-
-    /// <summary>
-    /// URL path prefix the filter enforces the ACL on. When a request
-    /// path does not start with this segment (case-insensitive) the
-    /// filter short-circuits to <c>next()</c> without parsing the body
-    /// or running the workspace/channel/user-group checks. Mirrors
-    /// <see cref="AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions.PathPrefix"/>
-    /// so the authorization gate covers exactly the same surface area
-    /// as the upstream HMAC middleware -- non-Slack MVC endpoints
-    /// (admin APIs, cache-invalidation hooks, future controllers
-    /// unrelated to Slack) are never rejected as <c>MissingTeamId</c>.
-    /// Defaults to <c>"/api/slack"</c>; an empty / whitespace value
-    /// disables the path guard (the filter runs on every action), which
-    /// is occasionally useful for diagnostic hosts that mount only
-    /// Slack controllers.
-    /// </summary>
-    public string PathPrefix { get; set; } = "/api/slack";
 
     /// <summary>
     /// Text rendered in the ephemeral Slack message returned on every

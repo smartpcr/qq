@@ -56,10 +56,22 @@ public static class SlackAuthorizationServiceCollectionExtensions
         services
             .AddOptions<SlackAuthorizationOptions>()
             .Bind(configuration.GetSection(SlackAuthorizationOptions.SectionName))
-            .Validate(
-                opts => opts.PathPrefix is null || !opts.PathPrefix.Contains(' '),
-                $"{nameof(SlackAuthorizationOptions)}.{nameof(SlackAuthorizationOptions.PathPrefix)} must not contain whitespace; set it to a URL prefix like '/api/slack' or leave empty to disable the path guard.")
             .ValidateOnStart();
+
+        // The filter derives its URL path scope from
+        // SlackSignatureOptions.PathPrefix (single source of truth: see
+        // the SlackAuthorizationOptions remarks for the security
+        // rationale). Bind the section defensively so resolving the
+        // filter in isolation -- e.g. a test host that calls
+        // AddSlackAuthorization without AddSlackSignatureValidation --
+        // still produces a valid IOptionsMonitor<SlackSignatureOptions>
+        // with the default '/api/slack' prefix. When the host also
+        // calls AddSlackSignatureValidation, AddOptions returns the
+        // same builder and bindings/validators compose -- this call is
+        // idempotent.
+        services
+            .AddOptions<SlackSignatureOptions>()
+            .Bind(configuration.GetSection(SlackSignatureOptions.SectionName));
 
         services.TryAddSingleton(TimeProvider.System);
 

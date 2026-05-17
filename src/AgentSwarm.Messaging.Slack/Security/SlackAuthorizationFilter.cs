@@ -10,6 +10,7 @@ using System;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Entities;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -100,17 +101,27 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
     private readonly ISlackMembershipResolver membershipResolver;
     private readonly ISlackAuthorizationAuditSink auditSink;
     private readonly IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor;
+    private readonly IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor;
     private readonly ILogger<SlackAuthorizationFilter> logger;
     private readonly TimeProvider timeProvider;
 
     /// <summary>
     /// Initializes a new instance with the supplied dependencies.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="signatureOptionsMonitor"/> is the single source of
+    /// truth for the URL path scope: the filter reads
+    /// <see cref="SlackSignatureOptions.PathPrefix"/> on every request
+    /// so the authorization gate and the upstream HMAC middleware are
+    /// mathematically guaranteed to enforce on the same surface area.
+    /// There is no <c>SlackAuthorizationOptions.PathPrefix</c> by design.
+    /// </remarks>
     public SlackAuthorizationFilter(
         ISlackWorkspaceConfigStore workspaceStore,
         ISlackMembershipResolver membershipResolver,
         ISlackAuthorizationAuditSink auditSink,
         IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor,
+        IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor,
         ILogger<SlackAuthorizationFilter> logger,
         TimeProvider? timeProvider = null)
     {
@@ -118,6 +129,7 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         this.membershipResolver = membershipResolver ?? throw new ArgumentNullException(nameof(membershipResolver));
         this.auditSink = auditSink ?? throw new ArgumentNullException(nameof(auditSink));
         this.optionsMonitor = optionsMonitor ?? throw new ArgumentNullException(nameof(optionsMonitor));
+        this.signatureOptionsMonitor = signatureOptionsMonitor ?? throw new ArgumentNullException(nameof(signatureOptionsMonitor));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -138,17 +150,20 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
 
         HttpContext http = context.HttpContext;
 
-        // Path scoping (evaluator iter-1 item 1): the filter is mounted
-        // as a global MVC filter so future Slack controllers inherit
-        // the gate automatically. Without this guard every non-Slack
-        // MVC endpoint -- admin APIs, cache invalidation, future
-        // controllers unrelated to Slack -- would be rejected as
-        // MissingTeamId because their bodies have no team_id. We mirror
-        // SlackSignatureOptions.PathPrefix so the authorization filter
-        // and the upstream HMAC middleware cover exactly the same URL
-        // surface; an empty/whitespace prefix disables the guard for
-        // diagnostic hosts that only mount Slack controllers.
-        if (!PathInScope(http, options))
+        // Path scoping (evaluator iter-2 follow-up): the filter is
+        // mounted as a global MVC filter so future Slack controllers
+        // inherit the gate automatically. The path scope is read from
+        // SlackSignatureOptions.PathPrefix -- the SAME option the
+        // upstream HMAC middleware uses -- so the two layers cannot
+        // drift apart. An operator who moves Slack:Signature:PathPrefix
+        // from /api/slack to /slack-gateway moves BOTH the signature
+        // gate and the authorization gate; there is no separate
+        // Slack:Authorization:PathPrefix to forget. Non-Slack MVC
+        // endpoints (admin APIs, cache-invalidation hooks, future
+        // controllers unrelated to Slack) short-circuit out of the
+        // ACL without parsing the body or looking up the workspace.
+        SlackSignatureOptions signatureOptions = this.signatureOptionsMonitor.CurrentValue;
+        if (!PathInScope(http, signatureOptions))
         {
             await next().ConfigureAwait(false);
             return;
@@ -314,19 +329,23 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         return false;
     }
 
-    private static bool PathInScope(HttpContext http, SlackAuthorizationOptions options)
+    private static bool PathInScope(HttpContext http, SlackSignatureOptions signatureOptions)
     {
-        if (string.IsNullOrWhiteSpace(options.PathPrefix))
+        // SlackSignatureOptions.PathPrefix is the single source of truth
+        // for the URL scope covered by both the HMAC middleware and
+        // this authorization filter. SlackSignatureValidationServiceCollectionExtensions
+        // enforces a non-empty, leading-'/' value at startup, so any
+        // value reaching this point is already a valid PathString.
+        if (string.IsNullOrWhiteSpace(signatureOptions.PathPrefix))
         {
-            // An explicitly empty prefix means "enforce on every
-            // request". Used by diagnostic hosts that mount only
-            // Slack controllers; the canonical Worker keeps the
-            // default '/api/slack' prefix.
+            // Defense-in-depth: a custom composition root that bypasses
+            // the validator (e.g., a test) and leaves PathPrefix empty
+            // means "no scope filter" -- enforce on every action.
             return true;
         }
 
         return http.Request.Path.StartsWithSegments(
-            new PathString(options.PathPrefix),
+            new PathString(signatureOptions.PathPrefix),
             StringComparison.OrdinalIgnoreCase);
     }
 

@@ -113,10 +113,17 @@ public class Program
         // 4.1) means every controller added later automatically
         // inherits the ACL gate without needing to decorate each
         // controller with [ServiceFilter(typeof(SlackAuthorizationFilter))].
-        // The filter is path-scoped via SlackAuthorizationOptions.PathPrefix
-        // (default '/api/slack', mirrors SlackSignatureOptions.PathPrefix)
-        // so non-Slack MVC endpoints -- admin APIs, cache invalidation,
-        // health probes that some hosts expose via controllers --
+        // The filter is path-scoped via SlackSignatureOptions.PathPrefix
+        // (default '/api/slack'): SlackAuthorizationFilter consumes
+        // the SAME option the upstream HMAC middleware does, so the
+        // signature gate and the ACL gate are mathematically guaranteed
+        // to enforce on the same URL surface. An operator who moves
+        // Slack:Signature:PathPrefix to /slack-gateway moves the
+        // authorization filter along with it -- there is no separate
+        // Slack:Authorization:PathPrefix to forget, which was the
+        // configurable-prefix authorization-bypass footgun called out
+        // by the iter-2 evaluator. Non-Slack MVC endpoints (admin
+        // APIs, cache invalidation, controller-mounted health probes)
         // short-circuit out of the ACL without parsing the body or
         // looking up the workspace. The signature middleware
         // (UseSlackSignatureValidation below) runs first and stamps
