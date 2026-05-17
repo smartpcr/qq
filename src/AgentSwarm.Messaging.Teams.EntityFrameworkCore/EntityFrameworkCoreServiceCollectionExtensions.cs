@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -153,6 +154,57 @@ public static class EntityFrameworkCoreServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(serviceProvider);
 
         var factory = serviceProvider.GetRequiredService<IDbContextFactory<TeamsLifecycleDbContext>>();
+        using var context = factory.CreateDbContext();
+        context.Database.Migrate();
+    }
+
+    /// <summary>
+    /// Register the EF Core context factory for <see cref="TeamsOutboxDbContext"/>
+    /// and the <see cref="SqlMessageOutbox"/> singleton, exposed under
+    /// <see cref="IMessageOutbox"/>. <b>Replaces</b> any prior
+    /// <see cref="IMessageOutbox"/> registration (e.g. the Stage 2.x no-op stub).
+    /// </summary>
+    /// <param name="services">DI container.</param>
+    /// <param name="optionsAction">Configures the underlying
+    /// <see cref="DbContextOptionsBuilder"/> — typically
+    /// <c>UseSqlServer(connectionString)</c>.</param>
+    /// <returns>The same <paramref name="services"/> for chaining.</returns>
+    public static IServiceCollection AddSqlMessageOutbox(
+        this IServiceCollection services,
+        Action<DbContextOptionsBuilder> optionsAction)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(optionsAction);
+
+        services.AddDbContextFactory<TeamsOutboxDbContext>(optionsAction);
+        services.TryAddSingleton<TimeProvider>(TimeProvider.System);
+
+        // Safe default — overridden when the host also calls AddTeamsOutboxEngine() (the
+        // Stage 6.1 helper in AgentSwarm.Messaging.Teams.Outbox), but ensures
+        // SqlMessageOutbox resolves even when wired in isolation. SqlMessageOutbox
+        // requires non-null OutboxOptions via its constructor null-guard.
+        services.TryAddSingleton<OutboxOptions>();
+        services.TryAddSingleton<SqlMessageOutbox>();
+
+        services.RemoveAll<IMessageOutbox>();
+        services.AddSingleton<IMessageOutbox>(
+            sp => sp.GetRequiredService<SqlMessageOutbox>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Apply any pending migrations against the <see cref="TeamsOutboxDbContext"/>
+    /// for the resolved service provider. Production hosts call this in a startup hook
+    /// (e.g. <c>app.Services.MigrateTeamsOutbox()</c>) after building the service
+    /// provider.
+    /// </summary>
+    /// <param name="serviceProvider">A built <see cref="IServiceProvider"/>.</param>
+    public static void MigrateTeamsOutbox(this IServiceProvider serviceProvider)
+    {
+        ArgumentNullException.ThrowIfNull(serviceProvider);
+
+        var factory = serviceProvider.GetRequiredService<IDbContextFactory<TeamsOutboxDbContext>>();
         using var context = factory.CreateDbContext();
         context.Database.Migrate();
     }

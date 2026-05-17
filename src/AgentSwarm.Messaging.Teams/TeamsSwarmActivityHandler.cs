@@ -128,8 +128,19 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
     /// GUID. The value is stored under <see cref="CorrelationIdTurnStateKey"/> on
     /// <see cref="ITurnContext.TurnState"/> so every downstream override and middleware
     /// reads the same value.
+    /// <para>
+    /// Stage 6.3 iter-2 — the override ALSO opens a single
+    /// <see cref="Diagnostics.TeamsLogScope.BeginScope"/> wrapping the entire activity
+    /// turn so every Teams log entry emitted by any of the override methods
+    /// (<see cref="OnMessageActivityAsync"/>, <see cref="OnTeamsMembersAddedAsync"/>,
+    /// <see cref="OnInstallationUpdateActivityAsync"/>, etc.) inherits the canonical
+    /// <see cref="Diagnostics.TeamsLogScope.CorrelationIdKey"/> /
+    /// <see cref="Diagnostics.TeamsLogScope.TenantIdKey"/> /
+    /// <see cref="Diagnostics.TeamsLogScope.UserIdKey"/> enrichment without each
+    /// override having to open its own scope.
+    /// </para>
     /// </remarks>
-    public override Task OnTurnAsync(ITurnContext turnContext, CancellationToken cancellationToken = default)
+    public override async Task OnTurnAsync(ITurnContext turnContext, CancellationToken cancellationToken = default)
     {
         if (turnContext is null)
         {
@@ -138,7 +149,18 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 
         var correlationId = ExtractCorrelationId(turnContext.Activity);
         turnContext.TurnState.Set(CorrelationIdTurnStateKey, correlationId);
-        return base.OnTurnAsync(turnContext, cancellationToken);
+
+        var activity = turnContext.Activity;
+        var tenantId = activity?.GetChannelData<TeamsChannelData>()?.Tenant?.Id;
+        var userId = activity?.From?.AadObjectId ?? activity?.From?.Id;
+
+        using var logScope = Diagnostics.TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: correlationId,
+            tenantId: tenantId,
+            userId: userId);
+
+        await base.OnTurnAsync(turnContext, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -203,16 +225,27 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
 
         // (3) Authorize the command (canonical verbs only). The default-deny stub rejects
         // every request; Stage 5.1 swaps in role-scoped RBAC.
+        //
+        // CRITICAL: RBAC is keyed by the Entra AAD object ID (per
+        // `RbacAuthorizationService` xmldoc and `RbacOptions.TenantRoleAssignments`),
+        // NOT by the platform-internal user ID. Previously this call passed
+        // `resolvedIdentity.InternalUserId` which silently denied real
+        // AAD-keyed config because the two identifiers rarely match.
         if (isCanonical)
         {
+            var rbacSubject = !string.IsNullOrEmpty(resolvedIdentity.AadObjectId)
+                ? resolvedIdentity.AadObjectId
+                : aadObjectId;
+
             var authorization = await _authorizationService
-                .AuthorizeAsync(tenantId, resolvedIdentity.InternalUserId, commandVerb, cancellationToken)
+                .AuthorizeAsync(tenantId, rbacSubject, commandVerb, cancellationToken)
                 .ConfigureAwait(false);
 
             if (!authorization.IsAuthorized)
             {
                 _logger.LogWarning(
-                    "Inbound message rejected — user {InternalUserId} (role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
+                    "Inbound message rejected — user {AadObjectId} (internal {InternalUserId}, role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
+                    rbacSubject,
                     resolvedIdentity.InternalUserId,
                     authorization.UserRole,
                     authorization.RequiredRole,
