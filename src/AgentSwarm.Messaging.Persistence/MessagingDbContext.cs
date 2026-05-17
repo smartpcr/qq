@@ -86,12 +86,18 @@ public class MessagingDbContext : DbContext
             entity.ToTable("DiscordInteractions");
 
             // At-most-once delivery (architecture.md Section 4.8) is gated by
-            // this primary key: SQLite materialises the PK as a unique B-tree
-            // on InteractionId, so a duplicate webhook INSERT collides at the
-            // constraint level. No companion unique index is declared --
-            // adding one would force SQLite to maintain two identical B-trees
-            // on every INSERT/UPDATE for zero semantic gain.
+            // this primary key. We also declare an explicit companion UNIQUE
+            // index named IX_DiscordInteractions_InteractionId_Unique so that
+            // (a) the migration-derived schema matches the index catalog the
+            // Schema_* SQLite-catalog tests assert against, and (b) operators
+            // get a discoverable, named index in the schema diff. The
+            // duplicated B-tree storage cost is negligible at messenger
+            // inbound volumes.
             entity.HasKey(x => x.InteractionId);
+
+            entity.HasIndex(x => x.InteractionId)
+                .IsUnique()
+                .HasDatabaseName("IX_DiscordInteractions_InteractionId_Unique");
 
             entity.Property(x => x.InteractionId)
                 .HasConversion(SnowflakeConverter)
@@ -185,12 +191,30 @@ public class MessagingDbContext : DbContext
                 .HasDefaultValue(OutboundMessage.DefaultMaxAttempts)
                 .IsRequired();
 
-            entity.Property(x => x.NextRetryAt);
+            // CreatedAt / NextRetryAt / SentAt are stored as UTC ticks
+            // (INTEGER) rather than the EF Core SQLite default ISO-8601 TEXT
+            // because Stage 2.3's PersistentOutboundQueue.DequeueAsync
+            // performs `NextRetryAt <= now` range comparisons that the EF
+            // Core 8 SQLite query translator cannot lower to SQL against
+            // DateTimeOffset TEXT columns. See
+            // UtcDateTimeOffsetTicksConverter for the full rationale.
+            entity.Property(x => x.CreatedAt)
+                .HasConversion(UtcDateTimeOffsetTicksConverter.Instance)
+                .HasColumnType("INTEGER")
+                .IsRequired();
+
+            entity.Property(x => x.NextRetryAt)
+                .HasConversion(NullableUtcDateTimeOffsetTicksConverter.Instance)
+                .HasColumnType("INTEGER");
+
             entity.Property(x => x.PlatformMessageId);
 
             entity.Property(x => x.CorrelationId).IsRequired();
-            entity.Property(x => x.CreatedAt).IsRequired();
-            entity.Property(x => x.SentAt);
+
+            entity.Property(x => x.SentAt)
+                .HasConversion(NullableUtcDateTimeOffsetTicksConverter.Instance)
+                .HasColumnType("INTEGER");
+
             entity.Property(x => x.ErrorDetail);
 
             entity.HasIndex(x => x.IdempotencyKey)
@@ -276,7 +300,23 @@ public class MessagingDbContext : DbContext
             entity.Property(x => x.ChatId).IsRequired();
             entity.Property(x => x.Payload).IsRequired();
             entity.Property(x => x.ErrorReason).IsRequired();
-            entity.Property(x => x.FailedAt).IsRequired();
+
+            // FailedAt mirrors the OutboundMessage timestamp storage contract:
+            // UTC ticks as INTEGER via UtcDateTimeOffsetTicksConverter rather
+            // than the EF Core SQLite default ISO-8601 TEXT. Operator triage
+            // queries routinely correlate dead-letter rows with their source
+            // OutboundMessage timestamps (CreatedAt / NextRetryAt / SentAt),
+            // and mixed TEXT/INTEGER storage would break range comparisons
+            // and joins across the two tables. Keeping the format identical
+            // across all timestamp columns in the messaging schema means
+            // SQLite-side comparisons (FailedAt vs OutboundMessage.SentAt,
+            // etc.) are unambiguous and translate cleanly under the EF Core
+            // 8 SQLite query translator.
+            entity.Property(x => x.FailedAt)
+                .HasConversion(UtcDateTimeOffsetTicksConverter.Instance)
+                .HasColumnType("INTEGER")
+                .IsRequired();
+
             entity.Property(x => x.AttemptCount).IsRequired();
 
             // Architecture.md Section 3.2 pins the relationship as
