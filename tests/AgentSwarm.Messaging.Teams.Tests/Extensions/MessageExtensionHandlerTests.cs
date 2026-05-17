@@ -387,10 +387,14 @@ public sealed class MessageExtensionHandlerTests
         Assert.Empty(dispatcher.Dispatched);
         Assert.Empty(publisher.Published);
 
-        // Authorization was actually consulted with the canonical verb "agent ask".
+        // Authorization was actually consulted with the canonical verb "agent ask"
+        // AND with the AAD object ID — RBAC is keyed by Entra `oid` claim, not by the
+        // platform-internal user ID. Previously this assertion expected
+        // "internal-viewer"; the iter-2 evaluator caught that the handler was passing
+        // the wrong identifier, so the call site (and this assertion) now use AAD.
         var call = Assert.Single(authorization.Calls);
         Assert.Equal(TenantId, call.TenantId);
-        Assert.Equal("internal-viewer", call.UserId);
+        Assert.Equal(ActorAadObjectId, call.UserId);
         Assert.Equal("agent ask", call.Command);
 
         var entry = Assert.Single(auditLogger.Entries);
@@ -482,6 +486,194 @@ public sealed class MessageExtensionHandlerTests
         Assert.Empty(publisher.Published);
     }
 
+    // ─── Channel-post forensic context (Subject / Locale / LinkToMessage / SenderId) ───
+
+    [Fact]
+    public async Task HandleAsync_ChannelPostWithSubject_PrependsSubjectToAgentPromptAndIncludesItOnConfirmationCard()
+    {
+        // Channel posts carry a `Subject` on the MessageActionsPayload that is often the
+        // most actionable line in a forward (incident titles, change-management headings,
+        // PR review summaries). The handler must:
+        //   * prepend the subject to the synthesised agent body (separated by a blank
+        //     line) so the agent sees the heading in the prompt;
+        //   * surface the subject as a "Source title" fact on the invoke confirmation
+        //     card so the user can confirm at a glance which thread the forward came
+        //     from; and
+        //   * include the subject in the audit payload for compliance/forensic review.
+        const string channelSubject = "PRODUCTION OUTAGE - orders API";
+        var publisher = new RecordingInboundEventPublisher();
+        var (handler, audit, _) = BuildE2EHandler(publisher);
+        var turnContext = NewSubmitActionTurnContext(
+            out var action,
+            body: ForwardedBody,
+            subject: channelSubject,
+            locale: "en-US",
+            linkToMessage: "https://teams.microsoft.com/l/message/19:abc/1700000000?tenantId=tenant-001",
+            correlationId: "corr-channel-1");
+
+        var response = await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        var commandEvent = Assert.IsType<CommandEvent>(Assert.Single(publisher.Published));
+        // Subject + body are concatenated (subject first, blank line, then body) and the
+        // "agent ask " prefix is stripped by AskCommandHandler, so CommandPayload.Payload
+        // contains both pieces in dispatch order.
+        Assert.StartsWith(channelSubject, commandEvent.Payload.Payload);
+        Assert.Contains(ForwardedBody, commandEvent.Payload.Payload);
+
+        Assert.NotNull(response.ComposeExtension);
+        var json = Assert.IsType<JObject>(Assert.Single(response.ComposeExtension!.Attachments).Content).ToString();
+        Assert.Contains("Source title", json);
+        Assert.Contains(channelSubject, json);
+
+        var entry = Assert.Single(audit.Entries);
+        Assert.NotNull(entry.PayloadJson);
+        Assert.Contains("\"subject\"", entry.PayloadJson!);
+        Assert.Contains(channelSubject, entry.PayloadJson!);
+        Assert.Contains("\"locale\"", entry.PayloadJson!);
+        Assert.Contains("en-US", entry.PayloadJson!);
+        Assert.Contains("\"linkToMessage\"", entry.PayloadJson!);
+        Assert.Contains("teams.microsoft.com", entry.PayloadJson!);
+    }
+
+    [Fact]
+    public async Task HandleAsync_NoSubject_SynthesizedBodyIsBodyOnlyAndConfirmationOmitsSourceTitleFact()
+    {
+        // 1:1 chats and group chats have no Subject; the dispatched body must be the
+        // plain-text content only (byte-for-byte compatible with the pre-enhancement
+        // contract) and the confirmation card must NOT contain a "Source title" fact —
+        // adding one with an empty value would confuse end users.
+        var publisher = new RecordingInboundEventPublisher();
+        var (handler, audit, _) = BuildE2EHandler(publisher);
+        var turnContext = NewSubmitActionTurnContext(out var action, body: ForwardedBody);
+
+        var response = await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        var commandEvent = Assert.IsType<CommandEvent>(Assert.Single(publisher.Published));
+        Assert.Equal(ForwardedBody, commandEvent.Payload.Payload);
+
+        var json = Assert.IsType<JObject>(Assert.Single(response.ComposeExtension!.Attachments).Content).ToString();
+        Assert.DoesNotContain("Source title", json);
+
+        var entry = Assert.Single(audit.Entries);
+        Assert.NotNull(entry.PayloadJson);
+        Assert.DoesNotContain("\"subject\"", entry.PayloadJson!);
+        Assert.DoesNotContain("\"locale\"", entry.PayloadJson!);
+        Assert.DoesNotContain("\"linkToMessage\"", entry.PayloadJson!);
+    }
+
+    [Fact]
+    public async Task HandleAsync_SenderIdExtracted_EvenWhenDisplayNameIsMissing()
+    {
+        // When a forwarded message's author has rotated / cleared their display name, the
+        // sender AAD/channel ID on `From.User.Id` is still preserved so the audit trail
+        // identifies who originated the content. Tests both the `senderId` field and the
+        // absence of the `sender` (display-name) field when the display name is empty.
+        var publisher = new RecordingInboundEventPublisher();
+        var (handler, audit, _) = BuildE2EHandler(publisher);
+        var turnContext = NewSubmitActionTurnContext(
+            out var action,
+            body: ForwardedBody,
+            senderDisplayName: string.Empty,
+            senderUserId: "29:original-author-aad-id");
+
+        await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        var entry = Assert.Single(audit.Entries);
+        Assert.NotNull(entry.PayloadJson);
+        Assert.Contains("\"senderId\":\"29:original-author-aad-id\"", entry.PayloadJson!);
+        // sender (display name) absent when empty/whitespace — only senderId carries the
+        // identity in this audit record.
+        Assert.Contains("\"sender\":null", entry.PayloadJson!);
+    }
+
+    [Fact]
+    public async Task HandleAsync_SubjectOnly_StillDispatchesBecauseSubjectAloneIsActionableContent()
+    {
+        // A channel "Announcement" post can carry a non-empty Subject and an empty body
+        // (Teams renders the subject as the headline). Treating this as "no content" and
+        // returning the select-message error card would defeat the user's intent. The
+        // handler must consider Subject-only payloads as content and dispatch them with
+        // the subject as the agent prompt.
+        const string subjectOnly = "All hands at 3pm";
+        var publisher = new RecordingInboundEventPublisher();
+        var (handler, audit, _) = BuildE2EHandler(publisher);
+        var turnContext = NewSubmitActionTurnContext(
+            out var action,
+            body: string.Empty,
+            subject: subjectOnly);
+
+        var response = await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        var commandEvent = Assert.IsType<CommandEvent>(Assert.Single(publisher.Published));
+        Assert.Equal(subjectOnly, commandEvent.Payload.Payload.Trim());
+
+        var json = Assert.IsType<JObject>(Assert.Single(response.ComposeExtension!.Attachments).Content).ToString();
+        Assert.Contains("Task submitted", json);
+        Assert.Contains(subjectOnly, json);
+
+        var entry = Assert.Single(audit.Entries);
+        Assert.Equal(AuditOutcomes.Success, entry.Outcome);
+    }
+
+    // ─── HTML normalisation ────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task HandleAsync_HtmlWithMultipleBrTags_PreservesLineBreaksInPlainText()
+    {
+        // The previous BlockBreakRegex only handled `</br>` (the technically-invalid
+        // closing form) and silently dropped Teams' standard `<br>` / `<br/>` /
+        // `<br />` self-closing form, merging adjacent lines. This test pins down the
+        // post-fix behaviour: every form of <br> becomes a newline.
+        var publisher = new RecordingInboundEventPublisher();
+        var (handler, _, _) = BuildE2EHandler(publisher);
+        const string html = "Line one<br>Line two<br/>Line three<br />Line four";
+        var turnContext = NewSubmitActionTurnContext(out var action, body: html, contentType: "html");
+
+        await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        var commandEvent = Assert.IsType<CommandEvent>(Assert.Single(publisher.Published));
+        Assert.Contains("Line one\nLine two", commandEvent.Payload.Payload);
+        Assert.Contains("Line three\nLine four", commandEvent.Payload.Payload);
+    }
+
+    [Fact]
+    public async Task HandleAsync_HtmlWithExcessConsecutiveBlankLines_CollapsesToTwoNewlines()
+    {
+        // A forwarded message peppered with empty paragraphs / stray `<br><br><br>`
+        // blocks must not balloon the agent prompt with whitespace. Three or more
+        // consecutive newlines (regardless of stray spaces / tabs in between) collapse
+        // to exactly two, preserving paragraph spacing without runaway blank-line runs.
+        var publisher = new RecordingInboundEventPublisher();
+        var (handler, _, _) = BuildE2EHandler(publisher);
+        const string html = "first<br><br><br><br>middle<br/><br/>last";
+        var turnContext = NewSubmitActionTurnContext(out var action, body: html, contentType: "html");
+
+        await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        var commandEvent = Assert.IsType<CommandEvent>(Assert.Single(publisher.Published));
+        Assert.Contains("first\n\nmiddle", commandEvent.Payload.Payload);
+        Assert.Contains("middle\n\nlast", commandEvent.Payload.Payload);
+        Assert.DoesNotContain("\n\n\n", commandEvent.Payload.Payload);
+    }
+
+    [Fact]
+    public async Task HandleAsync_HtmlEntities_AreDecodedAfterTagStripping()
+    {
+        // Pin the order: tag-strip first, then entity-decode. If decoding happened first
+        // an HTML-encoded `&lt;script&gt;` payload would be silently re-introduced as a
+        // <script> tag that the tag-stripper would then remove — silently dropping any
+        // strong-tag emphasis the sender included as encoded HTML in the source message.
+        var publisher = new RecordingInboundEventPublisher();
+        var (handler, _, _) = BuildE2EHandler(publisher);
+        const string html = "<p>Quote: &quot;ok&quot; &amp; &lt;strong&gt;done&lt;/strong&gt;</p>";
+        var turnContext = NewSubmitActionTurnContext(out var action, body: html, contentType: "html");
+
+        await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        var commandEvent = Assert.IsType<CommandEvent>(Assert.Single(publisher.Published));
+        Assert.Contains("Quote: \"ok\" & <strong>done</strong>", commandEvent.Payload.Payload);
+    }
+
     // ─── Helpers ───────────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -543,7 +735,12 @@ public sealed class MessageExtensionHandlerTests
         string? body,
         string contentType = "text",
         string? correlationId = null,
-        InertBotAdapter? adapter = null)
+        InertBotAdapter? adapter = null,
+        string? subject = null,
+        string? locale = null,
+        string? linkToMessage = null,
+        string? senderDisplayName = SenderDisplayName,
+        string? senderUserId = "29:sender-aad")
     {
         var activity = new Activity(ActivityTypes.Invoke)
         {
@@ -572,6 +769,9 @@ public sealed class MessageExtensionHandlerTests
                     Id = SourceMessageId,
                     MessageType = "message",
                     CreatedDateTime = "2024-08-10T12:34:56.789Z",
+                    Subject = subject,
+                    Locale = locale,
+                    LinkToMessage = linkToMessage is null ? null : new Uri(linkToMessage),
                     Body = new MessageActionsPayloadBody
                     {
                         ContentType = contentType,
@@ -581,8 +781,8 @@ public sealed class MessageExtensionHandlerTests
                     {
                         User = new MessageActionsPayloadUser
                         {
-                            Id = "29:sender-aad",
-                            DisplayName = SenderDisplayName,
+                            Id = senderUserId,
+                            DisplayName = senderDisplayName,
                             UserIdentityType = "aadUser",
                         },
                     },

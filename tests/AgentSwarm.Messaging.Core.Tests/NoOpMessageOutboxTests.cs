@@ -45,7 +45,21 @@ public sealed class NoOpMessageOutboxTests
     public async Task AcknowledgeAsync_CompletesWithoutThrowing()
     {
         var outbox = CreateOutbox();
-        await outbox.AcknowledgeAsync("outbox-1", CancellationToken.None);
+        await outbox.AcknowledgeAsync(
+            "outbox-1",
+            new OutboxDeliveryReceipt(ActivityId: "act-1", ConversationId: "conv-1", DeliveredAt: DateTimeOffset.UtcNow),
+            CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task RescheduleAsync_CompletesWithoutThrowing()
+    {
+        var outbox = CreateOutbox();
+        await outbox.RescheduleAsync(
+            "outbox-1",
+            DateTimeOffset.UtcNow.AddSeconds(2),
+            "transient failure",
+            CancellationToken.None);
     }
 
     [Fact]

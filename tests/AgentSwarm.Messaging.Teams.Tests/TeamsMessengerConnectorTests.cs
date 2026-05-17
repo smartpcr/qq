@@ -1,9 +1,11 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -139,7 +141,7 @@ public sealed class TeamsMessengerConnectorTests
     }
 
     [Fact]
-    public async Task SendQuestionAsync_HappyPath_PersistsQuestionUpdatesConversationIdAndSavesCardState()
+    public async Task SendQuestionAsync_HappyPath_PersistsQuestionWithConversationIdAndSavesCardState()
     {
         var harness = ConnectorHarness.Build();
         var stored = NewPersonalReference("ref-alice", aadObjectId: "aad-alice", internalUserId: "internal-alice");
@@ -149,12 +151,19 @@ public sealed class TeamsMessengerConnectorTests
 
         await harness.Connector.SendQuestionAsync(question, CancellationToken.None);
 
-        // Step 1 — question persisted before send.
+        // Iter-8 evaluator feedback #1 -- the AgentQuestion is persisted ONLY after the
+        // proactive send has succeeded AND yielded the conversation/activity metadata.
+        // The saved row carries the resolved deliveredConversationId from the proactive
+        // turn context, not the caller-supplied value (which is treated as advisory).
         var saved = Assert.Single(harness.AgentQuestionStore.Saved);
         Assert.Equal("Q-1001", saved.QuestionId);
-        Assert.Null(saved.ConversationId); // sanitization invariant — see SendQuestionAsync_StaleConversationId test below.
+        Assert.Equal(stored.ConversationId, saved.ConversationId);
 
-        // Step 2 — proactive send executed.
+        // The previous UpdateConversationIdAsync follow-up call is no longer needed
+        // for this connector because SaveAsync now writes the ConversationId directly.
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+
+        // Proactive send executed.
         var call = Assert.Single(harness.Adapter.ContinueCalls);
         Assert.Equal(MicrosoftAppId, call.BotAppId);
         Assert.Equal(stored.ConversationId, call.Reference.Conversation.Id);
@@ -172,12 +181,7 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Contains("Action.Submit", cardText, StringComparison.Ordinal);
         Assert.Contains("approve", cardText, StringComparison.Ordinal);
 
-        // Step 3 — question's ConversationId stamped from the proactive turn context, and
         // TeamsCardState saved with the activityId returned by SendActivitiesAsync.
-        var update = Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
-        Assert.Equal("Q-1001", update.QuestionId);
-        Assert.Equal(stored.ConversationId, update.ConversationId);
-
         var cardState = Assert.Single(harness.CardStateStore.Saved);
         Assert.Equal("Q-1001", cardState.QuestionId);
         Assert.False(string.IsNullOrWhiteSpace(cardState.ActivityId));
@@ -194,13 +198,14 @@ public sealed class TeamsMessengerConnectorTests
 
     /// <summary>
     /// Regression for evaluator-iter-1 finding #1 — a question arriving with a non-null
-    /// <c>ConversationId</c> must not be persisted with that stale routing data; the
-    /// connector saves a sanitized copy with <c>ConversationId = null</c> so the
-    /// bare-approve/bare-reject lookup path remains correct (the field is later stamped
-    /// with the actual proactive ConversationId in step 3).
+    /// <c>ConversationId</c> must NOT be persisted with that stale routing data; the
+    /// connector replaces it with the deliveredConversationId from the proactive turn
+    /// context so the bare-approve/bare-reject lookup path remains correct. Iter-8
+    /// evaluator feedback #1 moved the persist step to AFTER the send, so the saved
+    /// row's ConversationId is always the post-send value rather than null-then-update.
     /// </summary>
     [Fact]
-    public async Task SendQuestionAsync_QuestionWithStaleConversationId_PersistsSanitizedCopyWithNullConversationId()
+    public async Task SendQuestionAsync_QuestionWithStaleConversationId_PersistsCopyWithDeliveredConversationId()
     {
         var harness = ConnectorHarness.Build();
         var stored = NewPersonalReference("ref-alice", aadObjectId: "aad-alice", internalUserId: "internal-alice");
@@ -215,12 +220,15 @@ public sealed class TeamsMessengerConnectorTests
 
         var saved = Assert.Single(harness.AgentQuestionStore.Saved);
         Assert.Equal("Q-stale", saved.QuestionId);
-        Assert.Null(saved.ConversationId);
+        // The stale ConversationId is REPLACED by the proactive deliveredConversationId,
+        // not pass-through. This is the iter-1 sanitization invariant restated under the
+        // iter-8 save-after-send ordering.
         Assert.NotEqual("19:STALE-DO-NOT-PERSIST", saved.ConversationId);
+        Assert.Equal(stored.ConversationId, saved.ConversationId);
 
-        // Step 3 still stamps the actual proactive ConversationId via UpdateConversationIdAsync.
-        var update = Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
-        Assert.Equal(stored.ConversationId, update.ConversationId);
+        // UpdateConversationIdAsync is no longer called from SendQuestionAsync — the
+        // resolved ConversationId is written directly via SaveAsync above.
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
     }
 
     [Fact]
@@ -239,6 +247,66 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Empty(harness.ConversationReferenceStore.InternalUserLookups);
     }
 
+    // -----------------------------------------------------------------------------------
+    // Iter-5 evaluator feedback item 1 — channel-targeted SendQuestionAsync must NOT
+    // stamp the channel ID into the canonical TeamsLogScope UserId enrichment slot.
+    // -----------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task SendQuestionAsync_ChannelTarget_LogScopeOmitsUserIdEnrichment()
+    {
+        // Iter-5 — Regression for the channel-as-UserId mislabel at
+        // TeamsMessengerConnector.SendQuestionAsync (formerly line ~390 in iter-4 layout).
+        // When the orchestrator routes a question to a channel (TargetChannelId set,
+        // TargetUserId null), the connector's logging scope MUST contain
+        // (CorrelationId, TenantId) only; UserId must be absent so dashboards and
+        // user-oriented RBAC queries are not polluted with channel IDs that look
+        // like user IDs.
+        var logger = new ConnectorScopeRecordingLogger();
+        var harness = ConnectorHarness.Build(logger: logger);
+        var stored = NewChannelReference("ref-channel-scope", channelId: "19:team-channel-scope");
+        harness.ConversationReferenceStore.PreloadByChannelId[(TenantId, "19:team-channel-scope")] = stored;
+
+        var question = NewQuestion(
+            "Q-channel-scope",
+            targetUserId: null,
+            targetChannelId: "19:team-channel-scope");
+
+        await harness.Connector.SendQuestionAsync(question, CancellationToken.None);
+
+        var dispatchScope = Assert.Single(
+            logger.ScopeDictionaries,
+            d => d.TryGetValue(TeamsLogScope.CorrelationIdKey, out var c)
+                 && (string?)c == question.CorrelationId);
+        Assert.Equal(TenantId, dispatchScope[TeamsLogScope.TenantIdKey]);
+        Assert.False(
+            dispatchScope.ContainsKey(TeamsLogScope.UserIdKey),
+            "Channel-targeted SendQuestionAsync must not emit the UserId enrichment key. " +
+            $"Found UserId='{(dispatchScope.TryGetValue(TeamsLogScope.UserIdKey, out var v) ? v : null)}'.");
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_UserTarget_LogScopeEmitsUserIdEnrichment()
+    {
+        // Companion to the channel test — personal (TargetUserId-populated) questions
+        // SHOULD continue to surface the target user identity in the UserId slot.
+        var logger = new ConnectorScopeRecordingLogger();
+        var harness = ConnectorHarness.Build(logger: logger);
+        var stored = NewPersonalReference("ref-alice-scope", aadObjectId: "aad-alice", internalUserId: "internal-alice");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "internal-alice")] = stored;
+
+        var question = NewQuestion("Q-user-scope", targetUserId: "internal-alice");
+
+        await harness.Connector.SendQuestionAsync(question, CancellationToken.None);
+
+        var dispatchScope = Assert.Single(
+            logger.ScopeDictionaries,
+            d => d.TryGetValue(TeamsLogScope.CorrelationIdKey, out var c)
+                 && (string?)c == question.CorrelationId);
+        Assert.Equal(TenantId, dispatchScope[TeamsLogScope.TenantIdKey]);
+        Assert.Equal("internal-alice", dispatchScope[TeamsLogScope.UserIdKey]);
+    }
+
     [Fact]
     public async Task SendQuestionAsync_NoStoredReference_ThrowsInvalidOperationException()
     {
@@ -251,10 +319,11 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Contains("Q-3003", ex.Message, StringComparison.Ordinal);
         Assert.Contains("internal-bob", ex.Message, StringComparison.Ordinal);
 
-        // Question was still persisted (step 1 happens before reference resolution per
-        // the §2.3 brief).
-        var saved = Assert.Single(harness.AgentQuestionStore.Saved);
-        Assert.Equal("Q-3003", saved.QuestionId);
+        // Iter-7 evaluator feedback #4 -- reference lookup MUST run before
+        // AgentQuestionStore.SaveAsync. When no reference is found the connector
+        // throws without persisting the question, so no Open row is left behind for
+        // a question that was never delivered.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
 
         // Card state and conversation-id update did not run.
         Assert.Empty(harness.CardStateStore.Saved);
@@ -265,13 +334,13 @@ public sealed class TeamsMessengerConnectorTests
     /// <summary>
     /// Regression for evaluator-iter-1 finding #2 — when the proactive turn context yields
     /// no <c>Conversation.Id</c>, the connector must throw rather than silently skipping
-    /// <see cref="IAgentQuestionStore.UpdateConversationIdAsync"/>; otherwise bare
-    /// <c>approve</c>/<c>reject</c> resolution is broken without surfacing the failure.
-    /// Card state must NOT be saved when conversation ID is missing, so callers can rely
-    /// on the all-or-nothing persistence contract.
+    /// persistence; otherwise bare <c>approve</c>/<c>reject</c> resolution is broken
+    /// without surfacing the failure. Iter-8 evaluator feedback #1 strengthened this
+    /// contract: the AgentQuestion is no longer persisted before the send, so a missing
+    /// conversation ID leaves NEITHER an Open zombie row NOR a card state row.
     /// </summary>
     [Fact]
-    public async Task SendQuestionAsync_MissingConversationIdInProactiveCallback_ThrowsAndSkipsAllStep3Persistence()
+    public async Task SendQuestionAsync_MissingConversationIdInProactiveCallback_ThrowsAndPersistsNothing()
     {
         var stored = NewPersonalReference("ref-alice", aadObjectId: "aad-alice", internalUserId: "internal-alice");
         var harness = ConnectorHarness.Build(adapter: new ConversationlessCloudAdapter());
@@ -285,9 +354,11 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Contains("Q-missing-conv", ex.Message, StringComparison.Ordinal);
         Assert.Contains("Conversation.Id", ex.Message, StringComparison.Ordinal);
 
-        // Step 1 ran before the failure.
-        Assert.Single(harness.AgentQuestionStore.Saved);
-        // Step 3 never ran on either side — no partial persistence.
+        // Iter-8 evaluator feedback #1 -- the AgentQuestion is persisted ONLY after the
+        // send yields both Conversation.Id and Activity.Id. Because Conversation.Id was
+        // missing, NO row is written to the AgentQuestionStore, no UpdateConversationId
+        // call is made, and no card state is saved. This is the all-or-nothing contract.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
         Assert.Empty(harness.CardStateStore.Saved);
     }
@@ -297,10 +368,12 @@ public sealed class TeamsMessengerConnectorTests
     /// returns a <see cref="ResourceResponse"/> without an <c>Id</c>, the connector must
     /// throw rather than silently skipping <see cref="ICardStateStore.SaveAsync"/>; the
     /// proactive card was sent but cannot be updated/deleted and partial persistence would
-    /// hide the failure from operators.
+    /// hide the failure from operators. Iter-8 evaluator feedback #1 strengthened this
+    /// contract: the AgentQuestion is no longer persisted before the send, so a missing
+    /// activity ID leaves NEITHER an Open zombie row NOR a card state row.
     /// </summary>
     [Fact]
-    public async Task SendQuestionAsync_MissingActivityIdInResourceResponse_ThrowsAndSkipsAllStep3Persistence()
+    public async Task SendQuestionAsync_MissingActivityIdInResourceResponse_ThrowsAndPersistsNothing()
     {
         var stored = NewPersonalReference("ref-alice", aadObjectId: "aad-alice", internalUserId: "internal-alice");
         var adapter = new RecordingCloudAdapter
@@ -318,7 +391,8 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Contains("Q-missing-act", ex.Message, StringComparison.Ordinal);
         Assert.Contains("Activity.Id", ex.Message, StringComparison.Ordinal);
 
-        Assert.Single(harness.AgentQuestionStore.Saved);
+        // Iter-8 evaluator feedback #1 -- save-after-send means no AgentQuestion row.
+        Assert.Empty(harness.AgentQuestionStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
         Assert.Empty(harness.CardStateStore.Saved);
     }
@@ -477,7 +551,10 @@ public sealed class TeamsMessengerConnectorTests
         RecordingCardStateStore CardStateStore,
         TeamsMessagingOptions Options)
     {
-        public static ConnectorHarness Build(IInboundEventReader? reader = null, RecordingCloudAdapter? adapter = null)
+        public static ConnectorHarness Build(
+            IInboundEventReader? reader = null,
+            RecordingCloudAdapter? adapter = null,
+            ILogger<TeamsMessengerConnector>? logger = null)
         {
             adapter ??= new RecordingCloudAdapter();
             var options = new TeamsMessagingOptions { MicrosoftAppId = MicrosoftAppId };
@@ -496,8 +573,60 @@ public sealed class TeamsMessengerConnectorTests
                 cardStore,
                 renderer,
                 reader,
-                NullLogger<TeamsMessengerConnector>.Instance);
+                logger ?? NullLogger<TeamsMessengerConnector>.Instance);
             return new ConnectorHarness(connector, adapter, convStore, router, qStore, cardStore, options);
+        }
+    }
+
+    /// <summary>
+    /// Iter-5 — minimal <see cref="ILogger{T}"/> that snapshots every
+    /// <see cref="ILogger.BeginScope{TState}"/> dictionary into
+    /// <see cref="ScopeDictionaries"/>. Used by the channel-vs-personal
+    /// <see cref="TeamsLogScope"/> regression tests to assert which enrichment
+    /// keys are present / absent on the connector's logging scope. Snapshots are
+    /// captured via the <see cref="IEnumerable{T}"/> of
+    /// <see cref="KeyValuePair{TKey, TValue}"/> interface contract — the same
+    /// projection Serilog's <c>Microsoft.Extensions.Logging</c> bridge uses to
+    /// hoist scope state onto every emitted <c>LogEvent</c>.
+    /// </summary>
+    private sealed class ConnectorScopeRecordingLogger : ILogger<TeamsMessengerConnector>
+    {
+        public List<IReadOnlyDictionary<string, object?>> ScopeDictionaries { get; } = new();
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+        {
+            if (state is IEnumerable<KeyValuePair<string, object?>> kvps)
+            {
+                var snapshot = new Dictionary<string, object?>(StringComparer.Ordinal);
+                foreach (var kvp in kvps)
+                {
+                    snapshot[kvp.Key] = kvp.Value;
+                }
+
+                ScopeDictionaries.Add(snapshot);
+            }
+
+            return Noop.Instance;
+        }
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+        }
+
+        private sealed class Noop : IDisposable
+        {
+            public static readonly Noop Instance = new();
+            public void Dispose()
+            {
+            }
         }
     }
 

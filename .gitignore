@@ -1,4 +1,11 @@
-
+
+# Story-attachment directory. Operator-uploaded reference documents live here
+# so the engineer agent can read them, but they are NEVER part of the
+# implementation diff. The directory pattern below excludes everything so a
+# `git add` cannot accidentally stage an attachment, and any prior staged
+# attachment must be removed from the index (see iter-9 evaluator feedback
+# #3 -- the Stage 5.1 user-stories reference attachment was incorrectly
+# staged in iter-8 and removed in iter-9).
 .forge-attachments/
 
 # .NET build output

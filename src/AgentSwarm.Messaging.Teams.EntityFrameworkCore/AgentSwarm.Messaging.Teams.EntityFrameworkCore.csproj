@@ -28,6 +28,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AgentSwarm.Messaging.Teams\AgentSwarm.Messaging.Teams.csproj" />
+    <ProjectReference Include="..\AgentSwarm.Messaging.Core\AgentSwarm.Messaging.Core.csproj" />
   </ItemGroup>
 
 </Project>

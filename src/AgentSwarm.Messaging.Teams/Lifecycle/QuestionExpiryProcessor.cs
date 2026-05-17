@@ -209,6 +209,13 @@ public sealed class QuestionExpiryProcessor : BackgroundService
                 // connector). On fallback failure we log at error level — the durable
                 // question state has already moved to Expired so the user-facing approval
                 // is dead, but an operator-visible card may remain.
+                //
+                // Iter-9 (iter-8 evaluator #4) — this divergence from the brief's strict
+                // "delete the card" wording is documented in
+                // docs/stories/qq-MICROSOFT-TEAMS-MESS/stage-3.3-scope-and-attachments.md
+                // §4 and exercised by ProcessOnceAsync_DeleteThrows_FallsBackToMarkExpired_*
+                // / ProcessOnceAsync_DeleteAndFallbackBothFail_* tests in
+                // QuestionExpiryProcessorTests.cs.
                 _logger.LogError(
                     ex,
                     "ITeamsCardManager.DeleteCardAsync for question {QuestionId} failed after Open→Expired CAS; falling back to MarkExpired card update.",

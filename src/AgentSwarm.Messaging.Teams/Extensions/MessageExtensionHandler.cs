@@ -116,6 +116,13 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         @"<\s*/?\s*br\s*/?>|</\s*(?:p|div|li|tr|h[1-6])\s*/?>",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
+    // Collapse runs of 3+ consecutive line breaks (with optional in-between whitespace) to
+    // exactly two — preserves paragraph spacing while preventing a string of empty <p></p>
+    // / <br><br><br> blocks from blowing the dispatched prompt out with whitespace.
+    private static readonly Regex ExcessBlankLineRegex = new(
+        @"(?:[ \t]*\r?\n){3,}",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private readonly ICommandDispatcher _commandDispatcher;
     private readonly IIdentityResolver _identityResolver;
     private readonly IUserAuthorizationService _authorizationService;
@@ -248,14 +255,25 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         // "the 'agent ask' command requires role 'operator'" and viewer-only users are
         // denied with `MessagingExtensionActionResponse` carrying an access-denied card,
         // no MessengerEvent, plus a `SecurityRejection` audit entry.
+        //
+        // CRITICAL: RBAC is keyed by the Entra AAD object ID (see
+        // `RbacAuthorizationService` xmldoc + `RbacOptions.TenantRoleAssignments`).
+        // Passing `resolvedIdentity.InternalUserId` here would silently deny
+        // AAD-keyed role assignments because the platform-internal user ID and
+        // the AAD object ID rarely coincide.
+        var rbacSubject = !string.IsNullOrEmpty(resolvedIdentity.AadObjectId)
+            ? resolvedIdentity.AadObjectId
+            : aadObjectId;
+
         var authorization = await _authorizationService
-            .AuthorizeAsync(tenantId, resolvedIdentity.InternalUserId, CommandNames.AgentAsk, ct)
+            .AuthorizeAsync(tenantId, rbacSubject, CommandNames.AgentAsk, ct)
             .ConfigureAwait(false);
 
         if (!authorization.IsAuthorized)
         {
             _logger.LogWarning(
-                "Message-extension invoke rejected — user {InternalUserId} (role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
+                "Message-extension invoke rejected — user {AadObjectId} (internal {InternalUserId}, role {UserRole}) lacks role {RequiredRole} for command '{Command}' (tenant {TenantId}, correlation {CorrelationId}).",
+                rbacSubject,
                 resolvedIdentity.InternalUserId,
                 authorization.UserRole,
                 authorization.RequiredRole,
@@ -306,12 +324,13 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         }
 
         _logger.LogInformation(
-            "Message-extension forward dispatched (commandId '{CommandId}', tenant {TenantId}, actor {InternalUserId}, correlation {CorrelationId}, body length {BodyLength}).",
+            "Message-extension forward dispatched (commandId '{CommandId}', tenant {TenantId}, actor {InternalUserId}, correlation {CorrelationId}, body length {BodyLength}, has subject {HasSubject}).",
             commandId,
             tenantId,
             resolvedIdentity.InternalUserId,
             correlationId,
-            extraction.PlainText.Length);
+            extraction.PlainText.Length,
+            extraction.Subject is not null);
 
         // Synthesise the dispatch context with an "agent ask <body>" prefix so the
         // dispatcher's longest-prefix matcher routes to AskCommandHandler (which is the
@@ -319,7 +338,14 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         // SuppressReply = true ensure the published event carries the correct origination
         // and the handler does NOT post its acknowledgement card to the conversation
         // thread (the confirmation lives in the invoke response instead).
-        var synthesizedText = $"{CommandNames.AgentAsk} {extraction.PlainText}";
+        //
+        // For channel-post forwards Teams populates `MessageActionsPayload.Subject` with
+        // the post heading. When present we prepend it to the agent body (separated by a
+        // blank line) so the downstream agent sees the heading as part of the prompt
+        // rather than discarding what is often the most actionable line in a channel
+        // forward (e.g. "PRODUCTION OUTAGE — orders API"). When the subject is absent
+        // (1:1 chats, group chats) the dispatched body is unchanged.
+        var synthesizedText = BuildSynthesizedAskBody(extraction);
 
         // Forward the FULL resolved identity (InternalUserId / AadObjectId / DisplayName /
         // Role) into CommandContext so downstream consumers (CommandEvent envelope, audit
@@ -395,9 +421,37 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
             sourceTimestamp: extraction.SourceTimestamp,
             commandId: commandId,
             outcome: AuditOutcomes.Success,
-            ct).ConfigureAwait(false);
+            ct,
+            subject: extraction.Subject,
+            locale: extraction.Locale,
+            linkToMessage: extraction.LinkToMessage,
+            senderId: extraction.SenderId).ConfigureAwait(false);
 
-        return BuildConfirmationResponse(extraction.PlainText, correlationId);
+        return BuildConfirmationResponse(extraction.PlainText, correlationId, extraction.Subject);
+    }
+
+    /// <summary>
+    /// Build the <c>agent ask &lt;body&gt;</c> text the dispatcher routes to
+    /// <see cref="AskCommandHandler"/>. When the forwarded payload carries a non-empty
+    /// <see cref="MessageActionsPayload.Subject"/> (typical for channel posts) it is
+    /// prepended to the body separated by a blank line so the heading is preserved in the
+    /// downstream agent prompt. Otherwise the dispatched body is the plain-text content
+    /// only, byte-for-byte compatible with the pre-enhancement contract.
+    /// </summary>
+    internal static string BuildSynthesizedAskBody(PayloadExtraction extraction)
+    {
+        var hasSubject = !string.IsNullOrWhiteSpace(extraction.Subject);
+        var hasBody = !string.IsNullOrWhiteSpace(extraction.PlainText);
+
+        var prompt = (hasSubject, hasBody) switch
+        {
+            (true, true) => $"{extraction.Subject!.Trim()}\n\n{extraction.PlainText}",
+            (true, false) => extraction.Subject!.Trim(),
+            (false, true) => extraction.PlainText,
+            _ => string.Empty,
+        };
+
+        return $"{CommandNames.AgentAsk} {prompt}";
     }
 
     /// <summary>
@@ -406,25 +460,69 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
     /// the payload body is empty/whitespace, <see cref="HasContent"/> is <c>false</c> and
     /// the handler returns the select-message error card.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// In addition to the body / sender / timestamp triple required by the Stage 3.4 spec
+    /// ("Implement message content extraction: parse the
+    /// <see cref="MessagingExtensionAction.MessagePayload"/> to retrieve the forwarded
+    /// message text, sender, and timestamp"), this record also captures four
+    /// forensically-valuable channel-post fields that are commonly populated by Teams
+    /// when the source activity is a channel message:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description><see cref="Subject"/> — the channel post title (null for 1:1
+    /// chats and group chats). When non-null the value is prepended to the synthesised
+    /// agent-ask body so the agent has the post heading as context.</description></item>
+    /// <item><description><see cref="Locale"/> — the originating user's locale (e.g.
+    /// <c>en-US</c>); included verbatim in the audit payload so compliance reports can
+    /// segment by locale.</description></item>
+    /// <item><description><see cref="LinkToMessage"/> — the deep-link to the source
+    /// message in the Teams client; preserved in the audit payload so forensic reviewers
+    /// can navigate back to the originating thread.</description></item>
+    /// <item><description><see cref="SenderId"/> — the sender's AAD / channel ID
+    /// (<c>From.User.Id</c>); preserved alongside the display name so the audit trail
+    /// still identifies the sender even if their display name is missing or has been
+    /// changed since the message was authored.</description></item>
+    /// </list>
+    /// </remarks>
     internal readonly record struct PayloadExtraction(
         bool HasContent,
         string PlainText,
         string? SourceMessageId,
         string? SenderDisplayName,
-        string? SourceTimestamp);
+        string? SourceTimestamp,
+        string? Subject,
+        string? Locale,
+        string? LinkToMessage,
+        string? SenderId);
 
     /// <summary>
     /// Extract the canonical fields from
     /// <see cref="MessagingExtensionAction.MessagePayload"/>. The body content is HTML
     /// (Teams native) so we strip tags and decode entities; block-level tags are
-    /// translated to newlines so multi-paragraph forwards stay readable.
+    /// translated to newlines so multi-paragraph forwards stay readable. The richer
+    /// metadata fields (<see cref="MessageActionsPayload.Subject"/>,
+    /// <see cref="MessageActionsPayload.Locale"/>,
+    /// <see cref="MessageActionsPayload.LinkToMessage"/>, and the sender's
+    /// <see cref="MessageActionsPayloadUser.Id"/>) are passed through verbatim — they
+    /// flow into the audit payload so compliance / forensic reviews can reconstruct the
+    /// originating context even when the platform-internal IDs have rotated.
     /// </summary>
     internal static PayloadExtraction ExtractMessagePayload(MessagingExtensionAction action)
     {
         var payload = action.MessagePayload;
         if (payload is null)
         {
-            return new PayloadExtraction(HasContent: false, PlainText: string.Empty, SourceMessageId: null, SenderDisplayName: null, SourceTimestamp: null);
+            return new PayloadExtraction(
+                HasContent: false,
+                PlainText: string.Empty,
+                SourceMessageId: null,
+                SenderDisplayName: null,
+                SourceTimestamp: null,
+                Subject: null,
+                Locale: null,
+                LinkToMessage: null,
+                SenderId: null);
         }
 
         var bodyContent = payload.Body?.Content ?? string.Empty;
@@ -435,18 +533,29 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
 
         plainText = (plainText ?? string.Empty).Trim();
 
-        var hasContent = !string.IsNullOrWhiteSpace(plainText);
-        var senderDisplayName = payload.From?.User?.DisplayName;
-        var sourceTimestamp = payload.CreatedDateTime;
-        var sourceMessageId = payload.Id;
+        var subject = NullIfEmpty(payload.Subject);
+        var hasContent = !string.IsNullOrWhiteSpace(plainText) || !string.IsNullOrWhiteSpace(subject);
+        var senderDisplayName = NullIfEmpty(payload.From?.User?.DisplayName);
+        var senderId = NullIfEmpty(payload.From?.User?.Id);
+        var sourceTimestamp = NullIfEmpty(payload.CreatedDateTime);
+        var sourceMessageId = NullIfEmpty(payload.Id);
+        var locale = NullIfEmpty(payload.Locale);
+        var linkToMessage = NullIfEmpty(payload.LinkToMessage?.ToString());
 
         return new PayloadExtraction(
             HasContent: hasContent,
             PlainText: plainText ?? string.Empty,
             SourceMessageId: sourceMessageId,
             SenderDisplayName: senderDisplayName,
-            SourceTimestamp: sourceTimestamp);
+            SourceTimestamp: sourceTimestamp,
+            Subject: subject,
+            Locale: locale,
+            LinkToMessage: linkToMessage,
+            SenderId: senderId);
     }
+
+    private static string? NullIfEmpty(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value;
 
     /// <summary>
     /// Strip HTML tags and decode entities from a Teams-native message body. Block-level
@@ -454,7 +563,10 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
     /// and every form of the void <c>br</c> element (<c>&lt;br&gt;</c>,
     /// <c>&lt;br/&gt;</c>, <c>&lt;br /&gt;</c>, plus the technically-invalid
     /// <c>&lt;/br&gt;</c>) are first replaced with a newline so multi-paragraph content
-    /// stays readable in downstream consumers (audit log, agent prompt).
+    /// stays readable in downstream consumers (audit log, agent prompt). Runs of three
+    /// or more consecutive line breaks are collapsed to exactly two so a forwarded
+    /// message peppered with empty paragraphs / stray <c>&lt;br&gt;</c> blocks does
+    /// not balloon the agent prompt with whitespace.
     /// </summary>
     internal static string HtmlToPlainText(string html)
     {
@@ -465,7 +577,8 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
 
         var withBreaks = BlockBreakRegex.Replace(html, "\n");
         var stripped = HtmlTagRegex.Replace(withBreaks, string.Empty);
-        return WebUtility.HtmlDecode(stripped);
+        var decoded = WebUtility.HtmlDecode(stripped);
+        return ExcessBlankLineRegex.Replace(decoded, "\n\n");
     }
 
     private static string GetCorrelationId(ITurnContext turnContext)
@@ -523,7 +636,11 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
                 outcome: AuditOutcomes.Failed,
                 ct: ct,
                 errorType: exception.GetType().FullName,
-                errorMessage: exception.Message).ConfigureAwait(false);
+                errorMessage: exception.Message,
+                subject: extraction.Subject,
+                locale: extraction.Locale,
+                linkToMessage: extraction.LinkToMessage,
+                senderId: extraction.SenderId).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -558,7 +675,11 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         string outcome,
         CancellationToken ct,
         string? errorType = null,
-        string? errorMessage = null)
+        string? errorMessage = null,
+        string? subject = null,
+        string? locale = null,
+        string? linkToMessage = null,
+        string? senderId = null)
     {
         var payloadObject = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
@@ -568,6 +689,32 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
             ["sourceTimestamp"] = sourceTimestamp,
             ["commandId"] = string.IsNullOrEmpty(commandId) ? null : commandId,
         };
+
+        // The forensic-context fields below are only emitted when populated by the
+        // inbound payload so the audit envelope stays byte-for-byte compatible with the
+        // existing shape on rejection / empty-payload paths (where the fields are always
+        // null). Tests assert the absence of the keys on those paths via
+        // RecordingAuditLogger.Entries[i].PayloadJson, so adding them unconditionally
+        // would silently break the checksum stability guarantee.
+        if (!string.IsNullOrEmpty(subject))
+        {
+            payloadObject["subject"] = subject;
+        }
+
+        if (!string.IsNullOrEmpty(locale))
+        {
+            payloadObject["locale"] = locale;
+        }
+
+        if (!string.IsNullOrEmpty(linkToMessage))
+        {
+            payloadObject["linkToMessage"] = linkToMessage;
+        }
+
+        if (!string.IsNullOrEmpty(senderId))
+        {
+            payloadObject["senderId"] = senderId;
+        }
 
         // Only emit the `error` field when this is a failure-path audit. Keeping it absent
         // on success / rejection preserves byte-for-byte payload compatibility with the
@@ -763,9 +910,12 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
     /// task-submitted acknowledgement plus the correlation/tracking ID, wrapped in a
     /// <see cref="MessagingExtensionActionResponse"/> using the direct-submit
     /// <c>composeExtension</c> result shape (consistent with the <c>message-action-ux</c>
-    /// resolved decision: direct submit, no task module popup).
+    /// resolved decision: direct submit, no task module popup). When the forwarded
+    /// payload carried a non-empty <see cref="MessageActionsPayload.Subject"/> (channel
+    /// posts) the card surfaces it as a dedicated "Source title" fact so the user can
+    /// confirm at a glance which thread their forward was created from.
     /// </summary>
-    internal static MessagingExtensionActionResponse BuildConfirmationResponse(string body, string correlationId)
+    internal static MessagingExtensionActionResponse BuildConfirmationResponse(string body, string correlationId, string? subject = null)
     {
         var card = new AdaptiveCard(Cards.AdaptiveCardBuilder.SchemaVersion);
         card.Body.Add(new AdaptiveTextBlock
@@ -787,6 +937,11 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         var facts = new AdaptiveFactSet { Spacing = AdaptiveSpacing.Medium };
         facts.Facts.Add(new AdaptiveFact("Tracking ID", correlationId));
         facts.Facts.Add(new AdaptiveFact("Source", "Message action"));
+        if (!string.IsNullOrWhiteSpace(subject))
+        {
+            facts.Facts.Add(new AdaptiveFact("Source title", TruncateForCard(subject!)));
+        }
+
         card.Body.Add(facts);
 
         return BuildExtensionResponse(card);
