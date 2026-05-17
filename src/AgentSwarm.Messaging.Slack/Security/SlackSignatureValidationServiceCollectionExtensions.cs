@@ -62,8 +62,10 @@ public static class SlackSignatureValidationServiceCollectionExtensions
                 opts => opts.MaxBufferedBodyBytes > 0,
                 $"{nameof(SlackSignatureOptions)}.{nameof(SlackSignatureOptions.MaxBufferedBodyBytes)} must be positive.")
             .Validate(
-                opts => !string.IsNullOrWhiteSpace(opts.PathPrefix),
-                $"{nameof(SlackSignatureOptions)}.{nameof(SlackSignatureOptions.PathPrefix)} must be a non-empty URL prefix.")
+                opts => !string.IsNullOrWhiteSpace(opts.PathPrefix)
+                    && opts.PathPrefix.StartsWith('/')
+                    && !opts.PathPrefix.Contains(' '),
+                $"{nameof(SlackSignatureOptions)}.{nameof(SlackSignatureOptions.PathPrefix)} must be a non-empty URL prefix starting with '/' (e.g. '/api/slack'). It cannot contain whitespace and must be a valid PathString; SlackAuthorizationFilter shares this option for its own path scope, so an invalid value would also bypass the authorization gate.")
             .ValidateOnStart();
 
         services.TryAddSingleton(TimeProvider.System);

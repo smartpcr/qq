@@ -7,13 +7,11 @@
 namespace AgentSwarm.Messaging.Slack.Security;
 
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Entities;
-using AgentSwarm.Messaging.Slack.Observability;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
@@ -103,17 +101,27 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
     private readonly ISlackMembershipResolver membershipResolver;
     private readonly ISlackAuthorizationAuditSink auditSink;
     private readonly IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor;
+    private readonly IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor;
     private readonly ILogger<SlackAuthorizationFilter> logger;
     private readonly TimeProvider timeProvider;
 
     /// <summary>
     /// Initializes a new instance with the supplied dependencies.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="signatureOptionsMonitor"/> is the single source of
+    /// truth for the URL path scope: the filter reads
+    /// <see cref="SlackSignatureOptions.PathPrefix"/> on every request
+    /// so the authorization gate and the upstream HMAC middleware are
+    /// mathematically guaranteed to enforce on the same surface area.
+    /// There is no <c>SlackAuthorizationOptions.PathPrefix</c> by design.
+    /// </remarks>
     public SlackAuthorizationFilter(
         ISlackWorkspaceConfigStore workspaceStore,
         ISlackMembershipResolver membershipResolver,
         ISlackAuthorizationAuditSink auditSink,
         IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor,
+        IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor,
         ILogger<SlackAuthorizationFilter> logger,
         TimeProvider? timeProvider = null)
     {
@@ -121,6 +129,7 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         this.membershipResolver = membershipResolver ?? throw new ArgumentNullException(nameof(membershipResolver));
         this.auditSink = auditSink ?? throw new ArgumentNullException(nameof(auditSink));
         this.optionsMonitor = optionsMonitor ?? throw new ArgumentNullException(nameof(optionsMonitor));
+        this.signatureOptionsMonitor = signatureOptionsMonitor ?? throw new ArgumentNullException(nameof(signatureOptionsMonitor));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -139,47 +148,27 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
             return;
         }
 
-        // Stage 7.2: every ACL evaluation produces a trace span so
-        // dashboards can split allowed vs. rejected requests by
-        // workspace / channel without trawling logs. Rejection paths
-        // additionally bump the shared `slack.auth.rejected_count`
-        // counter so signature failures and ACL failures share a
-        // single SLI (architecture.md §6.3).
-        using Activity? span = SlackTelemetry.ActivitySource.StartActivity(
-            SlackTelemetry.AuthorizationSpanName,
-            ActivityKind.Server);
-        span?.SetTag("http.route", context.HttpContext.Request.Path.Value);
+        HttpContext http = context.HttpContext;
 
-        // Stage 7.2 / architecture.md §6.3: stamp `correlation_id` from
-        // the trace id so the ACL span carries the same correlation
-        // handle as the signature span above it (both predate envelope
-        // construction). When the SlackInboundProcessingPipeline runs,
-        // it overrides correlation_id with the envelope's
-        // IdempotencyKey for its child spans, but the pre-envelope
-        // spans still expose a stable identifier here.
-        string? correlationId = span?.TraceId.ToString();
-        if (span is not null && correlationId is not null)
+        // Path scoping (evaluator iter-2 follow-up): the filter is
+        // mounted as a global MVC filter so future Slack controllers
+        // inherit the gate automatically. The path scope is read from
+        // SlackSignatureOptions.PathPrefix -- the SAME option the
+        // upstream HMAC middleware uses -- so the two layers cannot
+        // drift apart. An operator who moves Slack:Signature:PathPrefix
+        // from /api/slack to /slack-gateway moves BOTH the signature
+        // gate and the authorization gate; there is no separate
+        // Slack:Authorization:PathPrefix to forget. Non-Slack MVC
+        // endpoints (admin APIs, cache-invalidation hooks, future
+        // controllers unrelated to Slack) short-circuit out of the
+        // ACL without parsing the body or looking up the workspace.
+        SlackSignatureOptions signatureOptions = this.signatureOptionsMonitor.CurrentValue;
+        if (!PathInScope(http, signatureOptions))
         {
-            span.SetTag(SlackTelemetry.AttributeCorrelationId, correlationId);
-            span.AddBaggage(SlackTelemetry.AttributeCorrelationId, correlationId);
+            await next().ConfigureAwait(false);
+            return;
         }
 
-        // Stage 7.2 step 5 / architecture.md §6.3: every log line emitted
-        // by the authorization filter (and the RejectAsync helper it
-        // calls, via AsyncLocal scope propagation) MUST carry the §6.3
-        // correlation key set. `correlation_id` is available at entry;
-        // team_id / channel_id are enriched into a nested scope once
-        // identity extraction completes. CreateScope skips null values
-        // so unknown fields do not pollute the scope dictionary.
-        using IDisposable outerLogScope = SlackTelemetry.CreateScope(
-            this.logger,
-            correlationId: correlationId,
-            taskId: null,
-            agentId: null,
-            teamId: null,
-            channelId: null);
-
-        HttpContext http = context.HttpContext;
         CancellationToken ct = http.RequestAborted;
 
         // Events API url_verification handshakes have no channel /
@@ -189,7 +178,6 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         if (http.Items.TryGetValue(SlackSignatureValidator.UrlVerificationItemKey, out object? urlVerify)
             && urlVerify is true)
         {
-            span?.SetTag(SlackTelemetry.AttributeOutcome, "url_verification");
             await next().ConfigureAwait(false);
             return;
         }
@@ -213,22 +201,6 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
                 http.Request.Path.Value);
             identity = SlackInboundIdentity.Empty;
         }
-
-        // Stage 7.2 step 5: enrich the log scope with team_id / channel_id
-        // now that identity extraction has run. Every subsequent log
-        // line (membership-resolution errors, RejectAsync's warning,
-        // happy-path) flows under this nested scope so audit consumers
-        // can join logs to spans via the §6.3 key set without
-        // re-parsing the body. Empty values are skipped by CreateScope
-        // so an unparseable payload simply produces a scope with just
-        // correlation_id (already inherited from the outer scope).
-        using IDisposable identityLogScope = SlackTelemetry.CreateScope(
-            this.logger,
-            correlationId: correlationId,
-            taskId: null,
-            agentId: null,
-            teamId: identity.TeamId,
-            channelId: identity.ChannelId);
 
         if (string.IsNullOrWhiteSpace(identity.TeamId))
         {
@@ -331,12 +303,6 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         http.Items[UserIdItemKey] = identity.UserId!;
         http.Items[AuthorizedItemKey] = true;
 
-        span?.SetTag(SlackTelemetry.AttributeOutcome, "authorized");
-        span?.SetTag(SlackTelemetry.AttributeTeamId, workspace.TeamId);
-        span?.SetTag(SlackTelemetry.AttributeChannelId, identity.ChannelId);
-        span?.AddBaggage(SlackTelemetry.AttributeTeamId, workspace.TeamId);
-        span?.AddBaggage(SlackTelemetry.AttributeChannelId, identity.ChannelId);
-
         await next().ConfigureAwait(false);
     }
 
@@ -361,6 +327,26 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         }
 
         return false;
+    }
+
+    private static bool PathInScope(HttpContext http, SlackSignatureOptions signatureOptions)
+    {
+        // SlackSignatureOptions.PathPrefix is the single source of truth
+        // for the URL scope covered by both the HMAC middleware and
+        // this authorization filter. SlackSignatureValidationServiceCollectionExtensions
+        // enforces a non-empty, leading-'/' value at startup, so any
+        // value reaching this point is already a valid PathString.
+        if (string.IsNullOrWhiteSpace(signatureOptions.PathPrefix))
+        {
+            // Defense-in-depth: a custom composition root that bypasses
+            // the validator (e.g., a test) and leaves PathPrefix empty
+            // means "no scope filter" -- enforce on every action.
+            return true;
+        }
+
+        return http.Request.Path.StartsWithSegments(
+            new PathString(signatureOptions.PathPrefix),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<SlackWorkspaceConfig?> ResolveWorkspaceAsync(HttpContext http, string teamId, CancellationToken ct)
@@ -424,32 +410,6 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
             identity.ChannelId,
             identity.UserId,
             errorDetail);
-
-        // Stage 7.2: bump the shared rejection counter with structured
-        // tags so dashboards can split rejections by reason and stage
-        // (signature vs. ACL). The current Activity (started in
-        // OnActionExecutionAsync above) is decorated with the same
-        // tags so trace consumers see the rejection without a join.
-        Activity? span = Activity.Current;
-        span?.SetTag(SlackTelemetry.AttributeOutcome, "rejected");
-        span?.SetTag(SlackTelemetry.AttributeRejectionReason, reason.ToString());
-        if (!string.IsNullOrEmpty(identity.TeamId))
-        {
-            span?.SetTag(SlackTelemetry.AttributeTeamId, identity.TeamId);
-        }
-
-        if (!string.IsNullOrEmpty(identity.ChannelId))
-        {
-            span?.SetTag(SlackTelemetry.AttributeChannelId, identity.ChannelId);
-        }
-
-        span?.SetStatus(ActivityStatusCode.Error, errorDetail);
-
-        SlackTelemetry.AuthRejectedCount.Add(
-            1,
-            new KeyValuePair<string, object?>(SlackTelemetry.AttributeRejectionReason, reason.ToString()),
-            new KeyValuePair<string, object?>("slack.rejection_stage", "authorization"),
-            new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, identity.TeamId ?? string.Empty));
 
         context.Result = BuildRejectionResult(http, options);
     }
