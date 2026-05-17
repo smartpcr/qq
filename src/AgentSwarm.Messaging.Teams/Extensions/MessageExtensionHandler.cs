@@ -382,14 +382,14 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
                 correlationId,
                 extraction.PlainText.Length);
 
-            await TryLogDispatchFailureAuditAsync(
+            await LogDispatchFailureAuditAsync(
                 correlationId: correlationId,
                 tenantId: tenantId,
                 actorId: actorForAudit,
                 conversationId: conversationId,
                 extraction: extraction,
                 commandId: commandId,
-                exception: ex,
+                dispatchException: ex,
                 ct: ct).ConfigureAwait(false);
 
             return BuildDispatchFailureResponse(correlationId);
@@ -500,23 +500,45 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
     }
 
     /// <summary>
-    /// Best-effort wrapper around <see cref="LogMessageActionReceivedAsync"/> for the
-    /// dispatch-failure path. Wraps the audit call in its own try/catch so an audit-logger
-    /// failure (which would itself throw) cannot cascade and resurrect the very gap we
-    /// closed by adding the dispatch try/catch in the first place: the user must always
-    /// receive an actionable error card with a correlation ID, even if the durable audit
-    /// store is also unhealthy. Secondary failure is recorded to <see cref="ILogger"/> so
-    /// ops still has a structured trail of "primary dispatch failed AND audit logger
-    /// failed" incidents.
+    /// Audit-emission wrapper for the dispatch-failure path. Stage 5.2 iter-7 (eval
+    /// iter-6 item 3) — when the audit emit ITSELF fails after a dispatch failure,
+    /// surface BOTH root causes via <see cref="AggregateException"/> rather than
+    /// swallowing the audit error. The prior log-and-swallow design allowed
+    /// <c>MessageActionReceived</c> audit rows to be silently absent on the
+    /// dispatch-failure path even though the workstream's compliance contract
+    /// requires every message-action submission to land an audit row (per
+    /// <c>tech-spec.md</c> §4.3 / canonical <see cref="AuditEventTypes.MessageActionReceived"/>).
     /// </summary>
-    private async Task TryLogDispatchFailureAuditAsync(
+    /// <remarks>
+    /// <para>
+    /// Mirrors the iter-5 <c>TeamsSwarmActivityHandler</c> dispatch+audit
+    /// double-failure pattern: dispatch error first, audit error second in
+    /// <see cref="AggregateException.InnerExceptions"/>. Teams' invoke retry
+    /// re-runs the message-action submission so the idempotent audit emit gets
+    /// another chance to land.
+    /// </para>
+    /// <para>
+    /// Branch summary:
+    /// <list type="bullet">
+    /// <item><description>dispatch fails, audit OK → caller returns the
+    /// dispatch-failure confirmation card to the user (audit row landed).</description></item>
+    /// <item><description>dispatch fails, audit fails →
+    /// <see cref="AggregateException"/> thrown carrying both root causes. The user
+    /// sees a Teams invoke failure rather than a friendly card, but compliance is
+    /// preserved (the failure is visible, not silently absent).</description></item>
+    /// <item><description>cancellation during audit → propagates unchanged
+    /// (graceful control-flow signal, not a compliance gap).</description></item>
+    /// </list>
+    /// </para>
+    /// </remarks>
+    private async Task LogDispatchFailureAuditAsync(
         string correlationId,
         string tenantId,
         string actorId,
         string? conversationId,
         PayloadExtraction extraction,
         string commandId,
-        Exception exception,
+        Exception dispatchException,
         CancellationToken ct)
     {
         try
@@ -533,8 +555,8 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
                 commandId: commandId,
                 outcome: AuditOutcomes.Failed,
                 ct: ct,
-                errorType: exception.GetType().FullName,
-                errorMessage: exception.Message).ConfigureAwait(false);
+                errorType: dispatchException.GetType().FullName,
+                errorMessage: dispatchException.Message).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -548,11 +570,15 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         {
             _logger.LogError(
                 auditException,
-                "Failed to write MessageActionReceived audit entry for dispatch failure (correlation {CorrelationId}, tenant {TenantId}, actor {ActorId}). Original dispatch error: {OriginalError}",
+                "MessageActionReceived audit emit failed AFTER dispatch failure (correlation {CorrelationId}, tenant {TenantId}, actor {ActorId}); surfacing AggregateException carrying BOTH root causes. Original dispatch error: {OriginalError}",
                 correlationId,
                 tenantId,
                 actorId,
-                exception.Message);
+                dispatchException.Message);
+            throw new AggregateException(
+                $"Message-extension dispatch failed AND MessageActionReceived audit-row persistence failed (correlation {correlationId}). Both root causes are carried in InnerExceptions; Teams should retry the invoke so the idempotent audit row can eventually land.",
+                dispatchException,
+                auditException);
         }
     }
 

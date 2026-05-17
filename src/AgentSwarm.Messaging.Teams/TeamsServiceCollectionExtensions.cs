@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
 using AgentSwarm.Messaging.Teams.Diagnostics;
@@ -126,18 +127,16 @@ public static class TeamsServiceCollectionExtensions
         // already wired the security graph explicitly.
         services.AddTeamsSecurity();
 
-        // Stage 6.3 iter-2 — telemetry is now WIRED BY DEFAULT (no separate
-        // AddTeamsDiagnostics() call required). The Stage 6.3 evaluator (iter-1 item 1)
-        // observed that opt-in telemetry meant "a normal AddTeamsMessengerConnector()
-        // deployment can still emit no Stage 6.3 spans or metrics". Making this the
-        // default closes that gap: every Teams host now publishes the canonical
-        // TeamsConnector.SendMessage / SendQuestion / Receive spans + the
-        // teams.messages.sent / teams.messages.received counters + the
-        // teams.card.delivery.duration_ms histogram + the teams.outbox.queue_depth gauge
-        // out of the box. The call is idempotent (TryAdd*), so hosts that already wired
-        // diagnostics explicitly remain unaffected.
-        services.AddTeamsConnectorTelemetry();
-        services.AddTeamsSerilogEnricher();
+        // Stage 5.2 — every host that wires the Teams connector inherits a working
+        // IAuditLogger registration. The default is NoOpAuditLogger so hosts that have
+        // not (yet) called AddSqlAuditLogger() can still construct the connector,
+        // CardActionHandler, TeamsProactiveNotifier, and TenantValidationMiddleware
+        // (all of which require IAuditLogger). Hosts that want durable persistence call
+        // AddSqlAuditLogger() AFTER this helper; the SQL helper uses RemoveAll+AddSingleton
+        // to unconditionally replace the no-op stub with the production logger. The
+        // TryAddSingleton here means an explicit IAuditLogger registration the host wired
+        // BEFORE this helper is preserved untouched.
+        services.TryAddSingleton<IAuditLogger, NoOpAuditLogger>();
 
         // Stage 5.1 iter-4 evaluator feedback item 2 — TimeProvider MUST be in the DI graph
         // so the constructor-with-TimeProvider+InstallationStateGate overload of
@@ -439,7 +438,8 @@ public static class TeamsServiceCollectionExtensions
             agentQuestionStore: sp.GetRequiredService<IAgentQuestionStore>(),
             logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsProactiveNotifier>>(),
             timeProvider: sp.GetRequiredService<TimeProvider>(),
-            installationStateGate: sp.GetRequiredService<InstallationStateGate>()));
+            installationStateGate: sp.GetRequiredService<InstallationStateGate>(),
+            auditLogger: sp.GetRequiredService<IAuditLogger>()));
         services.TryAddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<TeamsProactiveNotifier>());
 
         return services;

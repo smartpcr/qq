@@ -65,6 +65,67 @@ public sealed record CommandContext
     public string? ActivityId { get; init; }
 
     /// <summary>
+    /// Identifier of the agent associated with this command's outcome — populated by
+    /// the matched <see cref="ICommandHandler"/> AFTER it has resolved or created the
+    /// agent context (for example, <c>ApproveRejectCommandExecutor</c> stamps the
+    /// resolved <see cref="AgentQuestion.AgentId"/> here so the activity handler can
+    /// thread it into the <see cref="MessengerEventTypes.AgentTaskRequest"/>
+    /// <c>CommandReceived</c> audit entry per <c>tech-spec.md</c> §4.3).
+    /// </summary>
+    /// <remarks>
+    /// This property is intentionally mutable (<c>set</c> rather than <c>init</c>) so
+    /// handlers can populate it on the same context instance the activity handler
+    /// already holds and reads in its post-dispatch <c>finally</c> block. Leaving it
+    /// <c>null</c> is allowed — the audit row simply records the value as null, which
+    /// is the correct outcome for commands that do not associate with a specific
+    /// agent (e.g. bare <c>agent status</c> for swarm-wide status).
+    /// </remarks>
+    public string? AgentId { get; set; }
+
+    /// <summary>
+    /// Identifier of the agent task associated with this command's outcome —
+    /// populated by the matched <see cref="ICommandHandler"/> after creating or
+    /// resolving the task (for example, <c>AskCommandHandler</c> stamps the
+    /// newly-minted task tracking ID here; <c>ApproveRejectCommandExecutor</c>
+    /// stamps the resolved <see cref="AgentQuestion.TaskId"/>). Read by the
+    /// activity handler in its post-dispatch audit emission so the
+    /// <c>CommandReceived</c> audit row carries the task association required by
+    /// <c>tech-spec.md</c> §4.3 (<c>TaskId</c> column).
+    /// </summary>
+    /// <remarks>
+    /// Mutable for the same reason as <see cref="AgentId"/> — handlers populate it
+    /// on the context instance the activity handler already holds.
+    /// </remarks>
+    public string? TaskId { get; set; }
+
+    /// <summary>
+    /// Handler-declared outcome for the command, surfaced to the activity handler's
+    /// post-dispatch <c>CommandReceived</c> audit emission. <c>null</c> means "no
+    /// explicit outcome was declared" — the activity handler then defaults to
+    /// <c>AuditOutcomes.Success</c> when <see cref="ICommandDispatcher.DispatchAsync"/>
+    /// returned without throwing, or <c>AuditOutcomes.Failed</c> when it threw.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This property exists because handled command-level failures —
+    /// "question not found", "action not in AllowedActions", "comment required",
+    /// "CAS race already resolved" — are reported to the user via a reply card
+    /// rather than by throwing, so a no-exception return is NOT the same as
+    /// <c>Success</c> from a compliance-audit perspective. The matched
+    /// <see cref="ICommandHandler"/> sets this to <c>AuditOutcomes.Rejected</c>
+    /// on each early-return rejection branch so the persisted <c>AuditLog</c> row
+    /// records the truthful outcome.
+    /// </para>
+    /// <para>
+    /// Mutable (<c>set</c> rather than <c>init</c>) for the same reason as
+    /// <see cref="AgentId"/> / <see cref="TaskId"/> — handlers populate it on the
+    /// same context instance the activity handler holds and reads back in its
+    /// post-dispatch audit emission.
+    /// </para>
+    /// </remarks>
+    public string? Outcome { get; set; }
+
+    /// <summary>
     /// Arguments portion of the command — the text remaining after the canonical command
     /// keyword has been stripped from <see cref="NormalizedText"/>. Populated by
     /// <see cref="ICommandDispatcher"/> immediately before invoking the matching
@@ -73,13 +134,26 @@ public sealed record CommandContext
     /// pipeline validation) or when the inbound text matched no known command.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// For example, when <see cref="NormalizedText"/> is
     /// <c>"agent ask create e2e tests"</c> and the matched handler's
     /// <see cref="ICommandHandler.CommandName"/> is <c>"agent ask"</c>, the dispatcher sets
     /// <see cref="CommandArguments"/> to <c>"create e2e tests"</c>. For parameterless
     /// commands (e.g. bare <c>"approve"</c>), the value is the empty string.
+    /// </para>
+    /// <para>
+    /// Stage 5.2 iter-7 — declared <c>set</c> (not <c>init</c>) so the dispatcher can stamp
+    /// the parsed arguments onto the SAME context instance the activity handler holds and
+    /// reads back post-dispatch. The prior <c>init</c>-only declaration forced the
+    /// dispatcher into a <c>context with { CommandArguments = arguments }</c> clone that
+    /// gave handlers a throwaway record — any handler mutation of
+    /// <see cref="AgentId"/> / <see cref="TaskId"/> / <see cref="Outcome"/> on that clone
+    /// was lost when control returned to the activity handler, silently nulling those
+    /// fields in the persisted <c>CommandReceived</c> audit row. Moving to <c>set</c>
+    /// eliminates the clone and makes the mutable-handler-output contract sound.
+    /// </para>
     /// </remarks>
-    public string? CommandArguments { get; init; }
+    public string? CommandArguments { get; set; }
 
     /// <summary>
     /// Origination hint set by inbound producers that already know the canonical

@@ -40,22 +40,13 @@ internal static class SecurityTestDoubles
             => Task.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
 
         public Task AcknowledgeAsync(string outboxEntryId, OutboxDeliveryReceipt receipt, CancellationToken ct)
-        {
-            Acknowledged.Add((outboxEntryId, receipt));
-            return Task.CompletedTask;
-        }
+            => Task.CompletedTask;
 
         public Task RecordSendReceiptAsync(string outboxEntryId, OutboxDeliveryReceipt receipt, CancellationToken ct)
-        {
-            ReceiptsRecorded.Add((outboxEntryId, receipt));
-            return Task.CompletedTask;
-        }
+            => Task.CompletedTask;
 
         public Task RescheduleAsync(string outboxEntryId, DateTimeOffset nextRetryAt, string error, CancellationToken ct)
-        {
-            Rescheduled.Add((outboxEntryId, nextRetryAt, error));
-            return Task.CompletedTask;
-        }
+            => Task.CompletedTask;
 
         public Task DeadLetterAsync(string outboxEntryId, string error, CancellationToken ct)
         {

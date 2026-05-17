@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Persistence;
 using Microsoft.Bot.Builder;
 using Microsoft.Extensions.Logging;
 
@@ -100,6 +101,12 @@ internal sealed class ApproveRejectCommandExecutor
                     commandName,
                     explicitQuestionId,
                     context.CorrelationId);
+                // Stage 5.2 iter-4 (eval item 7) — handled command-level rejection is NOT
+                // a Success from the audit perspective, even though we return without
+                // throwing. Stamp the canonical Rejected outcome onto the context so the
+                // activity handler's post-dispatch CommandReceived audit records the
+                // truthful outcome (tech-spec.md §4.3).
+                context.Outcome = AuditOutcomes.Rejected;
                 await ReplyAsync(context, CommandReplyCards.BuildErrorCard(
                     title: "Question not found",
                     detail: $"No question with id `{explicitQuestionId}` exists. Re-issue the command with the correct id."), ct).ConfigureAwait(false);
@@ -115,6 +122,7 @@ internal sealed class ApproveRejectCommandExecutor
                     "Bare {Command} could not look up open questions — CommandContext.ConversationId is null (correlation {CorrelationId}).",
                     commandName,
                     context.CorrelationId);
+                context.Outcome = AuditOutcomes.Rejected;
                 await ReplyAsync(context, CommandReplyCards.BuildErrorCard(
                     title: $"Cannot {commandName}",
                     detail: $"This conversation has no identifier — re-issue the command with an explicit question id (e.g. `{commandName} q-123`)."), ct).ConfigureAwait(false);
@@ -131,6 +139,7 @@ internal sealed class ApproveRejectCommandExecutor
                     commandName,
                     conversationId,
                     context.CorrelationId);
+                context.Outcome = AuditOutcomes.Rejected;
                 await ReplyAsync(context, CommandReplyCards.BuildErrorCard(
                     title: $"Nothing to {commandName}",
                     detail: "There are no open questions in this conversation."), ct).ConfigureAwait(false);
@@ -145,12 +154,24 @@ internal sealed class ApproveRejectCommandExecutor
                     open.Count,
                     conversationId,
                     context.CorrelationId);
+                context.Outcome = AuditOutcomes.Rejected;
                 await ReplyAsync(context, CommandReplyCards.BuildDisambiguationCard(commandName, open), ct).ConfigureAwait(false);
                 return;
             }
 
             target = open[0];
         }
+
+        // Stage 5.2 step 3 — once a target question is identified (explicit ID or
+        // bare-single), stamp its AgentId / TaskId onto the CommandContext so the
+        // activity handler's post-dispatch CommandReceived audit (per tech-spec.md
+        // §4.3) can carry the agent/task association. This MUST happen BEFORE any
+        // of the rejection branches below (action-not-allowed, requires-comment,
+        // CAS race) so even a failed approve/reject still produces an audit row
+        // that points at the affected agent and task — that is exactly the
+        // forensic trail the audit table exists for.
+        context.AgentId = target.AgentId;
+        context.TaskId = target.TaskId;
 
         // Validate the action value against the question's allowed actions.
         var matchedAction = MatchAction(target, actionValue);
@@ -162,6 +183,7 @@ internal sealed class ApproveRejectCommandExecutor
                 target.QuestionId,
                 actionValue,
                 context.CorrelationId);
+            context.Outcome = AuditOutcomes.Rejected;
             var allowed = string.Join(", ", target.AllowedActions.Select(a => a.Value));
             await ReplyAsync(context, CommandReplyCards.BuildErrorCard(
                 title: $"Cannot {commandName}",
@@ -179,6 +201,7 @@ internal sealed class ApproveRejectCommandExecutor
                 commandName,
                 target.QuestionId,
                 context.CorrelationId);
+            context.Outcome = AuditOutcomes.Rejected;
             await ReplyAsync(context, CommandReplyCards.BuildErrorCard(
                 title: "Comment required",
                 detail: $"`{commandName}` for `{target.QuestionId}` requires a comment. Please use the card buttons so you can supply one."), ct).ConfigureAwait(false);
@@ -198,6 +221,7 @@ internal sealed class ApproveRejectCommandExecutor
                 commandName,
                 target.QuestionId,
                 context.CorrelationId);
+            context.Outcome = AuditOutcomes.Rejected;
             await ReplyAsync(context, CommandReplyCards.BuildErrorCard(
                 title: "Decision already recorded",
                 detail: $"Question `{target.QuestionId}` was resolved by another action before this one was processed."), ct).ConfigureAwait(false);

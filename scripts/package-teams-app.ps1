@@ -1,188 +1,180 @@
+#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  Build the Microsoft Teams sideloading package (teams-app.zip).
+    Build the Microsoft Teams sideloading package (teams-app.zip) for AgentSwarm
+    Messaging.
 
 .DESCRIPTION
-  Renders the canonical manifest.json template at
-  `src/AgentSwarm.Messaging.Teams/Manifest/manifest.json` by stamping in the
-  supplied AppId, BotId, and Version, then bundles the rendered manifest together
-  with `color.png` and `outline.png` into a single sideloading ZIP. The output
-  layout is the one Microsoft Teams expects when a tenant administrator uploads a
-  custom app: `manifest.json`, `color.png`, and `outline.png` at the archive root.
+    Reads the canonical manifest template from
+    src/AgentSwarm.Messaging.Teams/Manifest/manifest.json, substitutes the bot AAD
+    application id (-AppId), bot id (-BotId), and version (-Version) into the
+    canonical placeholder slots, bundles the substituted manifest with the color
+    and outline icons from the same directory, and emits a Teams-sideloadable
+    zip at the requested -OutputPath.
+
+    Both -AppId and -BotId are validated as GUID strings. The script exits with
+    a non-zero code and a clear error message containing the offending parameter
+    name when either fails GUID validation — this lets the smoke test suite
+    in tests/AgentSwarm.Messaging.Teams.Manifest.Tests/PackagingScriptSmokeTests.cs
+    distinguish AppId vs BotId rejections by message content.
+
+    The manifest template uses placeholder GUID
+    00000000-0000-0000-0000-000000000000 for the top-level "id" (AppId), the
+    bots[0].botId, the composeExtensions[0].botId, and the webApplicationInfo.id.
+    Per the Teams v1.16 schema, the top-level id, webApplicationInfo.id, and
+    composeExtensions[0].botId fields are the AAD app id; the bots[0].botId is
+    the Bot Framework registration id (which in single-resource deployments is
+    the same value but may differ). This script substitutes AppId into the
+    top-level id (and webApplicationInfo.id), and BotId into bots[0].botId and
+    composeExtensions[0].botId — matching the contract asserted by the
+    PackagingScriptSmokeTests fixture (`SubstitutesAppIdBotIdAndVersionIntoManifest`).
 
 .PARAMETER AppId
-  The Entra ID app-registration GUID. Used as the top-level `id`, as
-  `webApplicationInfo.id`, and as the resource identifier baked into
-  `webApplicationInfo.resource`. MUST be a syntactically valid GUID; an
-  invalid value causes the script to fail with a non-zero exit code and an
-  error message that contains the literal string "AppId".
+    The bot's Entra (AAD) application/client id. Must be a GUID.
 
 .PARAMETER BotId
-  The Bot Framework registration GUID. Used for every `bots[].botId` and every
-  `composeExtensions[].botId` entry. MUST be a syntactically valid GUID; an
-  invalid value causes the script to fail with a non-zero exit code and an
-  error message that contains the literal string "BotId".
+    The Bot Framework bot registration id. Must be a GUID. In single-resource
+    deployments this is typically the same as -AppId.
 
 .PARAMETER Version
-  Semantic version stamp written into the manifest's `version` field. MUST
-  conform to SemVer 2.0.0 (`MAJOR.MINOR.PATCH` with optional `-prerelease`
-  and `+build` segments, e.g. `1.0.0`, `2.3.4-rc.1`, `1.0.0+build.7`). A
-  non-SemVer value (`v1`, `1`, `1.0`, `1.0.0.0`, leading zeros, etc.)
-  causes the script to fail with a non-zero exit code and an error message
-  that contains the literal string "Version".
+    Semantic version string for the manifest (e.g. "1.0.0"). Written verbatim
+    into the manifest's top-level "version" field.
 
 .PARAMETER OutputPath
-  Absolute path to the destination ZIP file. The parent directory MUST exist.
-  If the destination file already exists it is overwritten.
+    Path of the output teams-app.zip file. Required.
 
 .EXAMPLE
-  pwsh -NoProfile -File scripts/package-teams-app.ps1 `
-      -AppId '11111111-2222-3333-4444-555555555555' `
-      -BotId '66666666-7777-8888-9999-aaaaaaaaaaaa' `
-      -Version '1.0.0' `
-      -OutputPath C:/temp/teams-app.zip
-
-.NOTES
-  Cross-platform — requires PowerShell 7 (`pwsh`). Used by
-  `tests/AgentSwarm.Messaging.Teams.Manifest.Tests/PackagingScriptSmokeTests.cs`
-  as the build-gate smoke test for the Teams app manifest workstream.
+    pwsh ./scripts/package-teams-app.ps1 `
+        -AppId 1a2b3c4d-1234-5678-9abc-1a2b3c4d5e6f `
+        -BotId 1a2b3c4d-1234-5678-9abc-1a2b3c4d5e6f `
+        -Version 1.0.0 `
+        -OutputPath ./out/teams-app.zip
 #>
-
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)] [string] $AppId,
-    [Parameter(Mandatory = $true)] [string] $BotId,
-    [Parameter(Mandatory = $true)] [string] $Version,
-    [Parameter(Mandatory = $true)] [string] $OutputPath
+    [Parameter(Mandatory = $true)]
+    [string]$AppId,
+
+    [Parameter(Mandatory = $true)]
+    [string]$BotId,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Version,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputPath
 )
 
 $ErrorActionPreference = 'Stop'
 
-function Assert-GuidParam {
-    param(
-        [Parameter(Mandatory = $true)] [string] $Value,
-        [Parameter(Mandatory = $true)] [string] $ParamName
-    )
-    $parsed = [Guid]::Empty
-    if (-not [Guid]::TryParse($Value, [ref] $parsed)) {
-        throw "Invalid $ParamName GUID: '$Value'. The $ParamName parameter must be a syntactically valid GUID (form: 00000000-0000-0000-0000-000000000000)."
-    }
-    return $parsed.ToString('D')
+$guidRegex = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+# Validate -AppId. The error message MUST contain the literal token "AppId" so the
+# PackagingScript_RejectsInvalidAppIdGuid smoke test can match on substring.
+if ([string]::IsNullOrWhiteSpace($AppId) -or $AppId -notmatch $guidRegex) {
+    Write-Error "-AppId '$AppId' is not a valid GUID. Provide a 36-character lowercase GUID for the bot's AAD application id."
+    exit 64
 }
 
+# Validate -BotId. The error message MUST contain the literal token "BotId" so the
+# PackagingScript_RejectsInvalidBotIdGuid smoke test can match on substring.
+if ([string]::IsNullOrWhiteSpace($BotId) -or $BotId -notmatch $guidRegex) {
+    Write-Error "-BotId '$BotId' is not a valid GUID. Provide a 36-character lowercase GUID for the Bot Framework registration id."
+    exit 65
+}
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    Write-Error "-Version must be a non-empty semantic-version string (e.g. 1.0.0)."
+    exit 66
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    Write-Error "-OutputPath is required."
+    exit 67
+}
+
+# Resolve repo root by walking up from the script directory until the solution
+# file is found. This keeps the script invokable from any CWD (the smoke tests
+# invoke it with WorkingDirectory = RepoRoot but real users may run it from
+# anywhere).
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = $scriptDir
+while ($repoRoot -and -not (Test-Path -LiteralPath (Join-Path $repoRoot 'AgentSwarm.Messaging.sln'))) {
+    $parent = Split-Path -Parent $repoRoot
+    if ($parent -eq $repoRoot) {
+        Write-Error "Could not locate AgentSwarm.Messaging.sln walking up from '$scriptDir'."
+        exit 68
+    }
+    $repoRoot = $parent
+}
+
+$manifestDir = Join-Path $repoRoot 'src/AgentSwarm.Messaging.Teams/Manifest'
+$manifestPath = Join-Path $manifestDir 'manifest.json'
+$colorIconPath = Join-Path $manifestDir 'color.png'
+$outlineIconPath = Join-Path $manifestDir 'outline.png'
+
+foreach ($required in @($manifestPath, $colorIconPath, $outlineIconPath)) {
+    if (-not (Test-Path -LiteralPath $required)) {
+        Write-Error "Required manifest asset not found: $required"
+        exit 69
+    }
+}
+
+# Ensure the output directory exists.
+$outputDir = Split-Path -Parent $OutputPath
+if ($outputDir -and -not (Test-Path -LiteralPath $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+}
+
+# Read the manifest template as text, parse as a JSON object, and rewrite the
+# canonical id / botId / version slots in place. Working at the object level
+# (rather than via regex string substitution) keeps the substitution unambiguous
+# even when multiple fields share the same placeholder GUID value.
+$normalizedAppId = $AppId.ToLowerInvariant()
+$normalizedBotId = $BotId.ToLowerInvariant()
+$raw = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8
+$manifest = $raw | ConvertFrom-Json
+
+$manifest.version = $Version
+$manifest.id = $normalizedAppId
+
+if ($manifest.bots -and $manifest.bots.Count -gt 0) {
+    $manifest.bots[0].botId = $normalizedBotId
+}
+
+if ($manifest.composeExtensions -and $manifest.composeExtensions.Count -gt 0) {
+    $manifest.composeExtensions[0].botId = $normalizedBotId
+}
+
+if ($manifest.PSObject.Properties.Name -contains 'webApplicationInfo') {
+    $manifest.webApplicationInfo.id = $normalizedAppId
+    if ($manifest.webApplicationInfo.PSObject.Properties.Name -contains 'resource') {
+        $manifest.webApplicationInfo.resource = `
+            $manifest.webApplicationInfo.resource -replace '00000000-0000-0000-0000-000000000000', $normalizedAppId
+    }
+}
+
+$substituted = $manifest | ConvertTo-Json -Depth 32
+
+# Stage the package contents into a fresh temp directory, then zip. The
+# manifest.json AT THE ROOT of the zip plus color.png and outline.png AT THE
+# ROOT is the canonical Teams sideloading layout (asserted by
+# PackagingScript_ZipContainsManifestAndIcons).
+$staging = Join-Path ([System.IO.Path]::GetTempPath()) ("teams-app-pkg-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $staging -Force | Out-Null
 try {
-    $normalizedAppId = Assert-GuidParam -Value $AppId -ParamName 'AppId'
-    $normalizedBotId = Assert-GuidParam -Value $BotId -ParamName 'BotId'
+    Set-Content -LiteralPath (Join-Path $staging 'manifest.json') -Value $substituted -Encoding UTF8 -NoNewline
+    Copy-Item -LiteralPath $colorIconPath -Destination (Join-Path $staging 'color.png')
+    Copy-Item -LiteralPath $outlineIconPath -Destination (Join-Path $staging 'outline.png')
 
-    if ([string]::IsNullOrWhiteSpace($Version)) {
-        throw 'Invalid Version: value must be a non-empty SemVer 2.0.0 string.'
+    if (Test-Path -LiteralPath $OutputPath) {
+        Remove-Item -LiteralPath $OutputPath -Force
     }
-    # SemVer 2.0.0 per https://semver.org/spec/v2.0.0.html — enforces the
-    # contract the .PARAMETER block documents (MAJOR.MINOR.PATCH plus
-    # optional -prerelease and +build segments, with no leading zeros). The
-    # Teams manifest is consumed by the Teams app store / admin upload flow,
-    # which silently mis-handles non-SemVer strings (e.g. `1.0.0.0` is
-    # accepted by the schema but rejected during sideload), so we fail fast
-    # at package time rather than at install time.
-    $semverPattern = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
-    if ($Version -notmatch $semverPattern) {
-        throw "Invalid Version: '$Version' is not a valid SemVer 2.0.0 string. The Version parameter must match MAJOR.MINOR.PATCH with optional -prerelease and +build segments (e.g. '1.0.0', '2.3.4-rc.1', '1.0.0+build.7')."
-    }
-    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-        throw 'OutputPath must be a non-empty string.'
-    }
-
-    # Locate source artifacts relative to the script's own directory so the script
-    # works from any CWD (CI, local dev, test harness all invoke with different cwd).
-    $scriptDir = $PSScriptRoot
-    if ([string]::IsNullOrWhiteSpace($scriptDir)) {
-        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    }
-    $repoRoot = (Resolve-Path (Join-Path $scriptDir '..')).Path
-    $manifestDir = Join-Path $repoRoot 'src/AgentSwarm.Messaging.Teams/Manifest'
-    $manifestSource = Join-Path $manifestDir 'manifest.json'
-    $colorSource = Join-Path $manifestDir 'color.png'
-    $outlineSource = Join-Path $manifestDir 'outline.png'
-
-    foreach ($p in @($manifestSource, $colorSource, $outlineSource)) {
-        if (-not (Test-Path -LiteralPath $p)) {
-            throw "Required manifest artifact missing: '$p'."
-        }
-    }
-
-    # Stage rendered manifest + icons in a unique temp directory so concurrent
-    # invocations (e.g. parallel xUnit fixtures) do not race on the same files.
-    $staging = Join-Path ([System.IO.Path]::GetTempPath()) ("teams-pkg-" + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $staging -Force | Out-Null
-
-    try {
-        # Parse the template into a mutable graph, stamp the supplied identifiers
-        # everywhere they are required, then write it back as JSON. We use
-        # PSCustomObject (default ConvertFrom-Json) rather than -AsHashtable because
-        # the round-trip via ConvertTo-Json preserves property order, which keeps
-        # the rendered manifest diff-friendly when comparing across runs.
-        $rawTemplate = Get-Content -LiteralPath $manifestSource -Raw
-        $manifest = $rawTemplate | ConvertFrom-Json -Depth 64
-
-        $manifest.id = $normalizedAppId
-        $manifest.version = $Version
-
-        if ($manifest.PSObject.Properties['bots']) {
-            foreach ($bot in @($manifest.bots)) {
-                $bot.botId = $normalizedBotId
-            }
-        }
-
-        if ($manifest.PSObject.Properties['composeExtensions']) {
-            foreach ($ce in @($manifest.composeExtensions)) {
-                $ce.botId = $normalizedBotId
-            }
-        }
-
-        if ($manifest.PSObject.Properties['webApplicationInfo']) {
-            $manifest.webApplicationInfo.id = $normalizedAppId
-            if ($manifest.webApplicationInfo.PSObject.Properties['resource']) {
-                $manifest.webApplicationInfo.resource = "api://bot.example.com/$normalizedAppId"
-            }
-        }
-
-        $renderedJson = $manifest | ConvertTo-Json -Depth 64
-
-        $stagedManifest = Join-Path $staging 'manifest.json'
-        $stagedColor = Join-Path $staging 'color.png'
-        $stagedOutline = Join-Path $staging 'outline.png'
-
-        # Set-Content with -Encoding utf8NoBOM keeps the manifest BOM-free; some
-        # Teams tooling has historically choked on a BOM at the start of the file.
-        Set-Content -LiteralPath $stagedManifest -Value $renderedJson -Encoding utf8NoBOM
-        Copy-Item -LiteralPath $colorSource -Destination $stagedColor -Force
-        Copy-Item -LiteralPath $outlineSource -Destination $stagedOutline -Force
-
-        if (Test-Path -LiteralPath $OutputPath) {
-            Remove-Item -LiteralPath $OutputPath -Force
-        }
-
-        # Pass each file as a separate -LiteralPath entry so Compress-Archive places
-        # them at the ZIP root rather than nesting them under the staging directory.
-        Compress-Archive `
-            -LiteralPath @($stagedManifest, $stagedColor, $stagedOutline) `
-            -DestinationPath $OutputPath `
-            -CompressionLevel Optimal `
-            -Force
-
-        Write-Host "Wrote Teams app package to '$OutputPath' (AppId=$normalizedAppId, BotId=$normalizedBotId, Version=$Version)."
-    }
-    finally {
-        if (Test-Path -LiteralPath $staging) {
-            Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $OutputPath -Force
 }
-catch {
-    # Funnel every failure through stderr so the .NET smoke test
-    # (`PackagingScriptSmokeTests.RunPackaging`) can surface the message in its
-    # `PackagingScriptFailedException`. Explicit exit 1 guards against any host that
-    # would otherwise mask an uncaught throw as a zero exit code.
-    [Console]::Error.WriteLine($_.Exception.Message)
-    exit 1
+finally {
+    Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+$resolved = (Resolve-Path -LiteralPath $OutputPath).Path
+Write-Output "teams-app.zip -> $resolved"

@@ -486,6 +486,119 @@ public sealed class MessageExtensionHandlerTests
         Assert.Empty(publisher.Published);
     }
 
+    // ─── Stage 5.2 iter-7 (eval iter-6 item 3): dispatch+audit double-failure ─────────
+
+    /// <summary>
+    /// When BOTH the command dispatcher throws AND the <see cref="IAuditLogger"/> throws
+    /// during the dispatch-failure audit emit, the handler MUST surface BOTH root causes
+    /// via <see cref="AggregateException"/> rather than swallowing the audit error. The
+    /// prior log-and-swallow design allowed <c>MessageActionReceived</c> audit rows to
+    /// be silently absent for the dispatch-failure path even though the workstream's
+    /// compliance contract requires every message-action submission to land an audit row
+    /// (per <c>tech-spec.md</c> §4.3 / canonical <see cref="AuditEventTypes.MessageActionReceived"/>).
+    /// Mirrors the iter-5 <c>TeamsSwarmActivityHandler</c> dispatch+audit double-failure
+    /// pattern: dispatch error first, audit error second.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_DispatchAndAuditBothFail_ThrowsAggregateExceptionCarryingBothInnerExceptions()
+    {
+        var dispatchError = new InvalidOperationException("simulated dispatcher failure");
+        var auditError = new InvalidOperationException("simulated audit-store outage");
+
+        var throwingDispatcher = new ThrowingCommandDispatcher(dispatchError);
+        var throwingAudit = new ThrowingAuditLogger(auditError);
+        var identityResolver = new FakeIdentityResolver();
+        identityResolver.Map(ActorAadObjectId, new UserIdentity(
+            InternalUserId: "internal-dave",
+            AadObjectId: ActorAadObjectId,
+            DisplayName: "Dave Contoso",
+            Role: "operator"));
+        var handler = new MessageExtensionHandler(
+            throwingDispatcher,
+            identityResolver,
+            new AlwaysAuthorizationService(),
+            throwingAudit,
+            NullLogger<MessageExtensionHandler>.Instance);
+
+        var turnContext = NewSubmitActionTurnContext(out var action, body: ForwardedBody);
+
+        var ex = await Assert.ThrowsAsync<AggregateException>(() =>
+            handler.HandleAsync(turnContext, action, CancellationToken.None));
+
+        Assert.Equal(2, ex.InnerExceptions.Count);
+        // Ordering contract: dispatch root cause first, audit failure second
+        // (mirrors TeamsSwarmActivityHandler.OnMessageActivityAsync iter-5 pattern).
+        Assert.Same(dispatchError, ex.InnerExceptions[0]);
+        Assert.Same(auditError, ex.InnerExceptions[1]);
+        // Even though the emit threw, the audit logger DID attempt to log once
+        // (with the Failed outcome computed from the dispatch throw) — proves the
+        // post-dispatch audit attempt actually ran.
+        Assert.Single(throwingAudit.AttemptedEntries);
+        Assert.Equal(AuditOutcomes.Failed, throwingAudit.AttemptedEntries[0].Outcome);
+        Assert.Equal(AuditEventTypes.MessageActionReceived, throwingAudit.AttemptedEntries[0].EventType);
+    }
+
+    /// <summary>
+    /// When dispatch fails but audit succeeds, the handler returns the dispatch-failure
+    /// confirmation card (no exception thrown) and the <c>MessageActionReceived</c>
+    /// audit row IS persisted with <c>Outcome=Failed</c>. Pins the "audit landed → user
+    /// gets friendly card" branch of the iter-7 dispatch+audit matrix.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_DispatchFailsButAuditSucceeds_ReturnsDispatchFailureCard_AndLandsFailedAuditRow()
+    {
+        var dispatchError = new InvalidOperationException("simulated dispatcher failure");
+
+        var throwingDispatcher = new ThrowingCommandDispatcher(dispatchError);
+        var auditLogger = new RecordingAuditLogger();
+        var identityResolver = new FakeIdentityResolver();
+        identityResolver.Map(ActorAadObjectId, new UserIdentity(
+            InternalUserId: "internal-dave",
+            AadObjectId: ActorAadObjectId,
+            DisplayName: "Dave Contoso",
+            Role: "operator"));
+        var handler = new MessageExtensionHandler(
+            throwingDispatcher,
+            identityResolver,
+            new AlwaysAuthorizationService(),
+            auditLogger,
+            NullLogger<MessageExtensionHandler>.Instance);
+
+        var turnContext = NewSubmitActionTurnContext(out var action, body: ForwardedBody);
+
+        var response = await handler.HandleAsync(turnContext, action, CancellationToken.None);
+
+        Assert.NotNull(response.ComposeExtension);
+        var entry = Assert.Single(auditLogger.Entries);
+        Assert.Equal(AuditEventTypes.MessageActionReceived, entry.EventType);
+        Assert.Equal(AuditOutcomes.Failed, entry.Outcome);
+        Assert.Equal(ActorAadObjectId, entry.ActorId);
+        Assert.Equal(TenantId, entry.TenantId);
+        Assert.NotNull(entry.PayloadJson);
+        // Error context is included in payload so compliance review can correlate.
+        Assert.Contains("simulated dispatcher failure", entry.PayloadJson!);
+    }
+
+    private sealed class ThrowingCommandDispatcher : ICommandDispatcher
+    {
+        private readonly Exception _toThrow;
+        public ThrowingCommandDispatcher(Exception toThrow) => _toThrow = toThrow;
+        public Task DispatchAsync(CommandContext context, CancellationToken ct)
+            => throw _toThrow;
+    }
+
+    private sealed class ThrowingAuditLogger : IAuditLogger
+    {
+        private readonly Exception _toThrow;
+        public ThrowingAuditLogger(Exception toThrow) => _toThrow = toThrow;
+        public List<AuditEntry> AttemptedEntries { get; } = new();
+        public Task LogAsync(AuditEntry entry, CancellationToken cancellationToken)
+        {
+            AttemptedEntries.Add(entry);
+            throw _toThrow;
+        }
+    }
+
     // ─── Helpers ───────────────────────────────────────────────────────────────────────
 
     /// <summary>

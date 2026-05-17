@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -205,6 +206,72 @@ public static class EntityFrameworkCoreServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(serviceProvider);
 
         var factory = serviceProvider.GetRequiredService<IDbContextFactory<TeamsOutboxDbContext>>();
+        using var context = factory.CreateDbContext();
+        context.Database.Migrate();
+    }
+
+    /// <summary>
+    /// Register the EF Core context factory for <see cref="AuditLogDbContext"/>, the
+    /// <see cref="SqlAuditLogger"/> singleton (exposed under <see cref="IAuditLogger"/>),
+    /// and the <see cref="SqlAuditLogQueryService"/> singleton (exposed under
+    /// <see cref="IAuditLogQueryService"/>). Implements Stage 5.2 of
+    /// <c>implementation-plan.md</c> per <c>tech-spec.md</c> §4.3.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Unconditionally replaces</b> any prior <see cref="IAuditLogger"/> registration
+    /// — including the Stage 5.2 <c>NoOpAuditLogger</c> stub registered by
+    /// <c>AddTeamsMessengerConnector</c>. The replacement is intentional: the audit
+    /// trail is a compliance-grade durable artifact, and silently keeping a no-op
+    /// logger when the host explicitly opted into SQL persistence would be a
+    /// dangerous behaviour for an enterprise audit story.
+    /// </para>
+    /// <para>
+    /// The <see cref="SqlAuditLogQueryService"/> registration uses <c>TryAdd</c> so a
+    /// host that pre-registered its own <see cref="IAuditLogQueryService"/> (e.g. a
+    /// caching decorator) is preserved.
+    /// </para>
+    /// </remarks>
+    /// <param name="services">DI container.</param>
+    /// <param name="optionsAction">Configures the underlying
+    /// <see cref="DbContextOptionsBuilder"/> — typically
+    /// <c>UseSqlServer(connectionString)</c>.</param>
+    /// <returns>The same <paramref name="services"/> for chaining.</returns>
+    public static IServiceCollection AddSqlAuditLogger(
+        this IServiceCollection services,
+        Action<DbContextOptionsBuilder> optionsAction)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(optionsAction);
+
+        services.AddDbContextFactory<AuditLogDbContext>(optionsAction);
+        services.TryAddSingleton<SqlAuditLogger>();
+        services.TryAddSingleton<SqlAuditLogQueryService>();
+        services.TryAddSingleton<IAuditLogQueryService>(
+            sp => sp.GetRequiredService<SqlAuditLogQueryService>());
+
+        // Unconditional replacement — see XML remarks above for the security rationale.
+        services.RemoveAll<IAuditLogger>();
+        services.AddSingleton<IAuditLogger>(
+            sp => sp.GetRequiredService<SqlAuditLogger>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Apply any pending migrations against the <see cref="AuditLogDbContext"/> for
+    /// the resolved service provider. Production hosts call this in a startup hook
+    /// (e.g. <c>app.Services.MigrateAuditLog()</c>) after building the service provider.
+    /// Applies the <c>20260516120058_InitialAuditLog</c> migration which provisions
+    /// the AuditLog table and the <c>INSTEAD OF UPDATE/DELETE</c> immutability triggers
+    /// per <c>tech-spec.md</c> §4.3.
+    /// </summary>
+    /// <param name="serviceProvider">A built <see cref="IServiceProvider"/>.</param>
+    public static void MigrateAuditLog(this IServiceProvider serviceProvider)
+    {
+        ArgumentNullException.ThrowIfNull(serviceProvider);
+
+        var factory = serviceProvider.GetRequiredService<IDbContextFactory<AuditLogDbContext>>();
         using var context = factory.CreateDbContext();
         context.Database.Migrate();
     }

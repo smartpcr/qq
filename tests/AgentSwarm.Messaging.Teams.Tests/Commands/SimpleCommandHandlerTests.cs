@@ -78,6 +78,74 @@ public sealed class SimpleCommandHandlerTests
     }
 
     [Fact]
+    public async Task AskCommandHandler_StampsTaskIdOnContext_DistinctFromCorrelationId()
+    {
+        // Stage 5.2 iter-4 (eval iter-2 item 6) — `AskCommandHandler` must NOT
+        // re-use the correlation ID as the agent task identifier. A correlation
+        // ID is the cross-cutting trace ID; the task ID is the (eventually
+        // persistent) work-item identifier the orchestrator adopts when it
+        // creates the agent task. Conflating the two defeats the AuditLog
+        // table's TaskId column per tech-spec.md §4.3.
+        //
+        // This test pins the iter-4 contract:
+        //   1. context.TaskId is non-null after HandleAsync.
+        //   2. context.TaskId starts with the canonical `task_` namespace prefix.
+        //   3. context.TaskId is NOT equal to context.CorrelationId.
+        var publisher = new TestDoubles.RecordingInboundEventPublisher();
+        var handler = new AskCommandHandler(publisher, NullLogger<AskCommandHandler>.Instance);
+
+        var (turn, _) = BuildTurnContext();
+        var context = BuildContext("agent ask plan migration", "plan migration", turn);
+        Assert.Null(context.TaskId);
+
+        await handler.HandleAsync(context, CancellationToken.None);
+
+        Assert.NotNull(context.TaskId);
+        Assert.StartsWith("task_", context.TaskId, StringComparison.Ordinal);
+        Assert.NotEqual(context.CorrelationId, context.TaskId);
+    }
+
+    [Fact]
+    public async Task AskCommandHandler_PropagatesTaskIdThroughParsedCommandToOrchestrator()
+    {
+        // Stage 5.2 iter-6 (eval iter-3 item 1) — the audit row's TaskId column
+        // must reference an identifier the downstream task pipeline is
+        // contractually bound to adopt. Stamping context.TaskId in isolation
+        // (iter-4) created a phantom reference: no consumer of the published
+        // CommandEvent saw the value, so the orchestrator could not bind its
+        // persistent agent-task work-item ID to it.
+        //
+        // The iter-6 structural fix adds ParsedCommand.TaskId and propagates
+        // context.TaskId onto the published CommandEvent.Payload so the
+        // orchestrator reads the EXACT same identifier the audit row records.
+        //
+        // This test pins the propagation contract end-to-end:
+        //   1. After HandleAsync the published CommandEvent's Payload is a
+        //      ParsedCommand whose TaskId is non-null and `task_`-prefixed.
+        //   2. ParsedCommand.TaskId equals context.TaskId (the audit value the
+        //      activity handler will write to the AuditLog.TaskId column),
+        //      proving the audit row and the orchestrator see the SAME ID.
+        //   3. ParsedCommand.TaskId is distinct from ParsedCommand.CorrelationId
+        //      (defense against a future regression that aliases the two slots).
+        var publisher = new TestDoubles.RecordingInboundEventPublisher();
+        var handler = new AskCommandHandler(publisher, NullLogger<AskCommandHandler>.Instance);
+
+        var (turn, _) = BuildTurnContext();
+        var context = BuildContext("agent ask design persistence", "design persistence", turn);
+
+        await handler.HandleAsync(context, CancellationToken.None);
+
+        var published = Assert.Single(publisher.Published);
+        var commandEvent = Assert.IsType<CommandEvent>(published);
+        var parsed = Assert.IsType<ParsedCommand>(commandEvent.Payload);
+
+        Assert.NotNull(parsed.TaskId);
+        Assert.StartsWith("task_", parsed.TaskId, StringComparison.Ordinal);
+        Assert.Equal(context.TaskId, parsed.TaskId);
+        Assert.NotEqual(parsed.CorrelationId, parsed.TaskId);
+    }
+
+    [Fact]
     public async Task StatusCommandHandler_QueriesProvider_PublishesCommandEvent_AndRendersStatusCard()
     {
         var publisher = new TestDoubles.RecordingInboundEventPublisher();
