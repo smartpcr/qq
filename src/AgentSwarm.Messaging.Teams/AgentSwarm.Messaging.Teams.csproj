@@ -27,4 +27,12 @@
     <ProjectReference Include="..\AgentSwarm.Messaging.Persistence\AgentSwarm.Messaging.Persistence.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Iter-3 evaluator feedback #3 (audit-retry test coverage): allow the Teams test
+         project to construct CardActionHandler via the 10-argument internal constructor
+         that exposes the audit-retry base delay so retry-recovery scenarios can run in
+         tens of milliseconds rather than the production-default 1500ms+ worst case. -->
+    <InternalsVisibleTo Include="AgentSwarm.Messaging.Teams.Tests" />
+  </ItemGroup>
+
 </Project>

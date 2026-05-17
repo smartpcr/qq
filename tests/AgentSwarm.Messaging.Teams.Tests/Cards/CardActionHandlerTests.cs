@@ -3,6 +3,7 @@ using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Schema;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json.Linq;
 using static AgentSwarm.Messaging.Teams.Tests.TestDoubles;
@@ -226,13 +227,28 @@ public sealed class CardActionHandlerTests
         var harness = HandlerHarness.Build();
         harness.QuestionStore.Seed(BuildOpenQuestion());
 
-        await harness.Handler.HandleAsync(BuildInvokeTurn("disapprove"), CancellationToken.None);
+        var response = await harness.Handler.HandleAsync(BuildInvokeTurn("disapprove"), CancellationToken.None);
 
         Assert.Empty(harness.Publisher.Published);
         Assert.Empty(harness.CardManager.Calls);
         var entry = Assert.Single(harness.Audit.Entries);
         Assert.Equal(AuditOutcomes.Rejected, entry.Outcome);
         Assert.Equal("disapprove", entry.Action);
+
+        // Iter-3 evaluator feedback #4 ΓÇö pin the Bot Framework Universal Action error
+        // response contract for rejected card actions. The Teams client renders
+        // 4xx + application/vnd.microsoft.error responses as error notifications;
+        // the prior HTTP 200 + application/vnd.microsoft.activity.message regression
+        // would silently render as a chat message acknowledgement so a regression
+        // here would mask invalid-action failures from the end-user. The code field
+        // discriminates ActionNotAllowed from other rejection types so operators
+        // can grep Bot Framework telemetry by code.
+        Assert.NotNull(response);
+        Assert.Equal(403, response.StatusCode);
+        Assert.Equal("application/vnd.microsoft.error", response.Type);
+        var errorValue = Assert.IsType<JObject>(response.Value);
+        Assert.Equal("ActionNotAllowed", (string?)errorValue["code"]);
+        Assert.Contains("disapprove", (string?)errorValue["message"] ?? string.Empty, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -367,14 +383,20 @@ public sealed class CardActionHandlerTests
     }
 
     /// <summary>
-    /// Iter-8 fix #3 — when <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, HumanDecisionEvent, string?, CancellationToken)"/>
-    /// throws AFTER the durable Open→Resolved CAS succeeds, the audit row must reflect
-    /// the lifecycle gap. The previous implementation wrote a <c>Success</c> outcome
-    /// even though the original interactive card was not replaced — operators had no
-    /// signal that the user-visible card was stale. The handler now writes
-    /// <see cref="AuditOutcomes.Failed"/> with a <c>cardUpdateError</c> marker in the
-    /// sanitised payload. The decision event is still published and the caller still
-    /// gets an <c>Accept</c> response because the durable resolution stands.
+    /// Iter-2 evaluator feedback #4 / iter-3 evaluator feedback #5 ΓÇö when
+    /// <see cref="ITeamsCardManager.UpdateCardAsync(string, CardUpdateAction, HumanDecisionEvent, string?, CancellationToken)"/>
+    /// throws AFTER the durable Open->Resolved CAS succeeds, the audit row must
+    /// reflect the lifecycle gap AND the caller must observe a Bot Framework error
+    /// response. The prior behaviour returned an <c>Accept</c> with a "Recorded ..."
+    /// confirmation message even though the original interactive card was not
+    /// replaced ΓÇö the user saw a success acknowledgement while the actionable card
+    /// sat stale and clickable on screen. The handler now returns
+    /// <see cref="AdaptiveCardInvokeResponse"/> with <c>StatusCode = 502</c>,
+    /// <c>Type = application/vnd.microsoft.error</c>, and a
+    /// <c>code = CardUpdateFailed</c> error body via <c>RejectCardUpdateFailure</c>;
+    /// the decision event is still published (the durable resolution stands), and
+    /// the audit row carries <see cref="AuditOutcomes.Failed"/> plus the
+    /// <c>cardUpdateError</c> marker so operators can reconcile lifecycle state.
     /// </summary>
     [Fact]
     public async Task HandleAsync_CardUpdateThrows_EmitsFailedAudit_DecisionStillPublished()
@@ -385,7 +407,8 @@ public sealed class CardActionHandlerTests
 
         var response = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
 
-        // Decision is still published and caller still gets a non-null Accept response.
+        // Decision is still published (the durable Open->Resolved CAS committed before
+        // the card update was attempted).
         Assert.NotNull(response);
         var ev = Assert.Single(harness.Publisher.Published);
         var decisionEvent = Assert.IsType<DecisionEvent>(ev);
@@ -401,6 +424,19 @@ public sealed class CardActionHandlerTests
         Assert.Equal(AuditOutcomes.Failed, entry.Outcome);
         Assert.Contains("cardUpdateError", entry.PayloadJson, StringComparison.Ordinal);
         Assert.Contains("update-card-down", entry.PayloadJson, StringComparison.Ordinal);
+
+        // Iter-3 evaluator feedback #5 ΓÇö pin the response shape so the previously-fixed
+        // Bot Framework error contract for card-update failures cannot regress to the
+        // misleading Accept("Recorded ...") shape. 502 communicates a downstream gateway
+        // failure (UpdateActivityAsync failed) and CardUpdateFailed lets operators
+        // discriminate this from action-not-allowed / not-found / expired rejections.
+        Assert.Equal(502, response.StatusCode);
+        Assert.Equal("application/vnd.microsoft.error", response.Type);
+        var errorValue = Assert.IsType<JObject>(response.Value);
+        Assert.Equal("CardUpdateFailed", (string?)errorValue["code"]);
+        var errorMessage = (string?)errorValue["message"] ?? string.Empty;
+        Assert.Contains("recorded", errorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("refresh", errorMessage, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -511,5 +547,170 @@ public sealed class CardActionHandlerTests
             => Task.FromResult<IReadOnlyList<AgentQuestion>>(Array.Empty<AgentQuestion>());
         public Task<IReadOnlyList<AgentQuestion>> GetOpenExpiredAsync(DateTimeOffset cutoff, int batchSize, CancellationToken ct)
             => Task.FromResult<IReadOnlyList<AgentQuestion>>(Array.Empty<AgentQuestion>());
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #3 ΓÇö an <see cref="IAuditLogger"/> test double that
+    /// throws on the first <c>FailuresBeforeSuccess</c> calls and succeeds afterwards.
+    /// Used to verify that <see cref="CardActionHandler.WriteAuditEntryWithRetryAsync"/>
+    /// recovers from transient audit-store outages via inline retry without losing the
+    /// compliance evidence to the silent-catch behaviour the iter-1 review flagged.
+    /// </summary>
+    private sealed class TransientFailureAuditLogger : IAuditLogger
+    {
+        public int FailuresBeforeSuccess { get; init; }
+        public int CallCount { get; private set; }
+        public List<AuditEntry> Persisted { get; } = new();
+
+        public Task LogAsync(AuditEntry entry, CancellationToken cancellationToken)
+        {
+            CallCount++;
+            if (CallCount <= FailuresBeforeSuccess)
+            {
+                throw new InvalidOperationException($"audit-store-transient-failure-attempt-{CallCount}");
+            }
+
+            Persisted.Add(entry);
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #3 ΓÇö exercise the durable recovery path. When the
+    /// audit store throws transiently AFTER the durable Open->Resolved CAS and the
+    /// DecisionEvent publish have committed, the handler retries
+    /// <see cref="IAuditLogger.LogAsync"/> with exponential backoff so the original
+    /// <c>Success</c> audit row eventually lands. This closes the compliance-evidence
+    /// gap the prior fail-loud-rethrow design exposed: on the retry path, the actor's
+    /// second invoke would hit the resolved-status guard and never re-emit the audit
+    /// row, so without the inline retry the row would be permanently missing.
+    ///
+    /// Uses the internal 10-arg constructor to override the audit retry base delay
+    /// to 10ms so the test completes in &lt; 100ms instead of the production
+    /// worst-case 1500ms.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_AuditTransientFailure_RetriesUntilSuccess_AuditRowPersisted()
+    {
+        var questionStore = new InMemoryAgentQuestionStore();
+        questionStore.Seed(BuildOpenQuestion());
+        var cardStore = new RecordingCardStateStore_();
+        var cardManager = new RecordingTeamsCardManager();
+        var publisher = new RecordingInboundEventPublisher();
+        // First two LogAsync calls throw; third succeeds. Verifies the retry loop
+        // tolerates multiple transient blips before giving up.
+        var audit = new TransientFailureAuditLogger { FailuresBeforeSuccess = 2 };
+        var handler = new CardActionHandler(
+            questionStore,
+            cardStore,
+            cardManager,
+            publisher,
+            audit,
+            NullLogger<CardActionHandler>.Instance,
+            TimeProvider.System,
+            CardActionHandler.DedupeRetentionPeriod,
+            auditRetryBaseDelay: TimeSpan.FromMilliseconds(10),
+            auditRetryMaxAttempts: CardActionHandler.AuditRetryMaxAttempts);
+
+        var response = await handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+
+        Assert.NotNull(response);
+        // Decision event published exactly once (the durable resolution stands).
+        var ev = Assert.Single(publisher.Published);
+        var decisionEvent = Assert.IsType<DecisionEvent>(ev);
+        Assert.Equal("approve", decisionEvent.Payload.ActionValue);
+
+        // Audit retry consumed three LogAsync attempts (2 transient failures + 1 success).
+        Assert.Equal(3, audit.CallCount);
+        var entry = Assert.Single(audit.Persisted);
+        Assert.Equal(AuditOutcomes.Success, entry.Outcome);
+        Assert.Equal("approve", entry.Action);
+        Assert.Equal(ActorAad, entry.ActorId);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback #3 ΓÇö verify the fallback log emission when audit
+    /// retries are exhausted. When the audit store fails for ALL retry attempts, the
+    /// handler must (a) still rethrow so the caller observes the failure, and (b)
+    /// emit the serialised <see cref="AuditEntry"/> as a <c>FALLBACK_AUDIT_ENTRY</c>
+    /// LogCritical line so the log sink (independent of the primary audit store)
+    /// serves as the durable recovery surface for the missing compliance evidence.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_AuditPersistentFailure_EmitsFallbackLogAndRethrows()
+    {
+        var questionStore = new InMemoryAgentQuestionStore();
+        questionStore.Seed(BuildOpenQuestion());
+        var cardStore = new RecordingCardStateStore_();
+        var cardManager = new RecordingTeamsCardManager();
+        var publisher = new RecordingInboundEventPublisher();
+        // FailuresBeforeSuccess high enough that every retry attempt throws.
+        var audit = new TransientFailureAuditLogger { FailuresBeforeSuccess = int.MaxValue };
+        var fallbackLogger = new RecordingFallbackLogger();
+        var handler = new CardActionHandler(
+            questionStore,
+            cardStore,
+            cardManager,
+            publisher,
+            audit,
+            fallbackLogger,
+            TimeProvider.System,
+            CardActionHandler.DedupeRetentionPeriod,
+            auditRetryBaseDelay: TimeSpan.FromMilliseconds(5),
+            auditRetryMaxAttempts: 3);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
+
+        // All retry attempts consumed.
+        Assert.Equal(3, audit.CallCount);
+        Assert.Empty(audit.Persisted);
+
+        // Decision still published — the durable CAS committed before the audit
+        // attempt, so the agent observes the human's choice via the channel.
+        Assert.Single(publisher.Published);
+
+        // Fallback log emit verified: at least one LogCritical message carrying the
+        // FALLBACK_AUDIT_ENTRY marker so log shippers can extract the compliance
+        // evidence for out-of-band replay into the primary audit store.
+        Assert.Contains(
+            fallbackLogger.CriticalMessages,
+            m => m.Contains("FALLBACK_AUDIT_ENTRY", StringComparison.Ordinal)
+              && m.Contains(CorrelationId, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Test double for <see cref="ILogger{T}"/> that records every formatted log
+    /// message at <see cref="LogLevel.Critical"/>. Used by the fallback-audit test
+    /// to verify the <c>FALLBACK_AUDIT_ENTRY</c> log line was emitted with the
+    /// serialised audit-entry payload after retry exhaustion.
+    /// </summary>
+    private sealed class RecordingFallbackLogger : ILogger<CardActionHandler>
+    {
+        public List<string> CriticalMessages { get; } = new();
+
+        public IDisposable BeginScope<TState>(TState state) where TState : notnull
+            => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == LogLevel.Critical)
+            {
+                CriticalMessages.Add(formatter(state, exception));
+            }
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+            public void Dispose() { }
+        }
     }
 }
