@@ -113,10 +113,16 @@ public class Program
         // 4.1) means every controller added later automatically
         // inherits the ACL gate without needing to decorate each
         // controller with [ServiceFilter(typeof(SlackAuthorizationFilter))].
-        // The signature middleware (UseSlackSignatureValidation
-        // below) runs first and stamps HttpContext.Items with the
-        // resolved SlackWorkspaceConfig, which the filter re-uses
-        // to avoid a second workspace lookup.
+        // The filter is path-scoped via SlackAuthorizationOptions.PathPrefix
+        // (default '/api/slack', mirrors SlackSignatureOptions.PathPrefix)
+        // so non-Slack MVC endpoints -- admin APIs, cache invalidation,
+        // health probes that some hosts expose via controllers --
+        // short-circuit out of the ACL without parsing the body or
+        // looking up the workspace. The signature middleware
+        // (UseSlackSignatureValidation below) runs first and stamps
+        // HttpContext.Items with the resolved SlackWorkspaceConfig,
+        // which the filter re-uses to avoid a second workspace
+        // lookup.
         builder.Services
             .AddControllers(options =>
             {

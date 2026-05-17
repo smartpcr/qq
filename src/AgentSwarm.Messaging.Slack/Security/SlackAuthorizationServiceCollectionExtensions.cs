@@ -56,6 +56,9 @@ public static class SlackAuthorizationServiceCollectionExtensions
         services
             .AddOptions<SlackAuthorizationOptions>()
             .Bind(configuration.GetSection(SlackAuthorizationOptions.SectionName))
+            .Validate(
+                opts => opts.PathPrefix is null || !opts.PathPrefix.Contains(' '),
+                $"{nameof(SlackAuthorizationOptions)}.{nameof(SlackAuthorizationOptions.PathPrefix)} must not contain whitespace; set it to a URL prefix like '/api/slack' or leave empty to disable the path guard.")
             .ValidateOnStart();
 
         services.TryAddSingleton(TimeProvider.System);

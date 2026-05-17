@@ -393,6 +393,101 @@ public sealed class SlackAuthorizationFilterTests
     }
 
     [Fact]
+    public async Task Non_slack_path_bypasses_filter_when_default_prefix_is_active()
+    {
+        // Evaluator iter-1 item 1: the filter is registered as a
+        // global MVC filter so future Slack controllers inherit the
+        // gate. Without path scoping every non-Slack MVC endpoint
+        // (admin APIs, cache invalidation, future controllers
+        // unrelated to Slack) would be rejected as MissingTeamId
+        // because their bodies have no team_id. Default
+        // PathPrefix='/api/slack' mirrors SlackSignatureOptions.PathPrefix
+        // and short-circuits non-Slack paths to next() with no audit
+        // record and no rejection result.
+        Harness h = Harness.Build(allowedChannels: new[] { ChannelId }, allowedGroups: new[] { AllowedGroup });
+
+        // An admin endpoint with no Slack identity fields whatsoever.
+        ActionExecutingContext ctx = BuildJsonContext("/api/admin/cache-invalidate", @"{""scope"":""all""}");
+
+        bool nextInvoked = false;
+        await h.Filter.OnActionExecutionAsync(ctx, () =>
+        {
+            nextInvoked = true;
+            return Task.FromResult<ActionExecutedContext>(null!);
+        });
+
+        nextInvoked.Should().BeTrue("non-Slack paths must pass through the filter without enforcement");
+        ctx.Result.Should().BeNull("the filter must not short-circuit a non-Slack request");
+        h.AuditSink.Records.Should().BeEmpty("no audit record should be emitted for non-Slack paths -- they are out of scope for the Slack ACL");
+        h.WorkspaceStore.LookupCount.Should().Be(0, "the filter must not parse the body or look up a workspace for non-Slack paths");
+    }
+
+    [Fact]
+    public async Task Custom_prefix_scopes_enforcement_to_matching_paths_only()
+    {
+        // Operators can override Slack:Authorization:PathPrefix to
+        // mount the connector under a non-default URL (e.g.,
+        // '/slack-gateway'). Inside the prefix the ACL enforces;
+        // outside it the filter is a no-op.
+        Harness h = Harness.Build(
+            allowedChannels: new[] { ChannelId },
+            allowedGroups: new[] { AllowedGroup },
+            options: new SlackAuthorizationOptions
+            {
+                Enabled = true,
+                PathPrefix = "/slack-gateway",
+            });
+        h.UserGroupClient.SetMembers(TeamId, AllowedGroup, UserId);
+
+        // (a) A path UNDER the configured prefix -- enforced.
+        ActionExecutingContext inScope = BuildCommandContext(
+            teamId: TeamId, channelId: ChannelId, userId: UserId,
+            command: "/agent", text: "ask");
+        inScope.HttpContext.Request.Path = "/slack-gateway/commands";
+
+        bool inScopeNext = false;
+        await h.Filter.OnActionExecutionAsync(inScope, () =>
+        {
+            inScopeNext = true;
+            return Task.FromResult<ActionExecutedContext>(null!);
+        });
+        inScopeNext.Should().BeTrue("an in-scope path with a valid identity must pass through");
+        inScope.HttpContext.Items[SlackAuthorizationFilter.AuthorizedItemKey].Should().Be(true);
+
+        // (b) An unrelated path -- bypassed even with no team_id.
+        ActionExecutingContext outOfScope = BuildJsonContext("/api/operator/diagnostics", @"{""op"":""ping""}");
+        bool outOfScopeNext = false;
+        await h.Filter.OnActionExecutionAsync(outOfScope, () =>
+        {
+            outOfScopeNext = true;
+            return Task.FromResult<ActionExecutedContext>(null!);
+        });
+        outOfScopeNext.Should().BeTrue("paths outside the configured prefix must pass through");
+        outOfScope.Result.Should().BeNull();
+        h.AuditSink.Records.Should().BeEmpty("an out-of-scope path must not emit an audit record");
+    }
+
+    [Fact]
+    public async Task Empty_prefix_disables_path_guard_and_enforces_on_every_action()
+    {
+        // A diagnostic host that only mounts Slack controllers can
+        // explicitly clear the prefix to enforce on every action.
+        Harness h = Harness.Build(
+            allowedChannels: new[] { ChannelId },
+            allowedGroups: new[] { AllowedGroup },
+            options: new SlackAuthorizationOptions { Enabled = true, PathPrefix = string.Empty });
+
+        // Even a non-/api/slack path without team_id must now be rejected.
+        ActionExecutingContext ctx = BuildJsonContext("/anything", "{}");
+        await h.Filter.OnActionExecutionAsync(ctx, () => Task.FromResult<ActionExecutedContext>(null!));
+
+        AssertEphemeral200(ctx.Result, SlackAuthorizationOptions.DefaultRejectionMessage);
+        h.AuditSink.Records.Should().ContainSingle()
+            .Which.Reason.Should().Be(SlackAuthorizationRejectionReason.MissingTeamId,
+                "an empty PathPrefix disables the bypass so non-Slack paths fall into the ACL just like inbound Slack paths");
+    }
+
+    [Fact]
     public async Task Custom_rejection_message_is_json_escaped_in_ephemeral_body()
     {
         // Defense against an operator-supplied string that contains

@@ -45,6 +45,23 @@ public sealed class SlackAuthorizationOptions
     public bool Enabled { get; set; } = true;
 
     /// <summary>
+    /// URL path prefix the filter enforces the ACL on. When a request
+    /// path does not start with this segment (case-insensitive) the
+    /// filter short-circuits to <c>next()</c> without parsing the body
+    /// or running the workspace/channel/user-group checks. Mirrors
+    /// <see cref="AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions.PathPrefix"/>
+    /// so the authorization gate covers exactly the same surface area
+    /// as the upstream HMAC middleware -- non-Slack MVC endpoints
+    /// (admin APIs, cache-invalidation hooks, future controllers
+    /// unrelated to Slack) are never rejected as <c>MissingTeamId</c>.
+    /// Defaults to <c>"/api/slack"</c>; an empty / whitespace value
+    /// disables the path guard (the filter runs on every action), which
+    /// is occasionally useful for diagnostic hosts that mount only
+    /// Slack controllers.
+    /// </summary>
+    public string PathPrefix { get; set; } = "/api/slack";
+
+    /// <summary>
     /// Text rendered in the ephemeral Slack message returned on every
     /// rejection. The brief mandates an ephemeral message body
     /// (<c>response_type=ephemeral</c>) on HTTP 200; the wording itself

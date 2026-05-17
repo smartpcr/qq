@@ -137,6 +137,23 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         }
 
         HttpContext http = context.HttpContext;
+
+        // Path scoping (evaluator iter-1 item 1): the filter is mounted
+        // as a global MVC filter so future Slack controllers inherit
+        // the gate automatically. Without this guard every non-Slack
+        // MVC endpoint -- admin APIs, cache invalidation, future
+        // controllers unrelated to Slack -- would be rejected as
+        // MissingTeamId because their bodies have no team_id. We mirror
+        // SlackSignatureOptions.PathPrefix so the authorization filter
+        // and the upstream HMAC middleware cover exactly the same URL
+        // surface; an empty/whitespace prefix disables the guard for
+        // diagnostic hosts that only mount Slack controllers.
+        if (!PathInScope(http, options))
+        {
+            await next().ConfigureAwait(false);
+            return;
+        }
+
         CancellationToken ct = http.RequestAborted;
 
         // Events API url_verification handshakes have no channel /
@@ -295,6 +312,22 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         }
 
         return false;
+    }
+
+    private static bool PathInScope(HttpContext http, SlackAuthorizationOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.PathPrefix))
+        {
+            // An explicitly empty prefix means "enforce on every
+            // request". Used by diagnostic hosts that mount only
+            // Slack controllers; the canonical Worker keeps the
+            // default '/api/slack' prefix.
+            return true;
+        }
+
+        return http.Request.Path.StartsWithSegments(
+            new PathString(options.PathPrefix),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<SlackWorkspaceConfig?> ResolveWorkspaceAsync(HttpContext http, string teamId, CancellationToken ct)
