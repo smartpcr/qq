@@ -1,5 +1,7 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
+using AgentSwarm.Messaging.Teams.Security;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
@@ -69,6 +71,7 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     private readonly IAgentQuestionStore _agentQuestionStore;
     private readonly ILogger<TeamsProactiveNotifier> _logger;
     private readonly TimeProvider _timeProvider;
+    private readonly InstallationStateGate? _installationStateGate;
 
     /// <summary>
     /// Production constructor — defaults the clock to <see cref="TimeProvider.System"/>.
@@ -84,7 +87,7 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ICardStateStore cardStateStore,
         IAgentQuestionStore agentQuestionStore,
         ILogger<TeamsProactiveNotifier> logger)
-        : this(adapter, options, conversationReferenceStore, cardRenderer, cardStateStore, agentQuestionStore, logger, TimeProvider.System)
+        : this(adapter, options, conversationReferenceStore, cardRenderer, cardStateStore, agentQuestionStore, logger, TimeProvider.System, installationStateGate: null)
     {
     }
 
@@ -103,6 +106,31 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         IAgentQuestionStore agentQuestionStore,
         ILogger<TeamsProactiveNotifier> logger,
         TimeProvider timeProvider)
+        : this(adapter, options, conversationReferenceStore, cardRenderer, cardStateStore, agentQuestionStore, logger, timeProvider, installationStateGate: null)
+    {
+    }
+
+    /// <summary>
+    /// Canonical production constructor wired by <c>AddTeamsProactiveNotifier</c> +
+    /// <c>AddTeamsSecurity</c>. Accepts an <see cref="InstallationStateGate"/> so every
+    /// proactive question is guarded by the Stage 5.1 install-state pre-check before the
+    /// Bot Framework call. The gate dead-letters and audits inactive targets; the notifier
+    /// short-circuits without invoking <c>ContinueConversationAsync</c>. When the gate is
+    /// supplied as <c>null</c> (legacy DI compositions and the test-only constructors
+    /// above), the install-state probe is bypassed — this is intended ONLY for
+    /// pre-Stage-5.1 unit tests; production hosts MUST resolve this constructor via
+    /// DI so the gate is never null in deployed environments.
+    /// </summary>
+    public TeamsProactiveNotifier(
+        CloudAdapter adapter,
+        TeamsMessagingOptions options,
+        IConversationReferenceStore conversationReferenceStore,
+        IAdaptiveCardRenderer cardRenderer,
+        ICardStateStore cardStateStore,
+        IAgentQuestionStore agentQuestionStore,
+        ILogger<TeamsProactiveNotifier> logger,
+        TimeProvider timeProvider,
+        InstallationStateGate? installationStateGate)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _options = options ?? throw new ArgumentNullException(nameof(options));
@@ -112,6 +140,10 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         _agentQuestionStore = agentQuestionStore ?? throw new ArgumentNullException(nameof(agentQuestionStore));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        // InstallationStateGate is intentionally allowed to be null for the test-only
+        // legacy constructors above. Production DI passes a real gate so every Bot
+        // Framework call is install-state-checked first.
+        _installationStateGate = installationStateGate;
     }
 
     /// <inheritdoc />
@@ -120,6 +152,47 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(message);
+
+        // Stage 6.3 iter-2 — push the canonical CorrelationId/TenantId/UserId enrichment
+        // onto every log entry emitted by this proactive send (both via ILogger.BeginScope
+        // and via the AsyncLocal-backed Serilog enricher feed).
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: message.CorrelationId,
+            tenantId: tenantId,
+            userId: userId);
+
+        // Stage 5.1 iter-5 evaluator feedback item 1 — STRUCTURAL fix. The install-state
+        // gate MUST run BEFORE the active-only GetByInternalUserIdAsync lookup. The real
+        // SqlConversationReferenceStore filters by `e.IsActive`, so an inactive (or
+        // never-installed) target returns null from the getter and the older "lookup-then-
+        // gate" ordering threw ConversationReferenceNotFoundException BEFORE the gate
+        // could emit the InstallationGateRejected audit row or dead-letter the outbox
+        // entry. The gate uses IsActiveByInternalUserIdAsync (a boolean probe that
+        // legitimately handles "missing" and "inactive" alike) so it does not need the
+        // getter to have run first.
+        if (_installationStateGate is not null)
+        {
+            var gateResult = await _installationStateGate.CheckTargetAsync(
+                tenantId: tenantId,
+                userId: userId,
+                channelId: null,
+                correlationId: message.CorrelationId ?? string.Empty,
+                outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
+                cancellationToken: ct).ConfigureAwait(false);
+
+            if (!gateResult.IsActive)
+            {
+                _logger.LogWarning(
+                    "InstallationStateGate rejected proactive MessengerMessage {MessageId} (correlation {CorrelationId}) to user {InternalUserId} in tenant {TenantId}. Skipping Bot Framework call and reference lookup. Reason: {Reason}",
+                    message.MessageId,
+                    message.CorrelationId,
+                    userId,
+                    tenantId,
+                    gateResult.Reason);
+                throw ConversationReferenceNotFoundException.ForUser(tenantId, userId);
+            }
+        }
 
         var stored = await _conversationReferenceStore
             .GetByInternalUserIdAsync(tenantId, userId, ct)
@@ -148,11 +221,21 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     }
 
     /// <inheritdoc />
-    public Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
+    public async Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Stage 6.3 iter-2 — enrichment scope is opened BEFORE argument-cross-check so
+        // even validation-failure logs carry the canonical keys. Method is async (not
+        // sync-returning-Task) so the scope persists across the entire SendQuestionCore
+        // await chain.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: userId);
 
         // Security-relevant consistency guard (iter-2 evaluator feedback #1, #2):
         // refuse to send a question through a tenant / user / scope that does not match
@@ -166,13 +249,13 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         EnsureTenantMatchesQuestion(tenantId, question);
         EnsureScopeUserTargeted(userId, question);
 
-        return SendQuestionCoreAsync(
+        await SendQuestionCoreAsync(
             tenantId,
             question,
             lookupAsync: innerCt => _conversationReferenceStore.GetByInternalUserIdAsync(tenantId, userId, innerCt),
             notFoundFactory: () => ConversationReferenceNotFoundException.ForUser(tenantId, userId, question.QuestionId),
             targetDescription: $"user '{userId}'",
-            ct);
+            ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -181,6 +264,41 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(message);
+
+        // Stage 6.3 iter-2 — channel sends carry the same enrichment minus UserId; the
+        // tenant + channel + correlation triple is what dashboards key on for
+        // channel-scoped delivery audits.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: message.CorrelationId,
+            tenantId: tenantId,
+            userId: null);
+
+        // Stage 5.1 iter-5 evaluator feedback item 1 — gate BEFORE the active-only
+        // channel lookup. Same structural fix as SendProactiveAsync above; see comment
+        // there for rationale.
+        if (_installationStateGate is not null)
+        {
+            var gateResult = await _installationStateGate.CheckTargetAsync(
+                tenantId: tenantId,
+                userId: null,
+                channelId: channelId,
+                correlationId: message.CorrelationId ?? string.Empty,
+                outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
+                cancellationToken: ct).ConfigureAwait(false);
+
+            if (!gateResult.IsActive)
+            {
+                _logger.LogWarning(
+                    "InstallationStateGate rejected proactive MessengerMessage {MessageId} (correlation {CorrelationId}) to channel {ChannelId} in tenant {TenantId}. Skipping Bot Framework call and reference lookup. Reason: {Reason}",
+                    message.MessageId,
+                    message.CorrelationId,
+                    channelId,
+                    tenantId,
+                    gateResult.Reason);
+                throw ConversationReferenceNotFoundException.ForChannel(tenantId, channelId);
+            }
+        }
 
         var stored = await _conversationReferenceStore
             .GetByChannelIdAsync(tenantId, channelId, ct)
@@ -209,24 +327,31 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     }
 
     /// <inheritdoc />
-    public Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
+    public async Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Stage 6.3 iter-2 — channel-scoped question enrichment scope.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: null);
 
         // Security-relevant consistency guard (iter-2 evaluator feedback #1, #2) —
         // see SendProactiveQuestionAsync for the full rationale.
         EnsureTenantMatchesQuestion(tenantId, question);
         EnsureScopeChannelTargeted(channelId, question);
 
-        return SendQuestionCoreAsync(
+        await SendQuestionCoreAsync(
             tenantId,
             question,
             lookupAsync: innerCt => _conversationReferenceStore.GetByChannelIdAsync(tenantId, channelId, innerCt),
             notFoundFactory: () => ConversationReferenceNotFoundException.ForChannel(tenantId, channelId, question.QuestionId),
             targetDescription: $"channel '{channelId}'",
-            ct);
+            ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -352,6 +477,34 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
                 "Proactive AgentQuestion {QuestionId} (correlation {CorrelationId}) row already present in IAgentQuestionStore with Status=Open; skipping duplicate SaveAsync and proceeding with lookup/send (outbox retry).",
                 question.QuestionId,
                 question.CorrelationId);
+        }
+
+        // Stage 5.1 iter-5 evaluator feedback item 1 — gate BEFORE the active-only
+        // lookupAsync. lookupAsync wraps GetByInternalUserIdAsync / GetByChannelIdAsync,
+        // both of which filter by IsActive in the SQL store, so the old "lookup-then-gate"
+        // ordering threw ConversationReferenceNotFoundException for inactive targets
+        // BEFORE the gate could emit the InstallationGateRejected audit row. The gate
+        // uses IsActiveByXxxAsync probes that handle missing/inactive alike, so it does
+        // not need the lookup to have succeeded first.
+        if (_installationStateGate is not null)
+        {
+            var gateResult = await _installationStateGate.CheckAsync(
+                question,
+                outboxEntryId: ProactiveSendContext.CurrentOutboxEntryId,
+                correlationId: question.CorrelationId ?? string.Empty,
+                ct).ConfigureAwait(false);
+
+            if (!gateResult.IsActive)
+            {
+                _logger.LogWarning(
+                    "InstallationStateGate rejected proactive AgentQuestion {QuestionId} (correlation {CorrelationId}) to {Target} in tenant {TenantId}. Skipping reference lookup and Bot Framework call. Reason: {Reason}",
+                    question.QuestionId,
+                    question.CorrelationId,
+                    targetDescription,
+                    tenantId,
+                    gateResult.Reason);
+                throw notFoundFactory();
+            }
         }
 
         var stored = await lookupAsync(ct).ConfigureAwait(false)

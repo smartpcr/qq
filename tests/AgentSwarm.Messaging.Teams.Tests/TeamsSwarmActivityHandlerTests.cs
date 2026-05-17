@@ -228,7 +228,11 @@ public sealed class TeamsSwarmActivityHandlerTests
 
         var call = Assert.Single(harness.Authorization.Calls);
         Assert.Equal(TenantId, call.TenantId);
-        Assert.Equal("internal-dave", call.UserId);
+        // RBAC is keyed by AAD object ID (per RbacAuthorizationService xmldoc) — the
+        // handler must pass `resolvedIdentity.AadObjectId`, NOT InternalUserId. Real
+        // AAD-keyed RbacOptions.TenantRoleAssignments would never match an internal
+        // user ID, so passing internal would silently deny every authorized user.
+        Assert.Equal("aad-obj-dave-001", call.UserId);
         Assert.Equal("agent ask", call.Command);
     }
 

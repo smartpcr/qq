@@ -534,7 +534,7 @@ public sealed class CardActionHandlerTests
         harness.QuestionStore.Seed(BuildOpenQuestion());
 
         // First submission completes normally.
-        await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+        var firstResponse = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
         Assert.Single(harness.Publisher.Published);
         Assert.Single(harness.Audit.Entries);
         Assert.Single(harness.CardManager.Calls);
@@ -543,6 +543,11 @@ public sealed class CardActionHandlerTests
         // Second submission (same actor, same question, same action) hits the dedupe set.
         var response = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
         Assert.NotNull(response);
+
+        // Stage 6.2 step 2 contract — duplicate submission returns the PREVIOUS result,
+        // not a generic rejection. The shared response value proves the cached terminal
+        // outcome is replayed.
+        Assert.Equal(firstResponse.Value, response.Value);
 
         // No additional decision event, no additional card update, no additional CAS,
         // no additional audit row — the dedupe layer short-circuits BEFORE any I/O.
@@ -608,6 +613,120 @@ public sealed class CardActionHandlerTests
             handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
 
         Assert.Equal(2, throwingStore.GetByIdCalls);
+    }
+
+    /// <summary>
+    /// Iter-2 evaluator fix #3 — a "question not found" rejection is a TRANSIENT outcome
+    /// (the question may simply not have been propagated yet, or the user fat-fingered
+    /// the QuestionId). It must NOT be cached in the in-memory processed-action set or
+    /// the actor will be silently blocked from submitting valid actions for the same
+    /// <c>(QuestionId, UserId)</c> pair for 24 hours.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_RejectedQuestionNotFound_DoesNotCache_PermitsRetry()
+    {
+        var harness = HandlerHarness.Build();
+
+        // First invocation — no question seeded yet. Should reject with "not found".
+        var firstResponse = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+        Assert.Contains("not found", firstResponse.Value?.ToString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(harness.Audit.Entries);
+
+        // The question is then seeded (simulating eventual propagation) and the user
+        // retries — the dedupe set MUST NOT block this. The second submission should
+        // run end-to-end and publish a decision.
+        harness.QuestionStore.Seed(BuildOpenQuestion());
+        var secondResponse = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+
+        Assert.Single(harness.Publisher.Published);
+        Assert.Equal(2, harness.Audit.Entries.Count);
+        Assert.NotEqual(firstResponse.Value, secondResponse.Value);
+    }
+
+    /// <summary>
+    /// Iter-2 evaluator fix #3 — a "not in AllowedActions" rejection is TRANSIENT
+    /// (the user may have submitted with a typo'd ActionValue and wants to retry with
+    /// the correct one). The dedupe key is <c>(QuestionId, UserId)</c> — so caching this
+    /// rejection would block ANY subsequent submission by the same user for that
+    /// question. Must not be cached.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_RejectedInvalidActionValue_DoesNotCache_PermitsRetryWithValidAction()
+    {
+        var harness = HandlerHarness.Build();
+        harness.QuestionStore.Seed(BuildOpenQuestion());
+
+        // First invocation — invalid ActionValue. Rejected.
+        var firstResponse = await harness.Handler.HandleAsync(BuildInvokeTurn("typo-action"), CancellationToken.None);
+        Assert.Contains("not permitted", firstResponse.Value?.ToString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+
+        // Second invocation — same actor, same question, but VALID action. The dedupe
+        // set must not block this; the action runs end-to-end.
+        var secondResponse = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+
+        Assert.Single(harness.Publisher.Published);
+        Assert.Equal(2, harness.Audit.Entries.Count);
+        Assert.Equal(AuditOutcomes.Rejected, harness.Audit.Entries[0].Outcome);
+        Assert.Equal(AuditOutcomes.Success, harness.Audit.Entries[1].Outcome);
+    }
+
+    /// <summary>
+    /// Iter-2 evaluator fix #2 — a concurrent second invocation that arrives BEFORE the
+    /// first completes must also receive the same terminal response. The Stage 6.2 step 2
+    /// contract is "return the previous result without re-executing"; returning a generic
+    /// "already submitted" rejection while the first run is still in flight would violate
+    /// that contract. The fix uses a TaskCompletionSource per entry so waiters block on
+    /// the first run's completion and replay its exact response.
+    /// </summary>
+    [Fact]
+    public async Task HandleAsync_ConcurrentDuplicateSubmissions_BothReceiveSameResponse_FirstRunOnly()
+    {
+        var harness = HandlerHarness.Build();
+        harness.QuestionStore.Seed(BuildOpenQuestion());
+
+        // Gate the first invocation inside the card-update step by making the card
+        // manager block on a TaskCompletionSource. The first call enters the pipeline,
+        // reaches UpdateCardAsync, then waits. While it waits the second call arrives
+        // and must observe the in-flight dedupe entry and wait for the first call to
+        // RecordResult.
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.CardManager.OnUpdate = () => gate.Task;
+
+        var firstTask = Task.Run(() => harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
+
+        // Give the first call time to enter UpdateCardAsync and block on the gate.
+        for (var attempt = 0; attempt < 50 && harness.CardManager.Calls.Count == 0; attempt++)
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.Single(harness.CardManager.Calls);
+        Assert.False(firstTask.IsCompleted, "First handler call should still be blocked at the card-update gate.");
+
+        // Start the second concurrent submission. It should observe the in-flight
+        // dedupe entry and wait for the first call to record a terminal response.
+        var secondTask = Task.Run(() => harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None));
+
+        // Give the second call enough time to enter HandleAsync and block on the TCS.
+        await Task.Delay(100);
+        Assert.False(secondTask.IsCompleted, "Second handler call should be waiting on the in-flight dedupe TCS.");
+
+        // Release the gate — first call records its terminal response.
+        gate.SetResult(true);
+
+        var firstResponse = await firstTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var secondResponse = await secondTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Both responses are the SAME object reference — the second call replayed the
+        // first call's cached terminal response without re-executing.
+        Assert.Equal(firstResponse.Value, secondResponse.Value);
+
+        // Only ONE decision was published, ONE card update, ONE audit entry, ONE CAS —
+        // the second call never touched the underlying stores.
+        Assert.Single(harness.Publisher.Published);
+        Assert.Single(harness.CardManager.Calls);
+        Assert.Single(harness.Audit.Entries);
+        Assert.Single(harness.QuestionStore.StatusTransitionCalls);
     }
 
     private sealed class ThrowingQuestionStore : IAgentQuestionStore
