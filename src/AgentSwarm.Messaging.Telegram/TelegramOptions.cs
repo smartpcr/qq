@@ -266,16 +266,30 @@ public sealed class TelegramOptions
     /// never returned by this method, so logging the options object is
     /// safe.
     /// </summary>
+    /// <remarks>
+    /// Includes the <see cref="OperatorBindings"/> count and the
+    /// <see cref="RateLimits"/> envelope (GlobalPerSecond +
+    /// PerChatPerMinute) so the host startup log shows the binding-count
+    /// + rate-limit envelope an on-call operator needs to validate
+    /// against the current SLO. Counts only — the binding entries
+    /// themselves are NOT echoed because they contain operator
+    /// chat IDs which, while not credentials, should not be exposed
+    /// to every log sink.
+    /// </remarks>
     public override string ToString()
     {
         var allowedCount = AllowedUserIds is null ? 0 : AllowedUserIds.Count;
+        var bindingCount = OperatorBindings is null ? 0 : OperatorBindings.Count;
+        var rl = RateLimits ?? new RateLimitOptions();
         return "TelegramOptions { "
              + $"BotToken = {(string.IsNullOrEmpty(BotToken) ? NotSetMarker : RedactedMarker)}, "
              + $"WebhookUrl = {(string.IsNullOrEmpty(WebhookUrl) ? NotSetMarker : WebhookUrl)}, "
              + $"UsePolling = {UsePolling}, "
              + $"AllowedUserIds = [{allowedCount} ids], "
+             + $"OperatorBindings = [{bindingCount} bindings], "
              + $"SecretToken = {(string.IsNullOrEmpty(SecretToken) ? NotSetMarker : RedactedMarker)}, "
-             + $"PollingTimeoutSeconds = {PollingTimeoutSeconds}"
+             + $"PollingTimeoutSeconds = {PollingTimeoutSeconds}, "
+             + $"RateLimits = {{ GlobalPerSecond = {rl.GlobalPerSecond}, GlobalBurstCapacity = {rl.GlobalBurstCapacity}, PerChatPerMinute = {rl.PerChatPerMinute}, PerChatBurstCapacity = {rl.PerChatBurstCapacity} }}"
              + " }";
     }
 }
