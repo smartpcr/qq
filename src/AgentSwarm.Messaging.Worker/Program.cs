@@ -171,9 +171,86 @@ public class Program
             .AddControllers(options =>
             {
                 options.Filters.AddService<SlackAuthorizationFilter>();
-            });
+            })
+
+            // Stage 4.1 iter-2 evaluator item 2: explicitly opt the
+            // Slack controllers' assembly into MVC's application-part
+            // scanner. The three controllers
+            // (SlackEventsController, SlackCommandsController,
+            // SlackInteractionsController) live in the
+            // AgentSwarm.Messaging.Slack assembly, not the Worker's
+            // entry assembly; AddSlackInboundControllers wires the
+            // ApplicationPart so MVC's controller-feature scanner
+            // discovers them deterministically across every host
+            // (Production Worker, WebApplicationFactory<Program>
+            // integration tests, future hosts that reuse Program).
+            // Without this call discovery depends on transitive
+            // assembly-load semantics, which is fragile under
+            // trimming, single-file publish, and AOT.
+            .AddSlackInboundControllers();
+
+        // Stage 4.1: register the three Slack inbound HTTP controllers
+        // (SlackEventsController, SlackCommandsController,
+        // SlackInteractionsController), the SlackInboundEnvelopeFactory
+        // they share, the in-process ChannelBasedSlackInboundQueue
+        // implementation of ISlackInboundQueue, the post-ACK
+        // dead-letter sink, the default modal fast-path handler, and
+        // the no-op interaction fast-path handler. AddSlackInboundTransport
+        // uses TryAdd* throughout so any production override
+        // registered above (e.g. a durable Service Bus
+        // ISlackInboundQueue, a dedicated dead-letter sink) wins.
+        builder.Services.AddSlackInboundTransport();
+
+        // Stage 4.1 (iter-4 evaluator item 1): swap the in-memory
+        // dead-letter sink registered by AddSlackInboundTransport for
+        // the durable file-system sink. The directory is read from
+        // Slack:Inbound:DeadLetterDirectory (defaults to
+        // data/slack-inbound-dead-letter, see appsettings.json) so an
+        // operator can point the JSONL spill at an attached volume or
+        // shared file system without recompiling. Without this call
+        // post-ACK enqueue failures captured before a Worker restart
+        // would vanish along with the in-memory ring buffer, violating
+        // FR-005 / FR-007 "no message loss" from
+        // agent_swarm_messenger_user_stories.md.
+        string inboundDeadLetterDirectory = builder.Configuration
+            .GetValue<string?>("Slack:Inbound:DeadLetterDirectory")
+            ?? "data/slack-inbound-dead-letter";
+        builder.Services.AddFileSystemSlackInboundEnqueueDeadLetterSink(inboundDeadLetterDirectory);
+
+        // Stage 4.3: wire the SlackInboundIngestor BackgroundService
+        // that drains ISlackInboundQueue and runs the idempotency +
+        // authorization + dispatch pipeline asynchronously. The Stage
+        // 4.1 controllers ACK Slack within the 3-second budget and
+        // hand the envelope to the ingestor via the queue; the
+        // ingestor is registered here so the Worker host's composition
+        // root owns the full inbound pipeline end-to-end. The Stage
+        // 5.x command / app-mention / interaction handlers are not
+        // yet implemented in this host, so we explicitly opt into the
+        // development handler stubs to keep the ingestor resolvable;
+        // production deployments replace AddSlackInboundDevelopmentHandlerStubs
+        // with the real handler registrations once Stage 5 ships.
+        builder.Services.AddSlackInboundIngestor<SlackPersistenceDbContext>();
+        builder.Services.AddSlackInboundDevelopmentHandlerStubs();
 
         WebApplication app = builder.Build();
+
+        // Stage 4.1 iter-2 evaluator item 3: fail-fast at host startup
+        // when the resolved ISlackInboundQueue is the in-process
+        // ChannelBasedSlackInboundQueue and the deployment claims to
+        // be Production. The in-process channel does not survive a
+        // pod restart, so allowing Production to boot with it would
+        // silently break FR-005 / FR-007 "no message loss" from
+        // agent_swarm_messenger_user_stories.md. Operators who have
+        // validated that an in-memory queue is acceptable for their
+        // deployment (e.g., a single-instance staging clone) can
+        // bypass the guard by setting
+        // 'Slack:Inbound:Queue:AllowInMemoryInProduction=true'.
+        // Development, Staging, and Testing environments are
+        // unaffected -- the guard is a no-op outside Production so
+        // local dev and CI keep working.
+        app.Services.EnsureDurableInboundQueueForProduction(
+            app.Environment,
+            app.Configuration);
 
         // Stage 3.1: ensure the durable Slack audit schema is provisioned
         // BEFORE the first inbound request. SQLite is the default backing

@@ -179,6 +179,7 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
         {
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
             "--Slack:Signature:PathPrefix=/slack-gateway",
+            $"--{AgentSwarm.Messaging.Slack.Transport.SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
         };
 
         WebApplication app = Program.BuildApp(args);
@@ -237,10 +238,18 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
         // WebApplication.CreateBuilder(args) reads "--Key=Value" CLI
         // overrides into IConfiguration, so this is the cleanest
         // parallel-safe alternative to mutating process-global state
-        // (env vars or CurrentDirectory) per test.
+        // (env vars or CurrentDirectory) per test. The third override
+        // (Slack:Inbound:Queue:AllowInMemoryInProduction=true) opts the
+        // signature-composition tests out of the Stage 4.1 iter-2
+        // evaluator item 3 durability guard: these tests verify
+        // signature / workspace / audit composition shape and run
+        // under the default Production env, intentionally exercising
+        // the in-memory ISlackInboundQueue default. The guard itself
+        // is covered by SlackInboundProductionDurabilityGuardTests.
         return new[]
         {
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
+            $"--{AgentSwarm.Messaging.Slack.Transport.SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
         };
     }
 }
