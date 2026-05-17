@@ -534,7 +534,7 @@ public sealed class CardActionHandlerTests
         harness.QuestionStore.Seed(BuildOpenQuestion());
 
         // First submission completes normally.
-        await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
+        var firstResponse = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
         Assert.Single(harness.Publisher.Published);
         Assert.Single(harness.Audit.Entries);
         Assert.Single(harness.CardManager.Calls);
@@ -543,6 +543,11 @@ public sealed class CardActionHandlerTests
         // Second submission (same actor, same question, same action) hits the dedupe set.
         var response = await harness.Handler.HandleAsync(BuildInvokeTurn("approve"), CancellationToken.None);
         Assert.NotNull(response);
+
+        // Stage 6.2 step 2 contract — duplicate submission returns the PREVIOUS result,
+        // not a generic rejection. The shared response value proves the cached terminal
+        // outcome is replayed.
+        Assert.Equal(firstResponse.Value, response.Value);
 
         // No additional decision event, no additional card update, no additional CAS,
         // no additional audit row — the dedupe layer short-circuits BEFORE any I/O.

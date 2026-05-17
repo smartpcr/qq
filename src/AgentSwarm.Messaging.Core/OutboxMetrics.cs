@@ -113,6 +113,14 @@ public sealed class OutboxMetrics : IDisposable
     /// </summary>
     public void SetPendingCount(long value) => Interlocked.Exchange(ref _pendingCount, value);
 
+    /// <summary>
+    /// Stage 6.3 — read the last <see cref="SetPendingCount"/> value. Exposed so the
+    /// Teams-side <c>OutboxMetricsQueueDepthProvider</c> can mirror the outbox-engine
+    /// depth onto the <c>teams.outbox.queue_depth</c> gauge published by the Teams meter
+    /// without duplicating the underlying counter.
+    /// </summary>
+    public long GetPendingCount() => Interlocked.Read(ref _pendingCount);
+
     /// <inheritdoc />
     public void Dispose() => _meter.Dispose();
 }

@@ -1,6 +1,7 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using AgentSwarm.Messaging.Teams.Security;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
@@ -301,11 +302,21 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     }
 
     /// <inheritdoc />
-    public Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
+    public async Task SendProactiveQuestionAsync(string tenantId, string userId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Stage 6.3 iter-2 — enrichment scope is opened BEFORE argument-cross-check so
+        // even validation-failure logs carry the canonical keys. Method is async (not
+        // sync-returning-Task) so the scope persists across the entire SendQuestionCore
+        // await chain.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: userId);
 
         // Security-relevant consistency guard (iter-2 evaluator feedback #1, #2):
         // refuse to send a question through a tenant / user / scope that does not match
@@ -319,13 +330,13 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         EnsureTenantMatchesQuestion(tenantId, question);
         EnsureScopeUserTargeted(userId, question);
 
-        return SendQuestionCoreAsync(
+        await SendQuestionCoreAsync(
             tenantId,
             question,
             lookupAsync: innerCt => _conversationReferenceStore.GetByInternalUserIdAsync(tenantId, userId, innerCt),
             notFoundFactory: () => ConversationReferenceNotFoundException.ForUser(tenantId, userId, question.QuestionId),
             targetDescription: $"user '{userId}'",
-            ct);
+            ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -433,24 +444,31 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     }
 
     /// <inheritdoc />
-    public Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
+    public async Task SendQuestionToChannelAsync(string tenantId, string channelId, AgentQuestion question, CancellationToken ct)
     {
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Stage 6.3 iter-2 — channel-scoped question enrichment scope.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: tenantId,
+            userId: null);
 
         // Security-relevant consistency guard (iter-2 evaluator feedback #1, #2) —
         // see SendProactiveQuestionAsync for the full rationale.
         EnsureTenantMatchesQuestion(tenantId, question);
         EnsureScopeChannelTargeted(channelId, question);
 
-        return SendQuestionCoreAsync(
+        await SendQuestionCoreAsync(
             tenantId,
             question,
             lookupAsync: innerCt => _conversationReferenceStore.GetByChannelIdAsync(tenantId, channelId, innerCt),
             notFoundFactory: () => ConversationReferenceNotFoundException.ForChannel(tenantId, channelId, question.QuestionId),
             targetDescription: $"channel '{channelId}'",
-            ct);
+            ct).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -87,6 +87,30 @@ public interface IConversationReferenceStore
     Task<IReadOnlyList<TeamsConversationReference>> GetAllActiveAsync(string tenantId, CancellationToken ct);
 
     /// <summary>
+    /// Stage 6.3 — return the <b>total</b> count of active references across <i>all</i>
+    /// tenants. Used by <c>ConversationReferenceStoreHealthCheck</c> to report the real
+    /// store population (per the §6.3 brief: "verify database connectivity AND reference
+    /// count"). A tenant-scoped variant (<see cref="GetAllActiveAsync"/>) is not suitable
+    /// for the health check because it requires picking an arbitrary tenant that may not
+    /// have any active references — leading to false-zero counts.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The default interface implementation returns <c>-1</c> as a sentinel meaning
+    /// "store does not support a cheap aggregate count" so existing test doubles and
+    /// alternative implementations compile without modification — the health check
+    /// interprets a negative value as "count not available" and reports only
+    /// reachability. Production stores (the <c>SqlConversationReferenceStore</c> in the
+    /// <c>AgentSwarm.Messaging.Teams.EntityFrameworkCore</c> assembly)
+    /// override this with a real <c>SELECT COUNT(*) WHERE IsActive = 1</c> query.
+    /// </para>
+    /// </remarks>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The total count of active references, or <c>-1</c> if the store does not
+    /// expose an aggregate count.</returns>
+    Task<long> CountActiveAsync(CancellationToken ct) => Task.FromResult(-1L);
+
+    /// <summary>
     /// Check whether the personal-scope reference for <paramref name="aadObjectId"/> exists
     /// and is currently active.
     /// </summary>

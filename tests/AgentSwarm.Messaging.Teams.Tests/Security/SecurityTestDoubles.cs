@@ -25,6 +25,9 @@ internal static class SecurityTestDoubles
     {
         public List<(string OutboxEntryId, string Error)> DeadLettered { get; } = new();
         public List<OutboxEntry> Enqueued { get; } = new();
+        public List<(string OutboxEntryId, OutboxDeliveryReceipt Receipt)> Acknowledged { get; } = new();
+        public List<(string OutboxEntryId, OutboxDeliveryReceipt Receipt)> ReceiptsRecorded { get; } = new();
+        public List<(string OutboxEntryId, DateTimeOffset NextRetryAt, string Error)> Rescheduled { get; } = new();
         public Exception? DeadLetterThrow { get; set; }
 
         public Task EnqueueAsync(OutboxEntry entry, CancellationToken ct)
@@ -104,6 +107,21 @@ internal static class SecurityTestDoubles
         /// <summary>If set, <see cref="GetAllActiveAsync"/> throws this exception — used to drive the unhealthy-store path.</summary>
         public Exception? GetAllActiveAsyncThrow { get; set; }
 
+        /// <summary>
+        /// Stage 6.3 — explicit result for <see cref="CountActiveAsync"/>; when null the
+        /// stub mirrors <see cref="ActiveSnapshot"/>.Count (so existing happy-path tests
+        /// that pre-load <see cref="ActiveSnapshot"/> continue to assert a real count
+        /// without needing to wire a second field).
+        /// </summary>
+        public long? CountActiveResult { get; set; }
+
+        /// <summary>
+        /// Stage 6.3 — if set, <see cref="CountActiveAsync"/> throws this exception; used
+        /// to drive the "database unreachable" health-check scenario directly through the
+        /// new count probe.
+        /// </summary>
+        public Exception? CountActiveAsyncThrow { get; set; }
+
         public Task<bool> IsActiveByInternalUserIdAsync(string tenantId, string internalUserId, CancellationToken ct)
         {
             UserProbeCalls.Add((tenantId, internalUserId));
@@ -126,6 +144,16 @@ internal static class SecurityTestDoubles
             }
 
             return Task.FromResult(ActiveSnapshot);
+        }
+
+        public Task<long> CountActiveAsync(CancellationToken ct)
+        {
+            if (CountActiveAsyncThrow is not null)
+            {
+                throw CountActiveAsyncThrow;
+            }
+
+            return Task.FromResult(CountActiveResult ?? ActiveSnapshot.Count);
         }
 
         public Task SaveOrUpdateAsync(TeamsConversationReference reference, CancellationToken ct)
