@@ -50,6 +50,12 @@ public sealed class TelegramTestFixtureHelperTests
                 Chat = new Chat { Id = 8001L, Type = ChatType.Private },
                 From = new User { Id = 9001L, IsBot = false, FirstName = "Operator" },
                 Text = "/status",
+                // Telegram never delivers a Message without a Date; setting
+                // an explicit UTC value here prevents the default
+                // DateTime.MinValue from flowing into the polling-stage
+                // TelegramUpdateMapper.ToUtc (which keys MessengerEvent.Timestamp
+                // off message.Date) when Stage 7.2 reuses this pattern.
+                Date = new DateTime(2025, 1, 15, 12, 0, 0, DateTimeKind.Utc),
             },
         };
 
@@ -78,6 +84,12 @@ public sealed class TelegramTestFixtureHelperTests
                 Chat = new Chat { Id = 8002L, Type = ChatType.Private },
                 From = new User { Id = 9002L, IsBot = false, FirstName = "Operator" },
                 Text = "/ping",
+                // Telegram never delivers a Message without a Date; setting
+                // an explicit UTC value here prevents the default
+                // DateTime.MinValue from flowing into the polling-stage
+                // TelegramUpdateMapper.ToUtc (which keys MessengerEvent.Timestamp
+                // off message.Date) when Stage 7.2 reuses this pattern.
+                Date = new DateTime(2025, 1, 15, 12, 0, 0, DateTimeKind.Utc),
             },
         };
 
