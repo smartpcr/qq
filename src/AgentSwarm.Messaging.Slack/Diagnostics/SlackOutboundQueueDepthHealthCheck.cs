@@ -40,6 +40,15 @@ using Microsoft.Extensions.Options;
 /// returns <c>Healthy</c> with <c>data["depth"] = null</c> so the
 /// readiness signal stays positive rather than spuriously degrading.
 /// </para>
+/// <para>
+/// If <see cref="ISlackOutboundQueueDepthProbe.GetCurrentDepth"/>
+/// throws, the check returns <c>Degraded</c> (not <c>Healthy</c>) so
+/// that genuine queue infrastructure failures are surfaced in the
+/// structured readiness payload. <c>Degraded</c> still maps to
+/// HTTP&#160;200 so the pod stays in Kubernetes rotation while the
+/// failure becomes visible to operators and alerting through
+/// <c>status=Degraded</c> and the <c>probe_error</c> data entry.
+/// </para>
 /// </remarks>
 internal sealed class SlackOutboundQueueDepthHealthCheck : IHealthCheck
 {
@@ -93,16 +102,18 @@ internal sealed class SlackOutboundQueueDepthHealthCheck : IHealthCheck
         {
             this.logger.LogWarning(
                 ex,
-                "Slack outbound-queue depth probe threw; treating as Healthy to avoid spurious degradation.");
-            return Task.FromResult(HealthCheckResult.Healthy(
-                description: $"Outbound queue depth probe threw {ex.GetType().Name}; treating as Healthy.",
-                data: new Dictionary<string, object?>
+                "Slack outbound-queue depth probe threw; reporting Degraded so the readiness payload surfaces the probe failure to operators.");
+            return Task.FromResult(HealthCheckResult.Degraded(
+                description: $"Outbound queue depth probe threw {ex.GetType().Name}; reporting Degraded so the failure is visible in the readiness payload.",
+                exception: ex,
+                data: new Dictionary<string, object>
                 {
                     ["threshold"] = threshold,
-                    ["depth"] = null,
-                    ["queue_type"] = this.queue.GetType().FullName,
+                    ["depth"] = null!,
+                    ["queue_type"] = (object?)this.queue.GetType().FullName ?? this.queue.GetType().Name,
                     ["probe_error"] = ex.Message,
-                }!));
+                    ["probe_error_type"] = ex.GetType().FullName ?? ex.GetType().Name,
+                }));
         }
 
         if (depth < 0)
