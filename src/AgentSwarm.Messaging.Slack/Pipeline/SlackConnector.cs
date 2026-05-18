@@ -83,6 +83,17 @@ using Microsoft.Extensions.Options;
 /// "Slack accepted the message". Audit failures are swallowed (logged
 /// only) so a transient audit-write blip never breaks the send.
 /// </para>
+/// <para>
+/// <b>Clock source.</b> The audit row's <see cref="SlackAuditEntry.Timestamp"/>
+/// is stamped from the injected <see cref="TimeProvider"/> -- the same
+/// clock <c>AddMessagingCore</c> registers (via <c>TryAddSingleton</c>)
+/// so a test composition root that swaps in a fake time source
+/// (e.g., <c>FakeTimeProvider</c>) observes deterministic timestamps
+/// on connector-emitted audit rows, matching the rest of the Slack
+/// pipeline (e.g., <see cref="SlackOutboundDispatcher"/>). Calling
+/// <see cref="DateTimeOffset.UtcNow"/> here would silently bypass the
+/// fake and defeat the testability guarantee.
+/// </para>
 /// </remarks>
 internal sealed class SlackConnector : IMessengerConnector
 {
@@ -114,17 +125,56 @@ internal sealed class SlackConnector : IMessengerConnector
     private readonly ISlackMessageRenderer renderer;
     private readonly IOptionsMonitor<SlackOutboundOptions> outboundOptions;
     private readonly ILogger<SlackConnector> logger;
+    private readonly TimeProvider timeProvider;
 
+    /// <summary>
+    /// Initializes a new <see cref="SlackConnector"/> using the
+    /// canonical wall-clock <see cref="TimeProvider.System"/>. This
+    /// is the constructor invoked by direct <c>new</c> callers (e.g.,
+    /// tests that exercise the connector without a DI container);
+    /// production wiring always goes through DI, which prefers the
+    /// internal 5-argument constructor below so a DI-registered
+    /// override (real clock today, fake clock under test) propagates
+    /// to every <see cref="SlackAuditEntry.Timestamp"/> emitted here.
+    /// </summary>
     public SlackConnector(
         SlackConnectorComponents components,
         ISlackMessageRenderer renderer,
         IOptionsMonitor<SlackOutboundOptions> outboundOptions,
         ILogger<SlackConnector> logger)
+        : this(
+            components,
+            renderer,
+            outboundOptions,
+            logger,
+            TimeProvider.System)
+    {
+    }
+
+    /// <summary>
+    /// Full-dependency constructor preferred by
+    /// <c>Microsoft.Extensions.DependencyInjection</c> (which selects
+    /// the ctor with the most resolvable parameters). The Stage 8.1
+    /// composition root registers <see cref="TimeProvider"/> via
+    /// <c>AddMessagingCore</c> as a <c>TryAddSingleton</c>, so a test
+    /// fixture that pre-registers a fake <see cref="TimeProvider"/>
+    /// (e.g., <c>FakeTimeProvider</c>) sees its instance flow into
+    /// every <see cref="WriteConnectorSendAuditAsync"/> call -- the
+    /// guarantee that motivated bundling the connector behind DI in
+    /// the first place.
+    /// </summary>
+    internal SlackConnector(
+        SlackConnectorComponents components,
+        ISlackMessageRenderer renderer,
+        IOptionsMonitor<SlackOutboundOptions> outboundOptions,
+        ILogger<SlackConnector> logger,
+        TimeProvider timeProvider)
     {
         this.components = components ?? throw new ArgumentNullException(nameof(components));
         this.renderer = renderer ?? throw new ArgumentNullException(nameof(renderer));
         this.outboundOptions = outboundOptions ?? throw new ArgumentNullException(nameof(outboundOptions));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
     }
 
     /// <inheritdoc />
@@ -266,7 +316,7 @@ internal sealed class SlackConnector : IMessengerConnector
             ResponsePayload = payload,
             Outcome = "success",
             ErrorDetail = null,
-            Timestamp = DateTimeOffset.UtcNow,
+            Timestamp = this.timeProvider.GetUtcNow(),
         };
 
         try
