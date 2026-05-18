@@ -315,11 +315,12 @@ public sealed class FileAuditFallbackSink : IAuditFallbackSink, IDisposable
             if (currentLength + bytes.LongLength > _maxFileBytes)
             {
                 _logger.LogCritical(
-                    "FileAuditFallbackSink REFUSED to persist audit fallback row to {FilePath}: current file size {CurrentBytes} bytes plus new row of {NewBytes} bytes would exceed the configured size cap of {MaxBytes} bytes. Both the primary audit DB AND the durable file-backed fallback are now unavailable for new rows — operator MUST rotate, replay, or truncate {FilePath} before further rejection audit rows can be persisted. (Letting the file grow unbounded would fill the local disk and crash the host process, taking the primary audit path with it.)",
+                    "FileAuditFallbackSink REFUSED to persist audit fallback row to {FilePath}: current file size {CurrentBytes} bytes plus new row of {NewBytes} bytes would exceed the configured size cap of {MaxBytes} bytes. Both the primary audit DB AND the durable file-backed fallback are now unavailable for new rows — operator MUST rotate, replay, or truncate {FilePathToRotate} before further rejection audit rows can be persisted. (Letting the file grow unbounded would fill the local disk and crash the host process, taking the primary audit path with it.)",
                     _filePath,
                     currentLength,
                     bytes.LongLength,
-                    _maxFileBytes);
+                    _maxFileBytes,
+                    _filePath);
 
                 throw new AuditFallbackCapacityExceededException(
                     _filePath,

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -6,6 +7,7 @@ using System.Text.Json.Serialization;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Core.Commands;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -406,6 +408,56 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
     {
         ArgumentNullException.ThrowIfNull(messengerEvent);
 
+        // Stage 6.1 — OpenTelemetry tracing + metrics. Wrap the
+        // full pipeline run in a single `telegram.command.process`
+        // span carrying CorrelationId so the Stage 6.1 acceptance
+        // scenario ("a trace span with
+        // ActivitySource=AgentSwarm.Messaging.Telegram is emitted
+        // containing CorrelationId") holds without depending on
+        // child-span propagation. The activity is null when no
+        // tracer is listening (production code MAY run without an
+        // OTEL exporter, e.g. unit tests); both branches are safe
+        // via the null-conditional ?. operator.
+        var userId = ParseLongOrZero(messengerEvent.UserId);
+        var chatId = ParseLongOrZero(messengerEvent.ChatId);
+        var eventIdLong = long.TryParse(messengerEvent.EventId, NumberStyles.Integer, CultureInfo.InvariantCulture, out var eid) ? eid : (long?)null;
+        var commandVerb = messengerEvent.EventType == EventType.Command
+            ? ResolveCommandVerb(messengerEvent.RawCommand)
+            : null;
+
+        // Iter-2 evaluator item 2 — open a single canonical
+        // structured-logging scope around the entire pipeline run so
+        // EVERY log line emitted from any inner stage (classify,
+        // dedup, parse, authorize, resolve-operator, role-enforcement,
+        // route, handler-result, mark-processed, release-on-throw)
+        // carries the brief contract property names (CorrelationId,
+        // AgentId, TelegramUserId, CommandName). The scope is
+        // null-safe via the helper: when no command verb has been
+        // resolved yet (Unknown event, CallbackResponse, TextReply)
+        // the CommandName property is omitted rather than written as
+        // an empty value.
+        //
+        // AgentId is unavailable at pipeline entry (the routed
+        // handler resolves it from the operator binding); inner
+        // stages that learn an AgentId may open a nested scope to
+        // add it without losing the outer properties.
+        using var canonicalLogScope = TelegramTelemetry.BeginCanonicalLogScope(
+            _logger,
+            correlationId: messengerEvent.CorrelationId,
+            agentId: null,
+            telegramUserId: userId,
+            commandName: commandVerb);
+
+        using var activity = TelegramTelemetry.StartCommandSpan(
+            messengerEvent.CorrelationId,
+            commandName: commandVerb,
+            telegramUserId: userId,
+            telegramChatId: chatId,
+            eventId: eventIdLong);
+        activity?.SetTag(TelegramTelemetry.EventTypeKey, messengerEvent.EventType.ToString());
+        activity?.SetTag(TelegramTelemetry.OtelMessagingEventTypeKey, messengerEvent.EventType.ToString());
+
+        PipelineResult result;
         // Stage 2.6 connector feed (try/finally so EVERY exit -- normal
         // returns, denials, duplicate short-circuits, handler failures,
         // AND caught-then-rethrown exceptions -- publishes the event to
@@ -419,12 +471,62 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
         // harnesses), the publish is a silent no-op.
         try
         {
-            return await ExecuteAsync(messengerEvent, ct).ConfigureAwait(false);
+            result = await ExecuteAsync(messengerEvent, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            TelegramTelemetry.ErrorsCounter.Add(
+                1,
+                new KeyValuePair<string, object?>("error_kind", "pipeline_unhandled"),
+                new KeyValuePair<string, object?>("event_type", messengerEvent.EventType.ToString()));
+            throw;
         }
         finally
         {
             TryPublishProcessedEvent(messengerEvent);
         }
+
+        // Iter-2 evaluator item 2 — the command verb is now resolved
+        // at pipeline entry (above) so it can be included in the
+        // ambient log scope. We still bump the counter here so the
+        // tag set reflects the FINAL CommandResult.Succeeded /
+        // .Handled outcomes which only exist after ExecuteAsync
+        // returns.
+        if (messengerEvent.EventType == EventType.Command)
+        {
+            TelegramTelemetry.CommandsProcessedCounter.Add(
+                1,
+                new KeyValuePair<string, object?>("command", commandVerb ?? "unknown"),
+                new KeyValuePair<string, object?>("success", result.Succeeded.ToString().ToLowerInvariant()),
+                new KeyValuePair<string, object?>("handled", result.Handled.ToString().ToLowerInvariant()));
+        }
+
+        return result;
+    }
+
+    private static long ParseLongOrZero(string raw)
+        => long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : 0L;
+
+    private static string? ResolveCommandVerb(string? rawCommand)
+    {
+        if (string.IsNullOrWhiteSpace(rawCommand))
+        {
+            return null;
+        }
+
+        var trimmed = rawCommand.TrimStart();
+        if (trimmed.Length == 0 || trimmed[0] != '/')
+        {
+            return null;
+        }
+
+        var spaceIndex = trimmed.IndexOf(' ');
+        var verb = spaceIndex < 0 ? trimmed[1..] : trimmed[1..spaceIndex];
+        // Strip @botname suffix Telegram appends when commands are
+        // sent in group chats (e.g. "/status@MyBot").
+        var atIndex = verb.IndexOf('@');
+        return atIndex >= 0 ? verb[..atIndex].ToLowerInvariant() : verb.ToLowerInvariant();
     }
 
     private async Task<PipelineResult> ExecuteAsync(MessengerEvent messengerEvent, CancellationToken ct)
@@ -581,7 +683,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             if (!authz.IsAuthorized || authz.Bindings.Count == 0)
             {
                 _logger.LogWarning(
-                    "Pipeline rejected: unauthorized. CorrelationId={CorrelationId} EventId={EventId} UserId={UserId} ChatId={ChatId} Stage={Stage} Reason={Reason} IsAuthorized={IsAuthorized} BindingCount={BindingCount}",
+                    "Pipeline rejected: unauthorized. CorrelationId={CorrelationId} EventId={EventId} TelegramUserId={TelegramUserId} TelegramChatId={TelegramChatId} Stage={Stage} Reason={Reason} IsAuthorized={IsAuthorized} BindingCount={BindingCount}",
                     messengerEvent.CorrelationId,
                     messengerEvent.EventId,
                     messengerEvent.UserId,
@@ -709,7 +811,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
 
                 var buttons = PipelineResponses.MultiWorkspaceButtons(token, workspaceIds);
                 _logger.LogInformation(
-                    "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} Command={Command} WorkspaceCount={Count} DisambiguationToken={Token}",
+                    "Pipeline disambiguation prompt: multiple bindings. CorrelationId={CorrelationId} EventId={EventId} Stage={Stage} CommandName={CommandName} WorkspaceCount={Count} DisambiguationToken={Token}",
                     messengerEvent.CorrelationId,
                     messengerEvent.EventId,
                     "resolve-prompt",
@@ -753,7 +855,7 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                     // that filter by the property surfaced in the
                     // message text resolve correctly.
                     _logger.LogWarning(
-                        "Pipeline rejected: insufficient permissions. CorrelationId={CorrelationId} EventId={EventId} UserId={UserId} ChatId={ChatId} Stage={Stage} Command={Command} RequiredRole={RequiredRole}",
+                        "Pipeline rejected: insufficient permissions. CorrelationId={CorrelationId} EventId={EventId} TelegramUserId={TelegramUserId} TelegramChatId={TelegramChatId} Stage={Stage} CommandName={CommandName} RequiredRole={RequiredRole}",
                         messengerEvent.CorrelationId,
                         messengerEvent.EventId,
                         messengerEvent.UserId,

@@ -1,6 +1,7 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Core.Commands;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using AgentSwarm.Messaging.Telegram.Polling;
@@ -10,6 +11,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Http.Logging;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
 
@@ -127,7 +129,33 @@ public static class TelegramServiceCollectionExtensions
 
         services.AddSingleton<IValidateOptions<TelegramOptions>, TelegramOptionsValidator>();
 
-        services.AddHttpClient(TelegramBotClientFactory.HttpClientName);
+        // Stage 6.1 -- the Telegram Bot API embeds the bearer bot
+        // token in the URL path (`/bot{TOKEN}/sendMessage`). The
+        // default Microsoft.Extensions.Http logging handlers
+        // (LoggingHttpMessageHandler + LoggingScopeHttpMessageHandler)
+        // log "Start processing HTTP request {Method} {Uri}" at
+        // Information level and would write that token verbatim to
+        // every operator's logs -- a direct violation of the brief's
+        // "Token excluded from logs" acceptance scenario.
+        //
+        // RemoveAllLoggers() strips BOTH default handlers; AddLogger
+        // attaches our RedactingHttpClientLogger which mirrors the
+        // start/stop/failed log shape but runs every URL through
+        // TelegramHttpRedactor.Redact before formatting. The pairing
+        // is load-bearing: without RemoveAllLoggers first, the
+        // defaults would still emit the raw URL alongside our
+        // redacted line.
+        //
+        // AddLogger<TLogger> resolves TLogger via the service
+        // provider on every HTTP message handler build, so the
+        // logger MUST be registered separately. Transient mirrors the
+        // lifetime contract of the default Microsoft.Extensions.Http
+        // logging handlers (one per pipeline build); the logger has
+        // no per-request state so the choice is safe.
+        services.TryAddTransient<RedactingHttpClientLogger>();
+        services.AddHttpClient(TelegramBotClientFactory.HttpClientName)
+            .RemoveAllLoggers()
+            .AddLogger<RedactingHttpClientLogger>();
 
         services.AddSingleton<TelegramBotClientFactory>();
 

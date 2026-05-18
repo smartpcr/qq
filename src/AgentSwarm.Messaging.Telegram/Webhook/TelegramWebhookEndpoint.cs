@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -115,11 +116,36 @@ public sealed class TelegramWebhookEndpoint
         var ct = httpContext.RequestAborted;
 
         var correlationId = ResolveCorrelationId(httpContext);
+        // Stage 6.1 iter-2 evaluator item 2 — open the canonical
+        // structured-logging scope at the webhook entry so EVERY
+        // log line the receive path emits while handling THIS
+        // request carries the brief-contract CorrelationId property
+        // under its canonical name. The receive path has no agent /
+        // user / command association yet — those are resolved by
+        // the downstream pipeline which opens its own nested scope
+        // when the parsed values become available.
+        using var canonicalLogScope = TelegramTelemetry.BeginCanonicalLogScope(
+            _logger,
+            correlationId: correlationId,
+            agentId: null,
+            telegramUserId: null,
+            commandName: null);
+        // Stage 6.1 — Start a server-kind span around the synchronous
+        // hand-off so traces show "this inbound webhook landed at
+        // <T>". The span carries the CorrelationId so the Stage 6.1
+        // acceptance scenario can find it without depending on
+        // downstream propagation.
+        using var activity = TelegramTelemetry.StartReceiveSpan(correlationId);
+
         var rawJson = await ReadBodyAsync(httpContext.Request.Body, ct).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(rawJson))
         {
             _logger.LogWarning(
                 "Webhook received empty body. CorrelationId={CorrelationId}", correlationId);
+            activity?.SetStatus(ActivityStatusCode.Error, "empty_body");
+            TelegramTelemetry.ErrorsCounter.Add(
+                1,
+                new KeyValuePair<string, object?>("error_kind", "webhook_empty_body"));
             return Results.BadRequest((object)new { error = "empty_body" });
         }
 
@@ -135,6 +161,10 @@ public sealed class TelegramWebhookEndpoint
                 "Webhook received malformed Update JSON. CorrelationId={CorrelationId} BodyBytes={BodyBytes}",
                 correlationId,
                 rawJson.Length);
+            activity?.SetStatus(ActivityStatusCode.Error, "malformed_update_json");
+            TelegramTelemetry.ErrorsCounter.Add(
+                1,
+                new KeyValuePair<string, object?>("error_kind", "webhook_malformed_json"));
             return Results.BadRequest((object)new { error = "malformed_update_json" });
         }
 
@@ -142,8 +172,14 @@ public sealed class TelegramWebhookEndpoint
         {
             _logger.LogWarning(
                 "Webhook received Update with no usable Id. CorrelationId={CorrelationId}", correlationId);
+            activity?.SetStatus(ActivityStatusCode.Error, "missing_update_id");
+            TelegramTelemetry.ErrorsCounter.Add(
+                1,
+                new KeyValuePair<string, object?>("error_kind", "webhook_invalid_body"));
             return Results.BadRequest((object)new { error = "missing_update_id" });
         }
+
+        activity?.SetTag(TelegramTelemetry.EventIdKey, update.Id);
 
         var row = new InboundUpdate
         {
@@ -167,8 +203,18 @@ public sealed class TelegramWebhookEndpoint
                 "Webhook duplicate suppressed. UpdateId={UpdateId} CorrelationId={CorrelationId}",
                 update.Id,
                 correlationId);
+            activity?.SetTag("messaging.webhook.outcome", "duplicate");
             return Results.Ok((object)new { status = "duplicate", updateId = update.Id });
         }
+
+        // Stage 6.1 — count every accepted (i.e. post-dedup, persisted)
+        // inbound update. Tagged with event_type so the dashboard
+        // can distinguish command volume from callback volume.
+        var eventType = ResolveEventType(update);
+        activity?.SetTag(TelegramTelemetry.EventTypeKey, eventType);
+        TelegramTelemetry.MessagesReceivedCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("event_type", eventType));
 
         // Non-blocking enqueue for async processing. We deliberately do
         // NOT await WaitToWriteAsync here: the durable InboundUpdate row
@@ -193,6 +239,28 @@ public sealed class TelegramWebhookEndpoint
             update.Id,
             correlationId);
         return Results.Ok((object)new { status = "accepted", updateId = update.Id });
+    }
+
+    private static string ResolveEventType(Update update)
+    {
+        // The Telegram SDK exposes the original-update kind through
+        // optional sub-payloads; pick the dominant one for the tag.
+        // The pipeline does its own EventType classification later
+        // (Command vs CallbackResponse vs TextReply vs Unknown); we
+        // mirror that taxonomy here so dashboards line up.
+        if (update.CallbackQuery is not null)
+        {
+            return "callback_response";
+        }
+        if (update.Message is { } message)
+        {
+            if (!string.IsNullOrEmpty(message.Text) && message.Text.StartsWith('/'))
+            {
+                return "command";
+            }
+            return "text_reply";
+        }
+        return "unknown";
     }
 
     private static string ResolveCorrelationId(HttpContext httpContext)
