@@ -5,12 +5,12 @@ using Microsoft.Extensions.Options;
 namespace AgentSwarm.Messaging.Tests;
 
 /// <summary>
-/// Stage 2.4 — webhook-mode validation rules added to
+/// Stage 2.4 -- webhook-mode validation rules added to
 /// <see cref="TelegramOptionsValidator"/>. The Stage 2.1 tests in
 /// <see cref="TelegramOptionsTests"/> cover the original BotToken
 /// guard; this file pins the two new rules required by the
 /// "Authentication" and "Security" rows of the story brief and by
-/// architecture.md §7.1:
+/// architecture.md section 7.1:
 ///   * Webhook mode requires <c>Telegram:SecretToken</c>.
 ///   * Webhook and polling are mutually exclusive.
 /// </summary>
@@ -113,7 +113,7 @@ public class TelegramOptionsValidatorWebhookTests
     public void NoReceiveMode_IsAllowed_ForUnitTestsAndCi()
     {
         // It is legitimate to register Telegram services with neither
-        // webhook URL nor polling enabled — that's the shape used by
+        // webhook URL nor polling enabled -- that's the shape used by
         // integration tests and CI smoke runs that only need the bot
         // client + pipeline without an actual receive loop. The
         // validator must not reject this shape.
@@ -132,7 +132,7 @@ public class TelegramOptionsValidatorWebhookTests
     }
 
     // ============================================================
-    // Iter-5 evaluator feedback item 2 — Telegram Bot API webhooks
+    // Iter-5 evaluator feedback item 2 -- Telegram Bot API webhooks
     // are HTTPS-only. The validator must reject non-https schemes
     // and non-absolute URIs at host startup so the operator gets a
     // clear OptionsValidationException at boot rather than a
@@ -205,6 +205,7 @@ public class TelegramOptionsValidatorWebhookTests
     public void OperatorBindings_BlankTenantId_Fails()
     {
         var validator = new TelegramOptionsValidator();
+#pragma warning disable CS0618
         var options = new TelegramOptions
         {
             BotToken = SampleToken,
@@ -220,6 +221,7 @@ public class TelegramOptionsValidatorWebhookTests
                 },
             },
         };
+#pragma warning restore CS0618
 
         var result = validator.Validate(Options.DefaultName, options);
 
@@ -231,6 +233,7 @@ public class TelegramOptionsValidatorWebhookTests
     public void OperatorBindings_BlankWorkspaceId_Fails()
     {
         var validator = new TelegramOptionsValidator();
+#pragma warning disable CS0618
         var options = new TelegramOptions
         {
             BotToken = SampleToken,
@@ -246,6 +249,7 @@ public class TelegramOptionsValidatorWebhookTests
                 },
             },
         };
+#pragma warning restore CS0618
 
         var result = validator.Validate(Options.DefaultName, options);
 
@@ -257,6 +261,7 @@ public class TelegramOptionsValidatorWebhookTests
     public void OperatorBindings_AllValid_Succeeds()
     {
         var validator = new TelegramOptionsValidator();
+#pragma warning disable CS0618
         var options = new TelegramOptions
         {
             BotToken = SampleToken,
@@ -272,6 +277,7 @@ public class TelegramOptionsValidatorWebhookTests
                 },
             },
         };
+#pragma warning restore CS0618
 
         var result = validator.Validate(Options.DefaultName, options);
 
@@ -282,7 +288,7 @@ public class TelegramOptionsValidatorWebhookTests
     public void MultipleFailures_AllAppearInFailureMessage()
     {
         // Catch regressions where the validator short-circuits on the
-        // first failure and hides downstream issues — the operator
+        // first failure and hides downstream issues -- the operator
         // should see every problem at once.
         var validator = new TelegramOptionsValidator();
         var options = new TelegramOptions
@@ -301,7 +307,7 @@ public class TelegramOptionsValidatorWebhookTests
     }
 
     // ============================================================
-    // Iter-1 evaluator feedback item 6 — RateLimitOptions must be
+    // Iter-1 evaluator feedback item 6 -- RateLimitOptions must be
     // validated at host startup instead of being silently clamped
     // by TokenBucketTelegramRateLimiter's prior Math.Max(1, ...)
     // guards. TokenBucketTelegramRateLimiterTests pins the ctor
@@ -342,7 +348,7 @@ public class TelegramOptionsValidatorWebhookTests
         var result = validator.Validate(Options.DefaultName, options);
 
         result.Failed.Should().BeTrue(
-            "non-positive rate-limit knobs must fail validation at host startup — silently clamping would mask the misconfiguration and degrade the §10.4 SLO envelope");
+            "non-positive rate-limit knobs must fail validation at host startup -- silently clamping would mask the misconfiguration and degrade the section 10.4 SLO envelope");
         result.FailureMessage.Should().Contain(expectedFieldInMessage,
             "the failure message must name the misconfigured field so the operator can fix it without reading source");
     }
@@ -352,7 +358,7 @@ public class TelegramOptionsValidatorWebhookTests
     {
         // Defense-in-depth: the default RateLimitOptions instance
         // (created via the property initialiser on TelegramOptions)
-        // must remain valid — otherwise every fresh TelegramOptions
+        // must remain valid -- otherwise every fresh TelegramOptions
         // would trip the validator on first boot.
         var validator = new TelegramOptionsValidator();
         var options = new TelegramOptions

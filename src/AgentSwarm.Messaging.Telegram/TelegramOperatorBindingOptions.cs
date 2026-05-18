@@ -21,21 +21,29 @@ namespace AgentSwarm.Messaging.Telegram;
 /// must use when emitting downstream events.
 /// </para>
 /// <para>
+/// <b>Stage 5.2 iter-4 retirement note.</b>
+/// <see cref="TelegramOptions.OperatorBindings"/> is now
+/// <see cref="ObsoleteAttribute"/>: the iter-5
+/// <c>ConfiguredOperatorAuthorizationService</c> that consumed it has
+/// been deleted in favour of the registry-backed
+/// <see cref="Auth.TelegramUserAuthorizationService"/> (Stage 3.4),
+/// and runtime bindings now live in the persistent
+/// <see cref="Core.IOperatorRegistry"/>. The same
+/// <see cref="TelegramOperatorBindingOptions"/> shape is still used by
+/// <see cref="TelegramOptions.DevOperators"/> (consumed by
+/// <see cref="Swarm.StubOperatorRegistry"/>) so the type remains
+/// non-obsolete.
+/// </para>
+/// <para>
 /// <b>Configuration shape.</b> Bindings are an ordered array under
-/// <c>Telegram:OperatorBindings</c>. The authorization service
-/// (<see cref="Auth.ConfiguredOperatorAuthorizationService"/>) returns
-/// <b>every</b> binding whose (<see cref="TelegramUserId"/>,
-/// <see cref="TelegramChatId"/>) pair matches the inbound update, in
-/// configuration order; the pipeline then prompts for workspace
-/// disambiguation when more than one binding matches (architecture.md
-/// §6.3 multi-workspace routing). Operators add or rotate bindings
-/// via Key Vault / environment variables / user-secrets — the same
-/// configuration channels as the bot token — so binding updates do
-/// not require a redeploy. To intentionally route a single (user,
-/// chat) pair to a single workspace, configure exactly one matching
-/// entry; to enable disambiguation across N workspaces, configure N
-/// entries with distinct
-/// <see cref="TenantId"/>/<see cref="WorkspaceId"/> values.
+/// <c>Telegram:OperatorBindings</c>. Entries are validated for
+/// non-blank tenant/workspace by
+/// <see cref="TelegramOptionsValidator"/> at startup but have no
+/// behavioural runtime consumer; deployments that need per-(user,
+/// chat) authorization should configure the persistent
+/// <see cref="Core.IOperatorRegistry"/> via
+/// <c>Telegram:UserTenantMappings</c> + the Stage 3.4 onboarding
+/// flow.
 /// </para>
 /// <example>
 /// <code language="json">
@@ -66,7 +74,7 @@ public sealed class TelegramOperatorBindingOptions
     /// <summary>
     /// Telegram chat id this binding authorizes. Required; must be the
     /// numeric Telegram chat id (negative for groups/supergroups,
-    /// positive for private chats — Telegram convention). The
+    /// positive for private chats -- Telegram convention). The
     /// authorization service rejects requests where the inbound chat
     /// id does not match a configured binding for the inbound user
     /// id, satisfying the "Validate chat/user allowlist before
@@ -77,7 +85,7 @@ public sealed class TelegramOperatorBindingOptions
     /// <summary>
     /// Tenant id surfaced on the <see cref="Core.OperatorBinding"/>
     /// returned by the authorization service. Required and must be
-    /// non-blank — pipelines route work to a tenant boundary, so a
+    /// non-blank -- pipelines route work to a tenant boundary, so a
     /// blank tenant id would silently coalesce all bindings into one
     /// tenant. Validated at startup by
     /// <see cref="TelegramOptionsValidator"/>.
@@ -104,7 +112,7 @@ public sealed class TelegramOperatorBindingOptions
     /// <see cref="Core.OperatorBinding.Roles"/>. The pipeline's command
     /// handlers consult these to enforce per-command authorization
     /// (e.g. <c>/approve</c> requires <c>"approver"</c>). Empty when
-    /// not configured — equivalent to "operator with no extra
+    /// not configured -- equivalent to "operator with no extra
     /// privileges".
     /// </summary>
     public List<string> Roles { get; set; } = new();
