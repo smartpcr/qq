@@ -1,3 +1,4 @@
+using AdaptiveCards;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
 using Newtonsoft.Json.Linq;
@@ -267,6 +268,129 @@ public sealed class AdaptiveCardBuilderTests
         Assert.Throws<ArgumentNullException>(() => renderer.RenderQuestionCard(null!));
     }
 
+    /// <summary>
+    /// Full coverage of the <c>AdaptiveCardBuilder.SeverityToContainerStyle</c> switch
+    /// expression (AdaptiveCardBuilder.cs:387–397) — the severity-to-container-style
+    /// table that drives the visual treatment of every severity header on question,
+    /// incident, and release-gate cards. Prior to this iteration only the
+    /// <see cref="MessageSeverities.Critical"/> branch was exercised (via
+    /// <c>RenderQuestionCard_SeverityCritical_RendersAttentionStyledHeader</c>), leaving
+    /// the <see cref="MessageSeverities.Error"/>, <see cref="MessageSeverities.Warning"/>,
+    /// <see cref="MessageSeverities.Info"/>, and <c>_ =&gt; Default</c> fallback branches
+    /// uncovered. The fallback branch matters for forward-compat: if a future
+    /// orchestrator emits a severity outside <see cref="MessageSeverities.All"/> (or
+    /// if an older record is replayed during a migration), the card must still
+    /// render with a non-explicit container style rather than throwing. We exercise
+    /// this through <see cref="IAdaptiveCardRenderer.RenderIncidentCard"/> because
+    /// <see cref="IncidentSummary"/> does not pre-validate <c>Severity</c>, unlike
+    /// <see cref="AgentQuestion"/> which enforces <see cref="MessageSeverities.IsValid"/>
+    /// in its constructor. This is the only realistic path to drive the
+    /// <c>_ =&gt; Default</c> arm without violating the construction contract of
+    /// <see cref="AgentQuestion"/>.
+    /// </summary>
+    [Theory]
+    [InlineData(MessageSeverities.Critical, "attention")]
+    [InlineData(MessageSeverities.Error,    "attention")]
+    [InlineData(MessageSeverities.Warning,  "warning")]
+    [InlineData(MessageSeverities.Info,     "emphasis")]
+    [InlineData("UnknownSeverity",          null)]
+    public void RenderIncidentCard_SeverityToContainerStyle_CoversFullSwitchTable(
+        string severity,
+        string? expectedStyle)
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var incident = new IncidentSummary(
+            IncidentId: $"inc-style-{severity}",
+            QuestionId: $"Q-style-{severity}",
+            TaskId: "task-style-matrix",
+            AgentId: "agent-style",
+            AffectedAgents: new[] { "agent-style" },
+            Severity: severity,
+            Title: "Severity matrix probe",
+            Description: "Drives SeverityToContainerStyle through its full switch table.",
+            OccurredAt: DateTimeOffset.Parse(
+                "2025-04-10T08:00:00Z",
+                System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: $"corr-style-{severity}");
+
+        var attachment = renderer.RenderIncidentCard(incident);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        // Severity container is always the first body element — AddSeverityHeader is
+        // the first call in RenderIncidentCard.
+        var firstBlock = (card["body"] as JArray)?.FirstOrDefault();
+        Assert.NotNull(firstBlock);
+        Assert.Equal("Container", (string?)firstBlock!["type"]);
+
+        var actualStyle = (string?)firstBlock["style"];
+        if (expectedStyle is null)
+        {
+            // _ => AdaptiveContainerStyle.Default: the AdaptiveCards serializer
+            // omits the "style" key entirely (Default is the implicit container
+            // style), so the property must be missing OR the literal "default" —
+            // both shapes are valid Adaptive Card 1.5 JSON for "no override".
+            Assert.True(
+                actualStyle is null
+                || string.Equals(actualStyle, "default", StringComparison.Ordinal),
+                $"Expected unknown severity '{severity}' to map to the AdaptiveContainerStyle.Default "
+                + $"fallback (missing or 'default' style), but got '{actualStyle}'.");
+        }
+        else
+        {
+            Assert.Equal(expectedStyle, actualStyle);
+        }
+
+        // Severity is also surfaced in the secondary TextBlock under the header,
+        // so the unknown-severity case still renders human-readable text
+        // ("Severity: UnknownSeverity") rather than swallowing the input.
+        var headerContainer = (JObject)firstBlock!;
+        var headerItems = (JArray)headerContainer["items"]!;
+        var severityLine = headerItems
+            .OfType<JObject>()
+            .Where(b => (string?)b["type"] == "TextBlock")
+            .Select(b => (string?)b["text"])
+            .FirstOrDefault(t => t is not null && t.StartsWith("Severity:", StringComparison.Ordinal));
+        Assert.Equal($"Severity: {severity}", severityLine);
+    }
+
+    /// <summary>
+    /// Action-button style mapping per <see cref="AdaptiveCardBuilder"/>'s severity
+    /// table: approve/acknowledge/resume render as <c>positive</c> regardless of
+    /// severity, while reject/escalate/pause only escalate to <c>destructive</c> on
+    /// <see cref="MessageSeverities.Critical"/> or <see cref="MessageSeverities.Error"/>;
+    /// other severities leave the dominant-action button at the Adaptive Card default
+    /// style. This is the UX safety affordance for impl-plan §3.1 step 2 ("severity
+    /// indicator … action buttons generated from <c>HumanAction</c> list") — without it
+    /// a critical-severity reject button is visually indistinguishable from an info
+    /// approve. The existing severity header test only covers the container style,
+    /// not the per-action button styling.
+    /// </summary>
+    [Theory]
+    [InlineData(MessageSeverities.Critical, "approve", "positive")]
+    [InlineData(MessageSeverities.Critical, "reject",  "destructive")]
+    [InlineData(MessageSeverities.Error,    "reject",  "destructive")]
+    [InlineData(MessageSeverities.Info,     "approve", "positive")]
+    [InlineData(MessageSeverities.Info,     "reject",  null)]
+    [InlineData(MessageSeverities.Warning,  "reject",  null)]
+    public void RenderQuestionCard_ActionButtonStyle_FollowsSeverityActionMatrix(
+        string severity,
+        string actionValue,
+        string? expectedStyle)
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var question = NewQuestion(
+            $"Q-style-{severity}-{actionValue}",
+            new HumanAction(actionValue, char.ToUpperInvariant(actionValue[0]) + actionValue[1..], actionValue, false));
+        question = question with { Severity = severity };
+
+        var attachment = renderer.RenderQuestionCard(question);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        var action = Assert.Single((JArray)card["actions"]!);
+        var actualStyle = (string?)action["style"];
+        Assert.Equal(expectedStyle, actualStyle);
+    }
+
     [Fact]
     public void RenderStatusCard_EmitsAgentMetadataAndOmitsActionButtons()
     {
@@ -301,6 +425,53 @@ public sealed class AdaptiveCardBuilderTests
     public void RenderStatusCard_NullStatus_ThrowsArgumentNullException()
     {
         Assert.Throws<ArgumentNullException>(() => new AdaptiveCardBuilder().RenderStatusCard(null!));
+    }
+
+    /// <summary>
+    /// Two untested production branches in <c>AdaptiveCardBuilder.RenderStatusCard</c>
+    /// (impl-plan §3.1 step 3): when <see cref="AgentStatusSummary.TaskId"/> is
+    /// <c>null</c> the renderer substitutes the literal <c>"(swarm-wide)"</c> on the
+    /// Task fact (the affordance for swarm-wide status reports per
+    /// <see cref="AgentStatusSummary.TaskId"/>'s XDoc "null for swarm-wide status"),
+    /// and when <see cref="AgentStatusSummary.ProgressPercent"/> is <c>null</c> the
+    /// Progress fact is omitted entirely (rather than rendered as 0% or "n/a"). The
+    /// existing status-card test only covers the populated-value path for both fields;
+    /// this test asserts the explicit omission and substitution semantics.
+    /// </summary>
+    [Fact]
+    public void RenderStatusCard_NullTaskIdAndNullProgressPercent_SubstitutesSwarmWideAndOmitsProgressFact()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var status = new AgentStatusSummary(
+            AgentId: "agent-swarm-monitor",
+            TaskId: null,
+            AgentName: "Swarm Monitor",
+            CurrentState: "Idle",
+            ActiveTaskCount: 0,
+            LastActivityAt: DateTimeOffset.Parse("2025-06-01T08:00:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            ProgressPercent: null,
+            Summary: "All agents idle.",
+            CorrelationId: "corr-status-swarm-wide");
+
+        var attachment = renderer.RenderStatusCard(status);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        var factSet = ((JArray)card["body"]!)
+            .Single(b => (string?)b["type"] == "FactSet");
+        var facts = ((JArray)factSet["facts"]!)
+            .Select(f => new
+            {
+                Title = (string?)f["title"],
+                Value = (string?)f["value"],
+            })
+            .ToList();
+
+        // Branch 1: null TaskId substitutes the swarm-wide literal.
+        var taskFact = Assert.Single(facts, f => f.Title == "Task");
+        Assert.Equal("(swarm-wide)", taskFact.Value);
+
+        // Branch 2: null ProgressPercent omits the Progress fact (not "0%", not "n/a").
+        Assert.DoesNotContain(facts, f => f.Title == "Progress");
     }
 
     [Fact]
@@ -357,6 +528,47 @@ public sealed class AdaptiveCardBuilderTests
     public void RenderIncidentCard_NullIncident_ThrowsArgumentNullException()
     {
         Assert.Throws<ArgumentNullException>(() => new AdaptiveCardBuilder().RenderIncidentCard(null!));
+    }
+
+    /// <summary>
+    /// Edge case for the incident card's "Affected agents" fact: when
+    /// <see cref="IncidentSummary.AffectedAgents"/> is empty, the renderer falls back
+    /// to the single reporting <see cref="IncidentSummary.AgentId"/> (per
+    /// <c>AdaptiveCardBuilder.RenderIncidentCard</c> lines 163–165) so the card still
+    /// shows a meaningful "Affected agents" value rather than an empty string. This
+    /// closes the only branch in <see cref="AdaptiveCardBuilder"/> with no direct
+    /// coverage; the existing incident card test exercises the multi-agent path only.
+    /// </summary>
+    [Fact]
+    public void RenderIncidentCard_EmptyAffectedAgents_FallsBackToReportingAgentId()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var incident = new IncidentSummary(
+            IncidentId: "inc-empty-affected",
+            QuestionId: "Q-inc-empty",
+            TaskId: "task-77",
+            AgentId: "release-agent-01",
+            AffectedAgents: Array.Empty<string>(),
+            Severity: MessageSeverities.Warning,
+            Title: "Single-agent advisory",
+            Description: "Heartbeat skew detected.",
+            OccurredAt: DateTimeOffset.Parse("2025-02-15T10:00:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: "corr-inc-empty");
+
+        var attachment = renderer.RenderIncidentCard(incident);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        // Walk the body for the FactSet that includes "Affected agents"; the renderer
+        // emits one FactSet containing the metadata facts (incident id, severity, task,
+        // reporting agent, affected agents, occurred).
+        var factSets = ((JArray)card["body"]!)
+            .Where(b => (string?)b["type"] == "FactSet")
+            .ToList();
+        var affectedFact = factSets
+            .SelectMany(fs => (JArray)fs["facts"]!)
+            .Single(f => (string?)f["title"] == "Affected agents");
+
+        Assert.Equal("release-agent-01", (string?)affectedFact["value"]);
     }
 
     [Fact]
@@ -474,6 +686,68 @@ public sealed class AdaptiveCardBuilderTests
         Assert.Throws<ArgumentNullException>(() => new AdaptiveCardBuilder().RenderReleaseGateCard(null!));
     }
 
+    /// <summary>
+    /// Untested production branch in <c>AdaptiveCardBuilder.RenderReleaseGateCard</c>
+    /// at line 225 (<c>if (gate.GateConditions.Count &gt; 0)</c>): when the
+    /// orchestrator constructs a <see cref="ReleaseGateRequest"/> with an empty
+    /// <see cref="ReleaseGateRequest.GateConditions"/>, the renderer omits BOTH the
+    /// "Gate conditions" <c>TextBlock</c> header AND the conditions <c>FactSet</c> —
+    /// the card must not render an empty header with no rows beneath it. This is
+    /// structurally different from the single-fact omission tested on the status
+    /// card (a TextBlock header + FactSet pair, not a single fact), and exercises a
+    /// real impl-plan §3.1 step 5 affordance: gates with no preconditions still
+    /// render their Approve/Reject/Defer action buttons but skip the empty checklist.
+    /// </summary>
+    [Fact]
+    public void RenderReleaseGateCard_EmptyGateConditions_OmitsBothConditionsHeaderAndFactSet()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var gate = new ReleaseGateRequest(
+            GateId: "gate-no-conditions",
+            QuestionId: "Q-gate-no-conditions-carol",
+            TaskId: "task-release-bare",
+            GateName: "Bare Approval Gate",
+            ReleaseVersion: "v0.1.0",
+            Environment: "Sandbox",
+            GateConditions: Array.Empty<ReleaseGateCondition>(),
+            GateStatus: "Pending",
+            Deadline: DateTimeOffset.Parse("2025-04-15T12:00:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: "corr-gate-no-conditions");
+
+        var attachment = renderer.RenderReleaseGateCard(gate);
+        var card = Assert.IsType<JObject>(attachment.Content);
+        var body = (JArray)card["body"]!;
+
+        // Branch 1: no TextBlock with text "Gate conditions" — the header is fully
+        // omitted, not rendered as an empty bolded label.
+        Assert.DoesNotContain(body.OfType<JObject>(), b =>
+            (string?)b["type"] == "TextBlock"
+            && (string?)b["text"] == "Gate conditions");
+
+        // Branch 2: the only FactSet on the body is the metadata fact set (Gate /
+        // Release / Environment / Status / Deadline). The conditions FactSet — which
+        // would have rendered one Fact per gate condition with the "✓ satisfied" /
+        // "✗ outstanding" markers — must not appear.
+        var factSets = body.OfType<JObject>()
+            .Where(b => (string?)b["type"] == "FactSet")
+            .ToList();
+        Assert.Single(factSets);
+        var metadataFacts = ((JArray)factSets[0]["facts"]!)
+            .OfType<JObject>()
+            .Select(f => (string?)f["title"])
+            .ToList();
+        Assert.DoesNotContain("✓ satisfied", metadataFacts);
+        Assert.DoesNotContain("✗ outstanding", metadataFacts);
+        Assert.Contains("Gate", metadataFacts);
+        Assert.Contains("Status", metadataFacts);
+
+        // The three action buttons still render — impl-plan §3.1 step 5 contract
+        // unaffected by an empty condition list.
+        var actions = card["actions"] as JArray;
+        Assert.NotNull(actions);
+        Assert.Equal(3, actions!.Count);
+    }
+
     [Fact]
     public void RenderDecisionConfirmationCard_OmitsActionButtonsAndIncludesDecisionMetadata()
     {
@@ -506,6 +780,187 @@ public sealed class AdaptiveCardBuilderTests
     {
         Assert.Throws<ArgumentNullException>(
             () => new AdaptiveCardBuilder().RenderDecisionConfirmationCard(null!));
+    }
+
+    /// <summary>
+    /// Schema-validity gate for Stage 3.1: the JObject content emitted by
+    /// <see cref="AdaptiveCardBuilder.RenderQuestionCard"/> must round-trip through the
+    /// official <c>AdaptiveCards</c> parser (<see cref="AdaptiveCard.FromJson"/>) and
+    /// reconstruct an <see cref="AdaptiveCard"/> at the pinned schema version. This is
+    /// stronger than the field-shape assertions in the other tests: it confirms Teams
+    /// will actually render the payload (mismatched schema features, unknown element
+    /// types, or malformed action data would surface as a parser exception or a missing
+    /// <c>parseResult.Card</c>). Closes the tech-spec §5.1 risk R-3 mitigation
+    /// ("Pin card schema version in templates") with executable verification.
+    /// </summary>
+    [Fact]
+    public void RenderQuestionCard_RoundTripsThroughAdaptiveCardParser_AtPinnedSchemaVersion()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var question = NewQuestion(
+            "Q-roundtrip-1",
+            new HumanAction("approve", "Approve", "approve", false),
+            new HumanAction("reject", "Reject", "reject", true));
+
+        var attachment = renderer.RenderQuestionCard(question);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        Assert.Equal(AdaptiveCardBuilder.SchemaVersion.ToString(), (string?)card["version"]);
+
+        var parseResult = AdaptiveCard.FromJson(card.ToString());
+        Assert.NotNull(parseResult);
+        Assert.NotNull(parseResult.Card);
+        Assert.Equal(
+            AdaptiveCardBuilder.SchemaVersion.ToString(),
+            parseResult.Card.Version.ToString());
+    }
+
+    /// <summary>
+    /// Parser-validity gate for the status card (impl-plan §3.1 step 3). Status cards
+    /// are structurally distinct from question cards — they carry a progress-percent
+    /// fact, a last-activity timestamp, and emit zero <c>Action.Submit</c> elements —
+    /// so re-parsing through <see cref="AdaptiveCard.FromJson"/> validates the
+    /// no-action shape independently of the question/release-gate paths.
+    /// </summary>
+    [Fact]
+    public void RenderStatusCard_RoundTripsThroughAdaptiveCardParser_AtPinnedSchemaVersion()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var status = new AgentStatusSummary(
+            AgentId: "agent-build-007",
+            TaskId: "task-42",
+            AgentName: "Build Agent",
+            CurrentState: "Working",
+            ActiveTaskCount: 3,
+            LastActivityAt: DateTimeOffset.Parse("2025-01-15T12:00:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            ProgressPercent: 72,
+            Summary: "Compiling integration tests.",
+            CorrelationId: "corr-status-roundtrip");
+
+        var attachment = renderer.RenderStatusCard(status);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        Assert.Equal(AdaptiveCardBuilder.SchemaVersion.ToString(), (string?)card["version"]);
+
+        var parseResult = AdaptiveCard.FromJson(card.ToString());
+        Assert.NotNull(parseResult);
+        Assert.NotNull(parseResult.Card);
+        Assert.Equal(
+            AdaptiveCardBuilder.SchemaVersion.ToString(),
+            parseResult.Card.Version.ToString());
+    }
+
+    /// <summary>
+    /// Parser-validity gate for the incident escalation card (impl-plan §3.1 step 4).
+    /// Incident cards exercise the attention-styled severity header path, the
+    /// affected-agents list rendering, and a two-button escalate/acknowledge action
+    /// set — none of which the question/status round-trip tests cover.
+    /// </summary>
+    [Fact]
+    public void RenderIncidentCard_RoundTripsThroughAdaptiveCardParser_AtPinnedSchemaVersion()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var incident = new IncidentSummary(
+            IncidentId: "inc-roundtrip",
+            QuestionId: "Q-inc-roundtrip-alice",
+            TaskId: "task-77",
+            AgentId: "release-agent-01",
+            AffectedAgents: new[] { "release-agent-01", "deploy-agent-03" },
+            Severity: MessageSeverities.Critical,
+            Title: "Production deploy failed",
+            Description: "Rollback initiated due to schema migration error.",
+            OccurredAt: DateTimeOffset.Parse("2025-02-01T03:14:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: "corr-incident-roundtrip");
+
+        var attachment = renderer.RenderIncidentCard(incident);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        Assert.Equal(AdaptiveCardBuilder.SchemaVersion.ToString(), (string?)card["version"]);
+
+        var parseResult = AdaptiveCard.FromJson(card.ToString());
+        Assert.NotNull(parseResult);
+        Assert.NotNull(parseResult.Card);
+        Assert.Equal(
+            AdaptiveCardBuilder.SchemaVersion.ToString(),
+            parseResult.Card.Version.ToString());
+    }
+
+    /// <summary>
+    /// Parser-validity gate for the release-gate card (impl-plan §3.1 step 5). Release
+    /// gate cards are the most structurally complex of the five templates: they emit a
+    /// gate-conditions checklist (each row a <c>TextBlock</c> with a status emoji), a
+    /// gate-status fact set, and a three-button approve/reject/defer action set whose
+    /// per-action <c>Data</c> payload carries the per-approver
+    /// <see cref="AgentQuestion.QuestionId"/> per architecture §6.3.1 multi-approver
+    /// modeling. Re-parsing through <see cref="AdaptiveCard.FromJson"/> validates that
+    /// all of this is schema-compliant Adaptive Card 1.5 JSON, not just well-formed
+    /// JObject content.
+    /// </summary>
+    [Fact]
+    public void RenderReleaseGateCard_RoundTripsThroughAdaptiveCardParser_AtPinnedSchemaVersion()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var gate = new ReleaseGateRequest(
+            GateId: "gate-roundtrip",
+            QuestionId: "Q-gate-roundtrip-alice",
+            TaskId: "task-release-99",
+            GateName: "Production Deploy Gate",
+            ReleaseVersion: "v1.42.0",
+            Environment: "Production",
+            GateConditions: new[]
+            {
+                new ReleaseGateCondition("All tests pass", true),
+                new ReleaseGateCondition("Security scan clean", true),
+                new ReleaseGateCondition("SRE sign-off", false),
+            },
+            GateStatus: "Pending",
+            Deadline: DateTimeOffset.Parse("2025-03-01T18:00:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: "corr-gate-roundtrip");
+
+        var attachment = renderer.RenderReleaseGateCard(gate);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        Assert.Equal(AdaptiveCardBuilder.SchemaVersion.ToString(), (string?)card["version"]);
+
+        var parseResult = AdaptiveCard.FromJson(card.ToString());
+        Assert.NotNull(parseResult);
+        Assert.NotNull(parseResult.Card);
+        Assert.Equal(
+            AdaptiveCardBuilder.SchemaVersion.ToString(),
+            parseResult.Card.Version.ToString());
+    }
+
+    /// <summary>
+    /// Parser-validity gate for the decision-confirmation card. Confirmation cards
+    /// emit zero action buttons and embed the answered <see cref="HumanDecisionEvent"/>
+    /// metadata as facts — a third structurally distinct shape that needs its own
+    /// schema-validity coverage so Teams' message-update path renders it cleanly.
+    /// </summary>
+    [Fact]
+    public void RenderDecisionConfirmationCard_RoundTripsThroughAdaptiveCardParser_AtPinnedSchemaVersion()
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var decision = new HumanDecisionEvent(
+            QuestionId: "Q-confirm-roundtrip",
+            ActionValue: "approve",
+            Comment: "Looks good to me.",
+            Messenger: "Teams",
+            ExternalUserId: "aad-alice",
+            ExternalMessageId: "act-roundtrip-1",
+            ReceivedAt: DateTimeOffset.Parse("2025-04-01T09:30:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: "corr-confirm-roundtrip");
+
+        var attachment = renderer.RenderDecisionConfirmationCard(decision);
+        var card = Assert.IsType<JObject>(attachment.Content);
+
+        Assert.Equal(AdaptiveCardBuilder.SchemaVersion.ToString(), (string?)card["version"]);
+
+        var parseResult = AdaptiveCard.FromJson(card.ToString());
+        Assert.NotNull(parseResult);
+        Assert.NotNull(parseResult.Card);
+        Assert.Equal(
+            AdaptiveCardBuilder.SchemaVersion.ToString(),
+            parseResult.Card.Version.ToString());
     }
 
     private static AgentQuestion NewQuestion(string questionId, params HumanAction[] actions)
