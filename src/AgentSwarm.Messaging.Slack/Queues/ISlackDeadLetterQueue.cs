@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using AgentSwarm.Messaging.Slack.Diagnostics;
 
 namespace AgentSwarm.Messaging.Slack.Queues;
 
@@ -77,7 +78,7 @@ internal interface ISlackDeadLetterQueue
 /// codebase convention demands one type per file.
 /// </para>
 /// </remarks>
-internal sealed class InMemorySlackDeadLetterQueue : ISlackDeadLetterQueue
+internal sealed class InMemorySlackDeadLetterQueue : ISlackDeadLetterQueue, ISlackDeadLetterQueueDepthProbe
 {
     private readonly ConcurrentQueue<SlackDeadLetterEntry> entries = new();
 
@@ -97,4 +98,12 @@ internal sealed class InMemorySlackDeadLetterQueue : ISlackDeadLetterQueue
         IReadOnlyList<SlackDeadLetterEntry> snapshot = this.entries.ToArray();
         return ValueTask.FromResult(snapshot);
     }
+
+    /// <summary>
+    /// <see cref="ISlackDeadLetterQueueDepthProbe"/> implementation:
+    /// returns the cheap <see cref="ConcurrentQueue{T}.Count"/> so
+    /// the Stage 7.3 DLQ-depth health check can sample without
+    /// materialising every entry.
+    /// </summary>
+    public int GetCurrentDepth() => this.entries.Count;
 }

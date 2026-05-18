@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Diagnostics;
 using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Persistence;
 using AgentSwarm.Messaging.Slack.Pipeline;
@@ -232,6 +233,55 @@ public class Program
         builder.Services.AddSlackInboundIngestor<SlackPersistenceDbContext>();
         builder.Services.AddSlackInboundDevelopmentHandlerStubs();
 
+        // Stage 7.3 (workstream:
+        // ws-qq-slack-messenger-supp-phase-observability-and-operations-stage-health-checks-and-diagnostics
+        // -- iter-4 evaluator item 1): wire the canonical Worker
+        // host's outbound queue and DLQ to the DURABLE file-system
+        // backings (NOT the in-memory defaults) so /health/ready
+        // samples the same operational depth the dispatch / retry
+        // pipelines actually drain. The directories are read from
+        // appsettings (Slack:Outbound:JournalDirectory and
+        // Slack:Outbound:DeadLetterDirectory; defaults match the
+        // documented data/slack-outbound-* convention). Both
+        // file-system extensions use services.RemoveAll<...>()
+        // internally so they win over any later TryAddSingleton
+        // (e.g., the in-memory DLQ default the inbound ingestor
+        // registers when no upstream binding exists), guaranteeing
+        // the health-check probes see the same queue instance the
+        // production dispatch pipeline writes to. Without this
+        // wiring the readiness probe would report 0 depth from an
+        // empty in-memory fallback while the durable journal on
+        // disk was actually backlogged, and an operator would have
+        // no way to tell the connector was falling behind via the
+        // Kubernetes readiness signal.
+        string outboundJournalDirectory = builder.Configuration
+            .GetValue<string?>("Slack:Outbound:JournalDirectory")
+            ?? "data/slack-outbound-journal";
+        string outboundDeadLetterDirectory = builder.Configuration
+            .GetValue<string?>("Slack:Outbound:DeadLetterDirectory")
+            ?? "data/slack-outbound-dead-letter";
+        builder.Services.AddFileSystemSlackOutboundQueue(outboundJournalDirectory);
+        builder.Services.AddFileSystemSlackDeadLetterQueue(outboundDeadLetterDirectory);
+
+        // Stage 7.3 (workstream:
+        // ws-qq-slack-messenger-supp-phase-observability-and-operations-stage-health-checks-and-diagnostics):
+        // register the Slack health-check pipeline and the
+        // startup-diagnostics hosted service. AddSlackHealthChecks
+        // binds Slack:Health from appsettings, registers the
+        // ISlackAuthTester production implementation, and adds three
+        // ASP.NET Core health checks (api connectivity / outbound
+        // queue depth / DLQ depth) tagged with
+        // SlackHealthChecksServiceCollectionExtensions.ReadyTag so
+        // MapSlackHealthEndpoints below mounts them on /health/ready.
+        // AddSlackStartupDiagnostics adds a hosted service that, on
+        // host start, logs one structured line per enabled workspace
+        // (with the per-workspace Events API / Socket Mode
+        // classification) plus a single rate-limit configuration
+        // summary line. Both extensions are TryAdd-style and safe to
+        // call multiple times.
+        builder.Services.AddSlackHealthChecks(builder.Configuration);
+        builder.Services.AddSlackStartupDiagnostics();
+
         WebApplication app = builder.Build();
 
         // Stage 4.1 iter-2 evaluator item 3: fail-fast at host startup
@@ -284,8 +334,21 @@ public class Program
         // /api/slack), so the health probes below are not affected.
         app.UseSlackSignatureValidation();
 
-        app.MapGet("/health/live", () => Results.Ok(new { status = "live" }));
-        app.MapGet("/health/ready", () => Results.Ok(new { status = "ready" }));
+        // Stage 7.3 (workstream:
+        // ws-qq-slack-messenger-supp-phase-observability-and-operations-stage-health-checks-and-diagnostics):
+        // mount the real Slack health-check endpoints. Replaces the
+        // Stage 3.1 stub MapGet placeholders that returned a static
+        // shape -- those would have ambiguously matched the real
+        // probe's MapHealthChecks registration on the same path.
+        // /health/ready runs every check tagged with
+        // SlackHealthChecksServiceCollectionExtensions.ReadyTag
+        // (api connectivity, outbound queue depth, DLQ depth);
+        // /health/live runs no checks and returns 200 as long as
+        // the process is reachable so Kubernetes liveness does NOT
+        // restart the pod during a Slack outage. Both endpoint paths
+        // are operator-configurable via Slack:Health:ReadyEndpointPath
+        // and Slack:Health:LiveEndpointPath in appsettings.
+        app.MapSlackHealthEndpoints();
 
         // Stage 3.2: map controller endpoints so the
         // SlackAuthorizationFilter registered as a global MVC filter
