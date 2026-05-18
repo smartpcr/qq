@@ -134,7 +134,11 @@ public sealed class TelegramWebhookEndpoint
         // hand-off so traces show "this inbound webhook landed at
         // <T>". The span carries the CorrelationId so the Stage 6.1
         // acceptance scenario can find it without depending on
-        // downstream propagation.
+        // downstream propagation. The span is started BEFORE body
+        // parse so the empty-body / malformed-JSON error branches
+        // also surface as traced spans (the eventId / eventType OTEL
+        // tags are applied later, once parsing has resolved them —
+        // see the SetTag calls after PersistAsync below).
         using var activity = TelegramTelemetry.StartReceiveSpan(correlationId);
 
         var rawJson = await ReadBodyAsync(httpContext.Request.Body, ct).ConfigureAwait(false);
@@ -179,7 +183,17 @@ public sealed class TelegramWebhookEndpoint
             return Results.BadRequest((object)new { error = "missing_update_id" });
         }
 
+        // Mirror the polling path's StartReceiveSpan(eventId,
+        // eventType) tagging contract: set BOTH the brief-contract
+        // key (EventId / EventType) AND the OTEL semantic-convention
+        // key (messaging.event_id / messaging.event_type) so the
+        // receive span is queryable by either taxonomy. We can't pass
+        // these through StartReceiveSpan because the span is started
+        // before the body is parsed (see comment at StartReceiveSpan
+        // call site) — the explicit pair-set is the supported
+        // alternative for that ordering.
         activity?.SetTag(TelegramTelemetry.EventIdKey, update.Id);
+        activity?.SetTag(TelegramTelemetry.OtelMessagingEventIdKey, update.Id);
 
         var row = new InboundUpdate
         {
@@ -211,7 +225,12 @@ public sealed class TelegramWebhookEndpoint
         // inbound update. Tagged with event_type so the dashboard
         // can distinguish command volume from callback volume.
         var eventType = ResolveEventType(update);
+        // As with EventId above, set BOTH the brief-contract and the
+        // OTEL semantic-convention keys so the receive span lines up
+        // with the polling-path span shape produced by
+        // StartReceiveSpan(correlationId, eventId, eventType).
         activity?.SetTag(TelegramTelemetry.EventTypeKey, eventType);
+        activity?.SetTag(TelegramTelemetry.OtelMessagingEventTypeKey, eventType);
         TelegramTelemetry.MessagesReceivedCounter.Add(
             1,
             new KeyValuePair<string, object?>("event_type", eventType));
