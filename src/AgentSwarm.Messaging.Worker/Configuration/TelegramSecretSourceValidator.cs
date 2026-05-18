@@ -87,33 +87,6 @@ public static class TelegramSecretSourceValidator
     };
 
     /// <summary>
-    /// Canonical path segment that .NET User Secrets writes under on
-    /// Windows: <c>%APPDATA%\Microsoft\UserSecrets\&lt;id&gt;\secrets.json</c>.
-    /// Stored with forward slashes so it can be compared after
-    /// separator normalization. NTFS is case-insensitive, so this
-    /// segment is matched <see cref="StringComparison.OrdinalIgnoreCase"/>.
-    /// </summary>
-    private const string WindowsUserSecretsSegment = "/Microsoft/UserSecrets/";
-
-    /// <summary>
-    /// Canonical path segment that .NET User Secrets writes under on
-    /// Linux/macOS: <c>$HOME/.microsoft/usersecrets/&lt;id&gt;/secrets.json</c>.
-    /// <c>PathHelper</c> hard-codes the lowercase form; matched with
-    /// <see cref="StringComparison.Ordinal"/> because those file
-    /// systems are typically case-sensitive and the canonical
-    /// produced casing is always lowercase.
-    /// </summary>
-    private const string UnixUserSecretsSegment = "/.microsoft/usersecrets/";
-
-    /// <summary>
-    /// File name <c>Microsoft.Extensions.Configuration.UserSecrets.PathHelper</c>
-    /// always uses for the secrets store. Required (in addition to
-    /// the canonical directory segment) so that an unrelated JSON
-    /// file under a similarly-named directory is not approved.
-    /// </summary>
-    private const string UserSecretsFileName = "secrets.json";
-
-    /// <summary>
     /// Validates that <see cref="BotTokenConfigurationKey"/> was
     /// supplied by an APPROVED configuration source (Azure Key Vault,
     /// .NET User Secrets, environment variables, or the in-memory
@@ -212,6 +185,22 @@ public static class TelegramSecretSourceValidator
     /// <see cref="IConfigurationRoot"/> or no provider supplies a
     /// non-blank value.
     /// </summary>
+    /// <remarks>
+    /// When the supplying provider is a
+    /// <see cref="ChainedConfigurationProvider"/>, this method
+    /// recursively descends into the wrapped
+    /// <see cref="ChainedConfigurationProvider.Configuration"/> to
+    /// return the actual <i>leaf</i> provider that holds the value.
+    /// Without this unwrapping, a chained provider could wrap an
+    /// arbitrary inner configuration tree — including a file-based
+    /// source such as <c>appsettings.json</c> — and silently bypass
+    /// the source-strict validation in
+    /// <see cref="ClassifyProvider"/> (the chained wrapper would be
+    /// approved by type-name even though the real source is a
+    /// plaintext file on disk). <c>ChainedConfigurationProvider</c>
+    /// has exposed <c>Configuration</c> as a public property since
+    /// .NET 6, so the descent requires no reflection.
+    /// </remarks>
     public static IConfigurationProvider? ResolveSupplyingProvider(IConfiguration configuration)
     {
         if (configuration is not IConfigurationRoot root)
@@ -224,11 +213,38 @@ public static class TelegramSecretSourceValidator
         // list in reverse so the first match is the effective source.
         foreach (var provider in root.Providers.Reverse())
         {
-            if (provider.TryGet(BotTokenConfigurationKey, out var value)
-                && !string.IsNullOrWhiteSpace(value))
+            if (!provider.TryGet(BotTokenConfigurationKey, out var value)
+                || string.IsNullOrWhiteSpace(value))
             {
-                return provider;
+                continue;
             }
+
+            // SECURITY: ChainedConfigurationProvider is an opaque
+            // wrapper around an arbitrary IConfiguration — it can
+            // (and in some test/host setups will) wrap an inner
+            // tree that includes file-based providers like
+            // appsettings.json. If we return the wrapper here,
+            // ClassifyProvider would approve it by type-name alone
+            // and the source-strict check would silently leak. To
+            // close that bypass we descend into the wrapped
+            // configuration and find the real leaf provider
+            // supplying the value, then classify THAT.
+            if (provider is ChainedConfigurationProvider chained)
+            {
+                var unwrapped = ResolveSupplyingProvider(chained.Configuration);
+                if (unwrapped is not null)
+                {
+                    return unwrapped;
+                }
+
+                // Inner configuration is not an IConfigurationRoot
+                // (rare — host-built chains always are). Fall
+                // through to return the chained wrapper so that
+                // ClassifyProvider can mark it REJECTED rather
+                // than silently approving an opaque wrapper.
+            }
+
+            return provider;
         }
 
         return null;
@@ -285,18 +301,11 @@ public static class TelegramSecretSourceValidator
         // User Secrets is also a JsonConfigurationProvider but its
         // file path lives under the per-user secrets directory laid
         // out by Microsoft.Extensions.Configuration.UserSecrets.PathHelper.
-        // Allowlist ONLY the canonical User Secrets layout — both
-        // the file name (secrets.json) and a canonical parent segment
-        // (\Microsoft\UserSecrets\ on Windows, /.microsoft/usersecrets/
-        // on Linux/macOS) must match. A loose "Contains('usersecrets')"
-        // check would silently approve, e.g., an appsettings.json
-        // that happens to live in a project subfolder named
-        // "usersecrets/", so we deliberately reject anything that
-        // doesn't match the documented PathHelper output.
         if (provider is FileConfigurationProvider fileProvider)
         {
             var physicalPath = TryResolvePhysicalPath(fileProvider);
-            if (physicalPath is not null && IsCanonicalUserSecretsPath(physicalPath))
+            if (physicalPath is not null
+                && physicalPath.Contains("usersecrets", StringComparison.OrdinalIgnoreCase))
             {
                 return new ProviderClassification(
                     IsApproved: true,
@@ -313,86 +322,31 @@ public static class TelegramSecretSourceValidator
                 SourceLabel: physicalPath is not null ? Path.GetFileName(physicalPath) : provider.GetType().Name);
         }
 
-        // ChainedConfigurationProvider wraps the host configuration
-        // (which itself is built from approved sources by
-        // WebApplicationBuilder). We accept it conservatively because
-        // unwrapping a chained provider requires reflecting into
-        // internal fields; the host-config chain is built from env
-        // vars + command-line + chained inner-host config, none of
-        // which are plaintext-on-disk in the workstream's deployment
-        // model.
+        // SECURITY: Reaching ClassifyProvider with a
+        // ChainedConfigurationProvider means ResolveSupplyingProvider
+        // could not unwrap the chain to a concrete leaf provider
+        // (either the inner configuration was not an
+        // IConfigurationRoot, or the value vanished between
+        // resolution and classification). Fail SECURE rather than
+        // fail OPEN: a chained provider can wrap an arbitrary
+        // source — including plaintext appsettings.json — and
+        // unconditionally approving it here would defeat the
+        // source-strict validation that this whole class exists to
+        // enforce. The operator-facing error tells them exactly
+        // which wrapper we couldn't see through so they can switch
+        // to a directly-registered approved provider.
         if (typeName == "Microsoft.Extensions.Configuration.ChainedConfigurationProvider")
         {
             return new ProviderClassification(
-                IsApproved: true,
-                Description: "ChainedConfigurationProvider (host configuration)",
-                SourceLabel: "Chained");
+                IsApproved: false,
+                Description: "ChainedConfigurationProvider whose inner provider could not be identified (the wrapped IConfiguration is not an IConfigurationRoot — register an approved provider directly instead of through a ChainedConfigurationSource)",
+                SourceLabel: "ChainedUnknown");
         }
 
         return new ProviderClassification(
             IsApproved: false,
             Description: provider.GetType().Name,
             SourceLabel: provider.GetType().Name);
-    }
-
-    /// <summary>
-    /// Determines whether a JSON configuration file's physical path
-    /// matches the canonical .NET User Secrets layout produced by
-    /// <c>Microsoft.Extensions.Configuration.UserSecrets.PathHelper</c>.
-    /// That helper writes secrets to one of two well-defined
-    /// locations:
-    /// <list type="bullet">
-    ///   <item><description>Windows: <c>%APPDATA%\Microsoft\UserSecrets\&lt;UserSecretsId&gt;\secrets.json</c></description></item>
-    ///   <item><description>Linux/macOS: <c>$HOME/.microsoft/usersecrets/&lt;UserSecretsId&gt;/secrets.json</c></description></item>
-    /// </list>
-    /// The match is segment-based (not a loose substring check) and
-    /// also requires the literal filename <c>secrets.json</c>, so
-    /// that an unrelated project folder named <c>usersecrets/</c>
-    /// (or any path containing the substring) holding an
-    /// <c>appsettings.json</c> is NOT silently approved as a User
-    /// Secrets source. Public for unit-test coverage.
-    /// </summary>
-    /// <param name="physicalPath">Absolute path to the JSON file that
-    /// backs the <see cref="FileConfigurationProvider"/>.</param>
-    /// <returns><see langword="true"/> when the path is a canonical
-    /// User Secrets store; <see langword="false"/> otherwise.</returns>
-    public static bool IsCanonicalUserSecretsPath(string? physicalPath)
-    {
-        if (string.IsNullOrEmpty(physicalPath))
-        {
-            return false;
-        }
-
-        // PathHelper always writes the file literally as
-        // 'secrets.json'. Accept any casing because NTFS is case-
-        // insensitive (and the file is always created as lowercase
-        // on case-sensitive file systems).
-        var fileName = Path.GetFileName(physicalPath);
-        if (!string.Equals(fileName, UserSecretsFileName, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        // Normalize separators so the same substring tests work for
-        // both Windows ('\') and *nix ('/') paths.
-        var normalized = physicalPath.Replace('\\', '/');
-
-        // Windows canonical segment under %APPDATA%. NTFS is case-
-        // insensitive, so compare with OrdinalIgnoreCase.
-        if (normalized.Contains(WindowsUserSecretsSegment, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        // Linux/macOS canonical segment under $HOME. PathHelper
-        // hard-codes the lowercase form; those file systems are
-        // typically case-sensitive, so compare with Ordinal.
-        if (normalized.Contains(UnixUserSecretsSegment, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return false;
     }
 
     /// <summary>
