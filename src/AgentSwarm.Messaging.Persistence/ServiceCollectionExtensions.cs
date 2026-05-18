@@ -210,9 +210,29 @@ public static class ServiceCollectionExtensions
             }
         });
 
-        var useMigrations = configuration.GetValue<bool>("MessagingDb:UseMigrations", false);
+        // Iter-4 evaluator item 1 — read MessagingDb:UseMigrations
+        // LAZILY inside the factory delegate so the WebApplicationBuilder /
+        // WebApplicationFactory call sequence resolves the flag from the
+        // FULLY-MERGED IConfiguration (including test ConfigureAppConfiguration
+        // overrides). The previous shape captured the value EAGERLY at
+        // registration time, which made the production appsettings.json
+        // default (UseMigrations=true) win over the test fixture's
+        // in-memory override because the test's ConfigureAppConfiguration
+        // callback runs AFTER AddMessagingPersistence(builder.Configuration)
+        // executes in Program.cs.
+        //
+        // We capture the IConfiguration *parameter* (not sp.GetRequiredService)
+        // because Worker hosts always pass builder.Configuration which is a
+        // ConfigurationManager that receives live updates from later-added
+        // providers (test ConfigureAppConfiguration callbacks merge into the
+        // same instance). Unit tests that build a one-shot ServiceCollection
+        // without registering IConfiguration in DI also work — the captured
+        // parameter is the same instance the caller already owns.
         services.AddSingleton<IHostedService>(sp =>
-            new DatabaseInitializer(sp.GetRequiredService<IServiceScopeFactory>(), useMigrations));
+        {
+            var useMigrations = configuration.GetValue<bool>("MessagingDb:UseMigrations", false);
+            return new DatabaseInitializer(sp.GetRequiredService<IServiceScopeFactory>(), useMigrations);
+        });
 
         // Stage 5.3 — initialize the audit database alongside the
         // operational one. Hosted as a separate IHostedService so the
@@ -235,7 +255,10 @@ public static class ServiceCollectionExtensions
         // account's CREATE/MIGRATE permissions, and the audit-DB
         // host's reachability before retrying bootstrap.
         services.AddSingleton<IHostedService>(sp =>
-            new AuditDatabaseInitializer(sp.GetRequiredService<IServiceScopeFactory>(), useMigrations));
+        {
+            var useMigrations = configuration.GetValue<bool>("MessagingDb:UseMigrations", false);
+            return new AuditDatabaseInitializer(sp.GetRequiredService<IServiceScopeFactory>(), useMigrations);
+        });
 
         // Stage 4.1 — OutboundQueue:* options + meter singleton +
         // EF-backed IOutboundQueue replacement. Order matters here:

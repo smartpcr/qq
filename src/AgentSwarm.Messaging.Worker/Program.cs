@@ -3,10 +3,12 @@ using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Auth;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using AgentSwarm.Messaging.Telegram.Webhook;
 using AgentSwarm.Messaging.Worker;
 using AgentSwarm.Messaging.Worker.Configuration;
 using AgentSwarm.Messaging.Worker.Observability;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -182,10 +184,50 @@ builder.Services.AddTelegramOpenTelemetry(builder.Configuration, builder.Environ
 // PersistentDeadLetterQueue registered via AddMessagingPersistence
 // above, so by the time the health check runs the EF-backed depth
 // is what surfaces.
+// Stage 6.2 -- Health Checks and Liveness. Three composite-friendly
+// checks fan in to the ASP.NET Core health-check pipeline so the
+// `/healthz` JSON response surfaces a single rolled-up status plus
+// per-check detail per the brief:
+//
+//   * TelegramBotHealthCheck -- calls Telegram's `getMe` through
+//     the singleton ITelegramBotClient with a hard 5-second
+//     timeout; Healthy iff the bot identity is returned in time.
+//     Tagged `telegram` so operators can filter for messenger
+//     health independently.
+//
+//   * OutboundQueueHealthCheck -- composite probe over the durable
+//     outbox depth (Pending + Sending) and the dead-letter queue
+//     depth. Reports Degraded when the outbox depth exceeds
+//     OutboundQueue:DegradedDepthThreshold (default 1000) and
+//     Unhealthy when the DLQ depth exceeds
+//     DeadLetterQueue:UnhealthyThreshold. Tagged `outbound` and
+//     `dead_letter` so the legacy DLQ probe filters still match.
+//
+//   * DatabaseHealthCheck -- verifies both MessagingDbContext and
+//     AuditDbContext are reachable AND their schemas are in place
+//     by running a Take(1) probe against the canonical DbSet of
+//     each. Tagged `database` and `audit` so audit operators can
+//     pivot on the audit signal independently.
+//
+// The legacy Stage 4.2 DeadLetterQueueHealthCheck registration is
+// retained alongside as a defense-in-depth signal -- both reach
+// the same DLQ row count via IDeadLetterQueue.CountAsync so they
+// cannot diverge, and operator dashboards that already pivot on
+// the Stage 4.2 check name (`outbound_dead_letter_queue_depth`)
+// keep working unchanged.
 builder.Services.AddHealthChecks()
     .AddCheck<DeadLetterQueueHealthCheck>(
         DeadLetterQueueHealthCheck.Name,
-        tags: new[] { "dead_letter", "outbound" });
+        tags: new[] { "dead_letter", "outbound" })
+    .AddCheck<TelegramBotHealthCheck>(
+        TelegramBotHealthCheck.Name,
+        tags: new[] { "telegram", "liveness" })
+    .AddCheck<OutboundQueueHealthCheck>(
+        OutboundQueueHealthCheck.Name,
+        tags: new[] { "outbound", "dead_letter" })
+    .AddCheck<DatabaseHealthCheck>(
+        DatabaseHealthCheck.Name,
+        tags: new[] { "database", "audit" });
 
 // IUserAuthorizationService -- iter-5 evaluator item 1 + Stage 3.4
 // onboarding. AddTelegram intentionally does NOT register one to
@@ -353,10 +395,26 @@ TelegramSecretSourceValidator.EnsureBotTokenConfigured(
 app.UseRouting();
 app.MapTelegramWebhook();
 
-// Liveness probe consumed by the Dockerfile HEALTHCHECK and the
-// Stage 7.1 integration-test fixture. Kept on the bare
-// AddHealthChecks() registration above so the endpoint is always
-// reachable even before Phase 6 adds the composite check.
-app.MapHealthChecks("/healthz");
+// Stage 6.2 -- /healthz liveness probe consumed by the Dockerfile
+// HEALTHCHECK, Kubernetes liveness/readiness probes, and the
+// Stage 7.1 integration-test fixture. Wires the four registered
+// health checks (DeadLetterQueueHealthCheck, TelegramBotHealthCheck,
+// OutboundQueueHealthCheck, DatabaseHealthCheck) into a structured
+// JSON response per the brief's "expose at `/healthz` with JSON
+// detail output" requirement. The Stage 6.2
+// HealthCheckJsonResponseWriter serialises the HealthReport into
+// { status, totalDuration, entries } where `entries` lists each
+// check's status, description, duration, tags, and data
+// dictionary -- enough for an operator runbook or dashboard to
+// pivot on the failing check by name.
+//
+// The HTTP status code rules out of MapHealthChecks are unchanged
+// from the framework default: Healthy/Degraded -> 200 OK,
+// Unhealthy -> 503 Service Unavailable. The body's `status`
+// field is still the canonical machine-readable signal.
+app.MapHealthChecks("/healthz", new HealthCheckOptions
+{
+    ResponseWriter = HealthCheckJsonResponseWriter.WriteAsync,
+});
 
 app.Run();

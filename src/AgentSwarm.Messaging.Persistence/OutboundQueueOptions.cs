@@ -90,4 +90,27 @@ public sealed class OutboundQueueOptions
     /// lockstep.
     /// </summary>
     public int MaxRetries { get; set; } = 5;
+
+    /// <summary>
+    /// Stage 6.2 — soft degraded-threshold for the outbound queue
+    /// depth (count of rows whose <c>Status</c> is
+    /// <see cref="Abstractions.OutboundMessageStatus.Pending"/> or
+    /// <see cref="Abstractions.OutboundMessageStatus.Sending"/>). The
+    /// Stage 6.2 <see cref="OutboundQueueHealthCheck"/> reports
+    /// <see cref="Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Degraded"/>
+    /// when the live count exceeds this value but the dead-letter
+    /// queue is still within its
+    /// <see cref="DeadLetterQueueOptions.UnhealthyThreshold"/> budget.
+    /// Default 1000 per the Stage 6.2 brief — well below
+    /// <see cref="MaxQueueDepth"/> (5000) so the operator sees a
+    /// degraded signal long before the backpressure dead-letter
+    /// path engages.
+    /// </summary>
+    /// <remarks>
+    /// The signal is informational — degraded does not block the
+    /// queue from accepting more rows; the
+    /// <see cref="MaxQueueDepth"/> backpressure path is the
+    /// admission boundary, not this threshold.
+    /// </remarks>
+    public int DegradedDepthThreshold { get; set; } = 1000;
 }
