@@ -114,6 +114,31 @@ using Microsoft.Extensions.Logging;
 /// decision" contract. iter-3 evaluator item 6 explicitly required
 /// this propagation.
 /// </para>
+/// <para>
+/// <b>Rollback-failure escalation.</b> When the post-failure
+/// <see cref="IDbContextTransaction.RollbackAsync(CancellationToken)"/>
+/// itself throws, the transaction state is <i>indeterminate</i> —
+/// the audit row may have committed (e.g. the primary failure was
+/// raised in EF Core's post-save validation after the DB-side
+/// commit) or may have been left aborted at the provider, and the
+/// writer has no reliable way to disambiguate. iter-11 reviewer
+/// flagged that the prior <see cref="ILogger.LogWarning"/> on the
+/// rollback exception was routinely filtered in production log
+/// pipelines and would not page on-call — yet a partial audit
+/// write is exactly the scenario an operator MUST investigate (it
+/// breaks the "every decision is durably logged" contract in
+/// either direction: a duplicate row on retry, or a missing row
+/// the caller believes is durable because the primary catch
+/// rethrew). The rollback failure is therefore now logged at
+/// <see cref="LogLevel.Critical"/> — the same severity tier the
+/// outbound writer reserves for "needs human attention now" events
+/// — and the diagnostic carries the same row keys
+/// (<c>Id</c> / <c>EntryKind</c> / <c>EventFamily</c> /
+/// <c>CorrelationId</c> / <c>Platform</c>) the primary error log
+/// already carries, plus the original primary-failure message
+/// chained as <c>PrimaryFailure</c>, so the on-call engineer can
+/// correlate the two log records without grep-walking timestamps.
+/// </para>
 /// </remarks>
 public sealed class PersistentAuditLogger : IAuditLogger
 {
@@ -499,36 +524,60 @@ public sealed class PersistentAuditLogger : IAuditLogger
                 }
                 catch (Exception rollbackEx)
                 {
-                    // iter-11 reviewer: a failed RollbackAsync after a
-                    // primary SaveChangesAsync failure leaves the
-                    // transaction state INDETERMINATE — depending on the
-                    // provider, the connection state, and when the
-                    // primary exception fired (pre-flush vs. mid-commit),
-                    // the audit row may or may not have been durably
-                    // committed. That ambiguity is precisely the
-                    // forensic problem the audit log is supposed to
-                    // prevent: an operator now has to manually inspect
-                    // the AuditLogs table to determine whether a partial
-                    // write landed for this Id, and the row must be
-                    // either reconciled with the rethrown business
-                    // failure or explicitly accepted as a ghost write.
-                    // Previously logged at Warning, which is routinely
-                    // filtered out of production log pipelines and would
-                    // not trigger an on-call alert; escalated to Critical
-                    // so the entry survives default log filters and pages
-                    // the operator. The structured properties expose
-                    // Id, EntryKind, EventFamily, CorrelationId, and
-                    // Platform so the operator can SELECT the suspect
-                    // row directly (`WHERE Id={Id}`) instead of
-                    // grepping logs for the original write.
+                    // iter-11 reviewer escalation. A failed
+                    // RollbackAsync after a primary SaveChanges
+                    // failure leaves the transaction state
+                    // *indeterminate* — the audit row may have
+                    // committed (e.g. the primary exception was
+                    // raised after the DB-side commit in EF Core's
+                    // post-save validation) or may have been left
+                    // aborted at the provider, and the writer has
+                    // no reliable way to disambiguate from
+                    // application code. That breaks the Stage 5.3
+                    // "every decision is durably logged" contract
+                    // in either direction:
+                    //
+                    //   * If the row DID land, the caller's rethrow
+                    //     above will (correctly per the contract)
+                    //     report failure to the upstream handler,
+                    //     which will retry / surface "audit
+                    //     missing" to the operator — yet the row
+                    //     IS in the table, producing a duplicate
+                    //     on the retry path or false-positive
+                    //     "missing audit" alerts.
+                    //   * If the row did NOT land, the rethrow is
+                    //     accurate but the rollback exception
+                    //     itself signals a deeper provider /
+                    //     connectivity fault the operator must
+                    //     investigate before further writes are
+                    //     trustworthy.
+                    //
+                    // Either way, an operator must investigate
+                    // promptly. The prior LogWarning was routinely
+                    // filtered in production log pipelines and did
+                    // not page on-call. Escalate to LogCritical —
+                    // the same tier the outbound writer reserves
+                    // for "needs human attention now" events — and
+                    // carry the same row-key context the primary
+                    // error log already carries (Id, EntryKind,
+                    // EventFamily, CorrelationId, Platform) so the
+                    // on-call engineer can correlate the two log
+                    // records without grep-walking timestamps. The
+                    // primary failure message is also threaded
+                    // through as a structured field so the
+                    // correlated context (which exception kicked
+                    // off the rollback that then failed) is
+                    // visible without needing to fetch the
+                    // preceding LogError record.
                     _logger.LogCritical(
                         rollbackEx,
-                        "PersistentAuditLogger transaction rollback FAILED after primary SaveChanges failure; transaction state is INDETERMINATE and the audit row may or may not have been committed. Operator must inspect AuditLogs for Id={Id} to determine whether a partial write landed and reconcile against the rethrown primary failure. Id={Id} EntryKind={EntryKind} EventFamily={EventFamily} CorrelationId={CorrelationId} Platform={Platform}",
+                        "PersistentAuditLogger transaction rollback FAILED after primary SaveChanges failure; audit row state is INDETERMINATE (may or may not be committed) and requires operator investigation. Id={Id} EntryKind={EntryKind} EventFamily={EventFamily} CorrelationId={CorrelationId} Platform={Platform} PrimaryFailure={PrimaryFailure}",
                         row.Id,
                         row.EntryKind,
                         row.EventFamily,
                         row.CorrelationId,
-                        row.Platform);
+                        row.Platform,
+                        ex.Message);
                 }
             }
             throw;
