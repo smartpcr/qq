@@ -10,7 +10,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Security;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
@@ -648,22 +647,19 @@ public static class TelegramSecretSourceValidator
             // unknown physical path classifies as unapproved.
             return null;
         }
-        catch (SecurityException)
-        {
-            // Code Access Security / restricted file-path failure
-            // (e.g., partial-trust host, file-provider whose
-            // GetFileInfo demands a permission the worker process
-            // does not have). Same fall-through reasoning as
-            // IOException — unknown physical path classifies as
-            // unapproved. We narrow the catch list to these three
-            // expected failure modes (rather than swallowing
-            // everything) so that unexpected exceptions —
-            // NullReferenceException from a misbehaving custom file
-            // provider, ArgumentException from a malformed Source.Path,
-            // etc. — surface at startup instead of being masked into a
-            // silent misclassification of the supplying provider.
-            return null;
-        }
+
+        // Intentionally NOT a bare 'catch' and intentionally NOT
+        // catching SecurityException either: this helper runs on the
+        // startup path, so any unexpected failure must surface so the
+        // operator can see WHY the validator could not classify the
+        // supplying provider. Per code review (Stage 5.1 r0,
+        // TelegramSecretSourceValidator.cs#L399), swallowing
+        // SecurityException (or NullReferenceException / Argument-
+        // Exception from a misbehaving custom file provider, etc.)
+        // would mask the real cause and could let the validator
+        // mis-classify the bot-token source. Only the two genuine,
+        // expected file-system failure modes above are caught;
+        // everything else propagates and fails host startup loudly.
     }
 
     private static void ThrowMissingTokenDiagnostic(
