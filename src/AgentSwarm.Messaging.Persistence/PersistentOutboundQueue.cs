@@ -222,31 +222,19 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
             };
             _context.Entry(existing).CurrentValues.SetValues(exhausted);
 
-            // Insert the dead-letter row in the same unit of work so a
-            // concurrent dispatcher cannot observe an intermediate
-            // Status=Failed,NextRetryAt=null snapshot and re-claim the
-            // exhausted message. DeadLetterAsync remains idempotent for
-            // direct callers; for the exhaustion path we inline the
-            // insert to keep the transition to a single SaveChanges.
-            var alreadyDeadLettered = await _context.DeadLetterMessages
-                .AsNoTracking()
-                .AnyAsync(d => d.OriginalMessageId == messageId, ct)
-                .ConfigureAwait(false);
-
-            if (!alreadyDeadLettered)
-            {
-                _context.DeadLetterMessages.Add(new DeadLetterMessage
-                {
-                    OriginalMessageId = exhausted.MessageId,
-                    ChatId = exhausted.ChatId,
-                    Payload = exhausted.Payload,
-                    ErrorReason = BuildErrorReason(exhausted),
-                    FailedAt = _timeProvider.GetUtcNow(),
-                    AttemptCount = exhausted.AttemptCount,
-                });
-            }
-
-            await _context.SaveChangesAsync(ct).ConfigureAwait(false);
+            // Persist the status transition and the dead-letter insert in a
+            // single unit of work, deferring duplicate suppression to the
+            // UNIQUE(OriginalMessageId) constraint rather than a TOCTOU
+            // pre-check. A concurrent operator-initiated DeadLetterAsync
+            // racing this exhaustion path will collide on the unique index;
+            // the catch handler detaches our duplicate insert and re-saves
+            // the status transition alone.
+            await PersistDeadLetterTransitionAsync(
+                exhausted,
+                BuildErrorReason(exhausted),
+                exhausted.AttemptCount,
+                _timeProvider.GetUtcNow(),
+                ct).ConfigureAwait(false);
             return;
         }
 
@@ -279,11 +267,6 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
         var existing = await LoadTrackedAsync(messageId, ct).ConfigureAwait(false);
         var now = _timeProvider.GetUtcNow();
 
-        var alreadyDeadLettered = await _context.DeadLetterMessages
-            .AsNoTracking()
-            .AnyAsync(d => d.OriginalMessageId == messageId, ct)
-            .ConfigureAwait(false);
-
         if (existing.Status != OutboundMessageStatus.DeadLettered)
         {
             var dead = existing with
@@ -294,20 +277,18 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
             _context.Entry(existing).CurrentValues.SetValues(dead);
         }
 
-        if (!alreadyDeadLettered)
-        {
-            _context.DeadLetterMessages.Add(new DeadLetterMessage
-            {
-                OriginalMessageId = existing.MessageId,
-                ChatId = existing.ChatId,
-                Payload = existing.Payload,
-                ErrorReason = BuildErrorReason(existing),
-                FailedAt = now,
-                AttemptCount = existing.AttemptCount,
-            });
-        }
-
-        await _context.SaveChangesAsync(ct).ConfigureAwait(false);
+        // Defer duplicate suppression to the UNIQUE(OriginalMessageId)
+        // index instead of a TOCTOU AnyAsync pre-check: under concurrent
+        // DeadLetter / MarkFailed-exhaustion calls the read-then-write
+        // window would allow both callers to insert. The catch-fallback
+        // in PersistDeadLetterTransitionAsync collapses the duplicate to
+        // a single row by detaching and re-saving the status transition.
+        await PersistDeadLetterTransitionAsync(
+            existing,
+            BuildErrorReason(existing),
+            existing.AttemptCount,
+            now,
+            ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -417,6 +398,48 @@ public sealed class PersistentOutboundQueue : IOutboundQueue
         }
 
         return existing;
+    }
+
+    /// <summary>
+    /// Persists the Sending/Failed → DeadLettered status transition (already
+    /// applied to the tracked <paramref name="exhausted"/> entity by the
+    /// caller) and inserts the linked <see cref="DeadLetterMessage"/> in a
+    /// single unit of work. Concurrent callers (e.g. a worker hitting the
+    /// MarkFailed exhaustion path while an operator separately invokes
+    /// DeadLetterAsync) collide on
+    /// <c>IX_DeadLetterMessages_OriginalMessageId_Unique</c>; the catch
+    /// handler detaches our duplicate insert and re-saves the status
+    /// transition alone so the row remains in DeadLettered state and the
+    /// caller never observes the UNIQUE-violation exception.
+    /// </summary>
+    private async Task PersistDeadLetterTransitionAsync(
+        OutboundMessage exhausted,
+        string errorReason,
+        int attemptCount,
+        DateTimeOffset failedAt,
+        CancellationToken ct)
+    {
+        var deadLetter = new DeadLetterMessage
+        {
+            OriginalMessageId = exhausted.MessageId,
+            ChatId = exhausted.ChatId,
+            Payload = exhausted.Payload,
+            ErrorReason = errorReason,
+            FailedAt = failedAt,
+            AttemptCount = attemptCount,
+        };
+
+        _context.DeadLetterMessages.Add(deadLetter);
+
+        try
+        {
+            await _context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
+        {
+            _context.Entry(deadLetter).State = EntityState.Detached;
+            await _context.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
     }
 
     private IQueryable<OutboundMessage> SelectEligibleQuery(DateTimeOffset now)
