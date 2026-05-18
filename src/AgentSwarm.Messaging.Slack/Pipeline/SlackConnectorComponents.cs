@@ -12,11 +12,9 @@ using AgentSwarm.Messaging.Slack.Queues;
 
 /// <summary>
 /// Explicit composition object that names every internal Slack
-/// subsystem <see cref="SlackConnector"/> "composes" per
-/// implementation-plan.md Stage 8.1 step 1: the inbound transport
-/// seam (<see cref="ISlackInboundQueue"/>) the
-/// <see cref="SlackInboundIngestor"/> background service drains, the
-/// outbound transport seam (<see cref="ISlackOutboundQueue"/>) the
+/// subsystem <see cref="SlackConnector"/> directly invokes per
+/// implementation-plan.md Stage 8.1 step 1: the outbound transport
+/// seam (<see cref="ISlackOutboundQueue"/>) the
 /// <see cref="SlackOutboundDispatcher"/> background service drains,
 /// the per-task thread manager (<see cref="ISlackThreadManager"/>),
 /// the audit logger (<see cref="ISlackAuditLogger"/>), and the
@@ -58,6 +56,19 @@ using AgentSwarm.Messaging.Slack.Queues;
 /// strictly stronger guarantee than the prior runtime check because
 /// it surfaces BEFORE the host even starts.
 /// </para>
+/// <para>
+/// <b>The inbound transport seam (<see cref="ISlackInboundQueue"/>)
+/// is intentionally NOT exposed on this bundle.</b> The connector
+/// never reads or enqueues against it -- the Events API / Socket Mode
+/// receivers enqueue, and <see cref="SlackInboundIngestor"/> drains
+/// and forwards processed events into
+/// <see cref="ISlackInboundEventBuffer"/> (which is the inbound seam
+/// this bundle DOES surface, because <see cref="SlackConnector.ReceiveAsync"/>
+/// drains it). Carrying an unused <see cref="ISlackInboundQueue"/>
+/// reference here would couple the bundle's DI resolution graph to
+/// the inbound queue for no behavioural benefit; it can be added back
+/// the moment a connector code path actually needs it.
+/// </para>
 /// </remarks>
 internal sealed class SlackConnectorComponents
 {
@@ -71,16 +82,6 @@ internal sealed class SlackConnectorComponents
     /// <c>chat.postMessage</c> call.
     /// </summary>
     public ISlackAuditLogger AuditLogger { get; }
-
-    /// <summary>
-    /// Inbound transport queue (the seam the Slack inbound HTTP
-    /// controllers push into and <see cref="SlackInboundIngestor"/>
-    /// drains). Surfaced as a composition reference so the connector's
-    /// SendMessageAsync audit row can correlate against the same
-    /// transport even though the connector itself never enqueues
-    /// inbound envelopes.
-    /// </summary>
-    public ISlackInboundQueue InboundTransport { get; }
 
     /// <summary>
     /// Outbound transport queue (the seam
@@ -104,13 +105,11 @@ internal sealed class SlackConnectorComponents
 
     public SlackConnectorComponents(
         ISlackAuditLogger auditLogger,
-        ISlackInboundQueue inboundTransport,
         ISlackOutboundQueue outboundTransport,
         ISlackThreadManager threadManager,
         ISlackInboundEventBuffer inboundEventBuffer)
     {
         this.AuditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
-        this.InboundTransport = inboundTransport ?? throw new ArgumentNullException(nameof(inboundTransport));
         this.OutboundTransport = outboundTransport ?? throw new ArgumentNullException(nameof(outboundTransport));
         this.ThreadManager = threadManager ?? throw new ArgumentNullException(nameof(threadManager));
         this.InboundEventBuffer = inboundEventBuffer ?? throw new ArgumentNullException(nameof(inboundEventBuffer));
