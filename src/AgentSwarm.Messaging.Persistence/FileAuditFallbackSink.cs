@@ -96,26 +96,17 @@ using Microsoft.Extensions.Logging;
 /// deferred alert is the recovery mechanism.
 /// </para>
 /// <para>
-/// <b>Lifetime / disposal.</b> The sink is intended to be registered
-/// as a DI singleton (the host's <c>IServiceCollection</c> wiring
-/// does so), which means the DI container owns its lifetime and
-/// will call <see cref="Dispose"/> exactly once during graceful
-/// shutdown. The internal <see cref="SemaphoreSlim"/> allocates a
-/// kernel-level <see cref="ManualResetEvent"/> on the first
-/// <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/> call to
-/// back its async-wait queue; that handle would leak across process
-/// restarts in long-lived hosts (containers that recycle the
-/// service provider without recycling the process) if the semaphore
-/// were not disposed. <see cref="Dispose"/> therefore exists solely
-/// to release that handle and is idempotent — calling it more than
-/// once is a no-op rather than an
-/// <see cref="ObjectDisposedException"/> so cooperative shutdown
-/// sequences cannot fail because two collaborators both attempted
-/// to clean up. After disposal further
-/// <see cref="EnqueueAsync(AuditEntry,CancellationToken)"/> calls
-/// throw <see cref="ObjectDisposedException"/>; this is preferable
-/// to silently dropping a rejection audit row, which is the whole
-/// failure mode the sink exists to prevent.
+/// <b>Lifetime / disposal.</b> The sink owns a
+/// <see cref="SemaphoreSlim"/> which lazily allocates a
+/// <see cref="ManualResetEvent"/> — and therefore a kernel handle —
+/// the first time <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/>
+/// observes contention. Because the sink is normally registered as a
+/// DI singleton, that handle would outlive the host on graceful
+/// shutdown unless the container disposes the sink. The class
+/// therefore implements <see cref="IDisposable"/>; the DI container
+/// (or any host that constructs the sink manually) MUST dispose it
+/// on shutdown to release the handle. <see cref="Dispose"/> is
+/// idempotent and safe to call from any thread.
 /// </para>
 /// </remarks>
 public sealed class FileAuditFallbackSink : IAuditFallbackSink, IDisposable
@@ -220,7 +211,6 @@ public sealed class FileAuditFallbackSink : IAuditFallbackSink, IDisposable
     public async Task EnqueueAsync(AuditEntry entry, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entry);
-        ThrowIfDisposed();
 
         var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
@@ -244,7 +234,6 @@ public sealed class FileAuditFallbackSink : IAuditFallbackSink, IDisposable
     public async Task EnqueueAsync(HumanResponseAuditEntry entry, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entry);
-        ThrowIfDisposed();
 
         var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
@@ -266,21 +255,27 @@ public sealed class FileAuditFallbackSink : IAuditFallbackSink, IDisposable
     }
 
     /// <summary>
-    /// Releases the kernel handle backing the internal
-    /// <see cref="SemaphoreSlim"/>. Safe to call more than once; the
-    /// second and subsequent invocations are no-ops so cooperative
-    /// shutdown sequences in which both the DI container and a
-    /// host-owned <c>using</c> scope dispose the sink do not throw.
+    /// Releases the kernel handle held by the internal
+    /// <see cref="SemaphoreSlim"/>. <c>SemaphoreSlim</c> lazily
+    /// allocates a <see cref="ManualResetEvent"/> (and therefore an
+    /// OS handle) the first time
+    /// <see cref="SemaphoreSlim.WaitAsync(CancellationToken)"/>
+    /// observes contention; because the sink is normally registered
+    /// as a DI singleton, that handle would otherwise outlive the
+    /// host on graceful shutdown. The DI container disposes the sink
+    /// during shutdown which triggers this method and releases the
+    /// handle. Dispose is idempotent via an
+    /// <see cref="Interlocked.Exchange(ref int,int)"/> flag so
+    /// double-disposal — manual <c>Dispose()</c> followed by
+    /// container shutdown, or vice versa — is safe and a no-op.
+    /// Hosts should not call <see cref="EnqueueAsync(AuditEntry,CancellationToken)"/>
+    /// after disposing the sink; that ordering is the container's
+    /// responsibility (singletons are disposed after hosted services
+    /// stop in the standard .NET Generic Host).
     /// </summary>
     public void Dispose()
     {
-        // Interlocked guard: the DI container disposes singletons
-        // serially, but a host that constructs the sink manually
-        // could race a `using` block against an in-flight shutdown
-        // hook. A CompareExchange-based once-only gate makes the
-        // SemaphoreSlim.Dispose() call exactly-once without paying
-        // for a lock on the cold path.
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
         {
             return;
         }
@@ -366,25 +361,7 @@ public sealed class FileAuditFallbackSink : IAuditFallbackSink, IDisposable
         }
         finally
         {
-            // Releasing a disposed SemaphoreSlim throws
-            // ObjectDisposedException, but the only path that reaches
-            // this finally has already passed the WaitAsync above —
-            // and Dispose itself never runs concurrently with an
-            // in-flight EnqueueAsync in the DI-singleton lifetime the
-            // sink is registered under (the container drains scopes
-            // before disposing singletons). Guarding against the
-            // pathological "Dispose ran mid-write" case would require
-            // a reader/writer lock on every write and is not worth
-            // the per-call cost on the hot path.
             _gate.Release();
-        }
-    }
-
-    private void ThrowIfDisposed()
-    {
-        if (Volatile.Read(ref _disposed) != 0)
-        {
-            throw new ObjectDisposedException(nameof(FileAuditFallbackSink));
         }
     }
 }
