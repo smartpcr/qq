@@ -499,10 +499,36 @@ public sealed class PersistentAuditLogger : IAuditLogger
                 }
                 catch (Exception rollbackEx)
                 {
-                    _logger.LogWarning(
+                    // iter-11 reviewer: a failed RollbackAsync after a
+                    // primary SaveChangesAsync failure leaves the
+                    // transaction state INDETERMINATE — depending on the
+                    // provider, the connection state, and when the
+                    // primary exception fired (pre-flush vs. mid-commit),
+                    // the audit row may or may not have been durably
+                    // committed. That ambiguity is precisely the
+                    // forensic problem the audit log is supposed to
+                    // prevent: an operator now has to manually inspect
+                    // the AuditLogs table to determine whether a partial
+                    // write landed for this Id, and the row must be
+                    // either reconciled with the rethrown business
+                    // failure or explicitly accepted as a ghost write.
+                    // Previously logged at Warning, which is routinely
+                    // filtered out of production log pipelines and would
+                    // not trigger an on-call alert; escalated to Critical
+                    // so the entry survives default log filters and pages
+                    // the operator. The structured properties expose
+                    // Id, EntryKind, EventFamily, CorrelationId, and
+                    // Platform so the operator can SELECT the suspect
+                    // row directly (`WHERE Id={Id}`) instead of
+                    // grepping logs for the original write.
+                    _logger.LogCritical(
                         rollbackEx,
-                        "PersistentAuditLogger transaction rollback failed after primary failure. Id={Id}",
-                        row.Id);
+                        "PersistentAuditLogger transaction rollback FAILED after primary SaveChanges failure; transaction state is INDETERMINATE and the audit row may or may not have been committed. Operator must inspect AuditLogs for Id={Id} to determine whether a partial write landed and reconcile against the rethrown primary failure. Id={Id} EntryKind={EntryKind} EventFamily={EventFamily} CorrelationId={CorrelationId} Platform={Platform}",
+                        row.Id,
+                        row.EntryKind,
+                        row.EventFamily,
+                        row.CorrelationId,
+                        row.Platform);
                 }
             }
             throw;
