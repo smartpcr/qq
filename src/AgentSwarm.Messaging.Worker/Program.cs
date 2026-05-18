@@ -151,7 +151,95 @@ builder.Host.ConfigureAppConfiguration((context, config) =>
 // EF Core + Telegram + webhook receiver (channel, processor, endpoint).
 builder.Services.AddMessagingPersistence(builder.Configuration);
 builder.Services.AddTelegram(builder.Configuration);
+// Stage 6.3 iter-3 evaluator item 1 — the brief lists
+// services.AddCommandProcessing() as a discrete Worker-host
+// composition surface ("call services.AddCommandProcessing() to
+// register CommandRouter, all ICommandHandler implementations,
+// CallbackQueryHandler, TelegramCommandParser"). AddTelegram
+// already invokes AddCommandProcessing internally so the inbound
+// pipeline composes end-to-end whether a host calls this method
+// or not; the explicit call here makes the Worker's surface match
+// the brief verbatim. AddCommandProcessing uses TryAddSingleton
+// + TryAddEnumerable so the double-invocation is idempotent
+// (zero additional descriptors).
+builder.Services.AddCommandProcessing();
 builder.Services.AddTelegramWebhook();
+
+// Stage 6.3 — IOutboundQueue composition switch (brief: "register
+// IOutboundQueue persistent or in-memory based on environment").
+//
+// AddMessagingPersistence above has Replace()'d IOutboundQueue with
+// the EF-backed PersistentOutboundQueue (durable outbox with WAL
+// fsync per message). Production hosts want exactly that; dev /
+// local hosts the brief asks to run on the bounded in-memory
+// Channel<OutboundMessage>-backed implementation so a developer's
+// laptop never accumulates a stale messaging.db full of in-flight
+// rows from interrupted runs.
+//
+// Selection rule, in order of precedence:
+//   1. Explicit `OutboundQueue:Mode` configuration value
+//      (`InMemory` / `Persistent`) — operator-supplied override, wins
+//      unconditionally. Comparison is case-insensitive.
+//   2. Implicit by environment — Development => InMemory, all other
+//      environments (Production, Staging, Integration, custom) =>
+//      Persistent. This matches appsettings.Development.json's
+//      explicit `OutboundQueue:Mode = "InMemory"` so the host
+//      composes the same shape whether the operator sets the key
+//      or leaves it at its environment default.
+//
+// `UseInMemoryOutboundQueue()` is a `Replace()` so it correctly
+// unseats the persistent registration AddMessagingPersistence
+// installed seconds ago; calling it BEFORE AddMessagingPersistence
+// would silently no-op.
+var configuredQueueMode = builder.Configuration["OutboundQueue:Mode"];
+var useInMemoryOutboundQueue = string.Equals(configuredQueueMode, "InMemory", StringComparison.OrdinalIgnoreCase)
+    || (string.IsNullOrWhiteSpace(configuredQueueMode) && builder.Environment.IsDevelopment());
+if (useInMemoryOutboundQueue)
+{
+    builder.Services.UseInMemoryOutboundQueue();
+}
+
+// =============================================================
+// Stage 6.3 -- PRODUCTION DEPLOYMENT REQUIREMENT (ISwarmCommandBus).
+//
+// AddTelegram registers IOperatorRegistry, ITaskOversightRepository,
+// and ISwarmCommandBus via TryAddSingleton so the inbound pipeline
+// can boot end-to-end before a host wires the concrete production
+// replacements. AddMessagingPersistence (above) Replace()'s the
+// first TWO with their EF-backed siblings
+// (PersistentOperatorRegistry, PersistentTaskOversightRepository)
+// so a default Production worker resolves both to durable
+// implementations.
+//
+// THERE IS NO CONCRETE ISwarmCommandBus IN THIS STORY'S SCOPE.
+// The brief calls the swarm transport adapter "out of scope" --
+// the StubSwarmCommandBus registration that AddTelegram installs
+// is the only one this assembly ships. A Production deployment
+// MUST register the concrete swarm-side bus BEFORE
+// `var app = builder.Build();` below or the StubGuardHealthCheck
+// fail-closes /healthz with HTTP 503. There is NO acknowledgement
+// path -- the Stage 6.3 brief mandates the guard prevent
+// production deployments from running with stubs.
+//
+//     using Microsoft.Extensions.DependencyInjection;
+//     using Microsoft.Extensions.DependencyInjection.Extensions;
+//     using AgentSwarm.Messaging.Abstractions;
+//     using Contoso.AgentSwarm.SwarmBus;   // your concrete adapter
+//
+//     builder.Services.Replace(
+//         ServiceDescriptor.Singleton<ISwarmCommandBus,
+//             ContosoSwarmCommandBus>());
+//
+// Replace() (not TryAdd) is required so the TryAdd from
+// AddTelegram is unseated. The same shape works for tests that
+// want to inject a fake.
+//
+// Operators can confirm /healthz reports the guard as Healthy
+// once their bus is wired by polling `/healthz` and inspecting
+// the entry under `entries.stub_guard` -- a Healthy entry whose
+// `data.swarmCommandBus` value is the operator's adapter
+// FullName proves the registration won the last-Replace race.
+// =============================================================
 
 // Stage 6.1 -- OpenTelemetry tracing + metrics. Registers the custom
 // ActivitySource AgentSwarm.Messaging.Telegram (plus AspNetCore and
@@ -215,6 +303,26 @@ builder.Services.AddTelegramOpenTelemetry(builder.Configuration, builder.Environ
 // cannot diverge, and operator dashboards that already pivot on
 // the Stage 4.2 check name (`outbound_dead_letter_queue_depth`)
 // keep working unchanged.
+// Stage 6.3 -- StubGuardHealthCheck is the production-readiness
+// gate that fails /healthz when ASPNETCORE_ENVIRONMENT=Production
+// AND any of the three swarm-side abstractions
+// (IOperatorRegistry, ITaskOversightRepository, ISwarmCommandBus)
+// resolve to their dev/test stub implementations. In non-Production
+// environments the check is intentionally a no-op so integration
+// tests and `dotnet run` Development hosts that legitimately rely
+// on the stubs are not regressed. The check is tagged `stub_guard`
+// so operator dashboards can pivot on it independently from the
+// other liveness signals.
+//
+// Stage 6.3 iter-3 evaluator items 1-3 -- the brief mandates the
+// guard is fail-closed: any stub in Production -> Unhealthy with
+// no acknowledgement / bypass path. Production deployments wire a
+// concrete ISwarmCommandBus via services.Replace() (see the
+// comment block above this one); the Docker image's HEALTHCHECK
+// directive intentionally fails for the stock image so an
+// operator who forgot to wire the production bus sees the
+// container reported Unhealthy by Docker / Kubernetes before
+// traffic is routed.
 builder.Services.AddHealthChecks()
     .AddCheck<DeadLetterQueueHealthCheck>(
         DeadLetterQueueHealthCheck.Name,
@@ -227,7 +335,10 @@ builder.Services.AddHealthChecks()
         tags: new[] { "outbound", "dead_letter" })
     .AddCheck<DatabaseHealthCheck>(
         DatabaseHealthCheck.Name,
-        tags: new[] { "database", "audit" });
+        tags: new[] { "database", "audit" })
+    .AddCheck<StubGuardHealthCheck>(
+        StubGuardHealthCheck.Name,
+        tags: new[] { "stub_guard", "production_readiness" });
 
 // IUserAuthorizationService -- iter-5 evaluator item 1 + Stage 3.4
 // onboarding. AddTelegram intentionally does NOT register one to
@@ -397,16 +508,23 @@ app.MapTelegramWebhook();
 
 // Stage 6.2 -- /healthz liveness probe consumed by the Dockerfile
 // HEALTHCHECK, Kubernetes liveness/readiness probes, and the
-// Stage 7.1 integration-test fixture. Wires the four registered
+// Stage 7.1 integration-test fixture. Wires the five registered
 // health checks (DeadLetterQueueHealthCheck, TelegramBotHealthCheck,
-// OutboundQueueHealthCheck, DatabaseHealthCheck) into a structured
-// JSON response per the brief's "expose at `/healthz` with JSON
-// detail output" requirement. The Stage 6.2
+// OutboundQueueHealthCheck, DatabaseHealthCheck, StubGuardHealthCheck)
+// into a structured JSON response per the brief's "expose at
+// `/healthz` with JSON detail output" requirement. The Stage 6.2
 // HealthCheckJsonResponseWriter serialises the HealthReport into
 // { status, totalDuration, entries } where `entries` lists each
 // check's status, description, duration, tags, and data
 // dictionary -- enough for an operator runbook or dashboard to
 // pivot on the failing check by name.
+//
+// Stage 6.3 -- StubGuardHealthCheck is the fifth check in the list
+// above. In Production it returns Unhealthy when IOperatorRegistry,
+// ITaskOversightRepository, or ISwarmCommandBus still resolve to
+// their dev-mode stubs; in every other environment (Development,
+// Staging, Integration, custom) it is a no-op that returns Healthy
+// so the integration-test fixture's /healthz probe stays green.
 //
 // The HTTP status code rules out of MapHealthChecks are unchanged
 // from the framework default: Healthy/Degraded -> 200 OK,

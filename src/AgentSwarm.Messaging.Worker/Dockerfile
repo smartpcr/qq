@@ -46,6 +46,52 @@ FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 # Stage 6.3 spec: webhook receiver listens on port 8443. Kestrel
 # is told to bind via ASPNETCORE_URLS so the same image works in
 # environments where the port is remapped externally.
+#
+# Stage 6.3 iter-5 evaluator item 1 -- the stock image MUST NOT
+# look "safe" while stubs run silently. For a production-readiness
+# workstream, the right default is fail-closed: the stock image
+# boots in Production, the StubGuardHealthCheck refuses to ship
+# stubs, /healthz returns HTTP 503, and the Docker HEALTHCHECK
+# below correctly marks the container `unhealthy`. That is the
+# brief-mandated signal "do not deploy this without wiring concrete
+# replacements" -- not an accident to paper over with a Development
+# default.
+#
+# Two consequences of this default:
+#
+#   1) `docker run agentswarm-messaging-worker` (no env override)
+#      starts the container, /healthz returns 503, Docker marks it
+#      `unhealthy`, and Kubernetes / docker swarm orchestrators
+#      will refuse to send traffic. This is the correct fail-closed
+#      signal for a deployment that forgot to wire concrete services.
+#
+#   2) Local developers use `docker compose up worker` -- the
+#      repo-root docker-compose.yml explicitly overrides
+#      `ASPNETCORE_ENVIRONMENT` to `Development` via
+#      `${ASPNETCORE_ENVIRONMENT:-Development}`, so the compose
+#      workflow boots green out of the box. That is the developer
+#      DX path; the bare image is the deployment path.
+#
+# A real production deployment MUST do two things together:
+#
+#   1) Bake in a concrete ISwarmCommandBus via
+#      `services.Replace(ServiceDescriptor.Singleton<ISwarmCommandBus,
+#      ContosoSwarmCommandBus>())` before `builder.Build()` -- either
+#      by deriving a custom image FROM this one and copying the
+#      adapter assembly, or by re-publishing the Worker with the
+#      registration in source. With concrete services wired the
+#      stock Production env results in /healthz=200 and the Docker
+#      HEALTHCHECK reports the container `healthy`.
+#
+#   2) Leave ASPNETCORE_ENVIRONMENT=Production (the stock default)
+#      so the strict stub guard activates and refuses to ship stubs.
+#
+# The verify-docker.ps1 script at the repo root exercises both the
+# fail-closed Production-stock path (/healthz=503 + Docker
+# `unhealthy`) and the green Development-override path
+# (/healthz=200 + Docker `healthy`) end-to-end against the actual
+# `docker build` + `docker run` + `docker inspect` pipeline so the
+# HEALTHCHECK contract and the HTTP probe stay consistent.
 ENV ASPNETCORE_URLS=http://+:8443 \
     ASPNETCORE_ENVIRONMENT=Production \
     DOTNET_RUNNING_IN_CONTAINER=true \
