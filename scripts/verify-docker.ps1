@@ -74,6 +74,12 @@
 #        directive was somehow stripped, or 200 + Docker `unhealthy`
 #        would mean the probe is flapping). The image's HEALTHCHECK
 #        contract is broken.
+#   6 -- parameter-validation failure: caller passed an invalid
+#        combination of switches (e.g. both -Development and
+#        -RequireHealthy, which describe mutually exclusive
+#        scenarios). The script aborts before touching Docker so
+#        CI can distinguish "operator mis-invoked the script" from
+#        runtime verification failures (codes 1-5).
 # =============================================================================
 
 [CmdletBinding()]
@@ -93,7 +99,7 @@ $ErrorActionPreference = 'Stop'
 if ($Development -and $RequireHealthy)
 {
     Write-Host "FAILED: -Development and -RequireHealthy are mutually exclusive." -ForegroundColor Red
-    exit 4
+    exit 6
 }
 
 # Scenario classification drives the (HTTP, Docker-health) allowlist.
