@@ -65,9 +65,15 @@ using Microsoft.Extensions.Logging;
 ///   <see cref="CommandResult.Success"/> /
 ///   <see cref="CommandResult.ErrorCode"/> outcome and any
 ///   thrown exception's type / message. Completion-write failures
-///   are LOGGED but do NOT rethrow — the receipt already
-///   guarantees the inbound command is captured in the audit
-///   trail; the completion row is the observability bonus.</description></item>
+///   do NOT rethrow — the receipt already guarantees the inbound
+///   command is captured in the audit trail; the completion row
+///   adds the outcome. Instead, the entry is enqueued onto the
+///   durable <see cref="IAuditFallbackSink"/> (the same backstop
+///   the pipeline uses for rejection rows) so the completion row
+///   survives a transient audit-DB outage rather than being
+///   silently dropped after a single log entry — the iter-10
+///   evaluator fix for "all completion audit rows are permanently
+///   lost with no durable backup".</description></item>
 /// </list>
 /// The unknown-command path emits a SINGLE row (Phase=Received,
 /// Action=<see cref="UnknownCommandAuditAction"/>) — there is no
@@ -148,15 +154,24 @@ using Microsoft.Extensions.Logging;
 /// invoked — the iter-6 evaluator item 2 fix: a command can never
 /// produce side effects (publish a SwarmCommand, emit a
 /// HumanDecisionEvent) while the matching <c>audit_logs</c> row is
-/// missing. A failed COMPLETION audit write is logged but NOT
-/// rethrown — the receipt row already satisfies the
-/// "log every inbound command" guarantee; the completion row is
-/// the observability bonus and the operator should not see a
-/// hard failure when the side effect already happened. Hosts that
-/// genuinely require lenient audit semantics can register a
-/// tolerant <see cref="IAuditLogger"/> decorator that catches
-/// inside the writer; the router itself never tolerates the
-/// receipt gap.
+/// missing. The receipt path intentionally does NOT fall back to
+/// <see cref="IAuditFallbackSink"/> — running the handler on the
+/// strength of a fallback row would split the audit trail across
+/// two mediums for the same correlation id and reintroduce the
+/// orphan-side-effect window the rethrow exists to prevent. A
+/// failed COMPLETION audit write, on the other hand, is logged
+/// AND enqueued onto <see cref="IAuditFallbackSink"/> (Stage 5.3
+/// iter-10 evaluator fix) — the receipt row already satisfies the
+/// "log every inbound command" guarantee, but the completion row
+/// carries the success/failure / error-code / handler-exception
+/// details that operators rely on for forensic queries and that
+/// must NOT silently disappear during a sustained audit-DB outage.
+/// The completion path never rethrows — failing the operator after
+/// a successful side effect would force them to retry an already-
+/// committed command. Hosts that genuinely require lenient audit
+/// semantics can register a tolerant <see cref="IAuditLogger"/>
+/// decorator that catches inside the writer; the router itself
+/// never tolerates the receipt gap.
 /// </para>
 /// </remarks>
 public sealed class CommandRouter : ICommandRouter
@@ -221,17 +236,72 @@ public sealed class CommandRouter : ICommandRouter
 
     private readonly IReadOnlyDictionary<string, ICommandHandler> _handlers;
     private readonly IAuditLogger _audit;
+
+    // Stage 5.3 iter-10 evaluator fix — durable backstop for the
+    // COMPLETION audit row when the primary _audit writer throws.
+    // Mirrors the pattern in TelegramUpdatePipeline.WriteRejectionAuditAsync:
+    // primary first, fallback only inside the catch. The Stage 5.3
+    // brief mandates "log every inbound command ... with full context"
+    // and the completion row carries the success / failure / error-code
+    // / handler-exception details that operators rely on for forensic
+    // queries — these MUST NOT be silently dropped during a sustained
+    // audit-DB outage. Production registers FileAuditFallbackSink via
+    // AddMessagingPersistence; dev / unit-test bootstraps fall back to
+    // NullAuditFallbackSink (a silent no-op) via the back-compat
+    // constructor below, which preserves the prior shape for the
+    // existing CommandRouterTests harnesses that pre-date this
+    // dependency. The receipt path intentionally does NOT consult this
+    // sink — see remarks above for why integrity beats durability on
+    // the pre-dispatch audit.
+    private readonly IAuditFallbackSink _auditFallback;
+
     private readonly TimeProvider _time;
     private readonly ILogger<CommandRouter> _logger;
 
+    /// <summary>
+    /// Backward-compatible constructor preserving the original
+    /// four-argument shape used by the in-tree
+    /// <c>CommandRouterTests</c> harness and any other direct-
+    /// construction call site that pre-dates the Stage 5.3 iter-10
+    /// <see cref="IAuditFallbackSink"/> dependency. Delegates to the
+    /// five-arg primary constructor with a
+    /// <see cref="NullAuditFallbackSink"/> so the fallback path is a
+    /// silent no-op in environments that do not register the durable
+    /// sink. Production hosts always resolve the five-arg overload via
+    /// DI because <c>AddMessagingPersistence</c> registers
+    /// <c>FileAuditFallbackSink</c> as the <see cref="IAuditFallbackSink"/>
+    /// binding.
+    /// </summary>
     public CommandRouter(
         IEnumerable<ICommandHandler> handlers,
         IAuditLogger audit,
         TimeProvider time,
         ILogger<CommandRouter> logger)
+        : this(handlers, audit, new NullAuditFallbackSink(), time, logger)
+    {
+    }
+
+    /// <summary>
+    /// Stage 5.3 iter-10 primary constructor. The injected
+    /// <see cref="IAuditFallbackSink"/> is consulted ONLY when the
+    /// primary <see cref="IAuditLogger"/> throws while persisting the
+    /// COMPLETION audit row — same discipline the pipeline's
+    /// <c>WriteRejectionAuditAsync</c> uses for denial rows. DI in
+    /// production wires <c>FileAuditFallbackSink</c> here (via
+    /// <c>AddMessagingPersistence</c>) so completion rows survive a
+    /// transient audit-DB outage on a durable JSONL file rather than
+    /// being lost after a single log entry.
+    /// </summary>
+    public CommandRouter(
+        IEnumerable<ICommandHandler> handlers,
+        IAuditLogger audit,
+        IAuditFallbackSink auditFallback,
+        TimeProvider time,
+        ILogger<CommandRouter> logger)
     {
         ArgumentNullException.ThrowIfNull(handlers);
         _audit = audit ?? throw new ArgumentNullException(nameof(audit));
+        _auditFallback = auditFallback ?? throw new ArgumentNullException(nameof(auditFallback));
         _time = time ?? throw new ArgumentNullException(nameof(time));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
@@ -361,10 +431,11 @@ public sealed class CommandRouter : ICommandRouter
         // exception) for forensic queries. The same correlation id
         // ties it to the receipt so log queries can
         // `WHERE CorrelationId=X` and reconstruct the command
-        // lifecycle. Failures here are LOGGED but NOT rethrown — the
-        // receipt row guarantees the audit trail; failing the
-        // operator after a successful side effect would force them
-        // to retry an already-committed command.
+        // lifecycle. Failures here are LOGGED and ENQUEUED onto the
+        // durable fallback sink (Stage 5.3 iter-10 fix) but NOT
+        // rethrown — the receipt row guarantees the audit trail and
+        // failing the operator after a successful side effect would
+        // force them to retry an already-committed command.
         await EmitCompletionAuditAsync(
             command,
             @operator,
@@ -455,7 +526,13 @@ public sealed class CommandRouter : ICommandRouter
             // — the operator observes a hard failure and retries
             // start from a clean slate when the audit DB recovers.
             // Hosts that need lenient audit semantics can wrap
-            // IAuditLogger with a tolerant decorator.
+            // IAuditLogger with a tolerant decorator. Note: the
+            // receipt path intentionally does NOT consult
+            // IAuditFallbackSink — running the handler on the
+            // strength of a fallback row would split the audit trail
+            // across two mediums for the same correlation id and
+            // reintroduce the orphan-side-effect window the rethrow
+            // exists to prevent.
             _logger.LogError(
                 ex,
                 "CommandRouter failed to persist RECEIPT audit entry; skipping handler dispatch to prevent orphan side effects (Stage 5.3 iter-6 evaluator item 2). Command={Command} OperatorId={OperatorId} CorrelationId={CorrelationId}",
@@ -510,25 +587,62 @@ public sealed class CommandRouter : ICommandRouter
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Stage 5.3 iter-6 evaluator item 2 — the completion row
-            // is observability, not integrity. The receipt row above
-            // already satisfies the "log every inbound command"
-            // guarantee, so we log the gap loudly but do NOT rethrow
+            // Stage 5.3 iter-10 evaluator fix — primary audit-DB
+            // failure must NOT silently drop the completion row.
+            // Completion rows carry success / failure / error-code /
+            // handler-exception details — exactly the forensic
+            // context operators rely on during incident review. The
+            // prior log-and-swallow shape permanently lost every
+            // completion row during a sustained audit-DB outage
+            // (the receipt row exists but the outcome row is gone),
+            // breaking the Stage 5.3 brief's "log every inbound
+            // command ... with full context" guarantee. We now mirror
+            // the discipline the pipeline's WriteRejectionAuditAsync
+            // uses: log loudly, then enqueue the entry onto the
+            // durable IAuditFallbackSink (FileAuditFallbackSink in
+            // production, NullAuditFallbackSink in dev / unit tests)
+            // so the row lands on a separate medium even when the
+            // primary writer is unavailable. We still do NOT rethrow
             // — failing the operator after a successful side effect
             // would force them to retry an already-committed command,
             // re-running the side effect with a different correlation
-            // id and no way to dedup against the prior attempt.
-            // Operators / SREs can reconstruct the outcome from logs
-            // and downstream artifacts when the completion row is
-            // missing.
+            // id and no way to dedup against the prior attempt. The
+            // receipt row above remains the integrity guarantee for
+            // "an audit row exists before the handler ran"; this
+            // fallback adds the matching outcome row's durability.
             _logger.LogError(
                 ex,
-                "CommandRouter failed to persist COMPLETION audit entry; receipt row is durable so handler outcome is not retried. Command={Command} OperatorId={OperatorId} CorrelationId={CorrelationId} HandlerThrew={HandlerThrew} Success={Success}",
+                "CommandRouter failed to persist COMPLETION audit entry; falling back to durable sink (Stage 5.3 iter-10). Command={Command} OperatorId={OperatorId} CorrelationId={CorrelationId} HandlerThrew={HandlerThrew} Success={Success}",
                 command.CommandName,
                 @operator.OperatorId,
                 auditCorrelationId,
                 handlerException is not null,
                 result.Success);
+            try
+            {
+                await _auditFallback.EnqueueAsync(entry, ct).ConfigureAwait(false);
+            }
+            catch (Exception fallbackEx) when (fallbackEx is not OperationCanceledException)
+            {
+                // Both primary AND fallback failed. The handler's
+                // side effects already happened (the receipt row
+                // captured the inbound command before they ran), so
+                // the operator is NOT failed — but the completion
+                // row is genuinely lost for this dispatch. Escalate
+                // to Critical so the operator is paged: a human must
+                // reconstruct the outcome from downstream artifacts
+                // and the structured logs below before declaring the
+                // command's audit trail complete.
+                _logger.LogCritical(
+                    fallbackEx,
+                    "CommandRouter completion audit fallback ALSO failed; completion row is lost for this dispatch. Operator intervention required. Command={Command} OperatorId={OperatorId} CorrelationId={CorrelationId} HandlerThrew={HandlerThrew} Success={Success} PrimaryError={PrimaryError}",
+                    command.CommandName,
+                    @operator.OperatorId,
+                    auditCorrelationId,
+                    handlerException is not null,
+                    result.Success,
+                    ex.Message);
+            }
         }
     }
 
