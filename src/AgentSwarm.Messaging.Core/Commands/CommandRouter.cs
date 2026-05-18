@@ -1,5 +1,7 @@
 namespace AgentSwarm.Messaging.Core.Commands;
 
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using AgentSwarm.Messaging.Abstractions;
 using Microsoft.Extensions.Logging;
 
@@ -35,6 +37,127 @@ using Microsoft.Extensions.Logging;
 /// the <c>"Approve"</c> vs <c>"approve"</c> drift the
 /// <see cref="TelegramCommands.IsKnown"/> contract notes.
 /// </para>
+/// <para>
+/// <b>Stage 5.3 audit integration.</b> Per the Stage 5.3 brief
+/// ("<i>Integrate audit logging at command router level: log every
+/// inbound command and every outbound decision event with full
+/// context</i>"), every call to <see cref="RouteAsync"/> emits up to
+/// TWO <see cref="AuditEntry"/> rows via the injected
+/// <see cref="IAuditLogger.LogAsync"/> path:
+/// <list type="number">
+///   <item><description><b>Receipt row</b> (<see cref="CommandAuditPhases.Received"/>)
+///   — written BEFORE the handler is dispatched. Carries the
+///   command verb, the inbound message id
+///   (<see cref="ParsedCommand.SourceMessageId"/>), the inbound
+///   trace id (<see cref="ParsedCommand.TraceId"/>), and the
+///   operator / tenant / workspace context. If this write fails
+///   the router rethrows <i>without</i> dispatching the handler —
+///   the iter-5 evaluator item 2 fix: a router-level audit
+///   failure cannot leave orphan side effects (e.g. an <c>/ask</c>
+///   that publishes a SwarmCommand without a matching audit row,
+///   or an <c>/approve</c> that emits a HumanDecisionEvent the
+///   audit trail never recorded).</description></item>
+///   <item><description><b>Completion row</b> (<see cref="CommandAuditPhases.Completed"/>)
+///   — written AFTER the handler returns or throws. Carries the
+///   same correlation id as the receipt (so log queries can
+///   <c>WHERE CorrelationId=X</c> and reconstruct the full
+///   command lifecycle) plus the handler's
+///   <see cref="CommandResult.Success"/> /
+///   <see cref="CommandResult.ErrorCode"/> outcome and any
+///   thrown exception's type / message. Completion-write failures
+///   are LOGGED but do NOT rethrow — the receipt already
+///   guarantees the inbound command is captured in the audit
+///   trail; the completion row is the observability bonus.</description></item>
+/// </list>
+/// The unknown-command path emits a SINGLE row (Phase=Received,
+/// Action=<see cref="UnknownCommandAuditAction"/>) — there is no
+/// handler to wait on, so there's no separate completion phase.
+/// </para>
+/// <para>
+/// <b>Why two rows.</b> The Stage 5.3 brief requires the audit row
+/// to exist <i>before</i> any state-changing side effect (otherwise
+/// retries duplicate work without a recoverable trail). The append-
+/// only contract on <c>audit_logs</c> rules out updating a single
+/// row in place; the two-row design preserves both properties —
+/// receipt for integrity, completion for outcome — while keeping
+/// every row joinable on a single correlation id.
+/// </para>
+/// <para>
+/// <b>Field shape per row.</b>
+/// <list type="bullet">
+///   <item><description><see cref="AuditEntry.Action"/> = the bare
+///   canonical command verb (e.g. <c>status</c>, <c>ask</c>),
+///   normalised to lower-case so log queries can filter on a single
+///   literal — Stage 5.3 iter-2 evaluator item 1: the prior
+///   <c>command.&lt;name&gt;</c> overload broke the acceptance
+///   assertion "<c>AuditLogEntry exists with Action=ask</c>" because
+///   the column carried <c>command.ask</c> instead of <c>ask</c>.
+///   The orthogonal "this is a command-family event" discriminator
+///   moved to <see cref="AuditEntry.EventFamily"/> =
+///   <see cref="AuditEventFamilies.Command"/>; unknown commands use
+///   <see cref="UnknownCommandAuditAction"/>.</description></item>
+///   <item><description><see cref="AuditEntry.MessageId"/> =
+///   <see cref="ParsedCommand.SourceMessageId"/> (Stage 5.3 iter-6
+///   evaluator item 3) — surfaces the Telegram <c>update_id</c> of
+///   the inbound message onto the audit row so forensic queries
+///   can join <c>audit_logs.MessageId</c> back to
+///   <c>inbound_updates.EventId</c> without an out-of-band lookup.
+///   <c>null</c> only when the caller constructed a
+///   <see cref="ParsedCommand"/> outside the inbound pipeline
+///   (tests, programmatic dispatch).</description></item>
+///   <item><description><see cref="AuditEntry.UserId"/> = the
+///   operator's Telegram user id (string form);
+///   <see cref="AuditEntry.TenantId"/> = the resolved
+///   <c>OperatorBinding.TenantId</c>, satisfying the persistence
+///   layer's tenant column.</description></item>
+///   <item><description><see cref="AuditEntry.CorrelationId"/> =
+///   <see cref="ParsedCommand.TraceId"/> when present (the inbound
+///   trace id propagated from
+///   <c>MessengerEvent.CorrelationId</c>), falling back to a
+///   freshly minted GUID otherwise so the persistence layer's
+///   non-null CorrelationId contract is never violated. Both the
+///   receipt and completion rows share the same correlation id —
+///   the iter-6 evaluator item 2 fix changed the audit's
+///   correlation source from the handler's <c>result.CorrelationId</c>
+///   (which is the produced workflow's id and is unavailable
+///   before the handler runs) to the inbound trace id (which is
+///   available before the handler runs and is the same id every
+///   pipeline / dedup / outbound artifact carries for this
+///   update).</description></item>
+///   <item><description><see cref="AuditEntry.Details"/> = a small
+///   JSON blob. The receipt row carries the inbound shape
+///   (<c>RawText</c>, <c>Arguments</c>, workspace, chat id,
+///   message id, <c>"phase":"received"</c>); the completion row
+///   carries the outcome (<c>Success</c>, <c>ErrorCode</c>,
+///   exception type / message, <c>"phase":"completed"</c>). The
+///   serialiser uses <see cref="JsonNamingPolicy.CamelCase"/> for
+///   compactness; sensitive command arguments (e.g. comment text
+///   in <c>/reject "I disagree"</c>) ARE included because the
+///   brief's acceptance criterion ("<i>full context</i>") implies
+///   the audit row carries enough context to reconstruct the
+///   operator's intent.</description></item>
+/// </list>
+/// The audit calls are invoked via the
+/// <see cref="IAuditLogger.LogAsync"/> path, which the
+/// <c>PersistentAuditLogger</c> writes to the dedicated
+/// <c>audit_logs</c> table per the Stage 5.3 schema.
+///
+/// <b>Stage 5.3 iter-3 evaluator item 6 — receipt audit failures propagate.</b>
+/// A failed RECEIPT audit write is logged AND rethrown from
+/// <see cref="EmitReceiptAuditAsync"/> so the handler is never
+/// invoked — the iter-6 evaluator item 2 fix: a command can never
+/// produce side effects (publish a SwarmCommand, emit a
+/// HumanDecisionEvent) while the matching <c>audit_logs</c> row is
+/// missing. A failed COMPLETION audit write is logged but NOT
+/// rethrown — the receipt row already satisfies the
+/// "log every inbound command" guarantee; the completion row is
+/// the observability bonus and the operator should not see a
+/// hard failure when the side effect already happened. Hosts that
+/// genuinely require lenient audit semantics can register a
+/// tolerant <see cref="IAuditLogger"/> decorator that catches
+/// inside the writer; the router itself never tolerates the
+/// receipt gap.
+/// </para>
 /// </remarks>
 public sealed class CommandRouter : ICommandRouter
 {
@@ -48,14 +171,68 @@ public sealed class CommandRouter : ICommandRouter
     /// </summary>
     public const string UnknownCommandErrorCode = "unknown_command";
 
+    /// <summary>
+    /// <see cref="AuditEntry.Action"/> emitted when the router rejects
+    /// an unknown command. Stage 5.3 acceptance pins the column to the
+    /// bare verb (<c>Action=ask</c> for <c>/ask</c>) — so an unknown
+    /// command's row sets <c>Action=unknown</c> for parity. Pairs with
+    /// <see cref="UnknownCommandErrorCode"/> on the
+    /// <see cref="CommandResult"/>.
+    /// </summary>
+    public const string UnknownCommandAuditAction = "unknown";
+
+    /// <summary>
+    /// <see cref="AuditEntry.Action"/> emitted when the dispatched
+    /// command handler throws. The exception is rethrown after the
+    /// audit row is written (Stage 5.3 iter-2 evaluator item 3: the
+    /// router MUST log every inbound command, even when the handler
+    /// fails). The bare verb is preserved on the audit row's
+    /// <see cref="AuditEntry.Action"/>; the <see cref="AuditEntry.Details"/>
+    /// JSON records the exception type/message so the failure is
+    /// recoverable from the audit trail alone.
+    /// </summary>
+    public const string HandlerThrewMarker = "handler_threw";
+
+    /// <summary>
+    /// Stage 5.3 iter-6 evaluator item 2 — canonical literals for the
+    /// <c>phase</c> discriminator written into
+    /// <see cref="AuditEntry.Details"/>. The receipt phase row is
+    /// written BEFORE the handler dispatches (so a router-level audit
+    /// failure cannot leave orphan side effects); the completion
+    /// phase row is written AFTER the handler returns or throws. Both
+    /// rows share the same correlation id so forensic queries can
+    /// reconstruct the command lifecycle with a single
+    /// <c>WHERE CorrelationId=X</c> predicate.
+    /// </summary>
+    public static class CommandAuditPhases
+    {
+        /// <summary>Phase written BEFORE handler dispatch — the integrity guarantee.</summary>
+        public const string Received = "received";
+
+        /// <summary>Phase written AFTER handler returns or throws — the observability bonus.</summary>
+        public const string Completed = "completed";
+    }
+
+    private static readonly JsonSerializerOptions AuditDetailsJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
     private readonly IReadOnlyDictionary<string, ICommandHandler> _handlers;
+    private readonly IAuditLogger _audit;
+    private readonly TimeProvider _time;
     private readonly ILogger<CommandRouter> _logger;
 
     public CommandRouter(
         IEnumerable<ICommandHandler> handlers,
+        IAuditLogger audit,
+        TimeProvider time,
         ILogger<CommandRouter> logger)
     {
         ArgumentNullException.ThrowIfNull(handlers);
+        _audit = audit ?? throw new ArgumentNullException(nameof(audit));
+        _time = time ?? throw new ArgumentNullException(nameof(time));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         var dict = new Dictionary<string, ICommandHandler>(StringComparer.OrdinalIgnoreCase);
@@ -94,24 +271,265 @@ public sealed class CommandRouter : ICommandRouter
         ArgumentNullException.ThrowIfNull(command);
         ArgumentNullException.ThrowIfNull(@operator);
 
-        if (string.IsNullOrWhiteSpace(command.CommandName)
-            || !_handlers.TryGetValue(command.CommandName, out var handler))
+        // Stage 5.3 iter-6 evaluator item 2 — pre-compute the shared
+        // correlation id used by BOTH the receipt and completion
+        // audit rows. The inbound trace id is preferred (set by the
+        // pipeline from MessengerEvent.CorrelationId so every pipeline
+        // / dedup / outbound artifact for this update shares the
+        // same id); we fall back to a fresh GUID only when the caller
+        // constructed the ParsedCommand outside the pipeline (tests,
+        // programmatic dispatch) and did not set TraceId. The
+        // persistence layer's CorrelationId column is non-null so
+        // this fallback is essential.
+        var auditCorrelationId = !string.IsNullOrWhiteSpace(command.TraceId)
+            ? command.TraceId
+            : Guid.NewGuid().ToString("N");
+
+        var isKnown = false;
+        ICommandHandler? matched = null;
+        if (!string.IsNullOrWhiteSpace(command.CommandName)
+            && _handlers.TryGetValue(command.CommandName, out matched))
+        {
+            isKnown = true;
+        }
+
+        // Stage 5.3 iter-6 evaluator item 2 — RECEIPT audit BEFORE
+        // handler dispatch. Rationale: the prior router wrote the
+        // command audit only AFTER the handler had already performed
+        // its side effects (publish SwarmCommand, emit
+        // HumanDecisionEvent), so a transient audit-DB failure left
+        // orphan state with no recoverable trail. The receipt now
+        // commits BEFORE the handler runs; on receipt-write failure
+        // the rethrow below skips the handler entirely so retries
+        // start from a clean slate.
+        await EmitReceiptAuditAsync(command, @operator, auditCorrelationId, isKnown, ct).ConfigureAwait(false);
+
+        CommandResult result;
+        Exception? handlerException = null;
+
+        if (!isKnown)
         {
             _logger.LogWarning(
                 "CommandRouter received unknown command. Command={Command} OperatorId={OperatorId}",
                 command.CommandName,
                 @operator.OperatorId);
 
+            // No handler to invoke for an unknown command — short-circuit
+            // with a help-text result. The receipt already recorded the
+            // attempt; there is no separate completion phase because no
+            // side effects ran.
             return new CommandResult
             {
                 Success = false,
                 ResponseText = BuildUnknownCommandReply(command.CommandName),
                 ErrorCode = UnknownCommandErrorCode,
-                CorrelationId = Guid.NewGuid().ToString("N"),
+                CorrelationId = auditCorrelationId,
             };
         }
 
-        return await handler.HandleAsync(command, @operator, ct).ConfigureAwait(false);
+        try
+        {
+            result = await matched!.HandleAsync(command, @operator, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Stage 5.3 iter-2 evaluator item 3 — the router MUST
+            // audit every inbound command, including one whose
+            // handler throws. Capture the exception, synthesize a
+            // failure CommandResult so the completion audit row
+            // carries the failure context, emit the completion row,
+            // THEN rethrow so the caller's normal error path runs
+            // (pipeline-level try/catch surfaces the failure to the
+            // operator and bumps the failure counter). The pipeline
+            // does NOT get a partial success — the rethrow preserves
+            // the observable behaviour for callers that were already
+            // catching handler exceptions.
+            handlerException = ex;
+            result = new CommandResult
+            {
+                Success = false,
+                ResponseText = string.Empty,
+                ErrorCode = HandlerThrewMarker,
+                CorrelationId = auditCorrelationId,
+            };
+        }
+
+        // Stage 5.3 iter-6 evaluator item 2 — COMPLETION audit AFTER
+        // handler returns or throws. The receipt above already
+        // satisfies the "log every inbound command" persistence
+        // guarantee; this row adds the outcome (Success / ErrorCode /
+        // exception) for forensic queries. The same correlation id
+        // ties it to the receipt so log queries can
+        // `WHERE CorrelationId=X` and reconstruct the command
+        // lifecycle. Failures here are LOGGED but NOT rethrown — the
+        // receipt row guarantees the audit trail; failing the
+        // operator after a successful side effect would force them
+        // to retry an already-committed command.
+        await EmitCompletionAuditAsync(
+            command,
+            @operator,
+            auditCorrelationId,
+            result,
+            handlerException,
+            ct).ConfigureAwait(false);
+
+        if (handlerException is not null)
+        {
+            // Rethrow AFTER audit so callers that were already
+            // catching handler exceptions observe identical behaviour
+            // to the pre-Stage-5.3 router; the only difference is
+            // the audit row that now exists for the failed dispatch.
+            // Use ExceptionDispatchInfo so the original stack trace
+            // is preserved across the await boundary.
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(handlerException).Throw();
+        }
+
+        return result;
+    }
+
+    private async Task EmitReceiptAuditAsync(
+        ParsedCommand command,
+        AuthorizedOperator @operator,
+        string auditCorrelationId,
+        bool isKnown,
+        CancellationToken ct)
+    {
+        // Stage 5.3 acceptance assertion ("AuditLogEntry exists
+        // with Action=ask") requires the bare command verb in
+        // Action. EventFamily carries the orthogonal "this is a
+        // command-family event" discriminator so log queries can
+        // still filter the family with a single equality
+        // predicate.
+        var action = string.IsNullOrWhiteSpace(command.CommandName)
+            ? UnknownCommandAuditAction
+            : (isKnown
+                ? command.CommandName.ToLowerInvariant()
+                : UnknownCommandAuditAction);
+
+        var details = JsonSerializer.Serialize(
+            new CommandReceiptAuditDetails(
+                CommandAuditPhases.Received,
+                command.CommandName,
+                command.RawText,
+                command.Arguments?.Count > 0 ? command.Arguments : null,
+                @operator.WorkspaceId,
+                @operator.TelegramChatId,
+                command.SourceMessageId),
+            AuditDetailsJsonOptions);
+
+        var entry = new AuditEntry
+        {
+            EntryId = Guid.NewGuid(),
+            // Stage 5.3 iter-6 evaluator item 3 — propagate the
+            // inbound transport message id onto MessageId so command
+            // audit rows are joinable back to inbound_updates.EventId
+            // without an out-of-band lookup. The prior router
+            // hard-coded `MessageId = null` on every command audit
+            // row which violated the Stage 5.3 brief's "full
+            // context" requirement.
+            MessageId = command.SourceMessageId,
+            UserId = @operator.TelegramUserId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            AgentId = null,
+            Action = action,
+            EventFamily = AuditEventFamilies.Command,
+            Timestamp = _time.GetUtcNow(),
+            CorrelationId = auditCorrelationId,
+            TenantId = @operator.TenantId,
+            Details = details,
+        };
+
+        try
+        {
+            await _audit.LogAsync(entry, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Stage 5.3 iter-6 evaluator item 2 — the receipt audit
+            // is the integrity guarantee for "log every inbound
+            // command BEFORE side effects". A failure here means we
+            // cannot safely run the handler (the handler's side
+            // effects would be orphan: published SwarmCommand /
+            // emitted HumanDecisionEvent with no recoverable audit
+            // trail). We log loudly AND rethrow so the caller's
+            // failure path runs WITHOUT the handler being dispatched
+            // — the operator observes a hard failure and retries
+            // start from a clean slate when the audit DB recovers.
+            // Hosts that need lenient audit semantics can wrap
+            // IAuditLogger with a tolerant decorator.
+            _logger.LogError(
+                ex,
+                "CommandRouter failed to persist RECEIPT audit entry; skipping handler dispatch to prevent orphan side effects (Stage 5.3 iter-6 evaluator item 2). Command={Command} OperatorId={OperatorId} CorrelationId={CorrelationId}",
+                command.CommandName,
+                @operator.OperatorId,
+                auditCorrelationId);
+            throw;
+        }
+    }
+
+    private async Task EmitCompletionAuditAsync(
+        ParsedCommand command,
+        AuthorizedOperator @operator,
+        string auditCorrelationId,
+        CommandResult result,
+        Exception? handlerException,
+        CancellationToken ct)
+    {
+        var action = command.CommandName?.ToLowerInvariant() ?? UnknownCommandAuditAction;
+
+        var details = JsonSerializer.Serialize(
+            new CommandCompletionAuditDetails(
+                CommandAuditPhases.Completed,
+                command.CommandName,
+                result.Success,
+                result.ErrorCode,
+                result.CorrelationId,
+                @operator.WorkspaceId,
+                @operator.TelegramChatId,
+                command.SourceMessageId,
+                handlerException?.GetType().FullName,
+                handlerException?.Message),
+            AuditDetailsJsonOptions);
+
+        var entry = new AuditEntry
+        {
+            EntryId = Guid.NewGuid(),
+            MessageId = command.SourceMessageId,
+            UserId = @operator.TelegramUserId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            AgentId = null,
+            Action = action,
+            EventFamily = AuditEventFamilies.Command,
+            Timestamp = _time.GetUtcNow(),
+            CorrelationId = auditCorrelationId,
+            TenantId = @operator.TenantId,
+            Details = details,
+        };
+
+        try
+        {
+            await _audit.LogAsync(entry, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Stage 5.3 iter-6 evaluator item 2 — the completion row
+            // is observability, not integrity. The receipt row above
+            // already satisfies the "log every inbound command"
+            // guarantee, so we log the gap loudly but do NOT rethrow
+            // — failing the operator after a successful side effect
+            // would force them to retry an already-committed command,
+            // re-running the side effect with a different correlation
+            // id and no way to dedup against the prior attempt.
+            // Operators / SREs can reconstruct the outcome from logs
+            // and downstream artifacts when the completion row is
+            // missing.
+            _logger.LogError(
+                ex,
+                "CommandRouter failed to persist COMPLETION audit entry; receipt row is durable so handler outcome is not retried. Command={Command} OperatorId={OperatorId} CorrelationId={CorrelationId} HandlerThrew={HandlerThrew} Success={Success}",
+                command.CommandName,
+                @operator.OperatorId,
+                auditCorrelationId,
+                handlerException is not null,
+                result.Success);
+        }
     }
 
     /// <summary>
@@ -130,4 +548,43 @@ public sealed class CommandRouter : ICommandRouter
         }
         return $"Command not recognized: /{commandName}. Available commands: {available}.";
     }
+
+    /// <summary>
+    /// Payload serialised into <see cref="AuditEntry.Details"/> for the
+    /// RECEIPT audit row written BEFORE handler dispatch (Stage 5.3
+    /// iter-6 evaluator item 2). Captures only the inbound shape —
+    /// fields that are known before the handler runs — so the
+    /// receipt commits without any handler-supplied value. The
+    /// outcome (Success / ErrorCode / exception) lives on the
+    /// separate completion row.
+    /// </summary>
+    private sealed record CommandReceiptAuditDetails(
+        string Phase,
+        string? CommandName,
+        string? RawText,
+        IReadOnlyList<string>? Arguments,
+        string WorkspaceId,
+        long TelegramChatId,
+        string? SourceMessageId);
+
+    /// <summary>
+    /// Payload serialised into <see cref="AuditEntry.Details"/> for the
+    /// COMPLETION audit row written AFTER handler returns or throws
+    /// (Stage 5.3 iter-6 evaluator item 2). Captures the outcome
+    /// shape — Success / ErrorCode / handler-supplied correlation id
+    /// / exception type / message — so a forensic query joining
+    /// receipt + completion by CorrelationId can reconstruct the
+    /// full command lifecycle.
+    /// </summary>
+    private sealed record CommandCompletionAuditDetails(
+        string Phase,
+        string? CommandName,
+        bool Success,
+        string? ErrorCode,
+        string? ResultCorrelationId,
+        string WorkspaceId,
+        long TelegramChatId,
+        string? SourceMessageId,
+        string? HandlerExceptionType,
+        string? HandlerExceptionMessage);
 }

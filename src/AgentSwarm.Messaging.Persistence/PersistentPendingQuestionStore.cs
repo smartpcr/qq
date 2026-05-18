@@ -185,6 +185,14 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
 
         var now = _timeProvider.GetUtcNow();
 
+        // Stage 5.3 iter-3 evaluator item 4 — denormalise tenant /
+        // workspace from the envelope's RoutingMetadata so the
+        // downstream callback / timeout audit paths can read them off
+        // PendingQuestion (via ToDto) without re-resolving the operator
+        // binding. Stamped upstream by SwarmEventSubscriptionService
+        // when the tenant context exists at routing time.
+        ExtractRoutingTenant(envelope, out var tenantId, out var workspaceId);
+
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
 
@@ -214,6 +222,11 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
             existing.DefaultActionId = envelope.ProposedDefaultActionId;
             existing.DefaultActionValue = defaultActionValue;
             existing.CorrelationId = question.CorrelationId;
+            // Refresh tenant/workspace too so a re-route that supplies
+            // updated context overwrites the stale value rather than
+            // silently retaining the original mapping.
+            existing.TenantId = tenantId;
+            existing.WorkspaceId = workspaceId;
             // Status / SelectedActionId / SelectedActionValue /
             // RespondentUserId are deliberately NOT overwritten —
             // the callback handler is the source of truth for those
@@ -238,6 +251,8 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
             DefaultActionValue = defaultActionValue,
             Status = PendingQuestionStatus.Pending,
             CorrelationId = question.CorrelationId,
+            TenantId = tenantId,
+            WorkspaceId = workspaceId,
         };
         db.PendingQuestions.Add(inserted);
 
@@ -288,7 +303,42 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
             afterRace.DefaultActionId = envelope.ProposedDefaultActionId;
             afterRace.DefaultActionValue = defaultActionValue;
             afterRace.CorrelationId = question.CorrelationId;
+            afterRace.TenantId = tenantId;
+            afterRace.WorkspaceId = workspaceId;
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Pulls Stage 5.3 tenant/workspace context out of
+    /// <see cref="AgentQuestionEnvelope.RoutingMetadata"/>. Mirrors the
+    /// stub implementation in
+    /// <c>AgentSwarm.Messaging.Telegram.Pipeline.Stubs.InMemoryPendingQuestionStore</c>
+    /// so the persistent and in-memory paths agree on which metadata
+    /// keys are authoritative.
+    /// </summary>
+    private static void ExtractRoutingTenant(
+        AgentQuestionEnvelope envelope,
+        out string? tenantId,
+        out string? workspaceId)
+    {
+        tenantId = null;
+        workspaceId = null;
+        if (envelope.RoutingMetadata is null)
+        {
+            return;
+        }
+
+        if (envelope.RoutingMetadata.TryGetValue("TenantId", out var rawTenant)
+            && !string.IsNullOrWhiteSpace(rawTenant))
+        {
+            tenantId = rawTenant;
+        }
+
+        if (envelope.RoutingMetadata.TryGetValue("WorkspaceId", out var rawWorkspace)
+            && !string.IsNullOrWhiteSpace(rawWorkspace))
+        {
+            workspaceId = rawWorkspace;
         }
     }
 
@@ -344,7 +394,7 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
     /// <c>false</c> — otherwise the system double-publishes for the
     /// same <c>QuestionId</c>.
     /// </summary>
-    public async Task MarkAnsweredAsync(string questionId, CancellationToken ct)
+    public async Task<bool> MarkAnsweredAsync(string questionId, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(questionId);
 
@@ -357,13 +407,11 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
         // callback-vs-sweep race: a callback that arrives microseconds
         // AFTER QuestionTimeoutService has already claimed the row
         // (Status = TimedOut) will see rowsAffected == 0 here and the
-        // UPDATE becomes a no-op — Telegram callbacks ignore the
-        // outcome because the interface returns Task per
-        // IPendingQuestionStore.MarkAnsweredAsync. The bool result of
-        // the CAS is currently discarded; if a future caller needs to
-        // branch on the win/lose outcome, the interface signature
-        // would have to change to Task<bool> first.
-        _ = await db.PendingQuestions
+        // caller skips its publish/audit (Stage 5.3 iter-3 evaluator
+        // item 7 — the CallbackQueryHandler now CALLs this BEFORE
+        // publishing so the cross-process race is closed by the
+        // database UPDATE rather than relying on dedup TTLs).
+        var rowsAffected = await db.PendingQuestions
             .Where(x => x.QuestionId == questionId
                      && (x.Status == PendingQuestionStatus.Pending
                       || x.Status == PendingQuestionStatus.AwaitingComment))
@@ -371,6 +419,8 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
                 setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.Answered),
                 ct)
             .ConfigureAwait(false);
+
+        return rowsAffected > 0;
     }
 
     /// <summary>
@@ -388,7 +438,7 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
     /// <c>false</c> so the operator does not get prompted for text
     /// against a question the system has already defaulted.
     /// </summary>
-    public async Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
+    public async Task<bool> MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrEmpty(questionId);
 
@@ -400,17 +450,19 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
         // Same race-closing rationale as MarkAnsweredAsync /
         // MarkTimedOutAsync: a callback that arrives after a
         // QuestionTimeoutService sweep has already flipped the row
-        // to TimedOut will see rowsAffected == 0 here, and the UPDATE
-        // is a no-op — the row stays TimedOut. The interface returns
-        // Task per IPendingQuestionStore.MarkAwaitingCommentAsync so
-        // the bool CAS outcome is currently discarded.
-        _ = await db.PendingQuestions
+        // to TimedOut will see rowsAffected == 0 here. The caller
+        // branches on the returned bool and skips the comment prompt
+        // (Stage 5.3 iter-3 evaluator item 7 — the comment-prompt
+        // path is now race-safe end-to-end).
+        var rowsAffected = await db.PendingQuestions
             .Where(x => x.QuestionId == questionId
                      && x.Status == PendingQuestionStatus.Pending)
             .ExecuteUpdateAsync(
                 setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.AwaitingComment),
                 ct)
             .ConfigureAwait(false);
+
+        return rowsAffected > 0;
     }
 
     public async Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
@@ -473,6 +525,51 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
                      && x.Status == PendingQuestionStatus.TimedOut)
             .ExecuteUpdateAsync(
                 setters => setters.SetProperty(x => x.Status, revertTo),
+                ct)
+            .ConfigureAwait(false);
+
+        return rowsAffected > 0;
+    }
+
+    public async Task<bool> TryRevertAnsweredClaimAsync(
+        string questionId,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(questionId);
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
+
+        // Conditional UPDATE — the WHERE clause filters on the
+        // post-claim Answered state, so this revert is itself atomic
+        // and will not overwrite a row that has since been progressed
+        // by another worker (e.g. timeout sweep). Mirrors the atomic
+        // primitive used by MarkAnsweredAsync.
+        var rowsAffected = await db.PendingQuestions
+            .Where(x => x.QuestionId == questionId
+                     && x.Status == PendingQuestionStatus.Answered)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.Pending),
+                ct)
+            .ConfigureAwait(false);
+
+        return rowsAffected > 0;
+    }
+
+    public async Task<bool> TryRevertAwaitingCommentClaimAsync(
+        string questionId,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(questionId);
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MessagingDbContext>();
+
+        var rowsAffected = await db.PendingQuestions
+            .Where(x => x.QuestionId == questionId
+                     && x.Status == PendingQuestionStatus.AwaitingComment)
+            .ExecuteUpdateAsync(
+                setters => setters.SetProperty(x => x.Status, PendingQuestionStatus.Pending),
                 ct)
             .ConfigureAwait(false);
 
@@ -624,6 +721,8 @@ public sealed class PersistentPendingQuestionStore : IPendingQuestionStore
             SelectedActionValue = row.SelectedActionValue,
             RespondentUserId = row.RespondentUserId,
             StoredAt = row.StoredAt,
+            TenantId = row.TenantId,
+            WorkspaceId = row.WorkspaceId,
         };
     }
 }

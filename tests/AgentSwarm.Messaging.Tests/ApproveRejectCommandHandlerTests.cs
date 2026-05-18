@@ -30,7 +30,7 @@ public class ApproveRejectCommandHandlerTests
         store.Setup(s => s.GetAsync("Q1", It.IsAny<CancellationToken>()))
             .ReturnsAsync(NewPendingQuestion("Q1", "corr-1"));
         store.Setup(s => s.MarkAnsweredAsync("Q1", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+            .ReturnsAsync(true);
 
         HumanDecisionEvent? captured = null;
         bus.Setup(b => b.PublishHumanDecisionAsync(It.IsAny<HumanDecisionEvent>(), It.IsAny<CancellationToken>()))
@@ -80,7 +80,7 @@ public class ApproveRejectCommandHandlerTests
         store.Setup(s => s.GetAsync("Q2", It.IsAny<CancellationToken>()))
             .ReturnsAsync(NewPendingQuestion("Q2", "corr-2"));
         store.Setup(s => s.MarkAnsweredAsync("Q2", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+            .ReturnsAsync(true);
 
         HumanDecisionEvent? captured = null;
         bus.Setup(b => b.PublishHumanDecisionAsync(It.IsAny<HumanDecisionEvent>(), It.IsAny<CancellationToken>()))
@@ -106,7 +106,7 @@ public class ApproveRejectCommandHandlerTests
         store.Setup(s => s.GetAsync("Q3", It.IsAny<CancellationToken>()))
             .ReturnsAsync(NewPendingQuestion("Q3", "corr-3"));
         store.Setup(s => s.MarkAnsweredAsync("Q3", It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
+            .ReturnsAsync(true);
 
         HumanDecisionEvent? captured = null;
         bus.Setup(b => b.PublishHumanDecisionAsync(It.IsAny<HumanDecisionEvent>(), It.IsAny<CancellationToken>()))

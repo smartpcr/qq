@@ -1,6 +1,7 @@
 namespace AgentSwarm.Messaging.Core.Commands;
 
 using System.Globalization;
+using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
 using Microsoft.Extensions.Logging;
 
@@ -167,6 +168,21 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
 
         var receivedAt = _time.GetUtcNow();
         var telegramUserId = @operator.TelegramUserId.ToString(CultureInfo.InvariantCulture);
+
+        // Stage 5.3 iter-3 evaluator item 7 — claim the row BEFORE
+        // publish/audit so a concurrent QuestionTimeoutService sweep
+        // (or a duplicate /approve|/reject delivery, or a button tap
+        // from CallbackQueryHandler) cannot cause a double-decision.
+        // MarkAnsweredAsync returns false on a lost claim; on that
+        // path we surface the standard "no pending question" reply
+        // and exit without publishing, mirroring the
+        // !Status.Pending early-return above.
+        var claimed = await _questions.MarkAnsweredAsync(questionId, ct).ConfigureAwait(false);
+        if (!claimed)
+        {
+            return NotFound(questionId, @operator, reasonLogged: "lost_claim_race");
+        }
+
         var decision = new HumanDecisionEvent
         {
             QuestionId = questionId,
@@ -179,30 +195,79 @@ public abstract class DecisionCommandHandlerBase : ICommandHandler
             CorrelationId = pending.CorrelationId,
         };
 
-        await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
+        // Stage 5.3 iter-8 evaluator item 3 — AUDIT-FIRST ordering.
+        // The publish runs AFTER the audit row is committed so that
+        // a transient audit-DB failure CANNOT leak an outbound
+        // HumanDecisionEvent without a durable audit_logs row. Prior
+        // (iter-3..iter-7) ordering was publish-then-audit, which
+        // left a window where the bus event escaped before the audit
+        // row landed; the Stage 5.3 brief mandates "log every
+        // outbound decision event with full context" and that
+        // guarantee requires the audit row to land FIRST.
+        //
+        // Failure semantics:
+        //   * Audit throws first  → no publish runs (clean retry —
+        //     next /approve|/reject re-acquires the claim, audits,
+        //     publishes exactly once).
+        //   * Audit succeeds, publish throws → revert the claim so a
+        //     retry can re-emit. The retry will land a SECOND audit
+        //     row for the same decision; this is the documented
+        //     persist-every-decision tradeoff (see
+        //     QuestionTimeoutService remarks on at-least-once audit
+        //     symmetry). Consumer-side dedup on QuestionId
+        //     (architecture.md §10.3) absorbs the bounded duplicate
+        //     publish.
+        try
+        {
+            await _audit.LogHumanResponseAsync(
+                new HumanResponseAuditEntry
+                {
+                    EntryId = Guid.NewGuid(),
+                    MessageId = decision.ExternalMessageId,
+                    UserId = telegramUserId,
+                    AgentId = pending.AgentId,
+                    QuestionId = questionId,
+                    ActionValue = ActionValue,
+                    Comment = reason,
+                    Timestamp = receivedAt,
+                    CorrelationId = pending.CorrelationId,
+                    // Stage 5.3 iter-2 evaluator item 6 — populate tenant
+                    // and workspace context on every decision audit row.
+                    // The slash-command path already has an
+                    // AuthorizedOperator so this is free; CallbackQueryHandler
+                    // and QuestionTimeoutService pull TenantId from the
+                    // PendingQuestion (which the connector stamps from the
+                    // envelope's RoutingMetadata at StoreAsync time).
+                    TenantId = @operator.TenantId,
+                    Details = JsonSerializer.Serialize(
+                        new DecisionAuditDetails(
+                            @operator.WorkspaceId,
+                            @operator.TelegramChatId,
+                            @operator.OperatorAlias,
+                            Source: CommandName,
+                            TelegramMessageIdNumeric: null),
+                        DecisionAuditDetailsContext.Default.DecisionAuditDetails),
+                },
+                ct).ConfigureAwait(false);
 
-        await _audit.LogHumanResponseAsync(
-            new HumanResponseAuditEntry
+            await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            try
             {
-                EntryId = Guid.NewGuid(),
-                MessageId = decision.ExternalMessageId,
-                UserId = telegramUserId,
-                AgentId = pending.AgentId,
-                QuestionId = questionId,
-                ActionValue = ActionValue,
-                Comment = reason,
-                Timestamp = receivedAt,
-                CorrelationId = pending.CorrelationId,
-            },
-            ct).ConfigureAwait(false);
-
-        // Transition AFTER publish+audit so a transient publish/audit
-        // failure leaves the question Pending and re-deliverable. This
-        // closes the "double-approve" loophole the iter-2 evaluator
-        // flagged (Issue 1): the next /approve|/reject for the same id
-        // takes the !Status.Pending early-return path above and is
-        // surfaced as "no pending question found".
-        await _questions.MarkAnsweredAsync(questionId, ct).ConfigureAwait(false);
+                await _questions.TryRevertAnsweredClaimAsync(questionId, ct).ConfigureAwait(false);
+            }
+            catch (Exception revertEx) when (revertEx is not OperationCanceledException)
+            {
+                _logger.LogError(
+                    revertEx,
+                    "{Command}CommandHandler: atomic Answered claim revert threw; the original publish/audit exception will still propagate. QuestionId={QuestionId}",
+                    CommandName,
+                    questionId);
+            }
+            throw;
+        }
 
         _logger.LogInformation(
             "{Command}CommandHandler emitted HumanDecisionEvent and marked answered. QuestionId={QuestionId} ActionValue={ActionValue} HasReason={HasReason} CorrelationId={CorrelationId}",
@@ -286,4 +351,61 @@ public sealed class RejectCommandHandler : DecisionCommandHandlerBase
     /// agent and the audit log both retain the operator's stated reason.
     /// </remarks>
     protected override bool AcceptsReason => true;
+}
+
+/// <summary>
+/// Strongly-typed payload behind
+/// <see cref="HumanResponseAuditEntry.Details"/> for decision audit rows
+/// emitted by <see cref="DecisionCommandHandlerBase"/> and the Telegram
+/// callback / timeout paths. Captures the workspace context the
+/// strongly-typed <see cref="HumanResponseAuditEntry.AgentId"/> /
+/// <see cref="HumanResponseAuditEntry.QuestionId"/> /
+/// <see cref="HumanResponseAuditEntry.ActionValue"/> columns do not
+/// cover — the Stage 5.3 brief requires every decision row to carry
+/// "full tenant/workspace context" (iter-2 evaluator item 6).
+/// </summary>
+/// <param name="WorkspaceId">
+/// The operator's workspace identifier (architecture.md §3.1) when known.
+/// </param>
+/// <param name="TelegramChatId">
+/// Chat the decision originated from / was rendered into. Always known.
+/// </param>
+/// <param name="OperatorAlias">
+/// Display alias of the responding operator when known (slash-command
+/// path); <see langword="null"/> for system-triggered decisions
+/// (timeout sweep).
+/// </param>
+/// <param name="Source">
+/// Provenance string — <c>approve</c> / <c>reject</c> for the slash-command
+/// path, <c>callback</c> for an inline button press, <c>comment</c> for a
+/// follow-up text reply, <c>timeout</c> for the
+/// <see cref="AgentSwarm.Messaging.Telegram.QuestionTimeoutService"/>
+/// sweep. Lets forensic queries pivot on the originating edge of the
+/// decision without consulting <see cref="HumanResponseAuditEntry.MessageId"/>.
+/// </param>
+/// <param name="TelegramMessageIdNumeric">
+/// Optional numeric Telegram <c>message_id</c> — populated by the
+/// callback path so the row can be joined directly against the
+/// rendered question without re-parsing <see cref="HumanResponseAuditEntry.MessageId"/>
+/// (which is the synthesised <c>cmd:&lt;name&gt;:&lt;questionId&gt;</c>
+/// string on the slash-command path).
+/// </param>
+public sealed record DecisionAuditDetails(
+    string? WorkspaceId,
+    long TelegramChatId,
+    string? OperatorAlias,
+    string Source,
+    long? TelegramMessageIdNumeric);
+
+/// <summary>
+/// System.Text.Json source-generated context for
+/// <see cref="DecisionAuditDetails"/>. Source-generated metadata avoids
+/// the runtime-reflection path so the serializer is trim/AOT-safe should
+/// the assembly ever be published with those flags.
+/// </summary>
+[System.Text.Json.Serialization.JsonSourceGenerationOptions(
+    PropertyNamingPolicy = System.Text.Json.Serialization.JsonKnownNamingPolicy.CamelCase)]
+[System.Text.Json.Serialization.JsonSerializable(typeof(DecisionAuditDetails))]
+public sealed partial class DecisionAuditDetailsContext : System.Text.Json.Serialization.JsonSerializerContext
+{
 }

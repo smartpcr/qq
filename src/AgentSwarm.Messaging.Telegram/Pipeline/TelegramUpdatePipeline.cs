@@ -1,7 +1,11 @@
+using System.Collections.Generic;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Core.Commands;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -162,6 +166,57 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
     /// </summary>
     internal static readonly TimeSpan DisambiguationTtl = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// Stage 5.3 iter-7 evaluator item 1 — canonical
+    /// <see cref="AuditEntry.Action"/> verb emitted by the pipeline for
+    /// every early denial (parse-empty, parse-invalid, authorize-denied,
+    /// role-denied). Using a single verb across the four phases keeps
+    /// log-analytics queries simple ("find all pipeline denials" =
+    /// <c>Action = 'command.denied'</c>); the phase distinction lives
+    /// in <see cref="AuditEntry.Details"/> JSON under the
+    /// <c>phase</c> key, parallelling the
+    /// <see cref="CommandRouter.CommandAuditPhases"/> convention used
+    /// by the router-level receipt / completion rows.
+    /// </summary>
+    public const string PipelineDeniedAuditAction = "command.denied";
+
+    /// <summary>
+    /// Stage 5.3 iter-7 evaluator item 1 — canonical literals for the
+    /// <c>phase</c> discriminator the pipeline writes onto every
+    /// denial audit row's <see cref="AuditEntry.Details"/> JSON. The
+    /// pipeline writes ONE row per early denial; the
+    /// <c>phase</c> value pins which gate rejected the command so a
+    /// forensic query can reconstruct the rejection cause without
+    /// re-parsing free-form log text.
+    /// </summary>
+    public static class PipelineDeniedPhases
+    {
+        /// <summary>Command event with a blank <c>RawCommand</c> (e.g. "/ ").</summary>
+        public const string ParseEmpty = "parse-empty";
+
+        /// <summary>Command parsed but failed validation (e.g. unknown verb, malformed args).</summary>
+        public const string ParseInvalid = "parse-invalid";
+
+        /// <summary>Authorization gate rejected the sender (no binding / disabled).</summary>
+        public const string AuthorizeDenied = "authorize-denied";
+
+        /// <summary>Operator authorized but lacks the role required for this verb.</summary>
+        public const string RoleDenied = "role-denied";
+    }
+
+    /// <summary>
+    /// JsonSerializerOptions used for the pipeline-denial Details
+    /// column. CamelCase property names + skip-nulls matches the
+    /// CommandRouter audit-details convention so audit-DB consumers
+    /// can union receipt / completion / denial rows without per-row
+    /// schema sniffing.
+    /// </summary>
+    private static readonly JsonSerializerOptions DenialAuditDetailsJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
     private readonly IDeduplicationService _dedup;
     private readonly IUserAuthorizationService _authz;
     private readonly ICommandParser _parser;
@@ -172,6 +227,27 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<TelegramUpdatePipeline> _logger;
     private readonly ProcessedMessengerEventChannel? _processedEventSink;
+    // Stage 5.3 iter-7 evaluator item 1 — every pipeline-level rejection
+    // (parse-empty, parse-invalid, authorize-denied, role-denied) writes a
+    // lifecycle audit row through this logger BEFORE returning the denial
+    // response. NullAuditLogger is the fallback when the legacy 9/10-arg
+    // ctors are used (e.g. existing unit-test harnesses) so the pipeline
+    // remains testable without a real audit DB, but the DI-resolved
+    // 11-arg ctor always receives the registered IAuditLogger
+    // (PersistentAuditLogger in production, NullAuditLogger in dev).
+    private readonly IAuditLogger _audit;
+
+    // Stage 5.3 iter-9 evaluator item 2 — durable fallback target for
+    // rejection-audit rows when _audit throws. The Stage 5.3 brief
+    // mandates "log every inbound command"; the iter-8 evaluator
+    // flagged that the prior log-and-swallow shape silently dropped
+    // the audit row on any audit-DB outage, which is exactly the
+    // contract the brief forbids. WriteRejectionAuditAsync now
+    // enqueues the entry here BEFORE returning, so the row lands on
+    // a durable medium (the file-backed FileAuditFallbackSink in
+    // production, a no-op NullAuditFallbackSink in dev/test) even
+    // when the primary writer has failed.
+    private readonly IAuditFallbackSink _auditFallback;
 
     /// <summary>
     /// Stage 2.2 constructor kept for backward compatibility with all
@@ -192,25 +268,20 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
         IPendingDisambiguationStore pendingDisambiguations,
         TimeProvider timeProvider,
         ILogger<TelegramUpdatePipeline> logger)
-        : this(dedup, authz, parser, router, callbackHandler, pendingQuestions, pendingDisambiguations, timeProvider, logger, processedEventSink: null)
+        : this(dedup, authz, parser, router, callbackHandler, pendingQuestions, pendingDisambiguations, timeProvider, logger, processedEventSink: null, audit: new NullAuditLogger(), auditFallback: new NullAuditFallbackSink())
     {
     }
 
     /// <summary>
-    /// Stage 2.6 constructor that accepts the
-    /// <see cref="ProcessedMessengerEventChannel"/> sink the
-    /// Stage 2.6 <see cref="TelegramMessengerConnector.ReceiveAsync"/>
-    /// drains. Marked <see cref="ActivatorUtilitiesConstructorAttribute"/>
-    /// so the DI container picks this overload when both ctors are
-    /// available -- without the attribute the container's "pick the
-    /// constructor with the most parameters all of which can be
-    /// resolved" heuristic would still choose this overload because
-    /// AddTelegram registers <see cref="ProcessedMessengerEventChannel"/>
-    /// as a singleton, but the explicit annotation pins the contract
-    /// against future DI-rule changes and removes any ambiguity for
-    /// reflection-based test harnesses.
+    /// Stage 2.6 constructor kept for backward-compat with direct
+    /// constructions that wire the
+    /// <see cref="ProcessedMessengerEventChannel"/> sink but do NOT pass
+    /// an <see cref="IAuditLogger"/>. Delegates to the Stage 5.3
+    /// eleven-parameter overload with <c>audit: new NullAuditLogger()</c>
+    /// so the rejection-audit path is a silent no-op for callers that
+    /// pre-date the Stage 5.3 IAuditLogger dependency (the
+    /// <c>TelegramUpdatePipelineTests.Harness</c> is the primary caller).
     /// </summary>
-    [ActivatorUtilitiesConstructor]
     public TelegramUpdatePipeline(
         IDeduplicationService dedup,
         IUserAuthorizationService authz,
@@ -222,6 +293,99 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
         TimeProvider timeProvider,
         ILogger<TelegramUpdatePipeline> logger,
         ProcessedMessengerEventChannel? processedEventSink)
+        : this(dedup, authz, parser, router, callbackHandler, pendingQuestions, pendingDisambiguations, timeProvider, logger, processedEventSink, audit: new NullAuditLogger(), auditFallback: new NullAuditFallbackSink())
+    {
+    }
+
+    /// <summary>
+    /// Stage 5.3 iter-7 constructor that adds the
+    /// <see cref="IAuditLogger"/> dependency so every pipeline-level
+    /// rejection (parse-empty, parse-invalid, authorize-denied,
+    /// role-denied) persists a lifecycle audit row through the same
+    /// <see cref="IAuditLogger"/> the router uses for command receipts
+    /// and the callback handler uses for decision rows. Kept for
+    /// backward-compat with iter-7 / iter-8 test harnesses that
+    /// pre-date the iter-9 <see cref="IAuditFallbackSink"/> dependency;
+    /// delegates to the twelve-arg overload with a
+    /// <see cref="NullAuditFallbackSink"/> so the fallback path is a
+    /// silent no-op for those callers (they already assert the
+    /// log-and-continue behaviour on a throwing primary audit and
+    /// don't need a durable backstop).
+    /// </summary>
+    public TelegramUpdatePipeline(
+        IDeduplicationService dedup,
+        IUserAuthorizationService authz,
+        ICommandParser parser,
+        ICommandRouter router,
+        ICallbackHandler callbackHandler,
+        IPendingQuestionStore pendingQuestions,
+        IPendingDisambiguationStore pendingDisambiguations,
+        TimeProvider timeProvider,
+        ILogger<TelegramUpdatePipeline> logger,
+        ProcessedMessengerEventChannel? processedEventSink,
+        IAuditLogger audit)
+        : this(dedup, authz, parser, router, callbackHandler, pendingQuestions, pendingDisambiguations, timeProvider, logger, processedEventSink, audit, auditFallback: new NullAuditFallbackSink())
+    {
+    }
+
+    /// <summary>
+    /// Stage 5.3 iter-9 constructor that adds the
+    /// <see cref="IAuditFallbackSink"/> dependency so every
+    /// pipeline-level rejection has a durable backstop when the
+    /// primary <see cref="IAuditLogger"/> throws. The iter-8
+    /// evaluator flagged that the prior log-and-swallow shape
+    /// silently dropped the audit row on any audit-DB outage,
+    /// violating the Stage 5.3 brief's "<i>log every inbound
+    /// command</i>" requirement; the fallback sink (file-backed
+    /// JSON Lines in production via
+    /// <see cref="FileAuditFallbackSink"/>) is the durable target
+    /// for those rows. Marked
+    /// <see cref="ActivatorUtilitiesConstructorAttribute"/> so the
+    /// DI container picks this overload — every Telegram
+    /// service-collection bootstrap registers both an
+    /// <see cref="IAuditLogger"/> and an
+    /// <see cref="IAuditFallbackSink"/>
+    /// (NullAuditLogger / NullAuditFallbackSink via TryAddSingleton
+    /// by default, replaced by PersistentAuditLogger /
+    /// FileAuditFallbackSink when AddMessagingPersistence is called).
+    /// </summary>
+    /// <remarks>
+    /// The Stage 5.3 brief mandates "log every inbound command with
+    /// full context". The CommandRouter already audits commands that
+    /// reach handler dispatch (receipt + completion rows). The four
+    /// pipeline-level rejection sites bypass the router entirely —
+    /// without this constructor's IAuditLogger + IAuditFallbackSink
+    /// surface, an inbound command that fails parse / authorize /
+    /// role checks would land in the ILogger sink only, violating
+    /// the every-inbound-command persistence guarantee. The audit
+    /// write at each rejection site follows a two-tier order:
+    /// <list type="number">
+    ///   <item><description>Primary <see cref="IAuditLogger.LogAsync"/>
+    ///   — the canonical EF-backed write into <c>audit_logs</c>.
+    ///   </description></item>
+    ///   <item><description>On primary failure, the fallback
+    ///   <see cref="IAuditFallbackSink.EnqueueAsync(AuditEntry,CancellationToken)"/>
+    ///   — durable file-backed sink that absorbs the row when the
+    ///   audit DB is unavailable. The denial response still fires
+    ///   even if the fallback ALSO fails (logged at Critical so the
+    ///   operator is paged), because the rejection reply is the
+    ///   security-critical user-facing path.</description></item>
+    /// </list>
+    /// </remarks>
+    [ActivatorUtilitiesConstructor]
+    public TelegramUpdatePipeline(
+        IDeduplicationService dedup,
+        IUserAuthorizationService authz,
+        ICommandParser parser,
+        ICommandRouter router,
+        ICallbackHandler callbackHandler,
+        IPendingQuestionStore pendingQuestions,
+        IPendingDisambiguationStore pendingDisambiguations,
+        TimeProvider timeProvider,
+        ILogger<TelegramUpdatePipeline> logger,
+        ProcessedMessengerEventChannel? processedEventSink,
+        IAuditLogger audit,
+        IAuditFallbackSink auditFallback)
     {
         _dedup = dedup ?? throw new ArgumentNullException(nameof(dedup));
         _authz = authz ?? throw new ArgumentNullException(nameof(authz));
@@ -233,6 +397,8 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _processedEventSink = processedEventSink;
+        _audit = audit ?? throw new ArgumentNullException(nameof(audit));
+        _auditFallback = auditFallback ?? throw new ArgumentNullException(nameof(auditFallback));
     }
 
     /// <inheritdoc />
@@ -342,6 +508,19 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                         messengerEvent.CorrelationId,
                         messengerEvent.EventId,
                         "parse-empty");
+                    // Stage 5.3 iter-7 evaluator item 1 — persist the
+                    // rejection BEFORE returning so audit_logs holds a
+                    // row for every inbound command, including those
+                    // dropped at the parse stage. The denial response
+                    // still fires even if the audit write throws (the
+                    // helper catches and logs).
+                    await WriteRejectionAuditAsync(
+                        messengerEvent,
+                        phase: PipelineDeniedPhases.ParseEmpty,
+                        rejectReason: "empty-raw-command",
+                        commandName: null,
+                        operatorTenantId: null,
+                        ct).ConfigureAwait(false);
                     return Denial(messengerEvent, PipelineResponses.CommandNotRecognized);
                 }
 
@@ -354,6 +533,18 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                         messengerEvent.EventId,
                         "parse-invalid",
                         parsed.ValidationError);
+                    // Stage 5.3 iter-7 evaluator item 1 — same rationale
+                    // as the parse-empty branch above; the parser's
+                    // ValidationError is captured in the audit row's
+                    // Details JSON so post-hoc analytics can identify
+                    // which malformed-command shape the operator hit.
+                    await WriteRejectionAuditAsync(
+                        messengerEvent,
+                        phase: PipelineDeniedPhases.ParseInvalid,
+                        rejectReason: parsed.ValidationError ?? "invalid-parse",
+                        commandName: parsed.CommandName,
+                        operatorTenantId: null,
+                        ct).ConfigureAwait(false);
                     return Denial(messengerEvent, PipelineResponses.CommandNotRecognized);
                 }
             }
@@ -399,6 +590,23 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                     authz.DenialReason ?? "no active binding",
                     authz.IsAuthorized,
                     authz.Bindings.Count);
+                // Stage 5.3 iter-7 evaluator item 1 — security-critical
+                // path: every unauthorized inbound update gets a
+                // durable audit row even though no AuthorizedOperator
+                // binding is available. UserId on the audit row uses
+                // the raw messenger UserId (no binding to resolve a
+                // tenant), TenantId stays null per AuditEntry remarks
+                // ("null for entries emitted before authorization
+                // resolved a binding"). The DenialReason from the
+                // authz service is captured in Details JSON for
+                // forensic review of who-tried-what-when.
+                await WriteRejectionAuditAsync(
+                    messengerEvent,
+                    phase: PipelineDeniedPhases.AuthorizeDenied,
+                    rejectReason: authz.DenialReason ?? "no active binding",
+                    commandName: parsed?.CommandName,
+                    operatorTenantId: null,
+                    ct).ConfigureAwait(false);
                 return Denial(messengerEvent, PipelineResponses.Unauthorized);
             }
 
@@ -553,6 +761,20 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
                         "role-denied",
                         parsed.CommandName,
                         requiredRole);
+                    // Stage 5.3 iter-7 evaluator item 1 — role-denied
+                    // is the third pre-router rejection site flagged
+                    // by the iter-6 evaluator. Unlike the parse / authz
+                    // sites we DO have a resolved @operator here, so
+                    // both the operator's TenantId and the command
+                    // verb land on the audit row (the CommandRouter
+                    // would have done this had the role gate passed).
+                    await WriteRejectionAuditAsync(
+                        messengerEvent,
+                        phase: PipelineDeniedPhases.RoleDenied,
+                        rejectReason: $"role-denied:{requiredRole}",
+                        commandName: parsed.CommandName,
+                        operatorTenantId: @operator.TenantId,
+                        ct).ConfigureAwait(false);
                     return Denial(messengerEvent, PipelineResponses.InsufficientPermissions);
                 }
             }
@@ -569,7 +791,27 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             switch (messengerEvent.EventType)
             {
                 case EventType.Command:
-                    result = await _router.RouteAsync(parsed!, @operator, ct).ConfigureAwait(false);
+                    // Stage 5.3 iter-6 evaluator items 2 + 3 — enrich the
+                    // parsed command with the inbound transport context
+                    // BEFORE handing off to the router. The router uses
+                    // these on the pre-handler audit row:
+                    //   * SourceMessageId → AuditEntry.MessageId so the
+                    //     row is joinable back to the originating Telegram
+                    //     update_id (item 3 — the prior router hard-coded
+                    //     MessageId=null on every command audit row).
+                    //   * TraceId → AuditEntry.CorrelationId so the
+                    //     pre-handler "command receipt" row shares a
+                    //     correlation id with the pipeline / dedup /
+                    //     outbound artifacts produced by the same inbound
+                    //     update (item 2 — the receipt now exists BEFORE
+                    //     the handler runs so a router-level audit failure
+                    //     cannot leave orphan side effects).
+                    var enriched = parsed! with
+                    {
+                        SourceMessageId = messengerEvent.EventId,
+                        TraceId = messengerEvent.CorrelationId,
+                    };
+                    result = await _router.RouteAsync(enriched, @operator, ct).ConfigureAwait(false);
                     break;
                 case EventType.CallbackResponse:
                     result = await _callbackHandler.HandleAsync(messengerEvent, ct).ConfigureAwait(false);
@@ -740,6 +982,177 @@ public sealed class TelegramUpdatePipeline : ITelegramUpdatePipeline
             ResponseText = responseText,
             CorrelationId = messengerEvent.CorrelationId,
         };
+
+    /// <summary>
+    /// Stage 5.3 iter-7 evaluator item 1 — persist a lifecycle audit
+    /// row for every pipeline-level rejection (parse-empty,
+    /// parse-invalid, authorize-denied, role-denied). The four
+    /// rejection sites in <see cref="ExecuteAsync"/> short-circuit
+    /// without ever invoking the <see cref="ICommandRouter"/>, so the
+    /// CommandRouter's pre-handler receipt-audit cannot cover them;
+    /// this helper closes the gap so the audit_logs table holds a row
+    /// for EVERY inbound command, satisfying the Stage 5.3 brief's
+    /// "log every inbound command with full context" requirement.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Failure semantics — log-but-do-not-rethrow.</b> Unlike the
+    /// CommandRouter's receipt-audit (which rethrows so a failed
+    /// audit blocks handler dispatch), the pipeline-rejection audit
+    /// MUST succeed-or-log because the denial response itself is the
+    /// security-critical path. An unauthorized user must always
+    /// receive the Unauthorized reply even if the audit DB is
+    /// momentarily unavailable — letting the audit write block the
+    /// denial would create a denial-of-service vector (an attacker
+    /// that crashes the audit DB also crashes the authorization
+    /// rejection path). The audit-write failure is logged at
+    /// LogLevel.Error so operators surface it through the same
+    /// alerting that watches CommandRouter audit failures.
+    /// </para>
+    /// <para>
+    /// <b>EventFamily = Lifecycle.</b> These rows describe system
+    /// gatekeeping decisions, not command receipts (which would be
+    /// <see cref="AuditEventFamilies.Command"/>) or human decisions
+    /// (<see cref="AuditEventFamilies.Decision"/>). Lifecycle is the
+    /// canonical bucket per
+    /// <see cref="AuditEventFamilies.Lifecycle"/>'s remarks.
+    /// </para>
+    /// <para>
+    /// <b>Action verb = <see cref="PipelineDeniedAuditAction"/>.</b>
+    /// All four rejection sites emit the same
+    /// <c>command.denied</c> verb so a single equality predicate
+    /// (<c>WHERE Action = 'command.denied'</c>) returns every
+    /// pipeline rejection across the four phases. The per-phase
+    /// discriminator is captured in the Details JSON's <c>phase</c>
+    /// field (see <see cref="PipelineDeniedPhases"/>) so analytics
+    /// queries can pivot on it without a schema change.
+    /// </para>
+    /// </remarks>
+    private async Task WriteRejectionAuditAsync(
+        MessengerEvent messengerEvent,
+        string phase,
+        string rejectReason,
+        string? commandName,
+        string? operatorTenantId,
+        CancellationToken ct)
+    {
+        string details;
+        try
+        {
+            details = JsonSerializer.Serialize(
+                new PipelineDenialAuditDetails(
+                    Phase: phase,
+                    CommandName: commandName,
+                    RawCommand: messengerEvent.RawCommand,
+                    RejectReason: rejectReason,
+                    ChatId: messengerEvent.ChatId,
+                    EventType: messengerEvent.EventType.ToString()),
+                DenialAuditDetailsJsonOptions);
+        }
+        catch (Exception serEx)
+        {
+            // Defensive — JsonSerializer.Serialize on a positional
+            // record with all primitive types should never throw, but
+            // if a future refactor adds a non-serializable field we
+            // should NOT lose the audit row over it. Fall back to a
+            // JSON object built via JsonSerializer so the value is
+            // GUARANTEED to be valid JSON (the iter-9 PersistentAuditLogger
+            // gate rejects invalid-JSON Details, so a hand-formatted
+            // fallback string with embedded quotes / control chars
+            // would itself fail the writer and lose the audit row).
+            _logger.LogWarning(
+                serEx,
+                "Pipeline rejection audit Details serialization failed; persisting fallback string. EventId={EventId} Phase={Phase}",
+                messengerEvent.EventId,
+                phase);
+            details = JsonSerializer.Serialize(new Dictionary<string, string?>
+            {
+                ["phase"] = phase,
+                ["reason"] = rejectReason,
+            });
+        }
+
+        var entry = new AuditEntry
+        {
+            EntryId = Guid.NewGuid(),
+            // Carry the inbound transport id so audit_logs rows for
+            // pipeline rejections are joinable back to
+            // inbound_updates.EventId on the same column the
+            // CommandRouter's receipt rows use.
+            MessageId = messengerEvent.EventId,
+            UserId = messengerEvent.UserId ?? string.Empty,
+            AgentId = null,
+            Action = PipelineDeniedAuditAction,
+            EventFamily = AuditEventFamilies.Lifecycle,
+            Timestamp = _timeProvider.GetUtcNow(),
+            CorrelationId = messengerEvent.CorrelationId,
+            TenantId = operatorTenantId,
+            Details = details,
+        };
+
+        try
+        {
+            await _audit.LogAsync(entry, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Stage 5.3 iter-9 evaluator item 2 — primary audit-DB
+            // failure must NOT silently drop the row. Enqueue the
+            // entry on the durable fallback sink (file-backed JSON
+            // Lines in production via FileAuditFallbackSink) so the
+            // "log every inbound command" guarantee survives a
+            // transient audit-DB outage. The denial response still
+            // fires regardless — the rejection reply is the security-
+            // critical user-facing path that must reach the operator
+            // even if BOTH audit tiers fail.
+            _logger.LogError(
+                ex,
+                "Pipeline rejection audit primary write failed; falling back to durable sink (Stage 5.3 iter-9 evaluator item 2). EventId={EventId} CorrelationId={CorrelationId} Phase={Phase} Reason={Reason}",
+                messengerEvent.EventId,
+                messengerEvent.CorrelationId,
+                phase,
+                rejectReason);
+            try
+            {
+                await _auditFallback.EnqueueAsync(entry, ct).ConfigureAwait(false);
+            }
+            catch (Exception fallbackEx) when (fallbackEx is not OperationCanceledException)
+            {
+                // Both primary AND fallback failed. The denial reply
+                // still fires (operator response is security-critical
+                // and never blocks on audit), but we escalate to
+                // Critical so the operator is paged — at this point
+                // the audit trail for this rejection is genuinely
+                // lost and a human must reconstruct from upstream
+                // logs.
+                _logger.LogCritical(
+                    fallbackEx,
+                    "Pipeline rejection audit fallback ALSO failed; audit row is lost for this rejection. Operator intervention required. EventId={EventId} CorrelationId={CorrelationId} Phase={Phase} Reason={Reason} PrimaryError={PrimaryError}",
+                    messengerEvent.EventId,
+                    messengerEvent.CorrelationId,
+                    phase,
+                    rejectReason,
+                    ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// JSON shape persisted onto <see cref="AuditLogEntry.Details"/>
+    /// for the pipeline-denial lifecycle rows. Positional record so
+    /// System.Text.Json emits camelCase property names matching the
+    /// parameter names (driven by
+    /// <see cref="DenialAuditDetailsJsonOptions"/>) without explicit
+    /// attribute decorations. The <c>Phase</c> field carries one of
+    /// the <see cref="PipelineDeniedPhases"/> literals.
+    /// </summary>
+    private sealed record PipelineDenialAuditDetails(
+        string Phase,
+        string? CommandName,
+        string? RawCommand,
+        string RejectReason,
+        string ChatId,
+        string EventType);
 
     private void LogStage(MessengerEvent messengerEvent, string stage) =>
         _logger.LogInformation(

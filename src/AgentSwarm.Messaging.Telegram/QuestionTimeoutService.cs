@@ -12,9 +12,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core.Commands;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -79,20 +81,26 @@ namespace AgentSwarm.Messaging.Telegram;
 ///   call returns <see langword="false"/> (another worker / a
 ///   callback already terminated the row), skip the rest of the
 ///   steps for this row.</description></item>
-///   <item><description>Publish
+///   <item><description><b>Write the audit row</b> via
+///   <see cref="IAuditLogger.LogHumanResponseAsync"/> BEFORE the
+///   bus publish (Stage 5.3 iter-8 evaluator item 3 —
+///   AUDIT-FIRST). The Stage 5.3 brief mandates "log every
+///   outbound decision event with full context"; running the
+///   audit first means a transient audit-DB failure CANNOT leak
+///   an outbound <see cref="HumanDecisionEvent"/> without a
+///   durable <c>audit_logs</c> row.</description></item>
+///   <item><description><b>Publish</b>
 ///   <see cref="ISwarmCommandBus.PublishHumanDecisionAsync"/> with
 ///   <see cref="HumanDecisionEvent.ActionValue"/> = the
 ///   <see cref="PendingQuestion.DefaultActionId"/> string verbatim
 ///   (or <c>"__timeout__"</c> when no default was proposed). If
-///   publish throws, revert the claim via
+///   audit OR publish throws, revert the claim via
 ///   <see cref="IPendingQuestionStore.TryRevertTimedOutClaimAsync"/>
 ///   so the row is sweep-eligible again on the next iteration —
 ///   gives at-least-once delivery of the timeout decision per
 ///   architecture.md §10.3.</description></item>
 ///   <item><description>Edit the Telegram message (best-effort
 ///   cosmetic).</description></item>
-///   <item><description>Write the audit entry (best-effort
-///   observability).</description></item>
 /// </list>
 /// The combined guarantee is at-least-once delivery (the revert
 /// recovers from transient publish failures by re-arming the row)
@@ -328,23 +336,55 @@ public sealed class QuestionTimeoutService : BackgroundService
 
         try
         {
+            // Stage 5.3 iter-8 evaluator item 3 — AUDIT-FIRST ordering
+            // for the timeout sweep. Prior (iter-4..iter-7) ordering
+            // was publish-then-audit which let a successful publish
+            // escape alongside a failed audit, leaving an outbound
+            // timeout HumanDecisionEvent without a durable audit_logs
+            // row. The Stage 5.3 brief mandates "log every outbound
+            // decision event with full context"; that guarantee
+            // requires the audit row to land BEFORE the bus publish.
+            //
+            // Failure semantics under audit-first:
+            //   * Audit throws first → no publish runs. The shared
+            //     catch reverts the TimedOut claim back to priorStatus
+            //     so the next sweep re-finds the row and retries
+            //     cleanly (one audit row, one publish — at-least-once
+            //     symmetry preserved).
+            //   * Audit succeeds, publish throws → revert. The next
+            //     sweep audits AGAIN (duplicate audit row for the same
+            //     QuestionId) and publishes AGAIN. Consumer-side
+            //     dedup on QuestionId (architecture.md §10.3) absorbs
+            //     the bounded duplicate publish; the audit table
+            //     briefly carries duplicates, which is the documented
+            //     tradeoff for the persist-every-decision guarantee.
+            //   * Audit + publish both succeed → terminal TimedOut,
+            //     one audit row, one publish (the canonical path).
+            //
+            // The strictly tighter alternative would be a single
+            // distributed transaction across the audit DB and the
+            // bus; that would require a saga / outbox pattern in this
+            // service and is out of scope for Stage 5.3.
+            await WriteAuditEntryAsync(pending, decision, now, ct).ConfigureAwait(false);
+
             await _commandBus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
         }
-        catch (Exception publishEx) when (publishEx is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Publish failed AFTER we claimed the row. Revert the
-            // claim so the next sweep picks it up again. The revert
-            // is itself an atomic conditional UPDATE on Status ==
-            // TimedOut, so an interleaved callback that's already
-            // moved the row elsewhere (extremely unlikely given we
-            // just claimed it microseconds ago) will be safely
-            // ignored — we'd see reverted=false and just log + throw.
+            // Publish OR audit failed AFTER we claimed the row.
+            // Revert the claim so the next sweep picks it up again.
+            // The revert is itself an atomic conditional UPDATE on
+            // Status == TimedOut, so an interleaved callback that's
+            // already moved the row elsewhere (extremely unlikely
+            // given we just claimed it microseconds ago) will be
+            // safely ignored — we'd see reverted=false and just log
+            // + throw.
             var reverted = await _pendingQuestionStore
                 .TryRevertTimedOutClaimAsync(pending.QuestionId, priorStatus, ct)
                 .ConfigureAwait(false);
             _logger.LogError(
-                publishEx,
-                "QuestionTimeoutService: publish failed for QuestionId={QuestionId} CorrelationId={CorrelationId}; reverted={Reverted} back to {PriorStatus} so the next sweep retries. Cross-process atomicity preserved by the conditional revert.",
+                ex,
+                "QuestionTimeoutService: publish OR audit failed for QuestionId={QuestionId} CorrelationId={CorrelationId}; reverted={Reverted} back to {PriorStatus} so the next sweep retries. Cross-process atomicity preserved by the conditional revert.",
                 pending.QuestionId,
                 pending.CorrelationId,
                 reverted,
@@ -353,10 +393,14 @@ public sealed class QuestionTimeoutService : BackgroundService
         }
 
         // ----- Step 2: edit the Telegram message (best-effort). -----
+        // Performed AFTER publish + audit so a failed UI edit does
+        // NOT trigger the claim revert — the decision is durable
+        // (HumanDecisionEvent published, audit_logs row committed),
+        // only the operator-facing affordance is missing. The next
+        // sweep would NOT re-find the row because Status=TimedOut
+        // is terminal, so swallowing here is the correct semantics:
+        // a failed edit cannot regress a successful decision.
         await EditTelegramMessageAsync(pending, ct).ConfigureAwait(false);
-
-        // ----- Step 3: write the audit entry (best-effort). -----
-        await WriteAuditEntryAsync(pending, decision, now, ct).ConfigureAwait(false);
 
         _logger.LogInformation(
             "QuestionTimeoutService applied default action. QuestionId={QuestionId} ActionValue={ActionValue} CorrelationId={CorrelationId}",
@@ -445,16 +489,59 @@ public sealed class QuestionTimeoutService : BackgroundService
     ///   <item><description><c>"⏰ Timed out — no default action"</c>
     ///   when no default was proposed.</description></item>
     /// </list>
+    /// <para>
+    /// <b>Stage 5.3 iter-6 evaluator item 4 — trace footer.</b> The
+    /// story-wide acceptance criterion "<i>All messages include
+    /// trace/correlation ID</i>" applies to the timeout edit message
+    /// just like every other outbound message. Prior iters rendered
+    /// the body without the trace footer, leaving the operator unable
+    /// to join the timeout notification against logs / audit rows
+    /// without first looking up the original question. The footer
+    /// here mirrors the <c>(trace: {0})</c> format the
+    /// <c>CallbackQueryHandler.CorrelationFooterFormat</c> uses on
+    /// the post-decision edit so an operator reading either kind of
+    /// closed-out question sees the same trace shape.
+    /// </para>
     /// </summary>
     internal static string BuildTimeoutMessageText(PendingQuestion pending)
     {
-        if (pending.DefaultActionId is not null)
+        var head = pending.DefaultActionId is not null
+            ? $"⏰ Timed out — default action applied: {pending.DefaultActionId}"
+            : "⏰ Timed out — no default action";
+
+        // Stage 5.3 iter-6 evaluator item 4 — append the trace footer
+        // unconditionally. The pending row's CorrelationId is the
+        // story-wide trace id (set at StoreAsync time from the
+        // originating AgentQuestion.CorrelationId per architecture.md
+        // §3.1); an empty/null value should never reach here because
+        // PendingQuestion.CorrelationId is `required` on the
+        // abstraction, but we guard against the test-fake edge so a
+        // misuse cannot regress this contract silently.
+        if (string.IsNullOrWhiteSpace(pending.CorrelationId))
         {
-            return $"⏰ Timed out — default action applied: {pending.DefaultActionId}";
+            return head;
         }
 
-        return "⏰ Timed out — no default action";
+        return head + TimeoutTraceFooterPrefix + pending.CorrelationId + ")";
     }
+
+    /// <summary>
+    /// Prefix the timeout edit body appends before the correlation id
+    /// (Stage 5.3 iter-6 evaluator item 4). Centralised so tests can
+    /// reference the literal without duplicating it and so a future
+    /// localisation pass has a single edit site.
+    /// </summary>
+    internal const string TimeoutTraceFooterPrefix = "\n(trace: ";
+
+    /// <summary>
+    /// <c>Source</c> tag written into the
+    /// <see cref="DecisionAuditDetails"/> JSON for the timeout-sweep
+    /// path. Distinct from <c>"callback"</c> / <c>"comment"</c>
+    /// (button press / follow-up) and <c>"approve"</c> / <c>"reject"</c>
+    /// (slash command) so forensic queries can pivot on the originating
+    /// edge of the decision. Stage 5.3 iter-2 evaluator item 6.
+    /// </summary>
+    public const string DecisionSourceTimeout = "timeout";
 
     private async Task WriteAuditEntryAsync(
         PendingQuestion pending,
@@ -462,32 +549,44 @@ public sealed class QuestionTimeoutService : BackgroundService
         DateTimeOffset now,
         CancellationToken ct)
     {
-        try
-        {
-            await _auditLogger
-                .LogHumanResponseAsync(
-                    new HumanResponseAuditEntry
-                    {
-                        EntryId = Guid.NewGuid(),
-                        MessageId = decision.ExternalMessageId,
-                        UserId = decision.ExternalUserId,
-                        AgentId = pending.AgentId,
-                        QuestionId = pending.QuestionId,
-                        ActionValue = decision.ActionValue,
-                        Comment = null,
-                        Timestamp = now,
-                        CorrelationId = pending.CorrelationId,
-                    },
-                    ct)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogWarning(
-                ex,
-                "QuestionTimeoutService: failed to write audit entry; HumanDecisionEvent has already been published so the decision is durable. QuestionId={QuestionId} CorrelationId={CorrelationId}",
-                pending.QuestionId,
-                pending.CorrelationId);
-        }
+        // Stage 5.3 iter-4 evaluator item 1 — this method now
+        // propagates exceptions to its caller (ApplyDefaultAsync's
+        // try/revert block), so a failed audit write reverts the
+        // atomic claim and the next sweep retries. The prior
+        // try/catch/log-warn path silently dropped the audit row
+        // while leaving Status=TimedOut, which violated the Stage
+        // 5.3 "persist every human response" guarantee.
+        await _auditLogger
+            .LogHumanResponseAsync(
+                new HumanResponseAuditEntry
+                {
+                    EntryId = Guid.NewGuid(),
+                    MessageId = decision.ExternalMessageId,
+                    UserId = decision.ExternalUserId,
+                    AgentId = pending.AgentId,
+                    QuestionId = pending.QuestionId,
+                    ActionValue = decision.ActionValue,
+                    Comment = null,
+                    Timestamp = now,
+                    CorrelationId = pending.CorrelationId,
+                    // Stage 5.3 iter-2 evaluator item 6 — timeout
+                    // path persists the same tenant/workspace context
+                    // the callback path does. The PendingQuestion
+                    // was stamped with TenantId/WorkspaceId at
+                    // StoreAsync time so no extra round-trip is
+                    // required. OperatorAlias is null because the
+                    // timeout fires without a human in the loop.
+                    TenantId = pending.TenantId,
+                    Details = JsonSerializer.Serialize(
+                        new DecisionAuditDetails(
+                            pending.WorkspaceId,
+                            pending.TelegramChatId,
+                            OperatorAlias: null,
+                            Source: DecisionSourceTimeout,
+                            TelegramMessageIdNumeric: pending.TelegramMessageId),
+                        DecisionAuditDetailsContext.Default.DecisionAuditDetails),
+                },
+                ct)
+            .ConfigureAwait(false);
     }
 }

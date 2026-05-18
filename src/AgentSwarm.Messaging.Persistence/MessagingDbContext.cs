@@ -59,16 +59,6 @@ public class MessagingDbContext : DbContext
     public DbSet<TaskOversight> TaskOversights => Set<TaskOversight>();
 
     /// <summary>
-    /// <see cref="DbSet{TEntity}"/> backing the messenger gateway's
-    /// audit trail (Stage 3.2 iter-2 evaluator item 5). Single
-    /// discriminated table — both general <c>AuditEntry</c> and
-    /// typed <c>HumanResponseAuditEntry</c> writes share storage,
-    /// distinguished by <see cref="AuditLogEntry.EntryKind"/>.
-    /// Configured via <see cref="AuditLogEntryConfiguration"/>.
-    /// </summary>
-    public DbSet<AuditLogEntry> AuditLogEntries => Set<AuditLogEntry>();
-
-    /// <summary>
     /// <see cref="DbSet{TEntity}"/> backing the operator identity
     /// mapping table (Stage 3.4). One row per
     /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> binding;
@@ -130,6 +120,16 @@ public class MessagingDbContext : DbContext
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
-        modelBuilder.ApplyConfigurationsFromAssembly(typeof(MessagingDbContext).Assembly);
+
+        // Stage 5.3 — exclude AuditLogEntryConfiguration so the
+        // audit table lives exclusively in AuditDbContext (and its
+        // dedicated ConnectionStrings:AuditDb store). The
+        // assembly scan would otherwise pick the configuration up
+        // and re-create audit_logs inside MessagingDbContext's
+        // operational database, defeating the Stage 5.3 brief's
+        // storage-isolation intent.
+        modelBuilder.ApplyConfigurationsFromAssembly(
+            typeof(MessagingDbContext).Assembly,
+            type => type != typeof(AuditLogEntryConfiguration));
     }
 }
