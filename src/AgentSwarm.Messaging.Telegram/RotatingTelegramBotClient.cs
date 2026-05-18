@@ -100,6 +100,17 @@ namespace AgentSwarm.Messaging.Telegram;
 /// of the aggregated delegates happens under <see cref="_rebuildGate"/>
 /// so a rotation cannot race a concurrent <c>add</c>/<c>remove</c>.
 /// </para>
+/// <para>
+/// <b>Disposal semantics.</b> <see cref="Dispose"/> tears down the
+/// <see cref="IOptionsMonitor{TOptions}.OnChange"/> subscription and
+/// marks the proxy disposed. The <see cref="Current"/> getter then
+/// throws <see cref="ObjectDisposedException"/> on every subsequent
+/// access so a stale consumer cannot trigger a lazy <see cref="Rebuild"/>
+/// and silently allocate a fresh <see cref="TelegramBotClient"/> on a
+/// disposed proxy — which would otherwise happen when the proxy was
+/// constructed and disposed without any forwarded call having
+/// populated <c>_inner</c>.
+/// </para>
 /// </remarks>
 public sealed class RotatingTelegramBotClient : ITelegramBotClient, IDisposable
 {
@@ -276,6 +287,15 @@ public sealed class RotatingTelegramBotClient : ITelegramBotClient, IDisposable
     {
         get
         {
+            // Guard the lazy-build path: without this check, a forwarded
+            // call (e.g. BotId, SendRequest) made after Dispose() on a
+            // proxy whose _inner was never populated would silently
+            // construct a fresh TelegramBotClient on a disposed object,
+            // violating the standard IDisposable contract and leaking a
+            // client whose handlers can never be cleaned up by a future
+            // rotation (the change subscription is already gone).
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
             var snapshot = Volatile.Read(ref _inner);
             if (snapshot is not null)
             {
