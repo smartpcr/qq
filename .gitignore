@@ -1,5 +1,6 @@
 
-.forge-attachments/
+.forge-attachments/*
+!.forge-attachments/agent_swarm_messenger_user_stories.md
 .forge/
 
 # .NET

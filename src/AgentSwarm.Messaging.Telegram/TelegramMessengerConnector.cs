@@ -140,6 +140,29 @@ public sealed class TelegramMessengerConnector : IMessengerConnector
     public const string AlertIdMetadataKey = "AlertId";
 
     /// <summary>
+    /// Optional metadata key on
+    /// <see cref="AgentQuestionEnvelope.RoutingMetadata"/> carrying the
+    /// tenant identifier the question was routed to. Stage 5.3 iter-2
+    /// evaluator item 6 — stamped by
+    /// <see cref="AgentSwarm.Messaging.Telegram.Swarm.SwarmEventSubscriptionService"/>
+    /// when the tenant is known at routing time so the downstream
+    /// <see cref="IPendingQuestionStore.StoreAsync"/> can denormalise it
+    /// onto the <c>pending_questions</c> row and the callback / timeout
+    /// audit paths can persist <c>TenantId</c> on every decision
+    /// <c>audit_logs</c> row without re-resolving the operator binding.
+    /// Absent for legacy / test-only envelopes.
+    /// </summary>
+    public const string TenantIdMetadataKey = "TenantId";
+
+    /// <summary>
+    /// Optional metadata key on
+    /// <see cref="AgentQuestionEnvelope.RoutingMetadata"/> carrying the
+    /// workspace identifier the question was routed to. Same purpose as
+    /// <see cref="TenantIdMetadataKey"/> — Stage 5.3 audit context.
+    /// </summary>
+    public const string WorkspaceIdMetadataKey = "WorkspaceId";
+
+    /// <summary>
     /// Maximum number of <see cref="MessengerEvent"/> instances drained
     /// by a single <see cref="ReceiveAsync"/> invocation. Bounds the
     /// worst-case <see cref="List{T}"/> allocation and per-call latency

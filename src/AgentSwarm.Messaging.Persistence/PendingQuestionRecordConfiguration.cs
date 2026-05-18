@@ -147,6 +147,19 @@ public sealed class PendingQuestionRecordConfiguration
             .HasMaxLength(128)
             .IsRequired();
 
+        // Stage 5.3 iter-3 evaluator item 3 — denormalised tenant /
+        // workspace context stamped at StoreAsync time from the
+        // envelope's RoutingMetadata so the callback / timeout audit
+        // paths can persist tenant/workspace on every decision row
+        // without re-resolving the operator binding. Nullable for
+        // rows persisted before the metadata stamp existed (or for
+        // connectors that route without tenant context).
+        builder.Property(x => x.TenantId)
+            .HasMaxLength(128);
+
+        builder.Property(x => x.WorkspaceId)
+            .HasMaxLength(128);
+
         // The primary-key index already covers QuestionId, but pin a
         // named unique index so the constraint is legible against the
         // raw SQL file during incident triage.

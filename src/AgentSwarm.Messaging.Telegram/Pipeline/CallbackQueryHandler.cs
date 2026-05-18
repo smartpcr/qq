@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Core.Commands;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
@@ -78,12 +80,26 @@ namespace AgentSwarm.Messaging.Telegram.Pipeline;
 /// <b>Reservation lifecycle (release-on-throw, both keys).</b> Both
 /// reservations are owned by the same try/catch scope. If ANY step
 /// after the composite reservation succeeds throws (RecordSelectionAsync,
-/// PublishHumanDecisionAsync, audit, MarkAnsweredAsync), the catch block
+/// MarkAnsweredAsync, PublishHumanDecisionAsync, audit), the catch block
 /// releases <i>both</i> the per-callback AND the composite slot so a
 /// live re-delivery is processed normally — the bug the iter-1 evaluator
 /// flagged (composite reservation leaked, retry sees "Already responded"
 /// without publishing) is fixed here. Successful completion sticks both
 /// slots via <see cref="IDeduplicationService.MarkProcessedAsync"/>.
+/// </para>
+/// <para>
+/// <b>Stage 5.3 iter-3 ordering invariant.</b> The atomic
+/// <see cref="IPendingQuestionStore.MarkAnsweredAsync"/> claim runs
+/// <i>before</i> <see cref="ISwarmCommandBus.PublishHumanDecisionAsync"/>
+/// and <see cref="IAuditLogger.LogHumanResponseAsync"/>. If a concurrent
+/// <c>QuestionTimeoutService</c> sweep has already moved the row to
+/// <see cref="PendingQuestionStatus.TimedOut"/>, the conditional
+/// UPDATE returns 0 rows; we surface <see cref="AlreadyRespondedText"/>
+/// and exit without emitting a duplicate decision event or audit row.
+/// If the publish or audit step throws after a successful claim, the
+/// catch path issues a compensating
+/// <see cref="IPendingQuestionStore.TryRevertAnsweredClaimAsync"/> CAS
+/// so a retry can re-process the same QuestionId.
 /// </para>
 /// </remarks>
 public sealed class CallbackQueryHandler : ICallbackHandler
@@ -190,6 +206,27 @@ public sealed class CallbackQueryHandler : ICallbackHandler
     /// <see cref="HumanDecisionEvent.Messenger"/> the handler emits.
     /// </summary>
     public const string MessengerName = "telegram";
+
+    /// <summary>
+    /// <c>Source</c> tag written into the
+    /// <see cref="DecisionAuditDetails"/> JSON for an inline-button
+    /// press. Pairs with <see cref="DecisionSourceComment"/> on the
+    /// follow-up text-reply path and with <c>"approve"</c>/<c>"reject"</c>
+    /// emitted by <see cref="DecisionCommandHandlerBase"/>. Stage 5.3
+    /// iter-2 evaluator item 6 — lets forensic queries pivot on the
+    /// originating edge of the decision without parsing
+    /// <see cref="HumanResponseAuditEntry.MessageId"/>.
+    /// </summary>
+    public const string DecisionSourceCallback = "callback";
+
+    /// <summary>
+    /// <c>Source</c> tag written into the
+    /// <see cref="DecisionAuditDetails"/> JSON for a RequiresComment
+    /// follow-up text reply. Paired with <see cref="DecisionSourceCallback"/>
+    /// — the comment row carries the same <see cref="HumanAction.Value"/>
+    /// the operator originally tapped, plus the typed comment.
+    /// </summary>
+    public const string DecisionSourceComment = "comment";
 
     /// <summary>
     /// Key namespace used when writing duplicate-CallbackId replay
@@ -506,14 +543,24 @@ public sealed class CallbackQueryHandler : ICallbackHandler
             return new CommandResult { Success = true, CorrelationId = evt.CorrelationId };
         }
 
-        // ----- Stage 8: record the selection on the pending question. ---
-        await _store
-            .RecordSelectionAsync(questionId, action.ActionId, action.Value, respondentUserId, ct)
-            .ConfigureAwait(false);
+        // ----- Stage 8: claim-then-record ordering. ----------------------
+        // Stage 5.3 iter-5 evaluator item 2 — `RecordSelectionAsync`
+        // MUST run AFTER the atomic claim CAS succeeds. The prior
+        // ordering (RecordSelection here, claim later) admitted a
+        // race where a concurrent QuestionTimeoutService sweep
+        // terminal-d the row between this point and the claim, and
+        // we still mutated SelectedActionId/SelectedActionValue/
+        // RespondentUserId on the now-TimedOut row — leaving stale
+        // human-selection metadata on a row that never actually
+        // accepted a human decision. Both downstream branches
+        // (`HandleRequiresCommentAsync` for RequiresComment, the
+        // inline `MarkAnsweredAsync` block below for the standard
+        // case) now record the selection only on the winning side
+        // of the claim CAS so a lost-race callback never writes.
 
         if (action.RequiresComment)
         {
-            await HandleRequiresCommentAsync(evt, pending, action, callbackDedupKey, compositeDedupKey, ct)
+            await HandleRequiresCommentAsync(evt, pending, action, respondentUserId, callbackDedupKey, compositeDedupKey, ct)
                 .ConfigureAwait(false);
             return new CommandResult { Success = true, CorrelationId = evt.CorrelationId };
         }
@@ -522,6 +569,51 @@ public sealed class CallbackQueryHandler : ICallbackHandler
         var receivedAt = _time.GetUtcNow();
         var externalMessageId = pending.TelegramMessageId.ToString(CultureInfo.InvariantCulture);
         var externalUserId = respondentUserId.ToString(CultureInfo.InvariantCulture);
+
+        // Stage 5.3 iter-3 evaluator item 7 — claim the row BEFORE
+        // any side effect (publish, audit, message edit, callback ack)
+        // so the cross-process callback-vs-timeout race is closed by
+        // the database UPDATE rather than by dedup TTLs alone.
+        // MarkAnsweredAsync conditionally moves the row from
+        // (Pending|AwaitingComment) → Answered and returns false when
+        // a concurrent QuestionTimeoutService sweep already terminal-d
+        // it. On a lost claim we treat the callback as a "stale" tap
+        // — surface the standard already-responded reply, release the
+        // composite slot, and exit WITHOUT publishing or auditing so
+        // the system never double-emits a decision for the same
+        // QuestionId.
+        var claimed = await _store.MarkAnsweredAsync(questionId, ct).ConfigureAwait(false);
+        if (!claimed)
+        {
+            _logger.LogInformation(
+                "Callback short-circuited: lost the atomic Answered claim (a concurrent timeout sweep or duplicate callback won the race). CorrelationId={CorrelationId} QuestionId={QuestionId} RespondentUserId={RespondentUserId}",
+                evt.CorrelationId,
+                questionId,
+                respondentUserId);
+            await AnswerAndRememberAsync(evt, AlreadyRespondedText, ct).ConfigureAwait(false);
+            await _dedup.MarkProcessedAsync(callbackDedupKey, ct).ConfigureAwait(false);
+            await _dedup.MarkProcessedAsync(compositeDedupKey, ct).ConfigureAwait(false);
+            return new CommandResult { Success = true, CorrelationId = evt.CorrelationId };
+        }
+
+        // Stage 5.3 iter-5 evaluator item 2 — selection metadata is
+        // written ONLY after the atomic Answered claim succeeds.
+        // A callback that loses the claim CAS (timeout sweep won the
+        // race) short-circuits above WITHOUT mutating
+        // SelectedActionId/SelectedActionValue/RespondentUserId, so a
+        // timed-out row can never carry stale human-selection data
+        // for a decision the system did not accept. The fields are
+        // load-bearing for the text-reply path
+        // (`GetAwaitingCommentAsync` filters on RespondentUserId),
+        // but the inline Answered path never re-reads them — they
+        // are persisted purely for forensic / replay-cache value
+        // here. If the subsequent publish/audit throws and
+        // `TryRevertAnsweredClaimAsync` flips the row back to
+        // Pending, the stale fields remain but are overwritten by
+        // the next callback's `RecordSelectionAsync` on retry.
+        await _store
+            .RecordSelectionAsync(questionId, action.ActionId, action.Value, respondentUserId, ct)
+            .ConfigureAwait(false);
 
         var decision = new HumanDecisionEvent
         {
@@ -534,27 +626,84 @@ public sealed class CallbackQueryHandler : ICallbackHandler
             ReceivedAt = receivedAt,
             CorrelationId = pending.CorrelationId,
         };
-        await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
 
-        await _audit.LogHumanResponseAsync(
-            new HumanResponseAuditEntry
-            {
-                EntryId = Guid.NewGuid(),
-                MessageId = externalMessageId,
-                UserId = externalUserId,
-                AgentId = pending.AgentId,
-                QuestionId = questionId,
-                ActionValue = action.Value,
-                Comment = null,
-                Timestamp = receivedAt,
-                CorrelationId = pending.CorrelationId,
-            },
-            ct).ConfigureAwait(false);
+        // Stage 5.3 iter-8 evaluator item 3 — AUDIT-FIRST ordering for
+        // the standard callback path. Prior (iter-3..iter-7) shape was
+        // publish-then-audit which let a successful publish escape
+        // alongside a failed audit, leaving an outbound
+        // HumanDecisionEvent without a durable audit_logs row. The
+        // Stage 5.3 brief mandates "log every outbound decision event
+        // with full context"; that guarantee requires the audit row to
+        // land BEFORE the bus publish. The compensating revert is
+        // unchanged: any throw inside this try (audit OR publish)
+        // reverts the Answered claim so a retry can re-acquire and
+        // re-issue. The audit-first ordering means an audit failure
+        // never leaks a publish; a publish failure after audit
+        // succeeded may produce a duplicate audit row on retry (the
+        // documented persist-every-decision tradeoff — consumer-side
+        // QuestionId dedup absorbs the bounded duplicate publish per
+        // architecture.md §10.3).
+        try
+        {
+            await _audit.LogHumanResponseAsync(
+                new HumanResponseAuditEntry
+                {
+                    EntryId = Guid.NewGuid(),
+                    // Stage 5.3 iter-4 evaluator item 2 — the
+                    // acceptance scenario says "MessageId matching
+                    // the callback". For a Telegram CallbackQuery
+                    // the platform-native "message id of the human
+                    // reply" is the callback_query_id (per
+                    // MessengerEvent.CallbackId's xml-doc:
+                    // "callback-query id" is named as an acceptable
+                    // MessageId on HumanResponseAuditEntry). Use
+                    // evt.CallbackId when present so the audit row
+                    // can be joined directly against the inbound
+                    // platform event; the numeric Telegram
+                    // message_id of the question being answered is
+                    // still preserved in
+                    // DecisionAuditDetails.TelegramMessageIdNumeric
+                    // for forensic correlation back to the rendered
+                    // question. Fallback to externalMessageId on
+                    // the (in-practice-impossible) null-CallbackId
+                    // edge so the required column never becomes
+                    // null and the audit write still succeeds.
+                    MessageId = !string.IsNullOrEmpty(evt.CallbackId)
+                        ? evt.CallbackId
+                        : externalMessageId,
+                    UserId = externalUserId,
+                    AgentId = pending.AgentId,
+                    QuestionId = questionId,
+                    ActionValue = action.Value,
+                    Comment = null,
+                    Timestamp = receivedAt,
+                    CorrelationId = pending.CorrelationId,
+                    // Stage 5.3 iter-2 evaluator item 6 — callback path
+                    // must persist TenantId and a Details JSON so decision
+                    // audit rows carry full tenant/workspace context. The
+                    // PendingQuestion was stamped with TenantId/WorkspaceId
+                    // by the connector at StoreAsync time (architecture.md
+                    // §3.1) so this is a denormalised lookup, NOT another
+                    // OperatorBinding round-trip.
+                    TenantId = pending.TenantId,
+                    Details = JsonSerializer.Serialize(
+                        new DecisionAuditDetails(
+                            pending.WorkspaceId,
+                            pending.TelegramChatId,
+                            OperatorAlias: null,
+                            Source: DecisionSourceCallback,
+                            TelegramMessageIdNumeric: pending.TelegramMessageId),
+                        DecisionAuditDetailsContext.Default.DecisionAuditDetails),
+                },
+                ct).ConfigureAwait(false);
 
-        // Transition AFTER publish+audit so a transient failure leaves
-        // the question Pending and re-deliverable (mirrors the
-        // DecisionCommandHandlerBase contract).
-        await _store.MarkAnsweredAsync(questionId, ct).ConfigureAwait(false);
+            await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            await TryRevertClaimAsync(questionId, ct).ConfigureAwait(false);
+            throw;
+        }
 
         // ----- Stage 10: operator-facing feedback. -----------------------
         // Edit message text to embed the decision badge AND set
@@ -586,43 +735,126 @@ public sealed class CallbackQueryHandler : ICallbackHandler
         MessengerEvent evt,
         PendingQuestion pending,
         HumanAction action,
+        long respondentUserId,
         string callbackDedupKey,
         string compositeDedupKey,
         CancellationToken ct)
     {
-        // Transition to AwaitingComment so the pipeline's TextReply
-        // routing (GetAwaitingCommentAsync) correlates the follow-up
-        // text message back to this question.
-        await _store.MarkAwaitingCommentAsync(pending.QuestionId, ct).ConfigureAwait(false);
+        // Stage 5.3 iter-3 evaluator item 7 — claim the row BEFORE
+        // any side effect (prompt, message edit, callback ack) so the
+        // cross-process race between this RequiresComment branch and a
+        // concurrent QuestionTimeoutService sweep is closed by the
+        // database UPDATE rather than by dedup TTLs. MarkAwaitingComment
+        // returns false when the sweep already terminal-d the row; on
+        // a lost claim we issue the standard already-responded reply,
+        // edit the original message to embed the sweep's default-action
+        // outcome (operator still sees the question is settled), and
+        // exit without prompting for a comment they cannot supply.
+        var claimed = await _store.MarkAwaitingCommentAsync(pending.QuestionId, ct).ConfigureAwait(false);
+        if (!claimed)
+        {
+            _logger.LogInformation(
+                "Callback short-circuited: lost the atomic AwaitingComment claim (a concurrent timeout sweep or duplicate callback won the race). CorrelationId={CorrelationId} QuestionId={QuestionId}",
+                evt.CorrelationId,
+                pending.QuestionId);
+            await AnswerAndRememberAsync(evt, AlreadyRespondedText, ct).ConfigureAwait(false);
+            await _dedup.MarkProcessedAsync(callbackDedupKey, ct).ConfigureAwait(false);
+            await _dedup.MarkProcessedAsync(compositeDedupKey, ct).ConfigureAwait(false);
+            return;
+        }
 
-        // Send the prompt as a fresh chat message — the operator sees
-        // both the edited original question (with the selected action
-        // embedded, no more buttons) AND the comment prompt. The
-        // prompt body carries a trace footer per the story-wide
-        // "All messages include trace/correlation ID" criterion
-        // (iter-3 evaluator item 2 — bare CommentPromptText omitted
-        // the trace).
-        await _client.SendRequest(
-                new SendMessageRequest
-                {
-                    ChatId = pending.TelegramChatId,
-                    Text = BuildCommentPromptText(pending),
-                },
-                ct)
+        // Stage 5.3 iter-5 evaluator item 2 — selection metadata is
+        // written ONLY after the atomic AwaitingComment claim succeeds.
+        // This is load-bearing for `HandleCommentReplyAsync` /
+        // `GetAwaitingCommentAsync(chatId, userId)` (the text-reply
+        // path filters on Status=AwaitingComment AND RespondentUserId
+        // = the operator) so the fields MUST be populated BEFORE the
+        // operator's follow-up text reply could arrive. By running it
+        // immediately after the claim CAS (and BEFORE the prompt
+        // SendRequest can race with an arriving text reply), the
+        // row is fully resolvable from the moment its Status is
+        // AwaitingComment. A callback that loses the claim CAS
+        // (sweep won the race) short-circuits above and NEVER writes
+        // these fields, so a TimedOut row cannot carry stale
+        // human-selection data.
+        await _store
+            .RecordSelectionAsync(pending.QuestionId, action.ActionId, action.Value, respondentUserId, ct)
             .ConfigureAwait(false);
 
-        // Edit the original message to embed the selected action AND
-        // remove all buttons (visually closes the button row).
-        await EditMessageShowDecisionAsync(pending, action, ct).ConfigureAwait(false);
+        // Stage 5.3 iter-5 evaluator item 1 — the post-claim work
+        // (prompt, message edit, callback ack, dedup-seal) MUST run
+        // inside a try/revert envelope. The prior ordering let the
+        // claim succeed and then, if any of the side effects threw,
+        // the AwaitingComment claim stayed asserted forever — the
+        // operator was stuck with a "please send a comment" prompt
+        // that could never produce a decision because the
+        // GetAwaitingCommentAsync lookup would resolve to a row no
+        // retry could re-claim. The outer catch in
+        // `HandleCallbackAsync` releases the dedup slots; this
+        // try/catch is what releases the durable status claim so a
+        // retry can re-process the same question + user pair.
+        try
+        {
+            // Send the prompt as a fresh chat message — the operator sees
+            // both the edited original question (with the selected action
+            // embedded, no more buttons) AND the comment prompt. The
+            // prompt body carries a trace footer per the story-wide
+            // "All messages include trace/correlation ID" criterion
+            // (iter-3 evaluator item 2 — bare CommentPromptText omitted
+            // the trace).
+            await _client.SendRequest(
+                    new SendMessageRequest
+                    {
+                        ChatId = pending.TelegramChatId,
+                        Text = BuildCommentPromptText(pending),
+                    },
+                    ct)
+                .ConfigureAwait(false);
 
-        await AnswerAndRememberAsync(evt, DecisionShownLabelPrefix + action.Label, ct).ConfigureAwait(false);
+            // Edit the original message to embed the selected action AND
+            // remove all buttons (visually closes the button row).
+            await EditMessageShowDecisionAsync(pending, action, ct).ConfigureAwait(false);
 
-        // Mark BOTH slots processed — Telegram will never redeliver
-        // this specific CallbackQuery.Id, and a fresh tap from the
-        // same operator on the same question while we are awaiting
-        // their comment must be treated as "already responded".
-        await _dedup.MarkProcessedAsync(callbackDedupKey, ct).ConfigureAwait(false);
-        await _dedup.MarkProcessedAsync(compositeDedupKey, ct).ConfigureAwait(false);
+            await AnswerAndRememberAsync(evt, DecisionShownLabelPrefix + action.Label, ct).ConfigureAwait(false);
+
+            // Mark BOTH slots processed — Telegram will never redeliver
+            // this specific CallbackQuery.Id, and a fresh tap from the
+            // same operator on the same question while we are awaiting
+            // their comment must be treated as "already responded".
+            await _dedup.MarkProcessedAsync(callbackDedupKey, ct).ConfigureAwait(false);
+            await _dedup.MarkProcessedAsync(compositeDedupKey, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Stage 5.3 iter-5 evaluator item 1 — revert the
+            // AwaitingComment claim so a retry (webhook redelivery,
+            // operator re-tap, sweep) can re-process the same row.
+            // Without this revert, a single transient Telegram /
+            // network hiccup permanently strands the question: Status
+            // is AwaitingComment so no callback can re-claim it via
+            // MarkAwaitingCommentAsync (only Pending is a legal source
+            // state), and no text reply can complete it because the
+            // prompt the operator was supposed to see never sent.
+            // `TryRevertAwaitingCommentClaimAsync` is the documented
+            // compensation primitive for exactly this case
+            // (IPendingQuestionStore.TryRevertAwaitingCommentClaimAsync
+            // xml-doc: "if the post-claim 'please send a comment'
+            // prompt fails to send, the handler releases the claim so
+            // the operator's next tap can re-claim the slot"). The
+            // outer catch in HandleCallbackAsync releases the dedup
+            // keys; together the revert + dedup-release restore the
+            // pre-callback state so the retry sees a fresh question.
+            var reverted = await _store
+                .TryRevertAwaitingCommentClaimAsync(pending.QuestionId, ct)
+                .ConfigureAwait(false);
+            _logger.LogError(
+                ex,
+                "Callback failed AFTER the atomic AwaitingComment claim succeeded; reverted={Reverted} so the row is sweep-eligible again. CorrelationId={CorrelationId} QuestionId={QuestionId}",
+                reverted,
+                evt.CorrelationId,
+                pending.QuestionId);
+            throw;
+        }
 
         _logger.LogInformation(
             "Callback handled: AwaitingComment. CorrelationId={CorrelationId} QuestionId={QuestionId} ActionId={ActionId}",
@@ -701,6 +933,26 @@ public sealed class CallbackQueryHandler : ICallbackHandler
             var externalMessageId = pending.TelegramMessageId.ToString(CultureInfo.InvariantCulture);
             var externalUserId = userId.ToString(CultureInfo.InvariantCulture);
 
+            // Stage 5.3 iter-3 evaluator item 7 — claim the row
+            // BEFORE publish/audit so a late timeout sweep that
+            // terminal-d this AwaitingComment row between our
+            // GetAwaitingCommentAsync read and this point cannot
+            // produce a duplicate decision. The atomic CAS in
+            // MarkAnsweredAsync returns false on a lost claim;
+            // release the comment slot and silent-ack so the next
+            // sweep is the sole authority on the question's
+            // outcome.
+            var claimed = await _store.MarkAnsweredAsync(pending.QuestionId, ct).ConfigureAwait(false);
+            if (!claimed)
+            {
+                _logger.LogInformation(
+                    "Comment reply short-circuited: lost the atomic Answered claim (the AwaitingComment row was terminal-d by a concurrent sweep or duplicate reply). CorrelationId={CorrelationId} QuestionId={QuestionId}",
+                    evt.CorrelationId,
+                    pending.QuestionId);
+                await SafeReleaseAsync(commentDedupKey, evt, ct).ConfigureAwait(false);
+                return SilentAck(evt);
+            }
+
             var decision = new HumanDecisionEvent
             {
                 QuestionId = pending.QuestionId,
@@ -712,13 +964,33 @@ public sealed class CallbackQueryHandler : ICallbackHandler
                 ReceivedAt = receivedAt,
                 CorrelationId = pending.CorrelationId,
             };
-            await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
-
+            // Stage 5.3 iter-8 evaluator item 3 — AUDIT-FIRST ordering
+            // for the comment-reply (RequiresComment follow-up) path.
+            // Same rationale as the standard callback above: audit
+            // BEFORE publish so a transient audit-DB failure cannot
+            // leak an outbound HumanDecisionEvent without a durable
+            // audit_logs row. The shared try/revert envelope below
+            // still releases both the comment dedup slot AND the
+            // Answered claim on ANY throw inside this block, so a
+            // pre-publish audit failure cleanly aborts (no event
+            // escapes) and the operator's retry re-acquires both
+            // gates and re-issues exactly once.
             await _audit.LogHumanResponseAsync(
                 new HumanResponseAuditEntry
                 {
                     EntryId = Guid.NewGuid(),
-                    MessageId = externalMessageId,
+                    // Stage 5.3 iter-4 evaluator item 2 — for the
+                    // text-reply (RequiresComment follow-up) path
+                    // there is no callback-query id (it's a chat
+                    // message, not a button tap). The platform-native
+                    // identifier of the OPERATOR'S inbound message is
+                    // evt.EventId (the Telegram connector synthesises
+                    // it from update_id so MessageId is unique per
+                    // update and joinable against the inbound update
+                    // audit trail). Keep TelegramMessageIdNumeric in
+                    // Details so forensic queries can still join back
+                    // to the rendered question.
+                    MessageId = evt.EventId,
                     UserId = externalUserId,
                     AgentId = pending.AgentId,
                     QuestionId = pending.QuestionId,
@@ -726,10 +998,25 @@ public sealed class CallbackQueryHandler : ICallbackHandler
                     Comment = comment,
                     Timestamp = receivedAt,
                     CorrelationId = pending.CorrelationId,
+                    // Stage 5.3 iter-2 evaluator item 6 — text-reply
+                    // (RequiresComment follow-up) audit row carries the
+                    // same tenant/workspace context the callback row
+                    // does. Source is tagged "comment" so a forensic
+                    // query can pivot on the comment-fallback path
+                    // distinctly from the original button press.
+                    TenantId = pending.TenantId,
+                    Details = JsonSerializer.Serialize(
+                        new DecisionAuditDetails(
+                            pending.WorkspaceId,
+                            pending.TelegramChatId,
+                            OperatorAlias: null,
+                            Source: DecisionSourceComment,
+                            TelegramMessageIdNumeric: pending.TelegramMessageId),
+                        DecisionAuditDetailsContext.Default.DecisionAuditDetails),
                 },
                 ct).ConfigureAwait(false);
 
-            await _store.MarkAnsweredAsync(pending.QuestionId, ct).ConfigureAwait(false);
+            await _bus.PublishHumanDecisionAsync(decision, ct).ConfigureAwait(false);
 
             // Seal the comment reservation only on the success path so a
             // post-publish transient failure (handled below) releases the
@@ -752,6 +1039,11 @@ public sealed class CallbackQueryHandler : ICallbackHandler
             // live retry would falsely short-circuit as "already
             // responded" without ever publishing the decision (the same
             // class of bug the callback path's iter-1 fix eliminated).
+            // Stage 5.3 iter-3 evaluator items 6 + 7 — also revert the
+            // atomic Answered claim so the retry's MarkAnsweredAsync
+            // can re-acquire (without revert the question stays
+            // terminally Answered and the decision is lost).
+            await TryRevertClaimAsync(pending.QuestionId, ct).ConfigureAwait(false);
             await SafeReleaseAsync(commentDedupKey, evt, ct).ConfigureAwait(false);
             throw;
         }
@@ -800,6 +1092,40 @@ public sealed class CallbackQueryHandler : ICallbackHandler
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Best-effort compensation for a successful
+    /// <see cref="IPendingQuestionStore.MarkAnsweredAsync"/> when the
+    /// subsequent publish/audit step throws. The CAS revert returns
+    /// false when the row is no longer in
+    /// <see cref="PendingQuestionStatus.Answered"/> (e.g. another
+    /// process already progressed it) — which is the safe outcome —
+    /// or when the store itself throws, in which case we log and
+    /// swallow because the outer catch needs to rethrow the
+    /// ORIGINAL publish/audit exception so the pipeline's
+    /// release-on-throw layer can act on it. Stage 5.3 iter-3
+    /// evaluator items 6 + 7.
+    /// </summary>
+    private async Task TryRevertClaimAsync(string questionId, CancellationToken ct)
+    {
+        try
+        {
+            var reverted = await _store.TryRevertAnsweredClaimAsync(questionId, ct).ConfigureAwait(false);
+            if (!reverted)
+            {
+                _logger.LogInformation(
+                    "Atomic Answered claim revert returned false (row no longer in Answered state). QuestionId={QuestionId}",
+                    questionId);
+            }
+        }
+        catch (Exception revertEx) when (revertEx is not OperationCanceledException)
+        {
+            _logger.LogError(
+                revertEx,
+                "Atomic Answered claim revert threw; original publish/audit exception will still propagate. QuestionId={QuestionId}",
+                questionId);
+        }
     }
 
     /// <summary>

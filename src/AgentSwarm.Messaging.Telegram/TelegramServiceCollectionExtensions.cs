@@ -224,6 +224,20 @@ public static class TelegramServiceCollectionExtensions
         // hit the database — last-wins semantics on Replace().
         services.TryAddSingleton<IAuditLogger, NullAuditLogger>();
 
+        // Stage 5.3 iter-9 evaluator item 2 — no-op fallback sink
+        // as the TryAdd default so TelegramUpdatePipeline can take a
+        // hard IAuditFallbackSink dependency in dev / unit-test
+        // bootstraps that skip the persistence module.
+        // AddMessagingPersistence REPLACES this with the file-backed
+        // FileAuditFallbackSink so production hosts get a durable
+        // backstop when the primary audit DB throws — last-wins
+        // semantics on Replace(). Pairing PersistentAuditLogger with
+        // the no-op fallback would silently violate Stage 5.3's
+        // "log every inbound command" contract on any audit-DB
+        // outage, which is exactly why AddMessagingPersistence
+        // always replaces this binding.
+        services.TryAddSingleton<IAuditFallbackSink, NullAuditFallbackSink>();
+
         // Stage 3.3 swapped StubCallbackHandler for the production
         // CallbackQueryHandler. The handler depends on
         // IPendingQuestionStore + ISwarmCommandBus + IAuditLogger +

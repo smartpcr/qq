@@ -120,4 +120,23 @@ public sealed record PendingQuestion
     /// questions exist for the same operator.
     /// </summary>
     public required DateTimeOffset StoredAt { get; init; }
+
+    /// <summary>
+    /// Tenant the question belongs to. Stage 5.3 iter-2 evaluator item 6
+    /// — populated by <see cref="IPendingQuestionStore.StoreAsync"/> from
+    /// the envelope's routing metadata when present so the callback /
+    /// timeout audit paths can persist <c>TenantId</c> on every decision
+    /// row without re-resolving the operator binding. Nullable for
+    /// backward compatibility with rows created before the metadata
+    /// stamp was introduced.
+    /// </summary>
+    public string? TenantId { get; init; }
+
+    /// <summary>
+    /// Workspace the question belongs to. Same purpose as
+    /// <see cref="TenantId"/>; persisted alongside it so audit rows
+    /// emitted by the callback / timeout paths carry the full
+    /// tenant/workspace context Stage 5.3 mandates.
+    /// </summary>
+    public string? WorkspaceId { get; init; }
 }

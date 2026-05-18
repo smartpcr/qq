@@ -27,6 +27,23 @@
     <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks.Abstractions" Version="8.*" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!--
+      Stage 5.3 iter-8 evaluator item 1 — structural fix for bulk-API
+      audit immutability. The `AuditDbContext.AuditLogs` DbSet is now
+      `internal` so production code OUTSIDE this assembly cannot
+      resolve it and therefore cannot call `ExecuteDeleteAsync` /
+      `ExecuteUpdateAsync` on the audit table at all. The test
+      assembly needs to read rows back to assert what
+      `PersistentAuditLogger` persisted, and to negative-test the
+      change-tracker guard + bulk interceptor; expose it ONLY to
+      that one assembly via `InternalsVisibleTo` so the test
+      surface remains tight and no other consumer can resurrect
+      the public-DbSet hole.
+    -->
+    <InternalsVisibleTo Include="AgentSwarm.Messaging.Tests" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
