@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -266,6 +267,36 @@ internal sealed class TelegramPollingService : BackgroundService
                     try
                     {
                         var messengerEvent = TelegramUpdateMapper.Map(update);
+
+                        // Stage 6.1 iter-4 evaluator item 1 — observability
+                        // parity with the webhook receive path. Every inbound
+                        // update (regardless of receive mode) MUST emit:
+                        //   1. A Server-kind receive span tagged with the
+                        //      correlation id + event id + event-type so
+                        //      operators can pivot end-to-end traces back to
+                        //      the original ingestion.
+                        //   2. A canonical structured-logging scope so the
+                        //      pipeline's nested log lines carry the
+                        //      brief-contract CorrelationId property.
+                        //   3. The `telegram.messages.received` counter
+                        //      incremented with the same `event_type` tag the
+                        //      webhook emits, so dashboards aggregate inbound
+                        //      volume identically across modes.
+                        var eventTypeTag = ResolveEventTypeTag(messengerEvent.EventType);
+                        using var canonicalLogScope = TelegramTelemetry.BeginCanonicalLogScope(
+                            _logger,
+                            correlationId: messengerEvent.CorrelationId,
+                            agentId: null,
+                            telegramUserId: null,
+                            commandName: null);
+                        using var receiveActivity = TelegramTelemetry.StartReceiveSpan(
+                            correlationId: messengerEvent.CorrelationId,
+                            eventId: update.Id,
+                            eventType: eventTypeTag);
+                        TelegramTelemetry.MessagesReceivedCounter.Add(
+                            1,
+                            new KeyValuePair<string, object?>("event_type", eventTypeTag));
+
                         await _pipeline
                             .ProcessAsync(messengerEvent, stoppingToken)
                             .ConfigureAwait(false);
@@ -391,4 +422,19 @@ internal sealed class TelegramPollingService : BackgroundService
         // the established codebase convention.
         return ex.HttpStatusCode == System.Net.HttpStatusCode.Conflict;
     }
+
+    /// <summary>
+    /// Stage 6.1 — maps a <see cref="EventType"/> to the canonical
+    /// <c>event_type</c> tag string the webhook receive path emits.
+    /// Keeping the two modes' tags identical lets a single dashboard
+    /// panel sum <c>telegram.messages.received</c> across webhook and
+    /// polling without per-mode joins.
+    /// </summary>
+    private static string ResolveEventTypeTag(EventType eventType) => eventType switch
+    {
+        EventType.Command => "command",
+        EventType.CallbackResponse => "callback_response",
+        EventType.TextReply => "text_reply",
+        _ => "unknown",
+    };
 }

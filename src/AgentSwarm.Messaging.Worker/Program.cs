@@ -6,6 +6,7 @@ using AgentSwarm.Messaging.Telegram.Auth;
 using AgentSwarm.Messaging.Telegram.Webhook;
 using AgentSwarm.Messaging.Worker;
 using AgentSwarm.Messaging.Worker.Configuration;
+using AgentSwarm.Messaging.Worker.Observability;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -149,6 +150,20 @@ builder.Host.ConfigureAppConfiguration((context, config) =>
 builder.Services.AddMessagingPersistence(builder.Configuration);
 builder.Services.AddTelegram(builder.Configuration);
 builder.Services.AddTelegramWebhook();
+
+// Stage 6.1 -- OpenTelemetry tracing + metrics. Registers the custom
+// ActivitySource AgentSwarm.Messaging.Telegram (plus AspNetCore and
+// HttpClient instrumentation), the Meter AgentSwarm.Messaging.Telegram
+// (plus the pre-existing AgentSwarm.Messaging.Outbound meter), and
+// the observable telegram.queue.depth / telegram.dlq.depth gauges.
+// Exporters are gated by configuration: the Console exporter ships
+// out-of-the-box in Development for developer feedback; the OTLP
+// exporter activates when an endpoint is configured (either via
+// OpenTelemetry:OtlpEndpoint or the OTEL_EXPORTER_OTLP_ENDPOINT env
+// var). The HTTP-client instrumentation hook redacts the bot token
+// out of any api.telegram.org URL tag so spans never leak the
+// secret. See OpenTelemetrySetup.cs for the full wiring.
+builder.Services.AddTelegramOpenTelemetry(builder.Configuration, builder.Environment);
 
 // Stage 6.3: a minimal /healthz endpoint is mapped below so the
 // Dockerfile HEALTHCHECK has something to poll. Phase 6 (observability)

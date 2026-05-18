@@ -521,10 +521,10 @@ public sealed class Stage5_2AllowlistAndRoleEnforcementTests : IAsyncLifetime
         deniedEntry.Should().NotBeNull(
             "the brief's 'log the attempt at Warning level' requirement is satisfied by the pipeline's structured authorize-denied entry");
         deniedEntry!.Level.Should().Be(LogLevel.Warning);
-        deniedEntry.GetValue<object>("UserId")?.ToString().Should().Be("99999",
-            "the warning log must carry the Telegram numeric user id");
-        deniedEntry.GetValue<object>("ChatId")?.ToString().Should().Be("11111",
-            "the warning log must carry the Telegram numeric chat id");
+        deniedEntry.GetValue<object>("TelegramUserId")?.ToString().Should().Be("99999",
+            "Stage 6.1 brief: the warning log must carry the Telegram numeric user id under the canonical TelegramUserId property name");
+        deniedEntry.GetValue<object>("TelegramChatId")?.ToString().Should().Be("11111",
+            "Stage 6.1 brief: the warning log must carry the Telegram numeric chat id under the canonical TelegramChatId property name");
     }
 
     [Fact]
@@ -542,7 +542,8 @@ public sealed class Stage5_2AllowlistAndRoleEnforcementTests : IAsyncLifetime
         deniedEntry.Should().NotBeNull(
             "the brief's role-enforcement 'audit log entry at Warning level' is satisfied by the pipeline's structured role-denied entry");
         deniedEntry!.Level.Should().Be(LogLevel.Warning);
-        deniedEntry.GetValue<string>("Command").Should().Be(TelegramCommands.Approve);
+        deniedEntry.GetValue<string>("CommandName").Should().Be(TelegramCommands.Approve,
+            "Stage 6.1 brief: the warning log must carry the command verb under the canonical CommandName property name");
         deniedEntry.GetValue<string>("RequiredRole").Should().Be("Approver");
     }
 
@@ -599,7 +600,8 @@ public sealed class Stage5_2AllowlistAndRoleEnforcementTests : IAsyncLifetime
             "the brief mandates a Warning-level audit log entry on role denial");
         deniedEntry!.Level.Should().Be(LogLevel.Warning);
         deniedEntry.GetValue<string>("RequiredRole").Should().Be(expectedRole);
-        deniedEntry.GetValue<string>("Command").Should().Be(commandName);
+        deniedEntry.GetValue<string>("CommandName").Should().Be(commandName,
+            "Stage 6.1 brief: the role-denial warning log must carry the command verb under the canonical CommandName property name");
     }
 
     private static void AssertRouted(

@@ -361,6 +361,8 @@ public sealed class OutboundQueueProcessorTests
             "first_attempt_latency_ms must NOT be emitted for the retried success — only the row's first attempt counts");
         collector.Counts(OutboundQueueMetrics.AllAttemptsLatencyMsName).Should().Be(1,
             "all_attempts_latency_ms must be emitted on the retry success regardless of attempt count");
+        collector.Counts(OutboundQueueMetrics.RetryLatencyMsName).Should().Be(1,
+            "Stage 6.1 iter-2 evaluator item 5 — telegram.send.retry_latency_ms must be emitted on every successful send whose AttemptCount was > 0 at success so dashboards can split retried-send latency from first-attempt latency");
     }
 
     [Fact]

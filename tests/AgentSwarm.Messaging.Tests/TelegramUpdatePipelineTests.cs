@@ -1586,8 +1586,10 @@ public class TelegramUpdatePipelineTests
         deniedEntry.GetValue<string>("EventId").Should().Be(evt.EventId);
         deniedEntry.GetValue<string>("Reason").Should().Be("user not in allowlist",
             "denial reason from AuthorizationResult must surface in the structured log so audit consumers can identify why an event was rejected");
-        deniedEntry.GetValue<string>("UserId").Should().Be(evt.UserId);
-        deniedEntry.GetValue<string>("ChatId").Should().Be(evt.ChatId);
+        deniedEntry.GetValue<string>("TelegramUserId").Should().Be(evt.UserId,
+            "Stage 6.1 brief: the warning log must carry the Telegram numeric user id under the canonical TelegramUserId property name");
+        deniedEntry.GetValue<string>("TelegramChatId").Should().Be(evt.ChatId,
+            "Stage 6.1 brief: the warning log must carry the Telegram numeric chat id under the canonical TelegramChatId property name");
     }
 
     // ============================================================

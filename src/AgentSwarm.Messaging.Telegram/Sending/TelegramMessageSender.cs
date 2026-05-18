@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -247,6 +248,29 @@ public sealed class TelegramMessageSender : IMessageSender
         // chunks 2..N are not trace-less), and the caller is
         // responsible for the per-chunk persistence loop below.
         var (chunks, correlationId) = PrepareOutboundChunks(text);
+        // Stage 6.1 iter-2 evaluator item 2 — open the canonical
+        // structured-logging scope for the outbound send so EVERY
+        // log line the sender emits while delivering THIS text
+        // message carries the brief-contract CorrelationId property
+        // under its canonical name. The text path has no agent /
+        // user / command association (it is a connector-rendered
+        // CommandAck / StatusUpdate / Alert), so the helper omits
+        // those keys.
+        using var logScope = TelegramTelemetry.BeginCanonicalLogScope(
+            _logger,
+            correlationId: correlationId,
+            agentId: null,
+            telegramUserId: null,
+            commandName: null);
+        // Stage 6.1 — wrap the entire chunked send in a client-kind
+        // span so trace consumers see "this outbound text message
+        // was the one that produced N HTTP calls + downstream
+        // child spans". The source tag defaults to "text"; the
+        // chunk-level SendWithRetry counter increment reads the tag
+        // back via Activity.Current to label each chunk's
+        // messages.sent counter point.
+        using var sendActivity = TelegramTelemetry.StartSendSpan(correlationId, chatId, "text");
+        sendActivity?.SetTag("messaging.outbound.chunk_count", chunks.Count);
         long lastMessageId = 0;
         var anyRateLimited = false;
         for (var i = 0; i < chunks.Count; i++)
@@ -309,6 +333,33 @@ public sealed class TelegramMessageSender : IMessageSender
         // of how many chunks the body spans.
         var footer = BuildTraceFooter(correlationId);
         var chunks = SplitForTelegramWithFooter(body, footer);
+        // Stage 6.1 iter-2 evaluator item 2 — open the canonical
+        // structured-logging scope for the outbound question send
+        // so EVERY log line carries the brief-contract CorrelationId
+        // AND AgentId properties under their canonical names. The
+        // question path knows the AgentId via envelope.Question; we
+        // omit telegramUserId (the outbound row is "send to chat",
+        // not "send to a user") and commandName (no command verb on
+        // an outbound question).
+        using var logScope = TelegramTelemetry.BeginCanonicalLogScope(
+            _logger,
+            correlationId: correlationId,
+            agentId: envelope.Question.AgentId,
+            telegramUserId: null,
+            commandName: null);
+        // Stage 6.1 — wrap the chunked question send in a client-kind
+        // span tagged source_type=question so dashboards can split
+        // question vs text traffic and so the chunk-level
+        // SendWithRetry counter increment sees source_type=question
+        // via Activity.Current.GetTagItem.
+        using var sendActivity = TelegramTelemetry.StartSendSpan(correlationId, chatId, "question");
+        sendActivity?.SetTag("messaging.outbound.chunk_count", chunks.Count);
+        sendActivity?.SetTag("messaging.question.severity", envelope.Question.Severity.ToString());
+        if (!string.IsNullOrEmpty(envelope.Question.AgentId))
+        {
+            sendActivity?.SetTag(TelegramTelemetry.AgentIdKey, envelope.Question.AgentId);
+            sendActivity?.SetTag(TelegramTelemetry.OtelMessagingAgentIdKey, envelope.Question.AgentId);
+        }
         long lastMessageId = 0;
         var anyRateLimited = false;
         for (var i = 0; i < chunks.Count; i++)
@@ -855,6 +906,19 @@ public sealed class TelegramMessageSender : IMessageSender
                     parseMode: ParseMode.MarkdownV2,
                     replyMarkup: replyMarkup,
                     cancellationToken: ct).ConfigureAwait(false);
+                // Stage 6.1 — count each successful chunk send so the
+                // telegram.messages.sent counter tracks actual Telegram
+                // API deliveries (per chunk, since long messages span
+                // multiple sends). Tagged with source_type so dashboards
+                // can split question / text / callback-answer traffic;
+                // the source_type tag is set from the activity tag
+                // when a parent send span established it, otherwise
+                // defaulted to "text".
+                var sourceTag = Activity.Current?.GetTagItem(TelegramTelemetry.OutboundSourceKey) as string ?? "text";
+                TelegramTelemetry.MessagesSentCounter.Add(
+                    1,
+                    new KeyValuePair<string, object?>("source_type", sourceTag),
+                    new KeyValuePair<string, object?>("rate_limited", (rateLimitAttempts > 0).ToString().ToLowerInvariant()));
                 return new SendChunkOutcome(message, rateLimitAttempts > 0);
             }
             catch (ApiRequestException ex) when (IsTelegramRateLimit(ex) && rateLimitAttempts < MaxRateLimitRetries)
@@ -868,6 +932,17 @@ public sealed class TelegramMessageSender : IMessageSender
                     rateLimitAttempts,
                     MaxRateLimitRetries,
                     chatId);
+                TelegramTelemetry.ErrorsCounter.Add(
+                    1,
+                    new KeyValuePair<string, object?>("error_kind", "send_rate_limited"));
+                // Stage 6.1 iter-2 evaluator item 5 — emit one
+                // telegram.send.rate_limited_wait_ms sample per 429
+                // wait so dashboards can observe per-chat flood-control
+                // pressure independently of the eventual outcome.
+                TelegramTelemetry.RateLimitedWaitMs.Record(
+                    retryAfter.TotalMilliseconds,
+                    new KeyValuePair<string, object?>("chat_id", chatId),
+                    new KeyValuePair<string, object?>("attempt", rateLimitAttempts));
                 await Task.Delay(retryAfter, _timeProvider, ct).ConfigureAwait(false);
             }
             catch (ApiRequestException ex) when (IsTelegramRateLimit(ex))
@@ -883,6 +958,9 @@ public sealed class TelegramMessageSender : IMessageSender
                 // (which doesn't know to set DeadLetterReason or fire
                 // the alert).
                 var attemptCount = rateLimitAttempts + 1;
+                TelegramTelemetry.ErrorsCounter.Add(
+                    1,
+                    new KeyValuePair<string, object?>("error_kind", "send_rate_limited_exhausted"));
                 var rlPersisted = await EmitDeadLetterAsync(
                     chatId,
                     correlationId,
@@ -912,6 +990,9 @@ public sealed class TelegramMessageSender : IMessageSender
                     chatId,
                     backoff.TotalSeconds,
                     correlationId);
+                TelegramTelemetry.ErrorsCounter.Add(
+                    1,
+                    new KeyValuePair<string, object?>("error_kind", "send_transient"));
                 if (backoff > TimeSpan.Zero)
                 {
                     await Task.Delay(backoff, _timeProvider, ct).ConfigureAwait(false);
@@ -927,6 +1008,9 @@ public sealed class TelegramMessageSender : IMessageSender
                 // directly to IOutboundQueue.DeadLetterAsync.
                 lastTransientError = ex;
                 var transientAttemptCount = transientAttempts + 1;
+                TelegramTelemetry.ErrorsCounter.Add(
+                    1,
+                    new KeyValuePair<string, object?>("error_kind", "send_transient_exhausted"));
                 var transientPersisted = await EmitDeadLetterAsync(
                     chatId,
                     correlationId,
@@ -971,6 +1055,10 @@ public sealed class TelegramMessageSender : IMessageSender
                 // PreviousIy these escaped raw and the send was
                 // silently invisible to the dead-letter pipeline.
                 var permanentAttemptCount = transientAttempts + rateLimitAttempts + 1;
+                TelegramTelemetry.ErrorsCounter.Add(
+                    1,
+                    new KeyValuePair<string, object?>("error_kind", "send_permanent"),
+                    new KeyValuePair<string, object?>("http_status", ex.ErrorCode));
                 var permanentPersisted = await EmitDeadLetterAsync(
                     chatId,
                     correlationId,
