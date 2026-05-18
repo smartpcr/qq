@@ -110,6 +110,18 @@ internal sealed class SlackInboundProcessingPipeline
         ArgumentNullException.ThrowIfNull(envelope);
         ct.ThrowIfCancellationRequested();
 
+        // Stage 8.2 (AC-6): clear the ambient resolved-correlation
+        // slot at the top of every envelope so a previously-stamped
+        // value from a sibling task on the same logical thread cannot
+        // leak into this audit row. The interaction handler (and any
+        // future handler) that resolves a business correlation id from
+        // the thread mapping calls
+        // SlackInboundResolvedCorrelationContext.Set(...); the audit
+        // recorder reads the value when stamping the row's
+        // CorrelationId column. When no handler stamps a value, the
+        // recorder falls back to envelope.IdempotencyKey unchanged.
+        SlackInboundResolvedCorrelationContext.Reset();
+
         // Stage 7.2: the pipeline owns the child spans for the
         // architecture.md §6.3 instrumentation surface that runs
         // INSIDE the BackgroundService -- authorization, idempotency,

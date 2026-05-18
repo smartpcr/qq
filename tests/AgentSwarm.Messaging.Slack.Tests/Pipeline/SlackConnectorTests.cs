@@ -344,28 +344,28 @@ public sealed class SlackConnectorTests
     [Fact]
     public void SlackConnectorComponents_rejects_null_dependencies()
     {
-        // Stage 8.1 iter-2 item 1: the composition bundle pins the
-        // five named subsystems (audit logger, inbound transport,
-        // outbound transport, thread manager, inbound event buffer)
-        // at compile time so a future DI regression that drops any
-        // single one fails fast at component construction.
+        // Stage 8.1: the composition bundle pins the four named
+        // subsystems (audit logger, outbound transport, thread
+        // manager, inbound event buffer) at compile time so a future
+        // DI regression that drops any single one fails fast at
+        // component construction. The inbound transport seam is
+        // intentionally NOT exposed (the connector never reads it
+        // directly; the ingestor drains it) -- see
+        // SlackConnectorComponents class docs.
         ISlackAuditLogger audit = new RecordingAuditLogger();
-        ISlackInboundQueue inbound = new StubInboundQueue();
         ISlackOutboundQueue outbound = new RecordingOutboundQueue();
         ISlackThreadManager thread = new RecordingThreadManager(null);
         ISlackInboundEventBuffer buffer = new InMemorySlackInboundEventBuffer();
 
-        Action a = () => new SlackConnectorComponents(null!, inbound, outbound, thread, buffer);
-        Action b = () => new SlackConnectorComponents(audit, null!, outbound, thread, buffer);
-        Action c = () => new SlackConnectorComponents(audit, inbound, null!, thread, buffer);
-        Action d = () => new SlackConnectorComponents(audit, inbound, outbound, null!, buffer);
-        Action e = () => new SlackConnectorComponents(audit, inbound, outbound, thread, null!);
+        Action a = () => new SlackConnectorComponents(null!, outbound, thread, buffer);
+        Action b = () => new SlackConnectorComponents(audit, null!, thread, buffer);
+        Action c = () => new SlackConnectorComponents(audit, outbound, null!, buffer);
+        Action d = () => new SlackConnectorComponents(audit, outbound, thread, null!);
 
         a.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("auditLogger");
-        b.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("inboundTransport");
-        c.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("outboundTransport");
-        d.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("threadManager");
-        e.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("inboundEventBuffer");
+        b.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("outboundTransport");
+        c.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("threadManager");
+        d.Should().Throw<ArgumentNullException>().And.ParamName.Should().Be("inboundEventBuffer");
     }
 
     private static SlackConnector BuildConnector(
@@ -378,7 +378,6 @@ public sealed class SlackConnectorTests
         SlackOutboundOptions opts = new() { DefaultTeamId = defaultTeamId };
         SlackConnectorComponents components = new(
             auditLogger: auditLogger ?? new RecordingAuditLogger(),
-            inboundTransport: new StubInboundQueue(),
             outboundTransport: queue,
             threadManager: threadManager,
             inboundEventBuffer: buffer ?? new InMemorySlackInboundEventBuffer());

@@ -232,6 +232,15 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
             .ResolveCorrelationIdAsync(envelope, detail.ChannelId, lookupKey, fallbackCorrelationId, ct)
             .ConfigureAwait(false);
 
+        // Stage 8.2 (AC-6): stamp the resolved business correlation
+        // id into the ambient slot so SlackInboundAuditRecorder uses
+        // it as the audit row's CorrelationId column. Without this,
+        // the inbound interaction row would land under its per-click
+        // `interact:<...>` envelope key and the brief's "every
+        // agent/human exchange queryable by a single correlation id"
+        // promise would not hold.
+        SlackInboundResolvedCorrelationContext.Set(correlationId);
+
         if (requiresComment)
         {
             // Brief step 8: a button whose backing HumanAction.RequiresComment
@@ -406,6 +415,17 @@ internal sealed class SlackInteractionHandler : ISlackInteractionHandler
                     ResolveFallbackCorrelationId(envelope),
                     ct)
                 .ConfigureAwait(false);
+
+        // Stage 8.2 (AC-6): stamp the resolved business correlation
+        // id into the ambient slot -- same rationale as the
+        // HandleBlockActionsAsync path. view_submission envelopes
+        // resolve their correlation id either from the modal's pinned
+        // private_metadata or from the originating thread mapping;
+        // either way the resulting audit row needs to carry THIS id,
+        // not the envelope's `interact:<view_id>` key, so an operator
+        // can join the comment-modal submission to the originating
+        // `/agent ask` row in a single QueryAsync(correlationId) call.
+        SlackInboundResolvedCorrelationContext.Set(correlationId);
 
         string externalUserId = detail.UserId
             ?? metadata.UserId
