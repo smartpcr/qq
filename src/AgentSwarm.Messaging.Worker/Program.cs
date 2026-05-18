@@ -5,8 +5,11 @@ using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Auth;
 using AgentSwarm.Messaging.Telegram.Webhook;
 using AgentSwarm.Messaging.Worker;
+using AgentSwarm.Messaging.Worker.Configuration;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -63,6 +66,82 @@ using Microsoft.Extensions.Options;
 // =============================================================
 
 var builder = WebApplication.CreateBuilder(args);
+
+// =============================================================
+// Stage 5.1 — Secret Management Integration.
+//
+// Azure Key Vault is layered onto the configuration pipeline AFTER
+// the defaults established by WebApplication.CreateBuilder (JSON
+// files + environment variables + command-line + User Secrets in
+// Development) so vault values take precedence over local sources.
+// The provider is only added when `KeyVault:Uri` resolves to an
+// absolute URI; an unset / blank value leaves the host on
+// User-Secrets-and-env-vars only (the local-dev path documented in
+// docs/stories/qq-TELEGRAM-MESSENGER-S/dev-setup.md).
+//
+// `TelegramKeyVaultSecretManager` performs the brief's required
+// flat-secret-name → nested-configuration-key mapping
+// (TelegramBotToken → Telegram:BotToken) and acts as an allowlist
+// so a shared vault cannot silently bleed unrelated secrets into
+// the host configuration.
+//
+// `DefaultAzureCredential` is the standard token chain used by the
+// Azure SDKs: it tries (in order) Workload Identity, Managed
+// Identity, Visual Studio / VS Code, Azure CLI, and PowerShell so
+// the same code path works in AKS, App Service, and on a
+// developer's laptop without code changes.
+//
+// `ReloadInterval` enables the periodic Key Vault refresh required
+// by architecture.md §10 (line 1018) and the §11 Security model
+// (line 1091): every `Telegram:SecretRefreshIntervalMinutes`
+// (default 5) the provider re-fetches secrets from the vault, fires
+// IConfiguration's change-token, and `IOptionsMonitor<TelegramOptions>`
+// re-binds Telegram:BotToken so rotation takes effect without a
+// process restart — per tech-spec.md R-5.
+//
+// The wiring is registered as an `IHostBuilder.ConfigureAppConfiguration`
+// callback on `builder.Host` rather than a synchronous read of
+// `builder.Configuration["KeyVault:Uri"]` at top-level Program code.
+// `ConfigureAppConfiguration` callbacks fire in registration order
+// during `builder.Build()`. In production this is fine because
+// `KeyVault:Uri` is supplied by appsettings / environment variables
+// / command-line, all of which were attached to the builder's
+// configuration BEFORE Program.cs's top-level statements ran. In
+// the integration suite, the test fixture's own
+// `ConfigureAppConfiguration` callback (which sets in-memory
+// `KeyVault:Uri = https://fake-vault…`) is registered AFTER
+// Program.cs's callback, so by the time the bootstrap callback
+// fires the test override is NOT YET visible. To bridge that gap
+// without abandoning the callback shape (and the production
+// guarantee that any approved source can supply the URI), the
+// bootstrap consults
+// `TelegramKeyVaultBootstrap.OverrideKeyVaultUri` — an
+// `AsyncLocal<string?>` test seam that mirrors the existing
+// `OverrideSecretClientFactory` seam — BEFORE falling back to
+// `configuration["KeyVault:Uri"]`. Production code never sets the
+// override and so observes identical behaviour to a bare
+// configuration read; tests use the seam to drive the brief's
+// "Worker starts with Key Vault URI configured" scenario end-to-end
+// without spawning the worker out-of-process or fighting the
+// callback queue.
+//
+// `ASP0013` is the .NET 8 analyzer warning that prefers
+// `WebApplicationBuilder.Configuration` over
+// `builder.Host.ConfigureAppConfiguration`. That suggestion is the
+// right default for a synchronous one-shot read, but the
+// deferred-callback shape here is what allows the bootstrap to
+// observe the FULLY-MERGED configuration at Build time (rather
+// than the pre-callback snapshot a synchronous read would see).
+// Suppressing ASP0013 here is therefore intentional and surgical —
+// limited to this single registration where the deferred-callback
+// shape is load-bearing.
+// =============================================================
+#pragma warning disable ASP0013
+builder.Host.ConfigureAppConfiguration((context, config) =>
+{
+    TelegramKeyVaultBootstrap.TryAddTelegramKeyVault(config, context.Configuration);
+});
+#pragma warning restore ASP0013
 
 // EF Core + Telegram + webhook receiver (channel, processor, endpoint).
 builder.Services.AddMessagingPersistence(builder.Configuration);
@@ -218,6 +297,35 @@ builder.Services.AddHostedService<OutboundQueueProcessor>(sp =>
         sp.GetRequiredService<ILogger<OutboundQueueProcessor>>()));
 
 var app = builder.Build();
+
+// =============================================================
+// Stage 5.1, step 4 — secret-source validation.
+//
+// Runs BEFORE `app.Run()` so a misconfigured deployment fails
+// startup synchronously with a clear, source-by-source diagnostic
+// instead of getting deep into hosted-service start and surfacing
+// the failure as a generic OptionsValidationException. Logs at
+// Warning level when the token is missing (listing every source
+// it inspected and why each one did not provide the value) and
+// throws an InvalidOperationException to halt startup. The
+// existing `TelegramOptionsValidator` ValidateOnStart() hook is
+// retained as defence in depth.
+// =============================================================
+var secretValidatorLogger = app.Services
+    .GetRequiredService<ILoggerFactory>()
+    .CreateLogger("AgentSwarm.Messaging.Worker.SecretManagement");
+// Capture KeyVault:Uri AFTER builder.Build() so the validator's
+// diagnostic line reports the value that was effectively applied —
+// i.e. including overrides supplied by WebApplicationFactory's
+// ConfigureAppConfiguration callbacks and any post-Build env/User
+// Secrets layers. Reading from `app.Configuration` (the host's
+// finalized IConfiguration) is the canonical post-Build read.
+var keyVaultUriForDiagnostic = app.Configuration["KeyVault:Uri"];
+TelegramSecretSourceValidator.EnsureBotTokenConfigured(
+    app.Configuration,
+    app.Environment,
+    keyVaultUriForDiagnostic,
+    secretValidatorLogger);
 
 // Routing + endpoint. UseRouting is required when the host uses the
 // minimal-API endpoint conventions; MapTelegramWebhook attaches the

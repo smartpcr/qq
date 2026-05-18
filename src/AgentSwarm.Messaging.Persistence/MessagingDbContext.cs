@@ -110,6 +110,23 @@ public class MessagingDbContext : DbContext
     /// </summary>
     public DbSet<DeadLetterMessage> DeadLetterMessages => Set<DeadLetterMessage>();
 
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the Stage 4.3 inbound
+    /// deduplication sliding-window table. Written and read by
+    /// <see cref="PersistentDeduplicationService"/>; purged by
+    /// <see cref="DeduplicationCleanupService"/>. The schema is fixed
+    /// by <see cref="ProcessedEventConfiguration"/> and applied via
+    /// <see cref="OnModelCreating"/>'s assembly-scan, plus the
+    /// <c>20260601000007_AddProcessedEvents</c> migration. This DbSet
+    /// declaration is the missing piece that was dropped during the
+    /// Stage 4.3 deduplication merge (PR #92): every reference site
+    /// in <see cref="PersistentDeduplicationService"/> and
+    /// <see cref="DeduplicationCleanupService"/> calls
+    /// <c>db.ProcessedEvents</c>, so without this property the entire
+    /// Persistence assembly fails to compile (14 errors).
+    /// </summary>
+    public DbSet<ProcessedEvent> ProcessedEvents => Set<ProcessedEvent>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

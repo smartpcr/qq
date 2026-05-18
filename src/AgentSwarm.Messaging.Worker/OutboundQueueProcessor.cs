@@ -20,7 +20,19 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Telegram.Bot.Exceptions;
+
+// `global::` qualifier required: the file-scoped
+// `namespace AgentSwarm.Messaging.Worker;` declaration places this
+// using directive inside the `AgentSwarm.Messaging.Worker` namespace
+// scope, where `Telegram` resolves to the sibling
+// `AgentSwarm.Messaging.Telegram` (which lacks a `Bot` sub-namespace)
+// rather than the global `Telegram.Bot` SDK namespace. This is a
+// pre-existing build break in PR #93 that surfaces only after PR
+// #92's missing `DbSet<ProcessedEvent>` is restored (Persistence
+// compiles → Worker is reached → the namespace clash is exposed).
+// `global::` pins resolution to the root namespace so
+// `ApiRequestException` binds to the Telegram.Bot SDK type.
+using global::Telegram.Bot.Exceptions;
 
 /// <summary>
 /// Stage 4.1 — drains the durable outbox by dispatching outbound
