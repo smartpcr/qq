@@ -83,6 +83,23 @@ namespace AgentSwarm.Messaging.Telegram;
 /// future need to preserve them across rotations should be solved
 /// by storing the override on the proxy and re-applying on rebuild.
 /// </para>
+/// <para>
+/// <b>Event forwarding semantics.</b> <see cref="OnMakingApiRequest"/>
+/// and <see cref="OnApiResponseReceived"/> are multicast events on the
+/// underlying client used by instrumentation / diagnostics callers.
+/// Because a rotation swaps the inner client out, naively forwarding
+/// <c>add</c>/<c>remove</c> straight to <see cref="Current"/> would
+/// strand handlers on the discarded instance and silently stop firing
+/// after the first rotation. The proxy therefore tracks the aggregated
+/// multicast delegate for each event on its own field, attaches the
+/// new handler to the current inner client on <c>add</c> (so the very
+/// next API call observes it), and re-attaches the full aggregated
+/// delegate to every freshly-built inner client in <see cref="Rebuild"/>.
+/// The discarded inner is detached defensively so it doesn't keep the
+/// handler references alive past its own GC eligibility. All mutation
+/// of the aggregated delegates happens under <see cref="_rebuildGate"/>
+/// so a rotation cannot race a concurrent <c>add</c>/<c>remove</c>.
+/// </para>
 /// </remarks>
 public sealed class RotatingTelegramBotClient : ITelegramBotClient, IDisposable
 {
@@ -95,6 +112,13 @@ public sealed class RotatingTelegramBotClient : ITelegramBotClient, IDisposable
     private TelegramBotClient? _inner;
     private string? _currentToken;
     private bool _disposed;
+
+    // Aggregated multicast delegates for forwarded events. Tracked on
+    // the proxy so they survive an inner-client rotation; re-attached
+    // to every freshly-built inner client in Rebuild(). All mutation
+    // is gated by _rebuildGate.
+    private AsyncEventHandler<ApiRequestEventArgs>? _onMakingApiRequest;
+    private AsyncEventHandler<ApiResponseEventArgs>? _onApiResponseReceived;
 
     public RotatingTelegramBotClient(
         IOptionsMonitor<TelegramOptions> options,
@@ -133,15 +157,81 @@ public sealed class RotatingTelegramBotClient : ITelegramBotClient, IDisposable
     /// <inheritdoc/>
     public event AsyncEventHandler<ApiRequestEventArgs>? OnMakingApiRequest
     {
-        add => Current.OnMakingApiRequest += value;
-        remove => Current.OnMakingApiRequest -= value;
+        add
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            lock (_rebuildGate)
+            {
+                _onMakingApiRequest += value;
+                var inner = Volatile.Read(ref _inner);
+                if (inner is not null)
+                {
+                    inner.OnMakingApiRequest += value;
+                }
+            }
+        }
+
+        remove
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            lock (_rebuildGate)
+            {
+                _onMakingApiRequest -= value;
+                var inner = Volatile.Read(ref _inner);
+                if (inner is not null)
+                {
+                    inner.OnMakingApiRequest -= value;
+                }
+            }
+        }
     }
 
     /// <inheritdoc/>
     public event AsyncEventHandler<ApiResponseEventArgs>? OnApiResponseReceived
     {
-        add => Current.OnApiResponseReceived += value;
-        remove => Current.OnApiResponseReceived -= value;
+        add
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            lock (_rebuildGate)
+            {
+                _onApiResponseReceived += value;
+                var inner = Volatile.Read(ref _inner);
+                if (inner is not null)
+                {
+                    inner.OnApiResponseReceived += value;
+                }
+            }
+        }
+
+        remove
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            lock (_rebuildGate)
+            {
+                _onApiResponseReceived -= value;
+                var inner = Volatile.Read(ref _inner);
+                if (inner is not null)
+                {
+                    inner.OnApiResponseReceived -= value;
+                }
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -214,6 +304,42 @@ public sealed class RotatingTelegramBotClient : ITelegramBotClient, IDisposable
 
             var httpClient = _httpClientFactory?.CreateClient(TelegramBotClientFactory.HttpClientName);
             var fresh = new TelegramBotClient(opts.BotToken, httpClient);
+
+            // Re-attach any handlers subscribed on the proxy so they
+            // continue to fire after a rotation. Without this the
+            // discarded `existing` instance below would silently swallow
+            // every future invocation — see "Event forwarding semantics"
+            // in the type remarks.
+            var requestHandlers = _onMakingApiRequest;
+            if (requestHandlers is not null)
+            {
+                fresh.OnMakingApiRequest += requestHandlers;
+            }
+
+            var responseHandlers = _onApiResponseReceived;
+            if (responseHandlers is not null)
+            {
+                fresh.OnApiResponseReceived += responseHandlers;
+            }
+
+            if (existing is not null)
+            {
+                // Detach defensively so the discarded inner client does
+                // not keep handler references alive past its own GC
+                // eligibility. Safe even if the same handler is now
+                // attached to `fresh` — the delegates are reference-
+                // equal and event accessors use Delegate.Remove.
+                if (requestHandlers is not null)
+                {
+                    existing.OnMakingApiRequest -= requestHandlers;
+                }
+
+                if (responseHandlers is not null)
+                {
+                    existing.OnApiResponseReceived -= responseHandlers;
+                }
+            }
+
             Volatile.Write(ref _inner, fresh);
             _currentToken = opts.BotToken;
             return fresh;
