@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
@@ -501,6 +502,40 @@ public static class TelegramSecretSourceValidator
     /// line and the exception message can present a uniform table to
     /// the operator. Public for unit-test coverage.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The "Environment variable" row deliberately distinguishes
+    /// between the three observable states an operator can reach
+    /// when this row is rendered (which is ONLY during the
+    /// missing-token diagnostic — i.e. when the MERGED
+    /// configuration value for <see cref="BotTokenConfigurationKey"/>
+    /// resolved to blank/whitespace):
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description><b>Not set</b> — the OS process
+    ///   environment has no <c>Telegram__BotToken</c> at all.</description></item>
+    ///   <item><description><b>Set (non-blank) but did not surface</b> —
+    ///   the OS process environment DOES have a non-blank
+    ///   <c>Telegram__BotToken</c>, yet the merged configuration
+    ///   still came back blank. This happens because
+    ///   <see cref="IConfigurationRoot"/> uses last-writer-wins
+    ///   precedence: a higher-priority provider registered AFTER
+    ///   the environment-variables provider (commonly an
+    ///   <c>appsettings.{Environment}.json</c> file containing a
+    ///   literal blank <c>"Telegram": { "BotToken": "" }</c>
+    ///   entry, or a Key Vault provider returning an empty secret)
+    ///   silently overrides the env var. A less common cause is
+    ///   that the environment-variables provider was registered
+    ///   with a prefix filter (e.g.
+    ///   <c>AddEnvironmentVariables("OTHER_")</c>) that excludes
+    ///   the <c>Telegram__</c> prefix. The previous wording
+    ///   ("rejected as blank by the configuration provider") was
+    ///   inaccurate — the provider never received a blank value;
+    ///   the value was supplied non-blank and then overridden
+    ///   downstream — and it sent operators looking for a
+    ///   non-existent provider bug.</description></item>
+    /// </list>
+    /// </remarks>
     public static IReadOnlyList<SourceInspection> InspectSources(
         IHostEnvironment environment,
         string? keyVaultUri)
@@ -539,27 +574,11 @@ public static class TelegramSecretSourceValidator
             new(
                 "Environment variable '" + BotTokenEnvironmentVariableName + "'",
                 envVarSet
-                    // The env var IS non-blank in the current process, yet
-                    // the resolved configuration key still came back blank
-                    // (otherwise the caller — ThrowMissingTokenDiagnostic —
-                    // would never have run). In practice that means a
-                    // later-registered provider supplied a blank value for
-                    // the same key and won the last-writer-wins precedence
-                    // (e.g., a blank entry in appsettings.json layered on
-                    // top of EnvironmentVariablesConfigurationProvider), or
-                    // the env var was set in the parent shell *after* the
-                    // host built its configuration. Either way, the env var
-                    // itself is fine — the value just didn't reach the
-                    // resolved key, so steer the operator toward the right
-                    // place to look instead of the previous (misleading)
-                    // "rejected as blank" framing.
-                    ? "Set (non-blank), but did not reach the resolved '"
+                    ? "Set (non-blank in the process environment) but the value did not surface as '"
                       + BotTokenConfigurationKey
-                      + "' value — likely overridden by a higher-priority configuration provider "
-                      + "(e.g., a blank '"
-                      + BotTokenConfigurationKey
-                      + "' entry in appsettings.json / appsettings.{Environment}.json), "
-                      + "or the variable was exported after the host built its configuration"
+                      + "' in the merged configuration — most likely overridden by a higher-priority provider registered after the environment-variables provider (for example, an appsettings.json / appsettings.{Environment}.json entry writing a blank value for the key, or an Azure Key Vault secret returning empty). A less common cause is that AddEnvironmentVariables was registered with a prefix filter that excludes '"
+                      + BotTokenEnvironmentVariableName
+                      + "'. Remove the blank/overriding entry from the higher-priority source, or remove the prefix filter."
                     : "Not set"),
             new(
                 "appsettings.json / appsettings.{Environment}.json",
@@ -610,8 +629,39 @@ public static class TelegramSecretSourceValidator
             var fileInfo = fileProvider.GetFileInfo(source.Path);
             return fileInfo?.PhysicalPath ?? source.Path;
         }
-        catch
+        catch (IOException)
         {
+            // I/O failure while resolving the backing file's physical
+            // path (e.g., disk read error, transient file-provider
+            // failure). Fall back to a null path so the caller renders
+            // the provider type name without a file hint; the source-
+            // strict classifier already treats a null path as a
+            // "cannot prove canonical User Secrets layout" REJECT, so
+            // there is no risk of silently approving an unverifiable
+            // file source here.
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // ACL denial enumerating the configuration file's
+            // location. Same fall-through reasoning as IOException —
+            // unknown physical path classifies as unapproved.
+            return null;
+        }
+        catch (SecurityException)
+        {
+            // Code Access Security / restricted file-path failure
+            // (e.g., partial-trust host, file-provider whose
+            // GetFileInfo demands a permission the worker process
+            // does not have). Same fall-through reasoning as
+            // IOException — unknown physical path classifies as
+            // unapproved. We narrow the catch list to these three
+            // expected failure modes (rather than swallowing
+            // everything) so that unexpected exceptions —
+            // NullReferenceException from a misbehaving custom file
+            // provider, ArgumentException from a malformed Source.Path,
+            // etc. — surface at startup instead of being masked into a
+            // silent misclassification of the supplying provider.
             return null;
         }
     }
