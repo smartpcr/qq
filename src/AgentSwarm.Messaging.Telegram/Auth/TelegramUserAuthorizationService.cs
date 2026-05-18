@@ -272,10 +272,26 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
         // Dev / integration-test fixtures must populate
         // Telegram:AllowedUserIds with the user IDs they want to
         // onboard, exactly like production.
+        //
+        // LOG LEVEL: the empty-allowlist case is logged at ERROR (not
+        // Warning) on purpose. The fail-closed denial is correct
+        // *behaviour*, but the *condition* -- a production deployment
+        // shipped without any operator IDs configured -- is
+        // unambiguously a deployment configuration gap that no live
+        // /start should ever encounter. It is global (every /start
+        // denied) rather than per-user, and operators commonly alert
+        // on ERROR-level log signals to catch exactly this class of
+        // mis-deploy. The peer "blank UserTenantMappings entry"
+        // branch below uses LogError for the same reason; the
+        // per-user "not on the allowlist" / "no UserTenantMappings"
+        // branches stay at LogWarning because those are normal
+        // authorization decisions for individual users. Do NOT
+        // downgrade this back to LogWarning without also updating
+        // the ops alerting playbook.
         if (!allowlistConfigured)
         {
-            _logger.LogWarning(
-                "/start denied -- Telegram:AllowedUserIds is empty. User {TelegramUserId} from chat {TelegramChatId} cannot onboard because the allowlist contains no authorised user IDs.",
+            _logger.LogError(
+                "/start denied -- Telegram:AllowedUserIds is empty. User {TelegramUserId} from chat {TelegramChatId} cannot onboard because the allowlist contains no authorised user IDs. This indicates a deployment configuration gap -- populate Telegram:AllowedUserIds with the operator IDs allowed to onboard.",
                 userId,
                 chatIdValue);
             return Deny(
