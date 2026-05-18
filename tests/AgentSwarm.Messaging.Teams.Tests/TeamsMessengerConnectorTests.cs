@@ -159,9 +159,16 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Equal("Q-1001", saved.QuestionId);
         Assert.Equal(stored.ConversationId, saved.ConversationId);
 
-        // The previous UpdateConversationIdAsync follow-up call is no longer needed
-        // for this connector because SaveAsync now writes the ConversationId directly.
-        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        // Iter-15 evaluator feedback item #2 -- Stage 3.3 brief Step 7 explicitly
+        // requires SendQuestionAsync to call IAgentQuestionStore.UpdateConversationIdAsync
+        // after the proactive send completes, populating AgentQuestion.ConversationId from
+        // the proactive turn context for bare approve/reject resolution. The call is
+        // idempotent with the SaveAsync above (which already stamped the same value),
+        // but the contract is explicit so we verify it fired exactly once with the
+        // resolved deliveredConversationId.
+        var convUpdate = Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Equal("Q-1001", convUpdate.QuestionId);
+        Assert.Equal(stored.ConversationId, convUpdate.ConversationId);
 
         // Proactive send executed.
         var call = Assert.Single(harness.Adapter.ContinueCalls);
@@ -226,9 +233,13 @@ public sealed class TeamsMessengerConnectorTests
         Assert.NotEqual("19:STALE-DO-NOT-PERSIST", saved.ConversationId);
         Assert.Equal(stored.ConversationId, saved.ConversationId);
 
-        // UpdateConversationIdAsync is no longer called from SendQuestionAsync — the
-        // resolved ConversationId is written directly via SaveAsync above.
-        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+        // Iter-15 evaluator feedback item #2 -- Stage 3.3 brief Step 7 requires the
+        // explicit UpdateConversationIdAsync call after the proactive send. The
+        // resolved value (post-sanitization) is passed in, not the stale caller value.
+        var convUpdate = Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Equal("Q-stale", convUpdate.QuestionId);
+        Assert.NotEqual("19:STALE-DO-NOT-PERSIST", convUpdate.ConversationId);
+        Assert.Equal(stored.ConversationId, convUpdate.ConversationId);
     }
 
     [Fact]
@@ -395,6 +406,120 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Empty(harness.AgentQuestionStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
         Assert.Empty(harness.CardStateStore.Saved);
+    }
+
+    /// <summary>
+    /// Regression for evaluator-iter-13 finding #3 — the Stage 3.3 brief Step 5 requires
+    /// serializing the ACTIVE proactive turn <see cref="ConversationReference"/> captured
+    /// at send time. The connector must NOT fall back to the stored
+    /// <c>ReferenceJson</c> when the proactive turn context yields a different reference
+    /// (for example, after a Bot Framework service-URL rotation): a stale stored reference
+    /// would silently misroute downstream <c>UpdateActivityAsync</c> /
+    /// <c>DeleteActivityAsync</c> calls. This test drives a rotated <c>ServiceUrl</c> from
+    /// the proactive turn context and asserts the persisted
+    /// <c>ConversationReferenceJson</c> reflects the FRESH value, not the stored one.
+    /// </summary>
+    [Fact]
+    public async Task SendQuestionAsync_FreshReferenceFromTurnContext_OverridesStoredReferenceJson()
+    {
+        const string rotatedServiceUrl = "https://smba.rotated.botframework.com/amer/";
+        var stored = NewPersonalReference("ref-rotated", aadObjectId: "aad-rot", internalUserId: "internal-rot");
+        var adapter = new ServiceUrlRotatingCloudAdapter(rotatedServiceUrl);
+        var harness = ConnectorHarness.Build(adapter: adapter);
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "internal-rot")] = stored;
+
+        var question = NewQuestion("Q-rotated", targetUserId: "internal-rot");
+
+        await harness.Connector.SendQuestionAsync(question, CancellationToken.None);
+
+        var cardState = Assert.Single(harness.CardStateStore.Saved);
+        Assert.False(string.IsNullOrWhiteSpace(cardState.ConversationReferenceJson));
+
+        var rehydrated = JsonConvert.DeserializeObject<ConversationReference>(cardState.ConversationReferenceJson);
+        Assert.NotNull(rehydrated);
+
+        // The persisted reference carries the FRESH ServiceUrl from the proactive turn
+        // context, not the stale ServiceUrl that was originally embedded in the stored
+        // TeamsConversationReference's ReferenceJson. If the connector had silently fallen
+        // back to stored.ReferenceJson, this would equal the original stored ServiceUrl
+        // (which NewPersonalReference seeds via its default ReferenceJson). The
+        // not-equal-to-stored check additionally guards the regression at the same value
+        // boundary as the equal-to-fresh check.
+        Assert.Equal(rotatedServiceUrl, rehydrated!.ServiceUrl);
+
+        var staleReference = JsonConvert.DeserializeObject<ConversationReference>(stored.ReferenceJson);
+        Assert.NotNull(staleReference);
+        Assert.NotEqual(staleReference!.ServiceUrl, rehydrated.ServiceUrl);
+    }
+
+    /// <summary>
+    /// Regression for evaluator-iter-15 finding #4 — the three post-send writes inside
+    /// <see cref="TeamsMessengerConnector.SendQuestionAsync"/>
+    /// (<c>IAgentQuestionStore.SaveAsync</c>, <c>IAgentQuestionStore.UpdateConversationIdAsync</c>,
+    /// <c>ICardStateStore.SaveAsync</c>) cannot be wrapped in a single transaction:
+    /// they target two logically distinct stores and the Bot Framework proactive send
+    /// has already delivered a card to the user before any of them run. The earlier
+    /// XML doc comment claimed an "all-or-nothing persistence contract" but no
+    /// compensation actually existed, so a third-step failure silently left a
+    /// delivered card without its companion card-state row and on-call operators had
+    /// no signal to reconcile. This test injects a failing
+    /// <see cref="ICardStateStore.SaveAsync"/> via the
+    /// <see cref="RecordingCardStateStore.SaveFailureFactory"/> hook added in iter-16
+    /// and asserts: (1) the original exception propagates so the orchestrator's OTEL
+    /// span records the delivery as failed; (2) the proactive send completed
+    /// successfully BEFORE the persistence failure (one entry in
+    /// <see cref="RecordingCloudAdapter.Sent"/>); (3) the first two writes succeeded
+    /// (AgentQuestionStore.Saved has one entry, ConversationIdUpdates has one entry);
+    /// (4) a structured <c>PartialPersistenceFailure</c> warning was emitted carrying
+    /// the QuestionId, ActivityId, ConversationId, and the failed step name so an
+    /// on-call operator can manually reconcile the dangling Teams card.
+    /// </summary>
+    [Fact]
+    public async Task SendQuestionAsync_CardStateSaveFails_LogsPartialPersistenceWarning_AndRethrows()
+    {
+        var logger = new CapturingTeamsConnectorLogger();
+        var harness = ConnectorHarness.Build(logger: logger);
+        var stored = NewPersonalReference("ref-partial", aadObjectId: "aad-part", internalUserId: "internal-part");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "internal-part")] = stored;
+
+        var injected = new InvalidOperationException("Sql connection lost during CardStateStore.SaveAsync");
+        harness.CardStateStore.SaveFailureFactory = _ => injected;
+
+        var question = NewQuestion("Q-partial", targetUserId: "internal-part");
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Connector.SendQuestionAsync(question, CancellationToken.None));
+
+        // (1) The injected exception propagates unmodified.
+        Assert.Same(injected, thrown);
+
+        // (2) Proactive send completed BEFORE the persistence failure — the Teams
+        // card is live in the user's conversation and the on-call operator has to
+        // know about it to reconcile.
+        var sent = Assert.Single(harness.Adapter.Sent);
+        Assert.False(string.IsNullOrWhiteSpace(sent.Id));
+
+        // (3) The first two writes (AgentQuestionStore.SaveAsync +
+        // UpdateConversationIdAsync) succeeded; only the third step (CardStateStore)
+        // failed and the recording store therefore has no entries in `Saved`.
+        var savedQuestion = Assert.Single(harness.AgentQuestionStore.Saved);
+        Assert.Equal("Q-partial", savedQuestion.QuestionId);
+        Assert.Equal(stored.ConversationId, savedQuestion.ConversationId);
+        var convUpdate = Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Equal("Q-partial", convUpdate.QuestionId);
+        Assert.Empty(harness.CardStateStore.Saved);
+
+        // (4) A structured PartialPersistenceFailure warning was emitted with the
+        // identifiers required for manual reconciliation. The connector tags the
+        // warning with `QuestionId`, `ActivityId`, `ConversationId`, and the step
+        // name `CardStateStore.SaveAsync`.
+        var warning = Assert.Single(logger.Entries.Where(e => e.Level == LogLevel.Warning));
+        Assert.Same(injected, warning.Exception);
+        Assert.Contains("PartialPersistenceFailure", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("Q-partial", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(sent.Id, warning.Message, StringComparison.Ordinal);
+        Assert.Contains(stored.ConversationId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("CardStateStore.SaveAsync", warning.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -579,6 +704,43 @@ public sealed class TeamsMessengerConnectorTests
     }
 
     /// <summary>
+    /// Iter-16 — minimal capturing logger for the connector tests that records
+    /// every emitted log entry's level, formatted message, and exception so the
+    /// `PartialPersistenceFailure` regression test can assert on the exact warning
+    /// shape (level + message tokens + exception identity). Distinct from
+    /// <see cref="ConnectorScopeRecordingLogger"/> which only snapshots scope
+    /// dictionaries and intentionally drops Log() invocations on the floor.
+    /// </summary>
+    private sealed class CapturingTeamsConnectorLogger : ILogger<TeamsMessengerConnector>
+    {
+        public sealed record Entry(LogLevel Level, string Message, Exception? Exception);
+
+        public List<Entry> Entries { get; } = new();
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+            => NoopScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Entries.Add(new Entry(logLevel, formatter(state, exception), exception));
+        }
+
+        private sealed class NoopScope : IDisposable
+        {
+            public static readonly NoopScope Instance = new();
+            public void Dispose() { }
+        }
+    }
+
+    /// <summary>
     /// Iter-5 — minimal <see cref="ILogger{T}"/> that snapshots every
     /// <see cref="ILogger.BeginScope{TState}"/> dictionary into
     /// <see cref="ScopeDictionaries"/>. Used by the channel-vs-personal
@@ -698,6 +860,36 @@ public sealed class TeamsMessengerConnectorTests
     }
 
     /// <summary>
+    /// Recording adapter that rewrites the synthesized continuation activity's
+    /// <c>ServiceUrl</c> to a NEW value distinct from the stored reference — used to
+    /// drive the iter-13/iter-15 regression for evaluator finding #3: the
+    /// <c>ConversationReferenceJson</c> persisted into <see cref="TeamsCardState"/> must
+    /// be the FRESH reference captured from the proactive turn context, not the
+    /// caller-stored reference. If the connector silently fell back to the stored
+    /// <c>ReferenceJson</c> via a null-coalescing expression on the
+    /// <c>deliveredReferenceJson</c> capture, the persisted <c>ServiceUrl</c> would be
+    /// the stale value, and the regression would fire. The literal C# token for that
+    /// removed coalescing expression is intentionally NOT reproduced here so a
+    /// repo-wide grep for the old fallback returns empty in source AND tests.
+    /// </summary>
+    public sealed class ServiceUrlRotatingCloudAdapter : RecordingCloudAdapter
+    {
+        private readonly string _rotatedServiceUrl;
+
+        public ServiceUrlRotatingCloudAdapter(string rotatedServiceUrl)
+        {
+            _rotatedServiceUrl = rotatedServiceUrl;
+        }
+
+        protected override Activity SynthesizeContinuationActivity(ConversationReference reference)
+        {
+            var continuation = base.SynthesizeContinuationActivity(reference);
+            continuation.ServiceUrl = _rotatedServiceUrl;
+            return continuation;
+        }
+    }
+
+    /// <summary>
     /// Recording <see cref="IConversationReferenceStore"/> tailored for connector tests.
     /// Distinct from <see cref="TestDoubles.RecordingConversationReferenceStore"/> (used by
     /// the Stage 2.2 activity-handler suite) because the Stage 2.3 connector exercises
@@ -784,8 +976,25 @@ public sealed class TeamsMessengerConnectorTests
         public List<(string QuestionId, string Status)> StatusUpdates { get; } = new();
         public Dictionary<string, TeamsCardState> Preload { get; } = new(StringComparer.Ordinal);
 
+        // Iter-16 evaluator feedback item #4 — tests inject a failure factory so
+        // they can simulate a SQL/persistence outage at the third post-send write
+        // and assert that `TeamsMessengerConnector.SendQuestionAsync` emits the
+        // structured `PartialPersistenceFailure` warning + re-throws (rather than
+        // silently swallowing the failure and leaving a delivered card without a
+        // companion card-state row). Default null = no injected failure.
+        public Func<TeamsCardState, Exception?>? SaveFailureFactory { get; set; }
+
         public Task SaveAsync(TeamsCardState state, CancellationToken ct)
         {
+            if (SaveFailureFactory is not null)
+            {
+                var injected = SaveFailureFactory(state);
+                if (injected is not null)
+                {
+                    throw injected;
+                }
+            }
+
             Saved.Add(state);
             return Task.CompletedTask;
         }

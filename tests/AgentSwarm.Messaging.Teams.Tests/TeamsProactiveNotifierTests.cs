@@ -311,6 +311,194 @@ public sealed class TeamsProactiveNotifierTests
     }
 
     /// <summary>
+    /// Regression for evaluator-iter-15 finding #1 (sibling Stage 4.2 path missed in
+    /// iter-15) — the Stage 3.3 brief Step 5 requires serializing the ACTIVE proactive
+    /// turn <see cref="ConversationReference"/> captured at send time. Iter-15 patched
+    /// <c>TeamsMessengerConnector.SendQuestionAsync</c> but
+    /// <c>TeamsProactiveNotifier.SendProactiveQuestionAsync</c> still carried the
+    /// silent coalescing fallback to the caller-stored reference at the
+    /// <see cref="TeamsCardState"/> construction site. Iter-16 removes that fallback
+    /// and adds the same fail-fast guard. This test exercises a service-URL rotation
+    /// in the proactive turn context and asserts the persisted
+    /// <c>ConversationReferenceJson</c> reflects the FRESH ServiceUrl rather than the
+    /// stored one — exactly mirroring the connector's
+    /// <c>SendQuestionAsync_FreshReferenceFromTurnContext_OverridesStoredReferenceJson</c>.
+    /// The literal C# token for the removed coalescing fallback is intentionally NOT
+    /// reproduced here so a repo-wide grep for it returns empty in source AND tests.
+    /// </summary>
+    [Fact]
+    public async Task SendProactiveQuestionAsync_FreshReferenceFromTurnContext_OverridesStoredReferenceJson()
+    {
+        const string rotatedServiceUrl = "https://smba.rotated.botframework.com/amer/";
+        var adapter = new ServiceUrlRotatingCloudAdapter(rotatedServiceUrl);
+        var harness = NotifierHarness.Build(adapter);
+        var stored = NewPersonalReference("ref-rotated", aadObjectId: "aad-rot", internalUserId: "user-rot");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-rot")] = stored;
+        var question = NewQuestion("Q-rotated", targetUserId: "user-rot");
+
+        await harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-rot", question, CancellationToken.None);
+
+        var cardState = Assert.Single(harness.CardStateStore.Saved);
+        Assert.False(string.IsNullOrWhiteSpace(cardState.ConversationReferenceJson));
+
+        var rehydrated = JsonConvert.DeserializeObject<ConversationReference>(cardState.ConversationReferenceJson);
+        Assert.NotNull(rehydrated);
+        Assert.Equal(rotatedServiceUrl, rehydrated!.ServiceUrl);
+
+        var staleReference = JsonConvert.DeserializeObject<ConversationReference>(stored.ReferenceJson);
+        Assert.NotNull(staleReference);
+        Assert.NotEqual(staleReference!.ServiceUrl, rehydrated.ServiceUrl);
+    }
+
+    /// <summary>
+    /// Regression for evaluator-iter-15 finding #1 — when the proactive turn context
+    /// yields NO usable proactive activity (BotAdapter contract violation), the
+    /// notifier must fail loudly rather than persisting a <see cref="TeamsCardState"/>
+    /// with a stale stored-reference fallback. The iter-16 fix added an explicit
+    /// <see cref="InvalidOperationException"/> guard for the missing reference
+    /// mirroring the existing <c>Conversation.Id</c> / <c>Activity.Id</c> guards.
+    /// This test drives a null <c>Activity</c> from the proactive turn context —
+    /// whichever guard fires first, the contract is the same: no
+    /// <see cref="TeamsCardState"/> row may be written. The companion
+    /// <see cref="SendProactiveQuestionAsync_NoConversationIdFromTurnContext_ThrowsAndDoesNotPersist"/>
+    /// covers the Conversation.Id-specific guard; together they prove the
+    /// all-or-nothing persistence contract holds across every guard introduced in
+    /// iters 8/15/16.
+    /// </summary>
+    [Fact]
+    public async Task SendProactiveQuestionAsync_NullActivityFromTurnContext_ThrowsAndDoesNotPersistCardState()
+    {
+        var adapter = new ReferencelessCloudAdapter();
+        var harness = NotifierHarness.Build(adapter);
+        var stored = NewPersonalReference("ref-noref", aadObjectId: "aad-noref", internalUserId: "user-noref");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-noref")] = stored;
+        var question = NewQuestion("Q-noref", targetUserId: "user-noref");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-noref", question, CancellationToken.None));
+
+        // The exception message names the question id so operators can correlate it
+        // back to the failing send. We do NOT pin the specific guard's wording because
+        // the iter-8 Conversation.Id guard or the iter-16 ConversationReference guard
+        // may fire first depending on the order of property access — either failure
+        // upholds the all-or-nothing contract.
+        Assert.Contains("Q-noref", ex.Message, StringComparison.Ordinal);
+
+        // No card-state row written, no conversation-id update — the all-or-nothing
+        // guard fires before either persistence call.
+        Assert.Empty(harness.CardStateStore.Saved);
+        Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
+    }
+
+    /// <summary>
+    /// Regression for evaluator-iter-16 finding #4 — the two post-send writes inside
+    /// <see cref="TeamsProactiveNotifier.SendProactiveQuestionAsync"/>
+    /// (<c>IAgentQuestionStore.UpdateConversationIdAsync</c> then
+    /// <c>ICardStateStore.SaveAsync</c>) cannot be wrapped in a single transaction:
+    /// they target two logically distinct stores and the Bot Framework proactive send
+    /// has already delivered a card to the user before either of them runs. The earlier
+    /// "all-or-nothing persistence" comment was aspirational rather than transactional,
+    /// so a second-step failure silently left a delivered card without its companion
+    /// card-state row and on-call operators had no signal to reconcile. This test
+    /// mirrors the connector's
+    /// <c>SendQuestionAsync_CardStateSaveFails_LogsPartialPersistenceWarning_AndRethrows</c>:
+    /// it injects a failing <see cref="ICardStateStore.SaveAsync"/> via the
+    /// <see cref="RecordingCardStateStore.SaveFailureFactory"/> hook added in iter-17
+    /// and asserts: (1) the original exception propagates so the outbox engine + OTEL
+    /// span both record the delivery as failed; (2) the proactive send completed
+    /// successfully BEFORE the persistence failure (one entry in
+    /// <see cref="RecordingCloudAdapter.Sent"/>); (3) the first write succeeded
+    /// (<see cref="RecordingAgentQuestionStore.ConversationIdUpdates"/> has one entry);
+    /// (4) a structured <c>PartialPersistenceFailure</c> warning was emitted carrying
+    /// the QuestionId, ActivityId, ConversationId, and the failed step name
+    /// (<c>CardStateStore.SaveAsync</c>) so an on-call operator can manually reconcile
+    /// the dangling Teams card.
+    /// </summary>
+    [Fact]
+    public async Task SendProactiveQuestionAsync_CardStateSaveFails_LogsPartialPersistenceWarning_AndRethrows()
+    {
+        var logger = new CapturingProactiveNotifierLogger();
+        var harness = NotifierHarness.Build(logger: logger);
+        var stored = NewPersonalReference("ref-partial", aadObjectId: "aad-part", internalUserId: "user-part");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "user-part")] = stored;
+
+        var injected = new InvalidOperationException("Sql connection lost during CardStateStore.SaveAsync");
+        harness.CardStateStore.SaveFailureFactory = _ => injected;
+
+        var question = NewQuestion("Q-partial", targetUserId: "user-part");
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Notifier.SendProactiveQuestionAsync(TenantId, "user-part", question, CancellationToken.None));
+
+        // (1) The injected exception propagates unmodified — the outbox engine /
+        // OTEL span observe the delivery as failed.
+        Assert.Same(injected, thrown);
+
+        // (2) Proactive send completed BEFORE the persistence failure — the Teams
+        // card is live in the user's conversation and the on-call operator has to
+        // know about it to reconcile.
+        var sent = Assert.Single(harness.Adapter.Sent);
+        Assert.False(string.IsNullOrWhiteSpace(sent.Id));
+
+        // (3) The first write (UpdateConversationIdAsync) succeeded; only the
+        // second step (CardStateStore.SaveAsync) failed and the recording store
+        // therefore has no entries in `Saved`.
+        var convUpdate = Assert.Single(harness.AgentQuestionStore.ConversationIdUpdates);
+        Assert.Equal("Q-partial", convUpdate.QuestionId);
+        Assert.Equal(stored.ConversationId, convUpdate.ConversationId);
+        Assert.Empty(harness.CardStateStore.Saved);
+
+        // (4) A structured PartialPersistenceFailure warning was emitted with the
+        // identifiers required for manual reconciliation. The notifier tags the
+        // warning with `QuestionId`, `ActivityId`, `ConversationId`, and the step
+        // name `CardStateStore.SaveAsync`.
+        var warning = Assert.Single(logger.Entries.Where(e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning));
+        Assert.Same(injected, warning.Exception);
+        Assert.Contains("PartialPersistenceFailure", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("Q-partial", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(sent.Id, warning.Message, StringComparison.Ordinal);
+        Assert.Contains(stored.ConversationId, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("CardStateStore.SaveAsync", warning.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Iter-17 — minimal capturing logger for the notifier tests that records every
+    /// emitted log entry's level, formatted message, and exception so the
+    /// <c>PartialPersistenceFailure</c> regression test can assert on the exact
+    /// warning shape (level + message tokens + exception identity). Mirrors the
+    /// <c>CapturingTeamsConnectorLogger</c> used by the connector's iter-16
+    /// regression test so the two assemblies stay visually consistent.
+    /// </summary>
+    private sealed class CapturingProactiveNotifierLogger : Microsoft.Extensions.Logging.ILogger<TeamsProactiveNotifier>
+    {
+        public sealed record Entry(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Exception);
+
+        public List<Entry> Entries { get; } = new();
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+            => NoopScope.Instance;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Entries.Add(new Entry(logLevel, formatter(state, exception), exception));
+        }
+
+        private sealed class NoopScope : IDisposable
+        {
+            public static readonly NoopScope Instance = new();
+            public void Dispose() { }
+        }
+    }
+
+    /// <summary>
     /// Reference-not-found path for the channel scope mirrors the user-scope test —
     /// verifies the typed exception's <see cref="ConversationReferenceNotFoundException.ChannelId"/>
     /// carries the looked-up identifier.
@@ -943,7 +1131,9 @@ public sealed class TeamsProactiveNotifierTests
         RecordingCardStateStore CardStateStore,
         TeamsMessagingOptions Options)
     {
-        public static NotifierHarness Build(RecordingCloudAdapter? adapter = null)
+        public static NotifierHarness Build(
+            RecordingCloudAdapter? adapter = null,
+            Microsoft.Extensions.Logging.ILogger<TeamsProactiveNotifier>? logger = null)
         {
             adapter ??= new RecordingCloudAdapter();
             var options = new TeamsMessagingOptions { MicrosoftAppId = MicrosoftAppId };
@@ -958,7 +1148,7 @@ public sealed class TeamsProactiveNotifierTests
                 renderer,
                 cardStore,
                 qStore,
-                NullLogger<TeamsProactiveNotifier>.Instance);
+                logger ?? NullLogger<TeamsProactiveNotifier>.Instance);
             return new NotifierHarness(notifier, adapter, convStore, qStore, cardStore, options);
         }
     }
@@ -1028,6 +1218,112 @@ public sealed class TeamsProactiveNotifierTests
             continuation.Conversation = new ConversationAccount(id: null);
             return continuation;
         }
+    }
+
+    /// <summary>
+    /// Recording adapter that rewrites the synthesized continuation activity's
+    /// <c>ServiceUrl</c> to a NEW value distinct from the stored reference — used to
+    /// drive the iter-15/iter-16 regression for evaluator finding #1: the
+    /// <c>ConversationReferenceJson</c> persisted into <see cref="TeamsCardState"/>
+    /// from <see cref="TeamsProactiveNotifier.SendProactiveQuestionAsync"/> must be the
+    /// FRESH reference captured from the proactive turn context, not the
+    /// caller-stored reference. If the notifier had retained the silent coalescing
+    /// fallback to the stored reference (since removed in iter-16), the persisted
+    /// <c>ServiceUrl</c> would be the stale value and the regression would fire. The
+    /// literal C# token for that removed coalescing expression is intentionally NOT
+    /// reproduced here so a repo-wide grep for the old fallback returns empty in
+    /// source AND tests.
+    /// </summary>
+    public sealed class ServiceUrlRotatingCloudAdapter : RecordingCloudAdapter
+    {
+        private readonly string _rotatedServiceUrl;
+
+        public ServiceUrlRotatingCloudAdapter(string rotatedServiceUrl)
+        {
+            _rotatedServiceUrl = rotatedServiceUrl;
+        }
+
+        protected override Activity SynthesizeContinuationActivity(ConversationReference reference)
+        {
+            var continuation = base.SynthesizeContinuationActivity(reference);
+            continuation.ServiceUrl = _rotatedServiceUrl;
+            return continuation;
+        }
+    }
+
+    /// <summary>
+    /// Recording adapter whose continuation activity has neither a
+    /// <c>ChannelId</c> nor a <c>ServiceUrl</c> nor any other top-level field that
+    /// <see cref="Activity.GetConversationReference"/> would populate — the
+    /// resulting reference would be effectively empty, but the BotAdapter contract
+    /// guarantees a non-null reference object. To exercise the iter-16 fail-fast
+    /// guard (which fires when the reference is null), we override
+    /// <see cref="ContinueConversationAsync"/> to use a <see cref="NullActivityTurnContext"/>
+    /// whose <see cref="ITurnContext.Activity"/> getter returns <c>null</c>; the
+    /// notifier's <c>Activity?.GetConversationReference()</c> expression then yields
+    /// <c>null</c> and the explicit guard throws.
+    /// </summary>
+    public sealed class ReferencelessCloudAdapter : RecordingCloudAdapter
+    {
+        public override Task ContinueConversationAsync(
+            string botAppId,
+            ConversationReference reference,
+            BotCallbackHandler callback,
+            CancellationToken cancellationToken)
+        {
+            ContinueCalls.Add((botAppId, reference));
+            var continuation = SynthesizeContinuationActivity(reference);
+            var turnContext = new NullActivityTurnContext(this, continuation);
+            return callback(turnContext, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="TurnContext"/> whose <see cref="ITurnContext.Activity"/> getter
+    /// returns <c>null</c>. The Bot Framework SDK normally guarantees a non-null
+    /// activity inside a proactive callback, but the iter-16 fail-fast guard in
+    /// <see cref="TeamsProactiveNotifier"/> guards against the case where the
+    /// adapter contract is violated. This double provides a real
+    /// <see cref="ITurnContext"/> implementation so <see cref="MessageFactory"/>
+    /// and <see cref="ITurnContext.SendActivityAsync(IActivity, CancellationToken)"/>
+    /// still operate against the underlying recording adapter.
+    /// </summary>
+    public sealed class NullActivityTurnContext : ITurnContext
+    {
+        private readonly TurnContext _inner;
+        public NullActivityTurnContext(BotAdapter adapter, Activity activity)
+        {
+            _inner = new TurnContext(adapter, activity);
+        }
+
+        public BotAdapter Adapter => _inner.Adapter;
+        public TurnContextStateCollection TurnState => _inner.TurnState;
+        public Activity Activity => null!;
+        public bool Responded => _inner.Responded;
+
+        public Task<ResourceResponse> SendActivityAsync(string textReplyToSend, string speak = null!, string inputHint = "acceptingInput", CancellationToken cancellationToken = default)
+            => _inner.SendActivityAsync(textReplyToSend, speak, inputHint, cancellationToken);
+
+        public Task<ResourceResponse> SendActivityAsync(IActivity activity, CancellationToken cancellationToken = default)
+            => _inner.SendActivityAsync(activity, cancellationToken);
+
+        public Task<ResourceResponse[]> SendActivitiesAsync(IActivity[] activities, CancellationToken cancellationToken = default)
+            => _inner.SendActivitiesAsync(activities, cancellationToken);
+
+        public Task<ResourceResponse> UpdateActivityAsync(IActivity activity, CancellationToken cancellationToken = default)
+            => _inner.UpdateActivityAsync(activity, cancellationToken);
+
+        public Task DeleteActivityAsync(string activityId, CancellationToken cancellationToken = default)
+            => _inner.DeleteActivityAsync(activityId, cancellationToken);
+
+        public Task DeleteActivityAsync(ConversationReference conversationReference, CancellationToken cancellationToken = default)
+            => _inner.DeleteActivityAsync(conversationReference, cancellationToken);
+
+        public ITurnContext OnSendActivities(SendActivitiesHandler handler) => _inner.OnSendActivities(handler);
+        public ITurnContext OnUpdateActivity(UpdateActivityHandler handler) => _inner.OnUpdateActivity(handler);
+        public ITurnContext OnDeleteActivity(DeleteActivityHandler handler) => _inner.OnDeleteActivity(handler);
+
+        public void Dispose() => _inner.Dispose();
     }
 
     /// <summary>
@@ -1166,9 +1462,29 @@ public sealed class TeamsProactiveNotifierTests
         /// <summary>Optional hook fired BEFORE every <see cref="SaveAsync"/> records; used by ordering tests.</summary>
         public Action? OnSave { get; set; }
 
+        /// <summary>
+        /// Iter-17 evaluator feedback item #4 — tests inject a failure factory so
+        /// they can simulate a SQL / persistence outage at the second post-send
+        /// write and assert that
+        /// <see cref="TeamsProactiveNotifier.SendProactiveQuestionAsync"/> emits the
+        /// structured <c>PartialPersistenceFailure</c> warning + re-throws (rather
+        /// than silently swallowing the failure and leaving a delivered card
+        /// without a companion card-state row). Default null = no injected failure.
+        /// </summary>
+        public Func<TeamsCardState, Exception?>? SaveFailureFactory { get; set; }
+
         public Task SaveAsync(TeamsCardState state, CancellationToken ct)
         {
             OnSave?.Invoke();
+            if (SaveFailureFactory is not null)
+            {
+                var injected = SaveFailureFactory(state);
+                if (injected is not null)
+                {
+                    throw injected;
+                }
+            }
+
             Saved.Add(state);
             return Task.CompletedTask;
         }

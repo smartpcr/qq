@@ -541,39 +541,126 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
                     $"partial persistence.");
             }
 
+            // Iter-15/iter-16 evaluator feedback item #3/#1 — Stage 3.3 brief Step
+            // 5/7 says `ConversationReferenceJson` MUST be the serialized ACTIVE
+            // proactive turn reference captured at send time, not a fallback to any
+            // stale stored reference. Earlier iters used a coalescing expression
+            // joining the fresh and stored references with the C# null-coalescing
+            // operator at the TeamsCardState construction site; that silent fallback
+            // has been REMOVED (the assignment below uses the fresh capture only)
+            // and this explicit guard converts the previously-silent failure into a
+            // loud InvalidOperationException so the orchestrator can react. If
+            // `Activity.GetConversationReference()` ever returns null during the
+            // proactive turn (Bot Framework contract violation), we fail the send
+            // rather than persist a TeamsCardState with a NULL
+            // `ConversationReferenceJson` (which would break every downstream
+            // ITeamsCardManager.UpdateCardAsync / DeleteCardAsync rehydration). The
+            // companion regression test
+            // `SendQuestionAsync_FreshReferenceFromTurnContext_OverridesStoredReferenceJson`
+            // also drives a service-URL rotation through the proactive turn context
+            // to prove the persisted JSON reflects the FRESH reference rather than
+            // the caller-stored one. The companion `TeamsProactiveNotifier` carries
+            // the identical guard for the Stage 4.2 proactive path (also removed the
+            // same coalescing expression in iter-16).
+            if (string.IsNullOrWhiteSpace(deliveredReferenceJson))
+            {
+                throw new InvalidOperationException(
+                    $"ContinueConversationAsync for question '{question.QuestionId}' did not yield " +
+                    $"a ConversationReference from the proactive turn context. The card was sent but " +
+                    $"the active reference required for downstream UpdateActivityAsync / DeleteActivityAsync " +
+                    $"rehydration is unavailable; treating this as a delivery failure to avoid persisting " +
+                    $"a TeamsCardState that silently falls back to a stale stored reference.");
+            }
+
             // Iter-8 evaluator feedback #1 (Stage 3.3 lifecycle ordering, structural fix).
             // The AgentQuestion is persisted ONLY after the proactive send has fully
             // succeeded AND yielded the conversation/activity metadata required for
-            // downstream resolution. This is the strict all-or-nothing persistence
-            // contract: if any prerequisite check or the Bot Framework send itself
-            // throws, no AgentQuestion row is left behind in the store. The previous
-            // ordering (save first, send second) created zombie Open rows for
-            // ContinueConversationAsync / SendActivityAsync failures — a stale Open
-            // row with null ConversationId and no companion TeamsCardState that could
-            // never be resolved by bare approve/reject text commands. We now save with
-            // the resolved deliveredConversationId already populated, which is also why
-            // the previous UpdateConversationIdAsync follow-up call is no longer needed
-            // here. (UpdateConversationIdAsync remains on the contract for sibling
-            // callers like TeamsProactiveNotifier whose lifecycle is different.) The
-            // caller's `ConversationId` is treated as advisory: any stale value passed
-            // in is replaced by the value the proactive turn context yields, preserving
-            // the sanitization invariant from iter-1.
-            var resolvedQuestion = question with { ConversationId = deliveredConversationId };
-            await _agentQuestionStore.SaveAsync(resolvedQuestion, ct).ConfigureAwait(false);
-
-            var now = _timeProvider.GetUtcNow();
-            var cardState = new TeamsCardState
+            // downstream resolution. The previous ordering (save first, send second)
+            // created zombie Open rows for ContinueConversationAsync / SendActivityAsync
+            // failures — a stale Open row with null ConversationId and no companion
+            // TeamsCardState that could never be resolved by bare approve/reject text
+            // commands. We now save with the resolved deliveredConversationId already
+            // populated. The caller's `ConversationId` is treated as advisory: any
+            // stale value passed in is replaced by the value the proactive turn
+            // context yields, preserving the sanitization invariant from iter-1.
+            //
+            // Iter-16 evaluator feedback item #4 — the three post-send writes below
+            // (`IAgentQuestionStore.SaveAsync`, `IAgentQuestionStore.UpdateConversationIdAsync`,
+            // `ICardStateStore.SaveAsync`) cannot be wrapped in a single transaction:
+            // they target two logically distinct stores (question store + card-state
+            // store) that may map to different SQL servers, and the Bot Framework
+            // proactive send has ALREADY completed when this block runs — a card has
+            // been delivered to the user, and we cannot atomically "un-send" it. The
+            // earlier comment that described an "all-or-nothing persistence contract"
+            // for this block was therefore misleading. The actual contract is:
+            //   1. Either ALL three writes succeed (the happy path).
+            //   2. OR a write fails partway through and we emit a structured
+            //      `PartialPersistenceFailure` warning tagging the QuestionId,
+            //      ActivityId, ConversationId, and which write step failed, and
+            //      re-throw so the orchestrator + OTEL span both observe the failure
+            //      and operators can manually reconcile the dangling Teams card.
+            // The companion regression test
+            // `SendQuestionAsync_CardStateSaveFails_LogsPartialPersistenceWarning_AndRethrows`
+            // injects a failing `ICardStateStore.SaveAsync` and asserts the warning
+            // fires with the question/activity/conversation identifiers AND that the
+            // exception propagates AND that the Bot Framework send completed before
+            // the partial failure, so on-call operators have a clear signal that
+            // out-of-band reconciliation is required for that QuestionId.
+            string partialPersistenceStep = "AgentQuestionStore.SaveAsync";
+            try
             {
-                QuestionId = question.QuestionId,
-                ActivityId = deliveredActivityId!,
-                ConversationId = deliveredConversationId!,
-                ConversationReferenceJson = deliveredReferenceJson ?? stored.ReferenceJson,
-                Status = TeamsCardStatuses.Pending,
-                CreatedAt = now,
-                UpdatedAt = now,
-            };
+                var resolvedQuestion = question with { ConversationId = deliveredConversationId };
+                await _agentQuestionStore.SaveAsync(resolvedQuestion, ct).ConfigureAwait(false);
 
-            await _cardStateStore.SaveAsync(cardState, ct).ConfigureAwait(false);
+                // Iter-15 evaluator feedback item #2 — Stage 3.3 brief Step 7
+                // explicitly requires calling `IAgentQuestionStore.UpdateConversationIdAsync`
+                // after the proactive send completes. This call is idempotent with
+                // the SaveAsync above which already stamped the same ConversationId,
+                // but the contract is part of the established Stage 3.3 surface and
+                // is mirrored by `TeamsProactiveNotifier` (Stage 4.2). Keeping the
+                // call here ensures every IAgentQuestionStore implementation sees the
+                // same write sequence regardless of which proactive entrypoint is
+                // used, which matters for store implementations that key auditing or
+                // change notifications off `UpdateConversationIdAsync` specifically
+                // rather than off `SaveAsync`.
+                partialPersistenceStep = "AgentQuestionStore.UpdateConversationIdAsync";
+                await _agentQuestionStore
+                    .UpdateConversationIdAsync(question.QuestionId, deliveredConversationId!, ct)
+                    .ConfigureAwait(false);
+
+                var now = _timeProvider.GetUtcNow();
+                var cardState = new TeamsCardState
+                {
+                    QuestionId = question.QuestionId,
+                    ActivityId = deliveredActivityId!,
+                    ConversationId = deliveredConversationId!,
+                    ConversationReferenceJson = deliveredReferenceJson!,
+                    Status = TeamsCardStatuses.Pending,
+                    CreatedAt = now,
+                    UpdatedAt = now,
+                };
+
+                partialPersistenceStep = "CardStateStore.SaveAsync";
+                await _cardStateStore.SaveAsync(cardState, ct).ConfigureAwait(false);
+            }
+            catch (Exception persistenceEx) when (persistenceEx is not OperationCanceledException)
+            {
+                _logger.LogWarning(
+                    persistenceEx,
+                    "PartialPersistenceFailure: Teams card already delivered (QuestionId={QuestionId}, " +
+                    "ActivityId={ActivityId}, ConversationId={ConversationId}) but post-send write " +
+                    "'{FailedStep}' threw {ExceptionType}. The card is live in the Teams conversation " +
+                    "and on-call operators must reconcile the dangling card-state / question-store rows " +
+                    "manually; the exception is re-thrown so the orchestrator's OTEL span records the " +
+                    "delivery as failed and any retry policy can compensate.",
+                    question.QuestionId,
+                    deliveredActivityId,
+                    deliveredConversationId,
+                    partialPersistenceStep,
+                    persistenceEx.GetType().FullName);
+                throw;
+            }
+
             succeeded = true;
         }
         catch (Exception ex) when (activity is not null)
