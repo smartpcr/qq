@@ -19,13 +19,13 @@ using ChatType = Telegram.Bot.Types.Enums.ChatType;
 namespace AgentSwarm.Messaging.IntegrationTests;
 
 /// <summary>
-/// Stage 7.1 step 4 — smoke tests that exercise the Stage 7.1 test
+/// Stage 7.1 step 4 ΓÇö smoke tests that exercise the Stage 7.1 test
 /// helpers (<see cref="TelegramTestFixture.SimulateWebhookUpdateAsync"/>,
 /// <see cref="TelegramTestFixture.SimulateCallbackQueryAsync"/>,
 /// <see cref="TelegramTestFixture.AssertMessageSent"/>,
 /// <see cref="TelegramTestFixture.WaitForMessageSentAsync"/>) so that
-/// the Stage 7.2 acceptance suite — which is the helpers' real
-/// consumer — can rely on them. Without this guard a regression to the
+/// the Stage 7.2 acceptance suite ΓÇö which is the helpers' real
+/// consumer ΓÇö can rely on them. Without this guard a regression to the
 /// secret header, the JSON shape Telegram emits, or the assertion's
 /// substring-match contract would surface only in Stage 7.2 with
 /// noisier failure modes.
@@ -57,7 +57,7 @@ public sealed class TelegramTestFixtureHelperTests
 
         response.StatusCode.Should().Be(
             HttpStatusCode.OK,
-            "Stage 7.1 helper must drive the production webhook contract — secret-token header set and body parseable as a Telegram Update");
+            "Stage 7.1 helper must drive the production webhook contract ΓÇö secret-token header set and body parseable as a Telegram Update");
     }
 
     [Fact]
@@ -65,7 +65,7 @@ public sealed class TelegramTestFixtureHelperTests
     {
         // Acceptance criterion: "Duplicate webhook delivery does not
         // execute the same human command twice". The duplicate path
-        // returns 200 to keep Telegram from retrying — assert the
+        // returns 200 to keep Telegram from retrying ΓÇö assert the
         // helper observes that shape so AC004 in Stage 7.2 has a stable
         // contract to depend on.
         using var fixture = new TelegramTestFixture();
@@ -148,17 +148,17 @@ public sealed class TelegramTestFixtureHelperTests
     [Fact]
     public async Task AssertMessageSent_AfterSenderRuns_FindsMatch()
     {
-        // The brief's Stage 7.1 scenario 2 — "Fake API records calls —
+        // The brief's Stage 7.1 scenario 2 ΓÇö "Fake API records calls ΓÇö
         // Given FakeTelegramApi is configured, When SendTextAsync is
         // invoked via the connector, Then WireMock records the
-        // sendMessage call with correct parameters" — translated into
+        // sendMessage call with correct parameters" ΓÇö translated into
         // the helper API. AssertMessageSent must locate a recorded
         // sendMessage whose chat_id and substring match.
         using var fixture = new TelegramTestFixture();
         var sender = fixture.Services.GetRequiredService<IMessageSender>();
         const long chatId = 8201L;
         const string traceId = "tracehelperassert";
-        var text = "Build succeeded\n🔗 trace: " + traceId;
+        var text = "Build succeeded\n≡ƒöù trace: " + traceId;
 
         await sender.SendTextAsync(chatId, text, CancellationToken.None);
 
@@ -196,13 +196,22 @@ public sealed class TelegramTestFixtureHelperTests
         const long chatId = 8401L;
         const string traceId = "tracehelperwait";
 
-        _ = Task.Run(async () =>
+        // Capture the background task so any exception thrown inside
+        // SendTextAsync surfaces as the actual failure rather than
+        // being swallowed and presenting as a misleading 5-second
+        // "no message sent" timeout from WaitForMessageSentAsync.
+        var backgroundSend = Task.Run(async () =>
         {
             await Task.Delay(TimeSpan.FromMilliseconds(150));
-            await sender.SendTextAsync(chatId, "deferred send 🔗 trace: " + traceId, CancellationToken.None);
+            await sender.SendTextAsync(chatId, "deferred send ≡ƒöù trace: " + traceId, CancellationToken.None);
         });
 
         await fixture.WaitForMessageSentAsync(chatId, traceId, timeout: TimeSpan.FromSeconds(5));
+
+        // Re-await the background task so an exception thrown after
+        // (or concurrent with) the wait helper succeeding still fails
+        // the test with the real root cause.
+        await backgroundSend;
     }
 
     [Fact]
@@ -230,7 +239,7 @@ public sealed class TelegramTestFixtureHelperTests
         // through to AssertMessageSent, which reported a false
         // "no send observed" assertion failure instead of letting the
         // caller see the cancellation. After the fix, the cancellation
-        // token's OCE must propagate untouched — matching the
+        // token's OCE must propagate untouched ΓÇö matching the
         // cancellation contract used everywhere else in the codebase
         // (PersistentOutboundQueue, TelegramUpdatePipeline, etc.).
         using var fixture = new TelegramTestFixture();
@@ -247,7 +256,7 @@ public sealed class TelegramTestFixtureHelperTests
             cancellationToken: cts.Token);
 
         // Both TaskCanceledException and OperationCanceledException are
-        // acceptable — TaskCanceledException is a subtype. Asserting
+        // acceptable ΓÇö TaskCanceledException is a subtype. Asserting
         // the base type covers both .NET runtime emissions while
         // explicitly rejecting the prior bug where an
         // Xunit.Sdk.XunitException leaked out instead.
@@ -262,7 +271,7 @@ public sealed class TelegramTestFixtureHelperTests
     {
         // Edge case: token is already cancelled BEFORE the helper is
         // called. The first ThrowIfCancellationRequested() inside the
-        // loop should fire — the helper must NOT enqueue an assertion
+        // loop should fire ΓÇö the helper must NOT enqueue an assertion
         // exception in this case.
         using var fixture = new TelegramTestFixture();
         using var cts = new CancellationTokenSource();
@@ -285,7 +294,7 @@ public sealed class TelegramTestFixtureHelperTests
         // Stage 7.1 step 2 requires "in-memory dedup". Without the
         // explicit Replace() in WireMockBackedFactory.ConfigureServices,
         // AddMessagingPersistence's Replace() would leave
-        // PersistentDeduplicationService (EF Core) in the container —
+        // PersistentDeduplicationService (EF Core) in the container ΓÇö
         // technically backed by in-memory SQLite, but the SERVICE
         // implementation is the persistent one. This test pins the
         // brief's literal contract: the registered
@@ -311,7 +320,7 @@ public sealed class TelegramTestFixtureHelperTests
         // type by name because InMemoryOutboundQueue is `internal` to
         // the Telegram assembly (no InternalsVisibleTo to integration
         // tests). The name check is sufficient because the persistent
-        // sibling is `PersistentOutboundQueue` — a distinct class name.
+        // sibling is `PersistentOutboundQueue` ΓÇö a distinct class name.
         using var fixture = new TelegramTestFixture();
 
         var queue = fixture.Services.GetRequiredService<IOutboundQueue>();
