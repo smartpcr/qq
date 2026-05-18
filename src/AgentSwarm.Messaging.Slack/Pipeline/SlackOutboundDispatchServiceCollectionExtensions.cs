@@ -126,6 +126,20 @@ public static class SlackOutboundDispatchServiceCollectionExtensions
 
         // Slack implementation of the platform-neutral connector.
         services.TryAddSingleton<Rendering.ISlackMessageRenderer, Rendering.DefaultSlackMessageRenderer>();
+
+        // Stage 8.1 evaluator iter-2 item 1: bundle the consumed
+        // collaborators (audit logger + inbound transport + outbound
+        // transport + thread manager + inbound buffer) behind a
+        // single SlackConnectorComponents so SlackConnector's
+        // composition is explicit at compile time and a regression
+        // that drops any of the named registrations fails fast at
+        // BuildServiceProvider(ValidateOnBuild = true). Hosts that
+        // call AddSlackOutboundDispatcher in isolation MUST also
+        // register ISlackAuditLogger / ISlackInboundQueue /
+        // ISlackInboundEventBuffer / ISlackThreadManager (the
+        // upstream Stage 7.1 / 4.x / 6.2 / 8.1 extensions handle
+        // this; the AddSlackMessenger facade composes them all).
+        services.TryAddSingleton<SlackConnectorComponents>();
         services.TryAddSingleton<SlackConnector>();
         services.TryAddSingleton<IMessengerConnector>(sp =>
             sp.GetRequiredService<SlackConnector>());
