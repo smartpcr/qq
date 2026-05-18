@@ -71,6 +71,37 @@ using Microsoft.Extensions.Logging;
 /// to commit reverts the row and is logged via the catch below.
 /// </para>
 /// <para>
+/// <b>Pre-transaction column gates.</b> The writer validates the
+/// string-shape invariants of the mandatory required-and-bounded
+/// columns (<see cref="AuditLogEntry.Action"/>,
+/// <see cref="AuditLogEntry.EventFamily"/>,
+/// <see cref="AuditLogEntry.CorrelationId"/>,
+/// <see cref="AuditLogEntry.ExternalUserId"/>) <em>before</em>
+/// <see cref="DatabaseFacade.BeginTransactionAsync(System.Threading.CancellationToken)"/>
+/// opens a transaction. The motivation is iter-X reviewer item: the
+/// EF configuration declares each of those columns
+/// <c>HasMaxLength(N).IsRequired()</c>; a null or over-length value
+/// would otherwise surface as a provider-specific
+/// <see cref="DbUpdateException"/> at <c>SaveChangesAsync</c> time
+/// (silent truncation on some providers, an opaque integrity error
+/// on others) with no diagnostic pointing at <em>which</em> field is
+/// at fault. Failing fast at the persistence boundary with a typed
+/// <see cref="ArgumentException"/> whose <c>ParamName</c> names the
+/// offending property gives callers an unambiguous signal and keeps
+/// the transaction from opening for a request that cannot possibly
+/// succeed. The human-response path additionally null-coalesces
+/// <see cref="HumanResponseAuditEntry.ActionValue"/> to
+/// <see cref="MissingActionValuePlaceholder"/> before mapping it
+/// onto <see cref="AuditLogEntry.Action"/> — although the
+/// abstraction marks the field <c>required</c>, the runtime cannot
+/// guarantee a non-null value (reflection-based deserializers,
+/// <c>null!</c> initializers in tests, or any future code path that
+/// mints an entry without going through the constructor would
+/// otherwise crash the row with an opaque NULL-in-required-column
+/// error). The placeholder keeps the audit row landable so the
+/// failure is investigable rather than silently dropped.
+/// </para>
+/// <para>
 /// <b>Failure semantics.</b> Audit writes are <b>strict</b> — both
 /// the <see cref="IAuditLogger.LogAsync"/> and
 /// <see cref="IAuditLogger.LogHumanResponseAsync"/> paths log the
@@ -129,19 +160,85 @@ public sealed class PersistentAuditLogger : IAuditLogger
         + "(json_extract / JSON_VALUE / jsonb_path_query) cannot land "
         + "on a malformed row.";
 
+    /// <summary>
+    /// Maximum length of the <see cref="AuditLogEntry.Action"/> column
+    /// per <c>AuditLogEntryConfiguration</c>'s
+    /// <c>HasMaxLength(64).IsRequired()</c>. Pinned here so the
+    /// pre-transaction gate and tests reference one symbol rather
+    /// than duplicating the literal across files.
+    /// </summary>
+    internal const int ActionMaxLength = 64;
+
+    /// <summary>
+    /// Maximum length of the <see cref="AuditLogEntry.EventFamily"/>
+    /// column per <c>AuditLogEntryConfiguration</c>'s
+    /// <c>HasMaxLength(32).IsRequired()</c>.
+    /// </summary>
+    internal const int EventFamilyMaxLength = 32;
+
+    /// <summary>
+    /// Maximum length of the
+    /// <see cref="AuditLogEntry.CorrelationId"/> column per
+    /// <c>AuditLogEntryConfiguration</c>'s
+    /// <c>HasMaxLength(128).IsRequired()</c>.
+    /// </summary>
+    internal const int CorrelationIdMaxLength = 128;
+
+    /// <summary>
+    /// Maximum length of the
+    /// <see cref="AuditLogEntry.ExternalUserId"/> column per
+    /// <c>AuditLogEntryConfiguration</c>'s
+    /// <c>HasMaxLength(128).IsRequired()</c>.
+    /// </summary>
+    internal const int ExternalUserIdMaxLength = 128;
+
+    /// <summary>
+    /// Placeholder value mapped onto
+    /// <see cref="AuditLogEntry.Action"/> when a
+    /// <see cref="HumanResponseAuditEntry.ActionValue"/> arrives as
+    /// <see langword="null"/>. The abstraction marks
+    /// <c>ActionValue</c> as <c>required</c> so the compiler
+    /// rejects construction sites that omit it, but runtime paths
+    /// that bypass the constructor (reflection-based deserializers,
+    /// <c>null!</c> initializers in tests, future code paths that
+    /// mint an entry by other means) can still land a null. Coercing
+    /// to a stable sentinel keeps the row landable and the failure
+    /// investigable instead of crashing on the
+    /// <c>IsRequired()</c> column constraint at
+    /// <c>SaveChangesAsync</c> time with an opaque provider error.
+    /// </summary>
+    internal const string MissingActionValuePlaceholder = "unknown";
+
     /// <inheritdoc />
     public async Task LogAsync(AuditEntry entry, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(entry);
         ValidateDetailsIsJsonOrNull(entry.Details, nameof(entry.Details));
 
+        // Resolve EventFamily once: the abstraction defaults to
+        // "general" via property initializer, but a caller can still
+        // pass null/whitespace explicitly. Validate the resolved
+        // value (not the raw entry.EventFamily) because that is what
+        // actually lands in the column.
+        var eventFamily = string.IsNullOrWhiteSpace(entry.EventFamily)
+            ? AuditEventFamilies.General
+            : entry.EventFamily;
+
+        // Pre-transaction column gates (see class remarks). Validate
+        // all four required-and-bounded columns BEFORE WriteAsync
+        // opens a transaction so a malformed entry fails fast with a
+        // typed ArgumentException naming the offending field rather
+        // than as an opaque DbUpdateException at SaveChangesAsync.
+        ValidateRequiredColumn(entry.Action, ActionMaxLength, nameof(entry.Action));
+        ValidateRequiredColumn(eventFamily, EventFamilyMaxLength, nameof(entry.EventFamily));
+        ValidateRequiredColumn(entry.CorrelationId, CorrelationIdMaxLength, nameof(entry.CorrelationId));
+        ValidateRequiredColumn(entry.UserId, ExternalUserIdMaxLength, nameof(entry.UserId));
+
         var row = new AuditLogEntry
         {
             Id = entry.EntryId,
             EntryKind = AuditEntryKinds.General,
-            EventFamily = string.IsNullOrWhiteSpace(entry.EventFamily)
-                ? AuditEventFamilies.General
-                : entry.EventFamily,
+            EventFamily = eventFamily,
             MessageId = entry.MessageId,
             ExternalUserId = entry.UserId,
             AgentId = entry.AgentId,
@@ -165,6 +262,20 @@ public sealed class PersistentAuditLogger : IAuditLogger
         ArgumentNullException.ThrowIfNull(entry);
         ValidateDetailsIsJsonOrNull(entry.Details, nameof(entry.Details));
 
+        // Null-coalesce ActionValue → MissingActionValuePlaceholder
+        // before mapping it onto AuditLogEntry.Action (see
+        // MissingActionValuePlaceholder remarks for the rationale).
+        // EventFamily is hardcoded to AuditEventFamilies.Decision
+        // ("decision", 8 chars) below, so no per-call validation is
+        // needed there; CorrelationId and UserId are validated against
+        // their column max-lengths because both are caller-supplied
+        // strings landing in required-and-bounded columns.
+        var action = entry.ActionValue ?? MissingActionValuePlaceholder;
+
+        ValidateRequiredColumn(action, ActionMaxLength, nameof(entry.ActionValue));
+        ValidateRequiredColumn(entry.CorrelationId, CorrelationIdMaxLength, nameof(entry.CorrelationId));
+        ValidateRequiredColumn(entry.UserId, ExternalUserIdMaxLength, nameof(entry.UserId));
+
         var row = new AuditLogEntry
         {
             Id = entry.EntryId,
@@ -181,8 +292,14 @@ public sealed class PersistentAuditLogger : IAuditLogger
             // persistence row's Action column so a forensic query can
             // filter `WHERE Action='approve'` without consulting
             // ActionValue. EntryKind / EventFamily still distinguish
-            // decisions from commands when needed.
-            Action = entry.ActionValue,
+            // decisions from commands when needed. The value is
+            // coalesced above so a null ActionValue (which the
+            // `required` modifier should prevent at compile time but
+            // cannot guarantee at runtime — reflection-based
+            // deserializers, `null!` test initializers, etc.) lands
+            // as `MissingActionValuePlaceholder` rather than crashing
+            // the required-column constraint at SaveChanges time.
+            Action = action,
             Timestamp = entry.Timestamp,
             CorrelationId = entry.CorrelationId,
             TenantId = entry.TenantId,
@@ -233,6 +350,48 @@ public sealed class PersistentAuditLogger : IAuditLogger
         catch (JsonException ex)
         {
             throw new ArgumentException(InvalidDetailsJsonMessage, paramName, ex);
+        }
+    }
+
+    /// <summary>
+    /// Pre-transaction gate for required, length-bounded string
+    /// columns. Throws <see cref="ArgumentException"/> (or
+    /// <see cref="ArgumentNullException"/>) BEFORE
+    /// <see cref="WriteAsync"/> opens a transaction so a malformed
+    /// entry fails fast with a typed exception naming the offending
+    /// property rather than landing as an opaque
+    /// <see cref="DbUpdateException"/> at <c>SaveChangesAsync</c>
+    /// time. See class remarks "Pre-transaction column gates" for
+    /// the full rationale.
+    /// </summary>
+    /// <param name="value">Value the caller passed.</param>
+    /// <param name="maxLength">
+    /// Maximum length permitted by the EF configuration's
+    /// <c>HasMaxLength(N)</c> for the destination column.
+    /// </param>
+    /// <param name="paramName">
+    /// Name of the caller-facing property (used as
+    /// <see cref="ArgumentException.ParamName"/>) so the diagnostic
+    /// points operators at the offending field.
+    /// </param>
+    private static void ValidateRequiredColumn(string? value, int maxLength, string paramName)
+    {
+        if (value is null)
+        {
+            throw new ArgumentNullException(
+                paramName,
+                $"{paramName} maps to a required AuditLogEntry column and cannot be null.");
+        }
+
+        if (value.Length > maxLength)
+        {
+            throw new ArgumentException(
+                $"{paramName} length {value.Length} exceeds the AuditLogEntry column "
+                + $"maximum of {maxLength} characters. Trim or rehash the value at "
+                + "the call site before invoking IAuditLogger; the persistence "
+                + "boundary rejects over-length values to avoid silent provider "
+                + "truncation and opaque DbUpdateException at SaveChanges time.",
+                paramName);
         }
     }
 
