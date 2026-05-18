@@ -428,19 +428,19 @@ storyId: "qq-SLACK-MESSENGER-SUPP"
 ## Stage 7.3: Health Checks and Diagnostics
 
 ### Implementation Steps
-- [ ] Register ASP.NET Core health check for Slack API connectivity: call `auth.test` via SlackNet and report `Healthy` or `Unhealthy` based on the response
-- [ ] Register health check for outbound queue depth: report `Degraded` if queue depth exceeds a configurable threshold (default 1000)
-- [ ] Register health check for DLQ depth: report `Unhealthy` if DLQ depth exceeds a configurable threshold (default 100)
-- [ ] Expose health check endpoints at `/health/ready` (includes all checks) and `/health/live` (basic liveness) for Kubernetes probes
-- [ ] Add diagnostic logging on connector startup: log active workspaces, transport type per workspace (Events API vs Socket Mode), and rate-limit configuration
+- [x] Register ASP.NET Core health check for Slack API connectivity: call `auth.test` via SlackNet and report `Healthy` or `Unhealthy` based on the response -- `SlackApiConnectivityHealthCheck` + `SlackNetAuthTester` (src/AgentSwarm.Messaging.Slack/Diagnostics)
+- [x] Register health check for outbound queue depth: report `Degraded` if queue depth exceeds a configurable threshold (default 1000) -- `SlackOutboundQueueDepthHealthCheck` + `ISlackOutboundQueueDepthProbe`; threshold bound via `SlackHealthCheckOptions.OutboundQueueDegradedThreshold` from `Slack:Health`
+- [x] Register health check for DLQ depth: report `Unhealthy` if DLQ depth exceeds a configurable threshold (default 100) -- `SlackDeadLetterQueueDepthHealthCheck` + `ISlackDeadLetterQueueDepthProbe`; threshold bound via `SlackHealthCheckOptions.DeadLetterUnhealthyThreshold` from `Slack:Health`
+- [x] Expose health check endpoints at `/health/ready` (includes all checks) and `/health/live` (basic liveness) for Kubernetes probes -- `SlackHealthChecksServiceCollectionExtensions.MapSlackHealthEndpoints` wired from `Program.BuildApp`; paths operator-tunable via `Slack:Health:ReadyEndpointPath` / `LiveEndpointPath`; per-check status payload emitted by `SlackHealthCheckJsonResponseWriter` (e2e Scenario 20.2)
+- [x] Add diagnostic logging on connector startup: log active workspaces, transport type per workspace (Events API vs Socket Mode), and rate-limit configuration -- `SlackStartupDiagnosticsHostedService` registered via `AddSlackStartupDiagnostics`
 
 ### Dependencies
 - phase-observability-and-operations/stage-opentelemetry-traces-and-metrics
 
 ### Test Scenarios
-- [ ] Scenario: Healthy Slack connectivity -- Given a working Slack API connection, When the health check runs, Then it reports `Healthy`
-- [ ] Scenario: DLQ depth triggers unhealthy -- Given DLQ depth at 150 (threshold 100), When the health check runs, Then it reports `Unhealthy` with a descriptive message
-- [ ] Scenario: Startup diagnostic logging -- Given the connector starts with 2 configured workspaces, When startup completes, Then structured logs include workspace IDs and transport types
+- [x] Scenario: Healthy Slack connectivity -- Given a working Slack API connection, When the health check runs, Then it reports `Healthy` -- `SlackApiConnectivityHealthCheckTests.Healthy_Slack_connectivity_reports_healthy_when_authtest_succeeds`
+- [x] Scenario: DLQ depth triggers unhealthy -- Given DLQ depth at 150 (threshold 100), When the health check runs, Then it reports `Unhealthy` with a descriptive message -- `SlackDeadLetterQueueDepthHealthCheckTests.Brief_scenario_depth_150_threshold_100_reports_unhealthy_with_descriptive_message`
+- [x] Scenario: Startup diagnostic logging -- Given the connector starts with 2 configured workspaces, When startup completes, Then structured logs include workspace IDs and transport types -- `SlackStartupDiagnosticsHostedServiceTests.Brief_scenario_two_workspaces_produces_structured_logs_with_team_id_and_transport`
 
 
 # Phase 8: Connector Wiring and Acceptance Validation

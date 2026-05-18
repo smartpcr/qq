@@ -15,6 +15,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Diagnostics;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -65,7 +66,7 @@ using Microsoft.Extensions.Logging;
 /// surface had a transient IO error.
 /// </para>
 /// </remarks>
-internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, IDisposable
+internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, ISlackDeadLetterQueueDepthProbe, IDisposable
 {
     /// <summary>
     /// Default name of the JSONL file written under the configured
@@ -264,6 +265,60 @@ internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, ID
 
         this.disposed = true;
         this.writeGate.Dispose();
+    }
+
+    /// <summary>
+    /// <see cref="ISlackDeadLetterQueueDepthProbe"/> implementation:
+    /// counts non-empty lines in the JSONL dead-letter file without
+    /// deserialising any record. Returns <c>0</c> when the file does
+    /// not exist (no envelopes have been dead-lettered yet) or on
+    /// any IO failure, so a transient inspection error never crashes
+    /// the Kubernetes readiness probe.
+    /// </summary>
+    /// <remarks>
+    /// Stage 7.3 of
+    /// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>:
+    /// the DLQ-depth health check samples this value rather than
+    /// calling <see cref="InspectAsync(CancellationToken)"/>, which
+    /// would deserialise every record on every probe.
+    /// </remarks>
+    public int GetCurrentDepth()
+    {
+        if (this.disposed || !File.Exists(this.AbsoluteFilePath))
+        {
+            return 0;
+        }
+
+        try
+        {
+            int count = 0;
+            using FileStream stream = new(
+                this.AbsoluteFilePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite,
+                bufferSize: 4096,
+                useAsync: false);
+            using StreamReader reader = new(stream, Encoding.UTF8);
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+        catch (Exception ex)
+        {
+            this.logger.LogWarning(
+                ex,
+                "FileSystemSlackDeadLetterQueue depth probe: failed to read {DeadLetterFile}; reporting 0.",
+                this.AbsoluteFilePath);
+            return 0;
+        }
     }
 
     private static FileSystemSlackDeadLetterRecord ToRecord(SlackDeadLetterEntry entry)

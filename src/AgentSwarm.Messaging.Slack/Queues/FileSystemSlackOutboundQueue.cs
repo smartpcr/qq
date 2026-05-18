@@ -17,6 +17,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Diagnostics;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -108,7 +109,7 @@ using Microsoft.Extensions.Logging;
 /// their concrete type" guidance.
 /// </para>
 /// </remarks>
-internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutboundQueue, IDisposable
+internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutboundQueue, ISlackOutboundQueueDepthProbe, IDisposable
 {
     /// <summary>Default child directory holding pending envelopes.</summary>
     public const string PendingDirectoryName = "pending";
@@ -197,6 +198,31 @@ internal sealed class FileSystemSlackOutboundQueue : IAcknowledgeableSlackOutbou
         Directory.Exists(this.PendingDirectoryPath)
             ? Directory.GetFiles(this.PendingDirectoryPath, "*.json").Length
             : 0;
+
+    /// <summary>
+    /// <see cref="ISlackOutboundQueueDepthProbe"/> implementation:
+    /// returns the count of journal files under
+    /// <see cref="PendingDirectoryPath"/> so the Stage 7.3 outbound-
+    /// queue-depth health check can sample load without materialising
+    /// any envelope. Returns <c>0</c> on any IO failure rather than
+    /// throwing so a directory-listing hiccup never crashes the
+    /// Kubernetes readiness probe.
+    /// </summary>
+    public int GetCurrentDepth()
+    {
+        try
+        {
+            return this.PendingFileCount;
+        }
+        catch (Exception ex)
+        {
+            this.logger.LogWarning(
+                ex,
+                "FileSystemSlackOutboundQueue depth probe: failed to enumerate {Directory}; reporting 0.",
+                this.PendingDirectoryPath);
+            return 0;
+        }
+    }
 
     /// <inheritdoc />
     /// <remarks>
