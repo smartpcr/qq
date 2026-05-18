@@ -56,6 +56,7 @@ internal sealed class SlackInboundAuthorizer : ISlackInboundAuthorizer
     private readonly ISlackMembershipResolver membershipResolver;
     private readonly ISlackAuthorizationAuditSink auditSink;
     private readonly IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor;
+    private readonly ISlackEphemeralResponder ephemeralResponder;
     private readonly TimeProvider timeProvider;
     private readonly ILogger<SlackInboundAuthorizer> logger;
 
@@ -64,6 +65,7 @@ internal sealed class SlackInboundAuthorizer : ISlackInboundAuthorizer
         ISlackMembershipResolver membershipResolver,
         ISlackAuthorizationAuditSink auditSink,
         IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor,
+        ISlackEphemeralResponder ephemeralResponder,
         ILogger<SlackInboundAuthorizer> logger,
         TimeProvider? timeProvider = null)
     {
@@ -71,6 +73,7 @@ internal sealed class SlackInboundAuthorizer : ISlackInboundAuthorizer
         this.membershipResolver = membershipResolver ?? throw new ArgumentNullException(nameof(membershipResolver));
         this.auditSink = auditSink ?? throw new ArgumentNullException(nameof(auditSink));
         this.optionsMonitor = optionsMonitor ?? throw new ArgumentNullException(nameof(optionsMonitor));
+        this.ephemeralResponder = ephemeralResponder ?? throw new ArgumentNullException(nameof(ephemeralResponder));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -217,6 +220,26 @@ internal sealed class SlackInboundAuthorizer : ISlackInboundAuthorizer
         string errorDetail,
         CancellationToken ct)
     {
+        // Iter-7 evaluator item #2 (story FR-008 "Audit": persist
+        // Slack team ID, channel ID, thread timestamp, user ID,
+        // command text, and response payload). The pipeline-side
+        // authorizer previously passed CommandText: null, which made
+        // the sink fall back to a synthetic
+        // "authorization_rejected path=ingestor://command reason=..."
+        // marker — losing the verbatim slash-command invocation an
+        // operator needs to triage a denied-channel rejection. Reuse
+        // the same SlackInboundEnvelopeAuditFields helper the success
+        // / duplicate / error inbound audit rows use, so a rejected
+        // command row carries the literal "/agent ask <args>" string
+        // (matching the HTTP-facing SlackAuthorizationFilter path's
+        // CommandText), block-action rejections carry the action_id,
+        // and event rejections carry the event subtype. The helper
+        // is tolerant of malformed payloads and falls back to null
+        // when the envelope's RawPayload cannot be parsed — the sink
+        // then uses its existing synthetic marker, preserving the
+        // pre-fix behaviour for genuinely opaque envelopes.
+        SlackInboundEnvelopeAuditFields auditFields = SlackInboundEnvelopeAuditFields.Extract(envelope);
+
         SlackAuthorizationAuditRecord record = new(
             ReceivedAt: this.timeProvider.GetUtcNow(),
             Reason: reason,
@@ -225,7 +248,7 @@ internal sealed class SlackInboundAuthorizer : ISlackInboundAuthorizer
             TeamId: NullIfEmpty(envelope.TeamId),
             ChannelId: envelope.ChannelId,
             UserId: NullIfEmpty(envelope.UserId),
-            CommandText: null,
+            CommandText: NullIfEmpty(auditFields.CommandText),
             ErrorDetail: errorDetail);
 
         try
@@ -253,7 +276,61 @@ internal sealed class SlackInboundAuthorizer : ISlackInboundAuthorizer
             envelope.UserId,
             errorDetail);
 
+        // Stage 8.2 AC-5: deliver the operator-configured rejection
+        // text as an ephemeral reply to the originating user via the
+        // envelope's captured response_url. This is the brief's
+        // "ephemeral error message to the user" leg on the async
+        // pipeline path -- the sync MVC SlackAuthorizationFilter
+        // delivers the same text in the HTTP response body, but a
+        // request that bypasses the sync filter (Socket Mode, or a
+        // host that has detached the filter) reaches the originating
+        // user only via response_url. The responder swallows
+        // transport failures so a missed ephemeral cannot dead-letter
+        // an otherwise-correct rejection (architecture.md §5.5
+        // best-effort contract).
+        await this.TryPostEphemeralRejectionAsync(envelope, ct).ConfigureAwait(false);
+
         return SlackInboundAuthorizationResult.Rejected(reason, errorDetail);
+    }
+
+    private async Task TryPostEphemeralRejectionAsync(SlackInboundEnvelope envelope, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(envelope.ResponseUrl))
+        {
+            // Events API callbacks and any payload Slack delivered
+            // without response_url have no late-reply channel. The
+            // HTTP-facing sync filter (SlackAuthorizationFilter)
+            // remains the user-visible surface in that configuration;
+            // the audit row above is the only durable footprint.
+            return;
+        }
+
+        SlackAuthorizationOptions options = this.optionsMonitor.CurrentValue;
+        string message = string.IsNullOrWhiteSpace(options.RejectionMessage)
+            ? SlackAuthorizationOptions.DefaultRejectionMessage
+            : options.RejectionMessage;
+
+        try
+        {
+            await this.ephemeralResponder
+                .SendEphemeralAsync(envelope.ResponseUrl, message, ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Ephemeral delivery is best-effort per the responder's
+            // own contract; absorb any unexpected exception so the
+            // pipeline dispatch loop is not poisoned by a Slack
+            // transport hiccup.
+            this.logger.LogWarning(
+                ex,
+                "Slack ingestor authorization rejection ephemeral post failed for idempotency_key={IdempotencyKey}; rejection row was still persisted.",
+                envelope.IdempotencyKey);
+        }
     }
 
     private static string DescribeSourceType(SlackInboundSourceType sourceType) => sourceType switch

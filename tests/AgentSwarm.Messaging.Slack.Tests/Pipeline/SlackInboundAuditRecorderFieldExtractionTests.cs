@@ -166,6 +166,71 @@ public sealed class SlackInboundAuditRecorderFieldExtractionTests
     }
 
     [Fact]
+    public async Task RecordSuccessAsync_populates_fields_from_socket_mode_interaction_json_without_form_wrapper()
+    {
+        // Iter-9 evaluator item #1 (STRUCTURAL): the Socket Mode
+        // transport (SlackSocketModePayloadNormalizer.NormalizeInteraction)
+        // stamps the inner Block Kit JSON onto envelope.RawPayload
+        // verbatim -- with no surrounding "payload=" form wrapper,
+        // because the WebSocket frame's payload IS the JSON. The
+        // HTTP-companion test above exercises the form-wrapped path;
+        // this companion locks the JSON-only path so a regression
+        // that re-introduces form-only parsing (and silently empties
+        // every Socket Mode rejected_auth row's CommandText, ThreadTs,
+        // and MessageTs) fails sharply at the recorder level, not just
+        // at the rejected_auth audit level the authorizer test pins.
+        InMemorySlackAuditEntryWriter writer = new();
+        SlackInboundAuditRecorder recorder = new(
+            writer,
+            NullLogger<SlackInboundAuditRecorder>.Instance,
+            TimeProvider.System);
+
+        // Note: NO "payload=" prefix and NO URL-encoding -- this is
+        // the literal JSON the WebSocket frame's payload field
+        // carries.
+        const string rawSocketModeInteractionJson = @"{
+            ""type"": ""block_actions"",
+            ""team"": { ""id"": ""T1"" },
+            ""user"": { ""id"": ""U1"" },
+            ""trigger_id"": ""trig-sm"",
+            ""actions"": [
+                { ""action_id"": ""approve_socket_pr88"", ""value"": ""approve"" }
+            ],
+            ""container"": {
+                ""type"": ""message"",
+                ""thread_ts"": ""1700000111.000111"",
+                ""message_ts"": ""1700000222.000222""
+            }
+        }";
+
+        SlackInboundEnvelope envelope = new(
+            IdempotencyKey: "interact:T1:U1:approve_socket_pr88:trig-sm",
+            SourceType: SlackInboundSourceType.Interaction,
+            TeamId: "T1",
+            ChannelId: "C1",
+            UserId: "U1",
+            RawPayload: rawSocketModeInteractionJson,
+            TriggerId: "trig-sm",
+            ReceivedAt: DateTimeOffset.UtcNow);
+
+        await recorder.RecordSuccessAsync(envelope, requestType: null, CancellationToken.None);
+
+        SlackAuditEntry entry = writer.Entries.Should().ContainSingle().Subject;
+        entry.CommandText.Should().Be(
+            "approve_socket_pr88",
+            "Socket Mode interactions carry raw JSON without the HTTP transport's payload= wrapper; the extractor MUST auto-detect JSON and pull actions[0].action_id directly, otherwise audit rows for Socket Mode button clicks silently lose CommandText (story FR-008 Audit)");
+        entry.ThreadTs.Should().Be(
+            "1700000111.000111",
+            "the Socket Mode JSON path MUST extract container.thread_ts -- otherwise thread-scoped audit queries miss every Socket Mode-delivered button click");
+        entry.MessageTs.Should().Be(
+            "1700000222.000222",
+            "the Socket Mode JSON path MUST extract container.message_ts -- otherwise the audit row cannot pinpoint which message the user clicked on");
+        entry.ConversationId.Should().Be(
+            "1700000111.000111",
+            "ConversationId MUST collapse to container.thread_ts on Socket Mode interactions, mirroring the HTTP path (the conversation grouping rule is transport-agnostic)");
+    }
+
+    [Fact]
     public async Task RecordDuplicateAsync_still_populates_fields_so_duplicate_rows_are_queryable()
     {
         InMemorySlackAuditEntryWriter writer = new();

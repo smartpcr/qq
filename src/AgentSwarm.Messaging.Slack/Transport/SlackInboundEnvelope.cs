@@ -50,4 +50,30 @@ internal sealed record SlackInboundEnvelope(
     string UserId,
     string RawPayload,
     string? TriggerId,
-    DateTimeOffset ReceivedAt);
+    DateTimeOffset ReceivedAt)
+{
+    /// <summary>
+    /// Slack-issued <c>response_url</c> captured from the inbound
+    /// payload. Present on slash-command and interactive payloads only;
+    /// <see langword="null"/> for Events API callbacks (which have no
+    /// response_url). Carried on the envelope so any handler dispatched
+    /// from the BackgroundService pipeline -- including the Stage 4.3
+    /// <see cref="Pipeline.SlackInboundAuthorizer"/> on a rejection --
+    /// can deliver an ephemeral reply to the originating user via
+    /// <see cref="Pipeline.ISlackEphemeralResponder"/> after the HTTP
+    /// transport has already ACK'd Slack with HTTP 200.
+    /// </summary>
+    /// <remarks>
+    /// Stage 8.2 AC-5: the brief's "rejected during async processing
+    /// with an ephemeral error message to the user" leg requires the
+    /// pipeline-side authorizer to reach the original requester
+    /// AFTER the controller has completed the HTTP response. The only
+    /// Slack-supported channel for that late reply is response_url
+    /// (valid ~30 min for up to five posts), so the envelope carries
+    /// it through the queue to the dispatch loop. Property is
+    /// non-positional (<c>init</c>-only) so this addition does not
+    /// disturb the eight positional record parameters or any existing
+    /// constructor call sites.
+    /// </remarks>
+    public string? ResponseUrl { get; init; }
+}

@@ -121,7 +121,21 @@ internal static class SlackSocketModePayloadNormalizer
             UserId: user,
             RawPayload: frame.Payload,
             TriggerId: NullIfEmpty(payload.TriggerId),
-            ReceivedAt: receivedAt);
+            ReceivedAt: receivedAt)
+        {
+            // Iter-8 evaluator item #1 follow-on: Socket Mode slash
+            // commands carry response_url just like the HTTP
+            // transport (Slack docs: "slash_commands payload includes
+            // response_url valid for ~30 minutes"). Capturing it here
+            // lets the pipeline-side SlackInboundAuthorizer post a
+            // user-visible ephemeral on rejection -- the same way the
+            // HTTP-side SlackInboundEnvelopeFactory captures it on
+            // every command envelope (Transport/SlackInboundEnvelopeFactory.cs:185).
+            // Without this, a Socket Mode denied-channel command
+            // would silently drop the AC-5 ephemeral leg even though
+            // the audit row was persisted.
+            ResponseUrl = NullIfEmpty(payload.ResponseUrl),
+        };
     }
 
     private static SlackInboundEnvelope NormalizeInteraction(SlackSocketModeFrame frame, DateTimeOffset receivedAt)
