@@ -1,7 +1,7 @@
 namespace AgentSwarm.Messaging.Telegram;
 
 /// <summary>
-/// Stage 3.4 — single workspace entry under
+/// Stage 3.4 -- single workspace entry under
 /// <see cref="TelegramOptions.UserTenantMappings"/>. Carries the
 /// fields required to construct an
 /// <see cref="AgentSwarm.Messaging.Core.OperatorRegistration"/>
@@ -11,8 +11,8 @@ namespace AgentSwarm.Messaging.Telegram;
 /// <remarks>
 /// <para>
 /// Bound from the array under each Telegram user-id key in
-/// <c>Telegram:UserTenantMappings</c> per architecture.md §7.1
-/// (lines 1042–1065). The canonical JSON shape is:
+/// <c>Telegram:UserTenantMappings</c> per architecture.md section 7.1
+/// (lines 1042-1065). The canonical JSON shape is:
 /// </para>
 /// <example>
 /// <code language="json">
@@ -37,7 +37,7 @@ namespace AgentSwarm.Messaging.Telegram;
 /// from each array entry on <c>/start</c> and submits the full
 /// batch via
 /// <see cref="AgentSwarm.Messaging.Core.IOperatorRegistry.RegisterManyAsync"/>
-/// (Stage 3.4 iter-3 atomic upsert — the whole batch commits in
+/// (Stage 3.4 iter-3 atomic upsert -- the whole batch commits in
 /// one transaction or rolls back together, so a
 /// <c>(OperatorAlias, TenantId)</c> unique-index collision on row N
 /// cannot leave rows 1..N-1 partially persisted). Each successful
@@ -45,14 +45,16 @@ namespace AgentSwarm.Messaging.Telegram;
 /// <see cref="AgentSwarm.Messaging.Core.OperatorBinding"/> row.
 /// Subsequent commands trigger workspace disambiguation via inline
 /// keyboard when multiple bindings exist for the same (user, chat)
-/// pair (per architecture.md §4.3).
+/// pair (per architecture.md section 4.3).
 /// </para>
 /// <para>
 /// <b>Distinct from <see cref="TelegramOperatorBindingOptions"/>.</b>
-/// <see cref="TelegramOperatorBindingOptions"/> pins a static
-/// (user, chat) → tenant/workspace authorization (the iter-5 binding-
-/// aware authz model used by
-/// <see cref="Auth.ConfiguredOperatorAuthorizationService"/>).
+/// <see cref="TelegramOperatorBindingOptions"/> is the type used by
+/// the iter-5 binding-aware authz directory consumed by the
+/// now-retired <c>ConfiguredOperatorAuthorizationService</c>
+/// (deleted in Stage 5.2 iter-4) and by
+/// <see cref="TelegramOptions.DevOperators"/> consumed by
+/// <see cref="Swarm.StubOperatorRegistry"/>.
 /// <see cref="TelegramUserTenantMapping"/>, by contrast, is the
 /// <b>onboarding directory</b> consulted only at <c>/start</c> time
 /// to source the tenant/workspace/roles/alias for a new

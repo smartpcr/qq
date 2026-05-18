@@ -15,7 +15,7 @@ namespace AgentSwarm.Messaging.Telegram.Swarm;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Replacement contract (architecture.md §4.6 / implementation-plan.md
+/// <b>Replacement contract (architecture.md section 4.6 / implementation-plan.md
 /// Stage 2.7).</b> Registered in
 /// <see cref="TelegramServiceCollectionExtensions.AddTelegram"/> via
 /// <see cref="Microsoft.Extensions.DependencyInjection.Extensions.ServiceCollectionDescriptorExtensions.TryAddSingleton{TService, TImplementation}"/>
@@ -35,7 +35,7 @@ namespace AgentSwarm.Messaging.Telegram.Swarm;
 /// fixtures that join a hand-rolled
 /// <c>TaskOversight</c> record (with
 /// <c>OperatorBindingId</c> set to the binding id) to the alert routing
-/// path inside <c>SwarmEventSubscriptionService</c> — without a stable
+/// path inside <c>SwarmEventSubscriptionService</c> -- without a stable
 /// id, the test would have to inject a custom registry rather than just
 /// pre-populating <c>TelegramOptions.DevOperators</c>.
 /// </para>
@@ -47,7 +47,7 @@ namespace AgentSwarm.Messaging.Telegram.Swarm;
 /// no notion of "when /start ran" (that field only carries real meaning
 /// for the Stage 3.4 <c>PersistentOperatorRegistry</c>), and using
 /// <c>UtcNow</c> would make successive reads of the same logical binding
-/// return different <see cref="OperatorBinding.RegisteredAt"/> values —
+/// return different <see cref="OperatorBinding.RegisteredAt"/> values --
 /// breaking consumers that compare, sort, or cache by it. The epoch
 /// sentinel keeps the projection stable across calls and signals "not a
 /// real registration time" to anyone inspecting a stub binding.
@@ -220,7 +220,10 @@ public sealed class StubOperatorRegistry : IOperatorRegistry
     /// <summary>
     /// Deterministic <see cref="OperatorBinding.Id"/> derivation used by
     /// the stub. Mirrors the convention in
-    /// <see cref="Auth.ConfiguredOperatorAuthorizationService"/> so a
+    /// the convention used by the iter-5
+/// <c>ConfiguredOperatorAuthorizationService</c> (deleted in Stage 5.2
+/// iter-4 -- the retired in-memory authz that read static
+/// <c>OperatorBindings</c> from configuration) so a
     /// dev fixture that wires the same (user, chat, tenant, workspace)
     /// across both surfaces sees the same id and can join records
     /// across them (e.g. a TaskOversight row keyed off the alias-derived

@@ -17,7 +17,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
-/// Stage 3.4 — EF Core-backed <see cref="IOperatorRegistry"/>. Persists
+/// Stage 3.4 -- EF Core-backed <see cref="IOperatorRegistry"/>. Persists
 /// <see cref="OperatorBinding"/> rows in the <c>operator_bindings</c>
 /// table and supplies the runtime authorization, alias resolution,
 /// alert-fallback, and Stage 2.7 tenant-enumeration query paths.
@@ -25,7 +25,7 @@ using Microsoft.Extensions.Logging;
 /// last-wins DI replacement pattern in
 /// <see cref="ServiceCollectionExtensions.AddMessagingPersistence"/>
 /// (per implementation-plan.md Stage 3.4 step 1 and architecture.md
-/// §4.3).
+/// section 4.3).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -49,7 +49,7 @@ using Microsoft.Extensions.Logging;
 /// binding MUST be re-activated rather than ignored. The implementation
 /// looks up the existing row by the
 /// <c>UNIQUE (TelegramUserId, TelegramChatId, WorkspaceId)</c> index
-/// (architecture.md §3.1 "Constraints"); when found, it refreshes
+/// (architecture.md section 3.1 "Constraints"); when found, it refreshes
 /// <see cref="OperatorBinding.IsActive"/>,
 /// <see cref="OperatorBinding.RegisteredAt"/>,
 /// <see cref="OperatorBinding.Roles"/>, and
@@ -58,9 +58,9 @@ using Microsoft.Extensions.Logging;
 /// </para>
 /// <para>
 /// <b>Concurrent upsert race.</b> Two webhook deliveries of <c>/start</c>
-/// from the same user/chat may race the find→insert path. The
+/// from the same user/chat may race the find->insert path. The
 /// implementation catches <see cref="DbUpdateException"/> (the
-/// UNIQUE-constraint violation surface used by all EF Core providers —
+/// UNIQUE-constraint violation surface used by all EF Core providers --
 /// SQLite, PostgreSQL, SQL Server) and retries the lookup-then-update
 /// path once, mirroring the
 /// <see cref="PersistentTaskOversightRepository.UpsertAsync"/> race
@@ -184,7 +184,7 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     }
 
     /// <summary>
-    /// Stage 3.4 iter-3 (evaluator item 2) — atomic batch upsert.
+    /// Stage 3.4 iter-3 (evaluator item 2) -- atomic batch upsert.
     /// <see cref="TelegramUserAuthorizationService"/>'s
     /// <c>/start</c> onboarding flow used to iterate
     /// <see cref="RegisterAsync"/> one entry at a time when an
@@ -206,7 +206,7 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// and committed atomically. If ANY upsert throws (constraint
     /// violation, cancellation, transient DB error), the
     /// <c>await using</c> disposal of the transaction rolls back
-    /// every change in the batch — there is no
+    /// every change in the batch -- there is no
     /// <see cref="Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction.CommitAsync(CancellationToken)"/>
     /// path that runs in the presence of a thrown exception.
     /// </para>
@@ -273,7 +273,7 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
         // Pre-load every (TelegramUserId, TelegramChatId, WorkspaceId)
         // row that already exists for the batch in ONE tracking SELECT.
         // The returned dictionary lets the staging loop below decide
-        // insert-vs-update without issuing additional round-trips — EF
+        // insert-vs-update without issuing additional round-trips -- EF
         // Core's identity resolution has already attached each
         // pre-existing row to the change tracker, so the
         // `db.Entry(existing).CurrentValues.SetValues(...)` update
@@ -432,7 +432,7 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
                 // surviving a re-insert. Tenant is included in the
                 // derivation because the same (user, chat) pair may have
                 // bindings under DIFFERENT tenants in distinct workspaces
-                // — without tenant in the key, two simultaneous tenant
+                // -- without tenant in the key, two simultaneous tenant
                 // memberships would collide on Guid.
                 Id = DeriveBindingId(
                     registration.TelegramUserId,
@@ -453,13 +453,13 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
             return inserted;
         }
 
-        // Records are immutable — produce a refreshed copy and let
+        // Records are immutable -- produce a refreshed copy and let
         // EF Core's CurrentValues setter propagate the field
         // updates onto the tracked entity. Refresh the four
         // fields the brief calls out (IsActive, RegisteredAt,
         // Roles, OperatorAlias) PLUS ChatType (the chat's surface
         // may have changed from a private DM to a group between
-        // registrations — we honour the latest signal) PLUS
+        // registrations -- we honour the latest signal) PLUS
         // TenantId (defensive: a re-registration with a different
         // tenant indicates the operator's config moved tenants;
         // overwriting keeps the row authoritative for the new
@@ -488,17 +488,17 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// in-memory lookup. The query uses three axis-wise
     /// <see cref="Enumerable.Contains{TSource}(IEnumerable{TSource}, TSource)"/>
     /// filters (one per column) rather than a row-value
-    /// <c>WHERE (UserId, ChatId, WorkspaceId) IN (…)</c> because
+    /// <c>WHERE (UserId, ChatId, WorkspaceId) IN (...)</c> because
     /// EF Core 8's translation of row-value <c>IN</c> across
     /// SQLite / PostgreSQL / SQL Server is uneven and would either
     /// fall back to client evaluation or force a provider-specific
     /// raw-SQL escape hatch. The axis-wise form translates to a
-    /// stable parameterised SQL <c>WHERE … IN (…)</c> per axis on
+    /// stable parameterised SQL <c>WHERE ... IN (...)</c> per axis on
     /// every supported provider.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The axis-wise filter can return false positives — rows whose
+    /// The axis-wise filter can return false positives -- rows whose
     /// individual columns each match the batch but whose tuple does
     /// not. The dictionary build below discards these by only
     /// inserting rows whose exact
@@ -516,7 +516,7 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// <see cref="EntityFrameworkQueryableExtensions.AsNoTracking{TEntity}(IQueryable{TEntity})"/>)
     /// because the staging loop relies on EF Core's identity
     /// resolution to attach every pre-existing row to the change
-    /// tracker — that is what makes the subsequent
+    /// tracker -- that is what makes the subsequent
     /// <c>db.Entry(existing).CurrentValues.SetValues(...)</c>
     /// update path produce an UPDATE statement at
     /// <see cref="DbContext.SaveChangesAsync(CancellationToken)"/>
@@ -593,7 +593,7 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// <paramref name="tenantId"/>, <paramref name="workspaceId"/>)
     /// tuple. Mirrors the convention used by
     /// <see cref="Telegram.Swarm.StubOperatorRegistry.DeriveBindingId"/>
-    /// and <see cref="Telegram.Auth.ConfiguredOperatorAuthorizationService.DeriveBindingId"/>
+    /// and <see cref="Telegram.Auth.TelegramUserAuthorizationService"/>
     /// so a dev fixture that wires the same (user, chat, tenant, workspace)
     /// across the stub and the persistent registry sees the same
     /// id, which lets a hand-rolled <c>TaskOversight</c> row keyed off
@@ -604,10 +604,10 @@ public sealed class PersistentOperatorRegistry : IOperatorRegistry
     /// The hash key uses a distinct namespace prefix
     /// (<c>"PersistentOperatorRegistry:"</c>) so persistent-binding ids
     /// are not confused with stub-binding ids generated from the same
-    /// tuple — they must NOT collide because an integration test that
+    /// tuple -- they must NOT collide because an integration test that
     /// flips from stub to persistent should be able to assert the
     /// transition explicitly. The acceptance tests (architecture.md
-    /// §3.1 stable foreign-key requirement) require that a given
+    /// section 3.1 stable foreign-key requirement) require that a given
     /// (user, chat, tenant, workspace) always produces the SAME
     /// persistent id across restarts, which the deterministic hash
     /// satisfies.

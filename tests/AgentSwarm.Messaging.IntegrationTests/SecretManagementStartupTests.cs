@@ -31,7 +31,7 @@ using Microsoft.Extensions.Options;
 namespace AgentSwarm.Messaging.IntegrationTests;
 
 /// <summary>
-/// Stage 5.1 — pins the secret-management contract exercised by the
+/// Stage 5.1 -- pins the secret-management contract exercised by the
 /// Worker's <c>Program.cs</c>:
 /// <list type="bullet">
 ///   <item><description>
@@ -57,7 +57,7 @@ public sealed class SecretManagementStartupTests
     private const string FakeBotToken = "111111:integration-test-bot-token";
 
     // ---------------------------------------------------------------
-    // Mapping tests for TelegramKeyVaultSecretManager — pure unit
+    // Mapping tests for TelegramKeyVaultSecretManager -- pure unit
     // tests; do not need a host. The brief is explicit about the
     // mapping (TelegramBotToken -> Telegram:BotToken) so any
     // accidental rename of either side must trip a test.
@@ -85,7 +85,7 @@ public sealed class SecretManagementStartupTests
         manager.Load(SecretModelFactory.SecretProperties(name: "TelegramBotToken"))
             .Should().BeTrue("TelegramBotToken is in the allowlist");
         manager.Load(SecretModelFactory.SecretProperties(name: "TelegramSecretToken"))
-            .Should().BeTrue("TelegramSecretToken is in the allowlist (architecture.md §7.1 lines 1018-1021)");
+            .Should().BeTrue("TelegramSecretToken is in the allowlist (architecture.md section 7.1 lines 1018-1021)");
         manager.Load(SecretModelFactory.SecretProperties(name: "SomeOtherServiceSecret"))
             .Should().BeFalse("unrelated secrets in a shared vault must NOT bleed into the host configuration");
     }
@@ -122,7 +122,7 @@ public sealed class SecretManagementStartupTests
     }
 
     // ---------------------------------------------------------------
-    // SecretSourceValidator behaviour tests — exercise the validator
+    // SecretSourceValidator behaviour tests -- exercise the validator
     // directly against synthetic configuration so the test does not
     // need a real host. The Worker's Program.cs invokes the validator
     // via the same code path.
@@ -233,7 +233,7 @@ public sealed class SecretManagementStartupTests
     public void Host_FailsStartup_WhenTelegramBotTokenIsMissing_WithinFiveSeconds()
     {
         // Scenario from implementation-plan.md Stage 5.1:
-        // "Missing token fails startup — Given no token source is
+        // "Missing token fails startup -- Given no token source is
         //  configured, When the Worker starts, Then it exits with a
         //  descriptive error within 5 seconds."
         var stopwatch = Stopwatch.StartNew();
@@ -275,7 +275,7 @@ public sealed class SecretManagementStartupTests
             .GetRequiredService<IOptions<TelegramOptions>>()
             .Value;
         options.BotToken.Should().Be(FakeBotToken,
-            "the in-memory configuration provider stood in for User Secrets / env var / Key Vault — the host wires Telegram:BotToken into TelegramOptions identically regardless of source");
+            "the in-memory configuration provider stood in for User Secrets / env var / Key Vault -- the host wires Telegram:BotToken into TelegramOptions identically regardless of source");
     }
 
     // ---------------------------------------------------------------
@@ -338,13 +338,20 @@ public sealed class SecretManagementStartupTests
     [Fact]
     public void SourceValidator_Succeeds_WhenTokenIsSuppliedByUserSecretsJsonPath()
     {
-        // Simulate a User Secrets path by writing a JSON file under a
-        // directory whose name contains "UserSecrets" (case-insensitive
-        // match in the validator). The classifier inspects the file's
-        // physical path: paths under any "UserSecrets" segment are
-        // treated as User Secrets and approved, even though the
-        // underlying provider type is JsonConfigurationProvider.
-        var tempDir = Path.Combine(Path.GetTempPath(), "userSecrets-" + Guid.NewGuid().ToString("N"));
+        // Simulate a User Secrets path by writing a JSON file under the
+        // CANONICAL parent layout that
+        // Microsoft.Extensions.Configuration.UserSecrets.PathHelper
+        // produces on disk (Windows: "Microsoft\UserSecrets\<id>\secrets.json").
+        // The validator (TelegramSecretSourceValidator.IsCanonicalUserSecretsPath)
+        // deliberately rejects loose substring matches like "userSecrets-foo"
+        // and accepts only the canonical "/Microsoft/UserSecrets/" segment
+        // (case-insensitive via OrdinalIgnoreCase), which works
+        // cross-platform after backslash normalization. The classifier
+        // inspects the file's physical path: only paths under the canonical
+        // User Secrets segment are treated as User Secrets and approved,
+        // even though the underlying provider type is JsonConfigurationProvider.
+        var tempRoot = Path.Combine(Path.GetTempPath(), "secret-validator-" + Guid.NewGuid().ToString("N"));
+        var tempDir = Path.Combine(tempRoot, "Microsoft", "UserSecrets", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempDir);
         var secretsPath = Path.Combine(tempDir, "secrets.json");
         File.WriteAllText(secretsPath,
@@ -376,7 +383,7 @@ public sealed class SecretManagementStartupTests
         }
         finally
         {
-            try { Directory.Delete(tempDir, recursive: true); } catch { }
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
         }
     }
 
@@ -384,7 +391,7 @@ public sealed class SecretManagementStartupTests
     public void SourceValidator_ClassifiesEnvironmentVariablesProvider_AsApproved()
     {
         // Build a real EnvironmentVariablesConfigurationProvider and
-        // confirm the classifier treats it as approved — the brief
+        // confirm the classifier treats it as approved -- the brief
         // names env vars as one of the three approved local-dev paths.
         var configuration = new ConfigurationBuilder()
             .AddEnvironmentVariables()
@@ -422,14 +429,14 @@ public sealed class SecretManagementStartupTests
     // WebApplicationFactory<Program> with KeyVault:Uri set, but uses
     // TelegramKeyVaultBootstrap.OverrideSecretClientFactory to inject
     // a FakeSecretClient so the host hits the real AddAzureKeyVault
-    // → AzureKeyVaultConfigurationProvider → IConfiguration →
+    // -> AzureKeyVaultConfigurationProvider -> IConfiguration ->
     // TelegramOptions chain without ever calling Azure.
     // ---------------------------------------------------------------
 
     [Fact]
     public void Worker_WithKeyVaultUriConfigured_PopulatesTelegramOptions_FromKeyVault()
     {
-        // Stage 5.1 brief acceptance: "Key Vault token loaded — Given
+        // Stage 5.1 brief acceptance: "Key Vault token loaded -- Given
         // Key Vault contains TelegramBotToken, When the Worker starts
         // with Key Vault URI configured, Then TelegramOptions.BotToken
         // is populated from Key Vault."
@@ -518,7 +525,7 @@ public sealed class SecretManagementStartupTests
     public void TelegramKeyVaultBootstrap_OverrideKeyVaultUri_RestoresPreviousValueOnDispose()
     {
         // Symmetric stress test for the new KeyVault:Uri override
-        // seam — guarantees the AsyncLocal scope-guard mirrors the
+        // seam -- guarantees the AsyncLocal scope-guard mirrors the
         // SecretClientFactory pattern so a failing test cannot leak
         // the override into a subsequent test in the same xUnit
         // process.
@@ -550,8 +557,8 @@ public sealed class SecretManagementStartupTests
     public void TryAddTelegramKeyVault_WithConfigurationProvidedKeyVaultUri_WiresProviderAndPopulatesBotToken()
     {
         // Iter-4 evaluator Item 3: independently prove the normal
-        // production code path — `KeyVault:Uri` supplied via real
-        // IConfiguration, no OverrideKeyVaultUri seam — wires the
+        // production code path -- `KeyVault:Uri` supplied via real
+        // IConfiguration, no OverrideKeyVaultUri seam -- wires the
         // Azure Key Vault provider and populates Telegram:BotToken.
         // The OverrideSecretClientFactory seam is still required
         // because the Azure SDK cannot be talked to without real
@@ -577,7 +584,7 @@ public sealed class SecretManagementStartupTests
 
         // The seed configuration carries KeyVault:Uri at a real
         // IConfiguration value (in-memory provider stands in for
-        // appsettings.json / env var / command-line — the URI
+        // appsettings.json / env var / command-line -- the URI
         // source is irrelevant; what matters is that the bootstrap
         // reads it from IConfiguration, not from the override).
         var seedConfig = new ConfigurationBuilder()
@@ -639,7 +646,7 @@ public sealed class SecretManagementStartupTests
             seedConfig);
 
         wired.Should().BeFalse(
-            "no KeyVault:Uri means no Azure Key Vault provider — production local-dev relies on this no-op so developers without a vault subscription can still run the Worker");
+            "no KeyVault:Uri means no Azure Key Vault provider -- production local-dev relies on this no-op so developers without a vault subscription can still run the Worker");
 
         // The builder must remain empty; otherwise a spurious
         // provider could shadow downstream sources.
@@ -649,7 +656,7 @@ public sealed class SecretManagementStartupTests
     }
 
     // ---------------------------------------------------------------
-    // Internal helpers — kept inside the test class so the suite is
+    // Internal helpers -- kept inside the test class so the suite is
     // self-contained and the helpers have no chance of being reused
     // accidentally by unrelated tests.
     // ---------------------------------------------------------------
@@ -674,7 +681,7 @@ public sealed class SecretManagementStartupTests
             {
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
-                    // Last-wins shadowing — these blank values override
+                    // Last-wins shadowing -- these blank values override
                     // any earlier provider that may have supplied a
                     // real token, so the validator sees a truly empty
                     // Telegram:BotToken regardless of the host env.
@@ -702,7 +709,7 @@ public sealed class SecretManagementStartupTests
         // connection is open between hosted-service starts), and
         // InboundUpdateRecoveryStartup.StartAsync then throws
         // "no such table: inbound_updates" while attempting the
-        // Processing→Received reset.
+        // Processing->Received reset.
         private readonly Microsoft.Data.Sqlite.SqliteConnection _keepAlive;
         private readonly string _connectionString;
 
@@ -803,7 +810,7 @@ public sealed class SecretManagementStartupTests
                     ["Telegram:WebhookUrl"] = null,
                     // Deliberately leave Telegram:BotToken and
                     // Telegram:SecretToken UNSET in the in-memory
-                    // layer — the values must come from the fake
+                    // layer -- the values must come from the fake
                     // Key Vault provider, otherwise the test does
                     // not exercise the brief's "from Key Vault"
                     // condition.
@@ -879,7 +886,7 @@ public sealed class SecretManagementStartupTests
     }
 
     // ---------------------------------------------------------------
-    // End-to-end Key Vault load path — exercises the REAL
+    // End-to-end Key Vault load path -- exercises the REAL
     // AzureKeyVaultConfigurationExtensions.AddAzureKeyVault provider
     // (same overload Program.cs invokes) with a stubbed SecretClient
     // so that BOTH halves of the wiring are pinned in one test:
@@ -899,7 +906,7 @@ public sealed class SecretManagementStartupTests
     // The earlier KeyVaultSecretManager_* unit tests cover the
     // mapping methods in isolation; this test wires them through the
     // live provider so a future refactor that breaks the
-    // SecretClient → Provider → IConfiguration glue is caught.
+    // SecretClient -> Provider -> IConfiguration glue is caught.
     // ---------------------------------------------------------------
 
     [Fact]
@@ -924,9 +931,9 @@ public sealed class SecretManagementStartupTests
             .Build();
 
         configuration["Telegram:BotToken"].Should().Be(vaultLoadedBotToken,
-            "the live AzureKeyVaultConfigurationProvider must route vault secret 'TelegramBotToken' to configuration key 'Telegram:BotToken' via TelegramKeyVaultSecretManager.GetKey — Stage 5.1 brief Acceptance Criterion 1");
+            "the live AzureKeyVaultConfigurationProvider must route vault secret 'TelegramBotToken' to configuration key 'Telegram:BotToken' via TelegramKeyVaultSecretManager.GetKey -- Stage 5.1 brief Acceptance Criterion 1");
         configuration["Telegram:SecretToken"].Should().Be(vaultLoadedSecretToken,
-            "TelegramSecretToken is the second allowlisted vault secret per architecture.md §10 line 1021 (X-Telegram-Bot-Api-Secret-Token header validation)");
+            "TelegramSecretToken is the second allowlisted vault secret per architecture.md section 10 line 1021 (X-Telegram-Bot-Api-Secret-Token header validation)");
         configuration["UnrelatedServiceSecret"].Should().BeNull(
             "the manager's allowlist must prevent unrelated vault secrets from leaking into the host configuration");
     }
@@ -940,15 +947,15 @@ public sealed class SecretManagementStartupTests
         // TelegramOptions.BotToken is populated from Key Vault.
         // Direct WebApplicationFactory boot with KeyVault:Uri set
         // would require Program.cs to expose a DI-overridable
-        // SecretClient (architecture.md §10 line 1018 wires
+        // SecretClient (architecture.md section 10 line 1018 wires
         // DefaultAzureCredential directly), so we exercise the same
         // provider Program.cs uses via the public
-        // AddAzureKeyVault(SecretClient, options) extension —
+        // AddAzureKeyVault(SecretClient, options) extension --
         // proving the full chain
-        // SecretClient → AzureKeyVaultConfigurationProvider
-        // → IConfiguration["Telegram:BotToken"]
-        // → services.Configure<TelegramOptions>(section)
-        // → IOptions<TelegramOptions>.Value.BotToken.
+        // SecretClient -> AzureKeyVaultConfigurationProvider
+        // -> IConfiguration["Telegram:BotToken"]
+        // -> services.Configure<TelegramOptions>(section)
+        // -> IOptions<TelegramOptions>.Value.BotToken.
         const string vaultLoadedToken = "999999:end-to-end-vault-populated-token";
         var fakeClient = new FakeSecretClient(new Dictionary<string, string?>
         {
@@ -969,19 +976,19 @@ public sealed class SecretManagementStartupTests
 
         sp.GetRequiredService<IOptions<TelegramOptions>>().Value
             .BotToken.Should().Be(vaultLoadedToken,
-            "TelegramOptions.BotToken must bind from the IConfiguration value populated by the real AzureKeyVaultConfigurationProvider — the brief's Stage 5.1 'Key Vault token loaded' acceptance scenario");
+            "TelegramOptions.BotToken must bind from the IConfiguration value populated by the real AzureKeyVaultConfigurationProvider -- the brief's Stage 5.1 'Key Vault token loaded' acceptance scenario");
     }
 
     [Fact]
     public void ProgramCs_AddAzureKeyVault_PassesReloadInterval_PerArchitectureContract()
     {
-        // architecture.md §10 line 1018 and §11 line 1091 require
+        // architecture.md section 10 line 1018 and section 11 line 1091 require
         // periodic Key Vault refresh (default 5 minutes, configurable
         // via Telegram:SecretRefreshIntervalMinutes per tech-spec.md
         // R-5) so a vault rotation propagates to TelegramOptions
         // without a process restart. The
         // AzureKeyVaultConfigurationProvider constructor REJECTS a
-        // non-positive ReloadInterval — by pinning that
+        // non-positive ReloadInterval -- by pinning that
         // AzureKeyVaultConfigurationOptions { ReloadInterval = ... }
         // is valid against the provider, this test guards against a
         // future refactor that accidentally drops the option or
@@ -1001,7 +1008,7 @@ public sealed class SecretManagementStartupTests
             .Build();
 
         act.Should().NotThrow(
-            "Program.cs Stage 5.1 wiring uses ReloadInterval = TimeSpan.FromMinutes(Telegram:SecretRefreshIntervalMinutes ?? 5) — this contract must remain valid against the provider");
+            "Program.cs Stage 5.1 wiring uses ReloadInterval = TimeSpan.FromMinutes(Telegram:SecretRefreshIntervalMinutes ?? 5) -- this contract must remain valid against the provider");
         options.ReloadInterval.Should().BeGreaterThan(TimeSpan.Zero,
             "the provider rejects non-positive intervals, so the default must remain strictly positive");
     }

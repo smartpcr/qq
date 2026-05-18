@@ -14,7 +14,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 // =============================================================
-// AgentSwarm.Messaging.Worker — production host for the Telegram
+// AgentSwarm.Messaging.Worker -- production host for the Telegram
 // messenger receive path. Iter-5 wires the workstream's
 // "Webhook Receiver Endpoint" deliverables together:
 //
@@ -27,21 +27,23 @@ using Microsoft.Extensions.Options;
 //
 //   * AddMessagingPersistence wires MessagingDbContext + the
 //     DatabaseInitializer hosted service, AND replaces the in-memory
-//     stubs with their persistent siblings — including
+//     stubs with their persistent siblings -- including
 //     PersistentOperatorRegistry (Stage 3.4) which becomes the
 //     IOperatorRegistry backing the IUserAuthorizationService below.
 //
 //   * AddTelegram wires TelegramOptions (including OperatorBindings,
 //     DevOperators, and UserTenantMappings), the bot client, the
 //     inbound pipeline, and the Stage 2.2 stubs. UserTenantMappings
-//     (architecture.md §7.1 lines 636-650) is the source of truth
+//     (architecture.md section 7.1 lines 636-650) is the source of truth
 //     for /start onboarding consumed by TelegramUserAuthorizationService.
 //
 //   * The host registers TelegramUserAuthorizationService (Stage 3.4)
-//     as the IUserAuthorizationService implementation, superseding
-//     the earlier iter-5 ConfiguredOperatorAuthorizationService that
-//     read static OperatorBindings from configuration. The new
-//     implementation reads from the persistent IOperatorRegistry
+//     as the IUserAuthorizationService implementation. The earlier
+//     iter-5 ConfiguredOperatorAuthorizationService that read static
+//     OperatorBindings from configuration was deleted in Stage 5.2
+//     iter-4 (retire-from-supported-surface), so the registry-backed
+//     two-tier authz is now the only Telegram authorization path.
+//     The implementation reads from the persistent IOperatorRegistry
 //     for Tier 2 runtime authorization (binding lookup on every
 //     non-/start command) and from Telegram:UserTenantMappings for
 //     Tier 1 /start onboarding (one OperatorBinding row per
@@ -57,7 +59,7 @@ using Microsoft.Extensions.Options;
 //
 //   * The dispatcher, recovery startup, and recovery sweep are
 //     registered as hosted services in dependency order:
-//     recovery-startup runs FIRST (one-shot Processing→Received
+//     recovery-startup runs FIRST (one-shot Processing->Received
 //     reset), then the dispatcher and recovery sweep can begin
 //     claiming rows.
 //
@@ -68,7 +70,7 @@ using Microsoft.Extensions.Options;
 var builder = WebApplication.CreateBuilder(args);
 
 // =============================================================
-// Stage 5.1 — Secret Management Integration.
+// Stage 5.1 -- Secret Management Integration.
 //
 // Azure Key Vault is layered onto the configuration pipeline AFTER
 // the defaults established by WebApplication.CreateBuilder (JSON
@@ -80,8 +82,8 @@ var builder = WebApplication.CreateBuilder(args);
 // docs/stories/qq-TELEGRAM-MESSENGER-S/dev-setup.md).
 //
 // `TelegramKeyVaultSecretManager` performs the brief's required
-// flat-secret-name → nested-configuration-key mapping
-// (TelegramBotToken → Telegram:BotToken) and acts as an allowlist
+// flat-secret-name -> nested-configuration-key mapping
+// (TelegramBotToken -> Telegram:BotToken) and acts as an allowlist
 // so a shared vault cannot silently bleed unrelated secrets into
 // the host configuration.
 //
@@ -92,12 +94,12 @@ var builder = WebApplication.CreateBuilder(args);
 // developer's laptop without code changes.
 //
 // `ReloadInterval` enables the periodic Key Vault refresh required
-// by architecture.md §10 (line 1018) and the §11 Security model
+// by architecture.md section 10 (line 1018) and the section 11 Security model
 // (line 1091): every `Telegram:SecretRefreshIntervalMinutes`
 // (default 5) the provider re-fetches secrets from the vault, fires
 // IConfiguration's change-token, and `IOptionsMonitor<TelegramOptions>`
 // re-binds Telegram:BotToken so rotation takes effect without a
-// process restart — per tech-spec.md R-5.
+// process restart -- per tech-spec.md R-5.
 //
 // The wiring is registered as an `IHostBuilder.ConfigureAppConfiguration`
 // callback on `builder.Host` rather than a synchronous read of
@@ -109,15 +111,15 @@ var builder = WebApplication.CreateBuilder(args);
 // configuration BEFORE Program.cs's top-level statements ran. In
 // the integration suite, the test fixture's own
 // `ConfigureAppConfiguration` callback (which sets in-memory
-// `KeyVault:Uri = https://fake-vault…`) is registered AFTER
+// `KeyVault:Uri = https://fake-vault...`) is registered AFTER
 // Program.cs's callback, so by the time the bootstrap callback
 // fires the test override is NOT YET visible. To bridge that gap
 // without abandoning the callback shape (and the production
 // guarantee that any approved source can supply the URI), the
 // bootstrap consults
-// `TelegramKeyVaultBootstrap.OverrideKeyVaultUri` — an
+// `TelegramKeyVaultBootstrap.OverrideKeyVaultUri` -- an
 // `AsyncLocal<string?>` test seam that mirrors the existing
-// `OverrideSecretClientFactory` seam — BEFORE falling back to
+// `OverrideSecretClientFactory` seam -- BEFORE falling back to
 // `configuration["KeyVault:Uri"]`. Production code never sets the
 // override and so observes identical behaviour to a bare
 // configuration read; tests use the seam to drive the brief's
@@ -132,7 +134,7 @@ var builder = WebApplication.CreateBuilder(args);
 // deferred-callback shape here is what allows the bootstrap to
 // observe the FULLY-MERGED configuration at Build time (rather
 // than the pre-callback snapshot a synchronous read would see).
-// Suppressing ASP0013 here is therefore intentional and surgical —
+// Suppressing ASP0013 here is therefore intentional and surgical --
 // limited to this single registration where the deferred-callback
 // shape is load-bearing.
 // =============================================================
@@ -151,11 +153,11 @@ builder.Services.AddTelegramWebhook();
 // Stage 6.3: a minimal /healthz endpoint is mapped below so the
 // Dockerfile HEALTHCHECK has something to poll. Phase 6 (observability)
 // will replace this with a real composite check (Telegram getMe,
-// queue depth, dead-letter depth, database) — for now the bare
+// queue depth, dead-letter depth, database) -- for now the bare
 // AddHealthChecks() registration gives us a 200-OK liveness probe
 // without depending on services that don't exist yet.
 //
-// Stage 4.2 — `dead_letter_messages` depth check chained onto the
+// Stage 4.2 -- `dead_letter_messages` depth check chained onto the
 // canonical AddHealthChecks() registration so the existing /healthz
 // liveness probe upgrades from a static "200 OK" to a live
 // "is the operator drowning in dead-letters?" signal. The check
@@ -170,7 +172,7 @@ builder.Services.AddHealthChecks()
         DeadLetterQueueHealthCheck.Name,
         tags: new[] { "dead_letter", "outbound" });
 
-// IUserAuthorizationService — iter-5 evaluator item 1 + Stage 3.4
+// IUserAuthorizationService -- iter-5 evaluator item 1 + Stage 3.4
 // onboarding. AddTelegram intentionally does NOT register one to
 // keep the loud-failure semantic at the library level. The Worker
 // registers TelegramUserAuthorizationService (Stage 3.4) via
@@ -182,16 +184,18 @@ builder.Services.AddHealthChecks()
 // own scope-per-call pattern), so scoping it would create a
 // needless captive-dependency conflict with the singleton pipeline.
 //
-// TelegramUserAuthorizationService supersedes the iter-5
+// TelegramUserAuthorizationService is the sole supported Telegram
+// IUserAuthorizationService: the iter-5
 // ConfiguredOperatorAuthorizationService that read static
-// OperatorBindings from configuration: it now reads from the
-// persistent IOperatorRegistry (PersistentOperatorRegistry from
-// AddMessagingPersistence) for Tier 2 runtime authorization, and
-// from Telegram:UserTenantMappings configuration for Tier 1
-// /start onboarding (per architecture.md §7.1).
+// OperatorBindings from configuration was deleted in Stage 5.2
+// iter-4. It reads from the persistent IOperatorRegistry
+// (PersistentOperatorRegistry from AddMessagingPersistence) for
+// Tier 2 runtime authorization, and from Telegram:UserTenantMappings
+// configuration for Tier 1 /start onboarding (per architecture.md
+// section 7.1).
 builder.Services.TryAddSingleton<IUserAuthorizationService, TelegramUserAuthorizationService>();
 
-// IAlertService — iter-4 evaluator item 6. The Telegram sender's
+// IAlertService -- iter-4 evaluator item 6. The Telegram sender's
 // dead-letter path (TelegramMessageSender.EmitDeadLetterAlertAsync)
 // resolves IAlertService as an optional dependency; without a
 // registered concrete the alert path falls back to the sender's own
@@ -199,7 +203,7 @@ builder.Services.TryAddSingleton<IUserAuthorizationService, TelegramUserAuthoriz
 // dedicated alert sink. Register the LoggingAlertService default
 // here via TryAddSingleton so a later out-of-band channel
 // (Slack / PagerDuty / second-bot) wired in a future stage can
-// replace it without touching this file. Singleton lifetime — the
+// replace it without touching this file. Singleton lifetime -- the
 // service has no per-request state; logger injection is the only
 // dependency.
 builder.Services.TryAddSingleton<IAlertService, LoggingAlertService>();
@@ -208,9 +212,9 @@ builder.Services.TryAddSingleton<IAlertService, LoggingAlertService>();
 // scoped MessagingDbContext.
 builder.Services.AddScoped<IInboundUpdateStore, PersistentInboundUpdateStore>();
 
-// Background services: order MATTERS at runtime — IHostedService
+// Background services: order MATTERS at runtime -- IHostedService
 // instances start in registration order. Recovery startup runs FIRST
-// (one-shot Processing→Received reset BEFORE the dispatcher/sweep
+// (one-shot Processing->Received reset BEFORE the dispatcher/sweep
 // begin claiming rows); the dispatcher and recovery sweep can then
 // start safely.
 builder.Services.AddHostedService<InboundUpdateRecoveryStartup>();
@@ -238,7 +242,7 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
         maxRetries = parsedMax;
     }
 
-    // Iter-5 evaluator item 3 — periodic stale-Processing reclaim.
+    // Iter-5 evaluator item 3 -- periodic stale-Processing reclaim.
     // The default (30 minutes) is far above the story's 2-second P95
     // SLA, so a healthy long-running handler is never falsely reset.
     // Operators tune this via InboundRecovery:StaleProcessingThresholdSeconds
@@ -261,7 +265,7 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
         TimeSpan.FromSeconds(staleSeconds));
 });
 
-// Stage 4.1 — durable outbox drainer. Spawns
+// Stage 4.1 -- durable outbox drainer. Spawns
 // OutboundQueue:ProcessorConcurrency (default 10) independent worker
 // tasks that dequeue from the PersistentOutboundQueue replaced into
 // the container by AddMessagingPersistence above, dispatch through
@@ -274,9 +278,9 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
 // OutboundQueueMetrics. The processor must be registered AFTER
 // AddMessagingPersistence (binds OutboundQueueOptions + replaces
 // IOutboundQueue with the persistent impl) and AFTER AddTelegram
-// (registers IMessageSender → TelegramMessageSender).
+// (registers IMessageSender -> TelegramMessageSender).
 //
-// Stage 4.2 — explicit factory so the new RetryPolicy options,
+// Stage 4.2 -- explicit factory so the new RetryPolicy options,
 // IDeadLetterQueue, and IAlertService are wired into the processor's
 // long ctor. Without the factory the DI activator would fall back
 // to the legacy 5-arg ctor (Random isn't registered as a DI service)
@@ -299,7 +303,7 @@ builder.Services.AddHostedService<OutboundQueueProcessor>(sp =>
 var app = builder.Build();
 
 // =============================================================
-// Stage 5.1, step 4 — secret-source validation.
+// Stage 5.1, step 4 -- secret-source validation.
 //
 // Runs BEFORE `app.Run()` so a misconfigured deployment fails
 // startup synchronously with a clear, source-by-source diagnostic
@@ -315,7 +319,7 @@ var secretValidatorLogger = app.Services
     .GetRequiredService<ILoggerFactory>()
     .CreateLogger("AgentSwarm.Messaging.Worker.SecretManagement");
 // Capture KeyVault:Uri AFTER builder.Build() so the validator's
-// diagnostic line reports the value that was effectively applied —
+// diagnostic line reports the value that was effectively applied --
 // i.e. including overrides supplied by WebApplicationFactory's
 // ConfigureAppConfiguration callbacks and any post-Build env/User
 // Secrets layers. Reading from `app.Configuration` (the host's
