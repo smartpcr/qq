@@ -366,6 +366,47 @@ public sealed class WorkerWebHostIntegrationTests
     {
         public const string TestSecret = "integration-test-secret-token-value";
 
+        // Fixture-scope keep-alive connection that holds the SQLite
+        // shared-in-memory cache OPEN for the entire IClassFixture
+        // lifetime. Without this, the first hosted-service scope
+        // (DatabaseInitializer.StartAsync's transient EF context)
+        // opens the in-memory DB, applies the schema, then closes —
+        // and SQLite destroys the shared cache the instant ZERO
+        // connections remain open. Every subsequent transient scope
+        // (TestSchemaInitializer, the InboundUpdateDispatcher's
+        // scope-per-poll, the dedup write inside the pipeline) then
+        // opens a fresh in-memory DB with no tables, and the
+        // processed_events / inbound_updates rows the integration
+        // test polls for never appear.
+        //
+        // The connection string carries a GUID suffix so concurrent
+        // xUnit test classes do not collide on the same shared cache.
+        // The string itself is published to the host via the
+        // in-memory `ConnectionStrings:MessagingDb` key that
+        // CreateHost overrides below, so every DI scope inside the
+        // host opens against the SAME cache that this keep-alive
+        // connection is pinning.
+        private readonly Microsoft.Data.Sqlite.SqliteConnection _keepAlive;
+        private readonly string _connectionString;
+
+        public WorkerFactory()
+        {
+            _connectionString =
+                "DataSource=worker-integration-test-" + System.Guid.NewGuid().ToString("N")
+                + ";Mode=Memory;Cache=Shared";
+            _keepAlive = new Microsoft.Data.Sqlite.SqliteConnection(_connectionString);
+            _keepAlive.Open();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _keepAlive.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
         protected override IHost CreateHost(IHostBuilder builder)
         {
             builder.ConfigureAppConfiguration((_, config) =>
@@ -373,9 +414,11 @@ public sealed class WorkerWebHostIntegrationTests
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     // SQLite shared in-memory so DbContext + migrations
-                    // initialize cleanly without touching disk.
-                    ["ConnectionStrings:MessagingDb"] =
-                        "DataSource=worker-integration-test;Mode=Memory;Cache=Shared",
+                    // initialize cleanly without touching disk. The
+                    // GUID-suffixed cache name is shared with the
+                    // fixture's keep-alive connection so the schema
+                    // initializer's writes survive its scope's dispose.
+                    ["ConnectionStrings:MessagingDb"] = _connectionString,
                     ["MessagingDb:UseMigrations"] = "false",
                     ["Telegram:BotToken"] = "111111:integration-test-bot-token",
                     // UsePolling=true with WebhookUrl=null so the

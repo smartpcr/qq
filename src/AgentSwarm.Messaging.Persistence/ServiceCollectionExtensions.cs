@@ -135,14 +135,31 @@ public static class ServiceCollectionExtensions
         this IServiceCollection services,
         IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("MessagingDb")
-            ?? "Data Source=messaging.db";
-
         var providerName = configuration["MessagingDb:Provider"];
         var provider = ResolveProvider(providerName);
 
+        // The connection string is resolved INSIDE the AddDbContext
+        // options lambda so the read happens at DbContextOptions
+        // factory invocation time (i.e. when MessagingDbContext is
+        // first resolved from DI), AFTER `builder.Build()` has fired
+        // every deferred `ConfigureAppConfiguration` callback —
+        // including the integration-test fixture's in-memory
+        // `["ConnectionStrings:MessagingDb"] = "DataSource=...;Mode=Memory;Cache=Shared"`
+        // override that the WorkerWebHostIntegrationTests.WorkerFactory
+        // attaches via `IHostBuilder.ConfigureAppConfiguration`. A
+        // synchronous read at this method's top scope would observe
+        // only `WebApplication.CreateBuilder(args)`'s initial sources
+        // (JSON files + env vars + User Secrets + command-line) and
+        // would miss the in-memory override, so the persistent dedup
+        // gate would write rows to a different SQLite file than the
+        // test's keep-alive connection holds open — making the
+        // `processed_events` polling loop in the integration test
+        // observe an empty database forever.
         services.AddDbContext<MessagingDbContext>(options =>
         {
+            var connectionString = configuration.GetConnectionString("MessagingDb")
+                ?? "Data Source=messaging.db";
+
             switch (provider)
             {
                 case MessagingDbProvider.Sqlite:
@@ -303,6 +320,51 @@ public static class ServiceCollectionExtensions
         // (OutboundQueueProcessor) to the scoped MessagingDbContext
         // without violating the captive-dependency rule.
         services.Replace(ServiceDescriptor.Singleton<IDeadLetterQueue, PersistentDeadLetterQueue>());
+
+        // Stage 4.3 — durable inbound deduplication. The XMLDoc
+        // contract for this method (see <list> bullet
+        // "IDeduplicationService → PersistentDeduplicationService
+        // (Stage 4.3)" above) explicitly promises that calling
+        // AddMessagingPersistence replaces the in-memory
+        // SlidingWindowDeduplicationService that AddTelegram wires
+        // via TryAddSingleton. PR #92 (Stage 4.3 merge) introduced
+        // PersistentDeduplicationService + DeduplicationCleanupService
+        // and updated the documented contract, but the actual
+        // registration body was dropped during the merge. Without
+        // these four lines, AddTelegram's TryAddSingleton wins, the
+        // in-memory dedup is what runs, and the
+        // WorkerWebHostIntegrationTests.cs:241 dedup integration
+        // test (and the
+        // tests/AgentSwarm.Messaging.IntegrationTests deduplication
+        // suite) cannot observe the persisted processed_events row
+        // the test gate requires. Restoring the registration here —
+        // not in Worker/Program.cs — keeps the persistence layer's
+        // documented public contract honest and matches the existing
+        // services.Replace pattern used by every other persistent
+        // sibling above (IOutboundQueue, IOutboundMessageIdIndex,
+        // IOutboundDeadLetterStore, ITaskOversightRepository,
+        // IAuditLogger, IOperatorRegistry, IPendingQuestionStore,
+        // IDeadLetterQueue).
+        //
+        // services.AddLogging() is idempotent (TryAdd internally)
+        // so a host that already configured logging is unaffected;
+        // it is required by the
+        // MessagingDbContextTests.MessagingDbContext_ResolvesFromDI_AndCanConnect
+        // unit test harness which calls AddMessagingPersistence
+        // without AddLogging.
+        //
+        // DeduplicationOptions is bound via the lambda form
+        // .Configure(opts => section.Bind(opts)) rather than the
+        // .Bind(IConfiguration) extension because Bind ships in a
+        // separate Microsoft.Extensions.Options.ConfigurationExtensions
+        // package that the Persistence csproj does not reference;
+        // the lambda uses only Microsoft.Extensions.Configuration.Binder
+        // (already pulled in via EF Core).
+        services.AddLogging();
+        services.AddOptions<DeduplicationOptions>()
+            .Configure(opts => configuration.GetSection(DeduplicationOptions.SectionName).Bind(opts));
+        services.Replace(ServiceDescriptor.Singleton<IDeduplicationService, PersistentDeduplicationService>());
+        services.AddHostedService<DeduplicationCleanupService>();
 
         return services;
     }

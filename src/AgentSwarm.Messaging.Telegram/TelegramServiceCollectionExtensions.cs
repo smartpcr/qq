@@ -24,8 +24,12 @@ public static class TelegramServiceCollectionExtensions
     /// Registers Telegram options binding (<see cref="TelegramOptions"/>),
     /// the fail-fast validator (<see cref="TelegramOptionsValidator"/>),
     /// the named <see cref="HttpClient"/>, the
-    /// <see cref="TelegramBotClientFactory"/>, a singleton
-    /// <see cref="ITelegramBotClient"/> backed by the factory, the
+    /// <see cref="TelegramBotClientFactory"/> (retained for direct
+    /// one-shot construction sites), the Stage 5.1
+    /// <see cref="RotatingTelegramBotClient"/> proxy, a singleton
+    /// <see cref="ITelegramBotClient"/> resolved THROUGH the proxy so
+    /// vault token rotations propagate on the next API call (per
+    /// architecture.md §10 line 1018 and §11 line 1091), the
     /// Stage 2.2 <see cref="ITelegramUpdatePipeline"/>, the Stage 2.2
     /// in-memory stub implementations of the inbound pipeline's
     /// dependencies, and (Stage 2.5) the long-polling
@@ -45,7 +49,18 @@ public static class TelegramServiceCollectionExtensions
     /// The <see cref="ITelegramBotClient"/> registration is a singleton
     /// (the underlying <c>Telegram.Bot</c> client is thread-safe and
     /// reuses the <see cref="HttpClient"/>), so all senders share the
-    /// same instance.
+    /// same instance. The singleton is the
+    /// <see cref="RotatingTelegramBotClient"/> proxy — every API call
+    /// is forwarded to an inner <see cref="TelegramBotClient"/> that
+    /// is rebuilt whenever <see cref="IOptionsMonitor{T}.OnChange"/>
+    /// fires with a different <see cref="TelegramOptions.BotToken"/>.
+    /// That is how a Key Vault rotation (driven by the
+    /// <see cref="Azure.Extensions.AspNetCore.Configuration.Secrets.AzureKeyVaultConfigurationOptions.ReloadInterval"/>
+    /// wired in <c>Program.cs</c>) reaches every cached
+    /// <see cref="ITelegramBotClient"/> reference without a process
+    /// restart, as required by architecture.md §11 line 1091
+    /// ("The refreshed token is applied to the TelegramBotClient
+    /// instance on the next API call").
     /// </para>
     /// <para>
     /// <b>Stage 2.2 stubs (with Stage 3.1 production swap).</b>
@@ -115,8 +130,25 @@ public static class TelegramServiceCollectionExtensions
         services.AddHttpClient(TelegramBotClientFactory.HttpClientName);
 
         services.AddSingleton<TelegramBotClientFactory>();
+
+        // Stage 5.1 secret-rotation wiring. The proxy is registered as
+        // its own concrete singleton so a future test or diagnostic
+        // can resolve it directly, and as the ITelegramBotClient
+        // singleton so every existing consumer
+        // (TelegramMessageSender, TelegramBotClientUpdatePoller,
+        // CallbackQueryHandler, QuestionTimeoutService, the webhook
+        // registration service, the polling service) automatically
+        // observes vault rotations on the next API call. The proxy
+        // ctor subscribes to IOptionsMonitor<TelegramOptions>.OnChange
+        // — that is the contract architecture.md §11 line 1091 calls
+        // out ("the refreshed token is applied to the
+        // TelegramBotClient instance on the next API call"). Without
+        // this indirection the singleton ITelegramBotClient would
+        // capture the FIRST-seen token at activation time and ignore
+        // every subsequent vault refresh until process restart.
+        services.AddSingleton<RotatingTelegramBotClient>();
         services.AddSingleton<ITelegramBotClient>(sp =>
-            sp.GetRequiredService<TelegramBotClientFactory>().Create());
+            sp.GetRequiredService<RotatingTelegramBotClient>());
 
         // Stage 4.3 — IDeduplicationService.
         //
