@@ -108,10 +108,10 @@ public sealed class StubGuardHealthCheck : IHealthCheck
     /// </summary>
     public const string Name = "stub_guard";
 
-    private readonly IOperatorRegistry _operatorRegistry;
-    private readonly ITaskOversightRepository _taskOversightRepository;
-    private readonly ISwarmCommandBus _swarmCommandBus;
-    private readonly IHostEnvironment _environment;
+    private readonly IOperatorRegistry operatorRegistry;
+    private readonly ITaskOversightRepository taskOversightRepository;
+    private readonly ISwarmCommandBus swarmCommandBus;
+    private readonly IHostEnvironment environment;
 
     /// <summary>
     /// Constructs the stub guard. The four injected dependencies are
@@ -129,13 +129,13 @@ public sealed class StubGuardHealthCheck : IHealthCheck
         ISwarmCommandBus swarmCommandBus,
         IHostEnvironment environment)
     {
-        _operatorRegistry = operatorRegistry
+        this.operatorRegistry = operatorRegistry
             ?? throw new ArgumentNullException(nameof(operatorRegistry));
-        _taskOversightRepository = taskOversightRepository
+        this.taskOversightRepository = taskOversightRepository
             ?? throw new ArgumentNullException(nameof(taskOversightRepository));
-        _swarmCommandBus = swarmCommandBus
+        this.swarmCommandBus = swarmCommandBus
             ?? throw new ArgumentNullException(nameof(swarmCommandBus));
-        _environment = environment
+        this.environment = environment
             ?? throw new ArgumentNullException(nameof(environment));
     }
 
@@ -148,13 +148,13 @@ public sealed class StubGuardHealthCheck : IHealthCheck
         // OTHER than Production. Returning Healthy without inspecting
         // the bindings keeps integration-test hosts that intentionally
         // run with stubs green on /healthz.
-        if (!_environment.IsProduction())
+        if (!this.environment.IsProduction())
         {
             return Task.FromResult(HealthCheckResult.Healthy(
-                description: $"Stub guard inactive in environment '{_environment.EnvironmentName}'.",
+                description: $"Stub guard inactive in environment '{this.environment.EnvironmentName}'.",
                 data: new Dictionary<string, object>
                 {
-                    ["environment"] = _environment.EnvironmentName,
+                    ["environment"] = this.environment.EnvironmentName,
                     ["active"] = false,
                 }));
         }
@@ -168,9 +168,9 @@ public sealed class StubGuardHealthCheck : IHealthCheck
         // next.
         var inspections = new (string InterfaceName, object Instance, Type StubType)[]
         {
-            (nameof(IOperatorRegistry), _operatorRegistry, typeof(StubOperatorRegistry)),
-            (nameof(ITaskOversightRepository), _taskOversightRepository, typeof(StubTaskOversightRepository)),
-            (nameof(ISwarmCommandBus), _swarmCommandBus, typeof(StubSwarmCommandBus)),
+            (nameof(IOperatorRegistry), this.operatorRegistry, typeof(StubOperatorRegistry)),
+            (nameof(ITaskOversightRepository), this.taskOversightRepository, typeof(StubTaskOversightRepository)),
+            (nameof(ISwarmCommandBus), this.swarmCommandBus, typeof(StubSwarmCommandBus)),
         };
 
         var stubs = inspections
@@ -184,11 +184,11 @@ public sealed class StubGuardHealthCheck : IHealthCheck
                 description: "All swarm-side abstractions resolve to concrete implementations.",
                 data: new Dictionary<string, object>
                 {
-                    ["environment"] = _environment.EnvironmentName,
+                    ["environment"] = this.environment.EnvironmentName,
                     ["active"] = true,
-                    ["operatorRegistry"] = _operatorRegistry.GetType().FullName ?? "?",
-                    ["taskOversightRepository"] = _taskOversightRepository.GetType().FullName ?? "?",
-                    ["swarmCommandBus"] = _swarmCommandBus.GetType().FullName ?? "?",
+                    ["operatorRegistry"] = this.operatorRegistry.GetType().FullName ?? "?",
+                    ["taskOversightRepository"] = this.taskOversightRepository.GetType().FullName ?? "?",
+                    ["swarmCommandBus"] = this.swarmCommandBus.GetType().FullName ?? "?",
                 }));
         }
 
@@ -206,12 +206,12 @@ public sealed class StubGuardHealthCheck : IHealthCheck
             description: description,
             data: new Dictionary<string, object>
             {
-                ["environment"] = _environment.EnvironmentName,
+                ["environment"] = this.environment.EnvironmentName,
                 ["active"] = true,
                 ["stubInterfaces"] = stubs,
-                ["operatorRegistry"] = _operatorRegistry.GetType().FullName ?? "?",
-                ["taskOversightRepository"] = _taskOversightRepository.GetType().FullName ?? "?",
-                ["swarmCommandBus"] = _swarmCommandBus.GetType().FullName ?? "?",
+                ["operatorRegistry"] = this.operatorRegistry.GetType().FullName ?? "?",
+                ["taskOversightRepository"] = this.taskOversightRepository.GetType().FullName ?? "?",
+                ["swarmCommandBus"] = this.swarmCommandBus.GetType().FullName ?? "?",
             }));
     }
 }
