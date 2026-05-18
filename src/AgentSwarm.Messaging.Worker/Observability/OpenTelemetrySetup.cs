@@ -194,15 +194,21 @@ public static class OpenTelemetrySetup
             }
         }
 
+        // The single authoritative resource for both the tracer and
+        // meter providers. Each provider receives it via
+        // SetResourceBuilder below; we deliberately do NOT also call
+        // OpenTelemetryBuilder.ConfigureResource because
+        // SetResourceBuilder REPLACES the provider's resource builder
+        // wholesale, which would silently override anything
+        // contributed at the parent-builder layer. Keeping a single
+        // configuration site avoids any confusion about which call is
+        // authoritative.
         var resourceBuilder = ResourceBuilder.CreateDefault()
             .AddService(
                 serviceName: opts.ServiceName,
                 serviceVersion: opts.ServiceVersion);
 
         services.AddOpenTelemetry()
-            .ConfigureResource(rb => rb.AddService(
-                serviceName: opts.ServiceName,
-                serviceVersion: opts.ServiceVersion))
             .WithTracing(tracerBuilder =>
             {
                 tracerBuilder
