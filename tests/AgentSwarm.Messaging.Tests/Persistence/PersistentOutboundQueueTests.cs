@@ -346,6 +346,63 @@ public class PersistentOutboundQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task DeadLetterAsync_ConcurrentCallers_ExactlyOneDeadLetterRow_NoExceptionEscapes()
+    {
+        // Defends the catch-on-UNIQUE-violation fallback in
+        // PersistDeadLetterTransitionAsync: N workers race to dead-letter
+        // the same OutboundMessage; exactly one DeadLetterMessage row
+        // persists and no caller sees the SQLite UNIQUE constraint
+        // exception. This closes the same TOCTOU class the iter-1
+        // evaluator called out on the dequeue path, generalized to the
+        // dead-letter insert.
+        var clock = new StubTimeProvider(new DateTimeOffset(2026, 5, 16, 21, 0, 0, TimeSpan.Zero));
+
+        Guid contendedId;
+        using (var seed = NewContext())
+        {
+            var queue = new PersistentOutboundQueue(seed, clock);
+            var msg = NewMessage("dl-race", MessageSeverity.High, createdAt: clock.GetUtcNow());
+            contendedId = msg.MessageId;
+            await queue.EnqueueAsync(msg, default);
+        }
+
+        const int Workers = 8;
+        var barrier = new Barrier(Workers);
+        var exceptions = new ConcurrentBag<Exception>();
+
+        var tasks = Enumerable.Range(0, Workers).Select(_ => Task.Run(async () =>
+        {
+            try
+            {
+                using var ctx = NewContext();
+                var queue = new PersistentOutboundQueue(ctx, clock);
+                barrier.SignalAndWait();
+                await queue.DeadLetterAsync(contendedId, default);
+            }
+            catch (Exception ex)
+            {
+                exceptions.Add(ex);
+            }
+        })).ToArray();
+
+        await Task.WhenAll(tasks);
+
+        exceptions.Should().BeEmpty(
+            "the UNIQUE(OriginalMessageId) catch handler must swallow concurrent dead-letter inserts");
+
+        using var read = NewContext();
+        var deadLetterCount = await read.DeadLetterMessages.AsNoTracking()
+            .CountAsync(d => d.OriginalMessageId == contendedId);
+        var stored = await read.OutboundMessages.AsNoTracking()
+            .SingleAsync(m => m.MessageId == contendedId);
+
+        deadLetterCount.Should().Be(1,
+            "the UNIQUE constraint plus the catch handler collapses concurrent inserts to one row");
+        stored.Status.Should().Be(OutboundMessageStatus.DeadLettered,
+            "every winning save must leave the outbound row in the terminal state");
+    }
+
+    [Fact]
     public async Task DeadLetterAsync_IsIdempotent_DoesNotDuplicateDeadLetterRow()
     {
         var clock = new StubTimeProvider(new DateTimeOffset(2026, 5, 16, 14, 0, 0, TimeSpan.Zero));
