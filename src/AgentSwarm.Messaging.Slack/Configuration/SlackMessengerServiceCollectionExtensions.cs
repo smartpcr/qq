@@ -372,18 +372,28 @@ public static class SlackMessengerServiceCollectionExtensions
 
         foreach (ServiceDescriptor descriptor in services)
         {
-            // AddHostedService<T>() produces ServiceDescriptor{ ServiceType = IHostedService, ImplementationType = T };
-            // factory-based overloads have ImplementationType == null,
-            // so we fall back to inspecting the factory target type
-            // when ImplementationType is unavailable.
+            // AddHostedService<T>() produces ServiceDescriptor{ ServiceType = IHostedService, ImplementationType = T },
+            // and ServiceDescriptor.Singleton<IHostedService>(instance) preserves the runtime type via
+            // ImplementationInstance. Both AddSlackInboundIngestor<TContext>() and
+            // AddSlackOutboundDispatcher(IConfiguration) -- the only registrations this validator is required to
+            // detect -- use the typed AddHostedService<T>() overload, so ImplementationType is always populated.
+            //
+            // NOTE: factory-based overloads (AddHostedService(Func<IServiceProvider, T>)) leave ImplementationType
+            // null, and inspecting descriptor.ImplementationFactory?.Method.ReturnType is NOT a reliable fallback
+            // -- the factory is stored as Func<IServiceProvider, object>, so Method.ReturnType is always typeof(object)
+            // and would never match the concrete hosted-service types below. Detecting factory-registered hosted
+            // services therefore requires resolving the IServiceProvider (out of scope here, since that would
+            // eagerly construct every hosted service and defeat BuildServiceProvider(ValidateOnBuild = true)) or
+            // an explicit marker descriptor added by the registering extension. If a future host wires the
+            // ingestor or dispatcher through a factory overload, add such a marker rather than reviving a return-type
+            // probe that silently returns object.
             if (descriptor.ServiceType != typeof(Microsoft.Extensions.Hosting.IHostedService))
             {
                 continue;
             }
 
             Type? implType = descriptor.ImplementationType
-                ?? descriptor.ImplementationInstance?.GetType()
-                ?? descriptor.ImplementationFactory?.Method.ReturnType;
+                ?? descriptor.ImplementationInstance?.GetType();
 
             if (implType == typeof(SlackInboundIngestor))
             {
