@@ -142,7 +142,7 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
         {
             Predicate = static registration => registration.Tags.Contains(TeamsTag),
             ResponseWriter = writer,
-            ResultStatusCodes = ResponseStatusCodes,
+            ResultStatusCodes = CreateResultStatusCodesCopy(),
         });
 
         // Liveness — predicate returns false so HealthCheckService runs ZERO checks
@@ -155,7 +155,7 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
         {
             Predicate = static _ => false,
             ResponseWriter = writer,
-            ResultStatusCodes = ResponseStatusCodes,
+            ResultStatusCodes = CreateResultStatusCodesCopy(),
         });
 
         // Readiness alias — identical predicate to the primary readiness route.
@@ -165,7 +165,7 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
         {
             Predicate = static registration => registration.Tags.Contains(TeamsTag),
             ResponseWriter = writer,
-            ResultStatusCodes = ResponseStatusCodes,
+            ResultStatusCodes = CreateResultStatusCodesCopy(),
         });
 
         // Record the successful mapping in the per-builder marker so a subsequent
@@ -189,12 +189,35 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
     ///   Unavailable</description></item>
     /// </list>
     /// </summary>
-    public static readonly IDictionary<HealthStatus, int> ResponseStatusCodes = new Dictionary<HealthStatus, int>
+    /// <remarks>
+    /// Exposed as <see cref="IReadOnlyDictionary{TKey, TValue}"/> rather than
+    /// <see cref="IDictionary{TKey, TValue}"/> so that callers cannot mutate this
+    /// shared singleton via <c>Add</c>/<c>Remove</c>/indexer-set — a silent
+    /// cross-process corruption that would change every health probe's HTTP status
+    /// code after the first mutation. <see cref="HealthCheckOptions.ResultStatusCodes"/>
+    /// requires a mutable <see cref="IDictionary{TKey, TValue}"/>, so the three
+    /// internal assignment sites build a per-options <see cref="Dictionary{TKey, TValue}"/>
+    /// copy via <see cref="CreateResultStatusCodesCopy"/> — a one-time init cost
+    /// (three dictionaries, three entries each) traded for guaranteed immutability
+    /// of the canonical map. Hosts that need a different status-code mapping should
+    /// not mutate this property; instead, supply their own <see cref="HealthCheckOptions"/>
+    /// through the standard <c>MapHealthChecks</c> overload.
+    /// </remarks>
+    public static readonly IReadOnlyDictionary<HealthStatus, int> ResponseStatusCodes = new Dictionary<HealthStatus, int>
     {
         [HealthStatus.Healthy] = StatusCodes.Status200OK,
         [HealthStatus.Degraded] = StatusCodes.Status503ServiceUnavailable,
         [HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
     };
+
+    // Builds a mutable copy of ResponseStatusCodes for assignment to
+    // HealthCheckOptions.ResultStatusCodes (which requires IDictionary). Each
+    // mapped endpoint gets its own copy so a future ASP.NET Core update that
+    // mutates the options dictionary in-place (or any host middleware that
+    // does so) cannot corrupt the canonical read-only singleton above. The
+    // three-entry copy is paid exactly once per call to MapTeamsHealthChecks.
+    private static Dictionary<HealthStatus, int> CreateResultStatusCodesCopy()
+        => new(ResponseStatusCodes);
 
     /// <summary>
     /// Default JSON response writer. Emits a stable envelope so downstream dashboards
