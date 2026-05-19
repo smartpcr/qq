@@ -238,6 +238,20 @@ internal sealed class SlackIdempotencyGuard<TContext> : ISlackIdempotencyGuard
             return false;
         }
 
+        // Iter-2 evaluator item #1 (LEASE TIMESTAMP BUG): FirstSeenAt
+        // MUST be stamped at acquisition time (timeProvider.GetUtcNow()),
+        // NEVER from envelope.ReceivedAt. The stale-lease check above
+        // compares (now - existing.FirstSeenAt) against
+        // SlackIdempotencyOptions.StaleProcessingThresholdSeconds, so
+        // if FirstSeenAt = envelope.ReceivedAt and the envelope sat in
+        // the inbound queue longer than the threshold, the row would
+        // be inserted as *already stale*. A concurrent Slack retry (or
+        // a second replica) would then reclaim the lease while the
+        // first handler is still actively running, producing duplicate
+        // task/decision creation and breaking the central dedup
+        // contract. The audit log records envelope.ReceivedAt
+        // separately (see SlackInboundAuditRecorder) so no observability
+        // is lost by stamping FirstSeenAt at acquisition.
         SlackInboundRequestRecord record = new()
         {
             IdempotencyKey = envelope.IdempotencyKey,
@@ -247,7 +261,7 @@ internal sealed class SlackIdempotencyGuard<TContext> : ISlackIdempotencyGuard
             UserId = string.IsNullOrEmpty(envelope.UserId) ? "unknown" : envelope.UserId,
             RawPayloadHash = HashRawPayload(envelope.RawPayload),
             ProcessingStatus = SlackInboundRequestProcessingStatus.Processing,
-            FirstSeenAt = envelope.ReceivedAt == default ? this.timeProvider.GetUtcNow() : envelope.ReceivedAt,
+            FirstSeenAt = this.timeProvider.GetUtcNow(),
             CompletedAt = null,
         };
 

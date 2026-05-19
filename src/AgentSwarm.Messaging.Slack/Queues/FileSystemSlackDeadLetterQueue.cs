@@ -15,7 +15,6 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
-using AgentSwarm.Messaging.Slack.Diagnostics;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -66,7 +65,7 @@ using Microsoft.Extensions.Logging;
 /// surface had a transient IO error.
 /// </para>
 /// </remarks>
-internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, ISlackDeadLetterQueueDepthProbe, IDisposable
+internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, IDisposable
 {
     /// <summary>
     /// Default name of the JSONL file written under the configured
@@ -267,60 +266,6 @@ internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, IS
         this.writeGate.Dispose();
     }
 
-    /// <summary>
-    /// <see cref="ISlackDeadLetterQueueDepthProbe"/> implementation:
-    /// counts non-empty lines in the JSONL dead-letter file without
-    /// deserialising any record. Returns <c>0</c> when the file does
-    /// not exist (no envelopes have been dead-lettered yet) or on
-    /// any IO failure, so a transient inspection error never crashes
-    /// the Kubernetes readiness probe.
-    /// </summary>
-    /// <remarks>
-    /// Stage 7.3 of
-    /// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>:
-    /// the DLQ-depth health check samples this value rather than
-    /// calling <see cref="InspectAsync(CancellationToken)"/>, which
-    /// would deserialise every record on every probe.
-    /// </remarks>
-    public int GetCurrentDepth()
-    {
-        if (this.disposed || !File.Exists(this.AbsoluteFilePath))
-        {
-            return 0;
-        }
-
-        try
-        {
-            int count = 0;
-            using FileStream stream = new(
-                this.AbsoluteFilePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite,
-                bufferSize: 4096,
-                useAsync: false);
-            using StreamReader reader = new(stream, Encoding.UTF8);
-            string? line;
-            while ((line = reader.ReadLine()) is not null)
-            {
-                if (!string.IsNullOrWhiteSpace(line))
-                {
-                    count++;
-                }
-            }
-
-            return count;
-        }
-        catch (Exception ex)
-        {
-            this.logger.LogWarning(
-                ex,
-                "FileSystemSlackDeadLetterQueue depth probe: failed to read {DeadLetterFile}; reporting 0.",
-                this.AbsoluteFilePath);
-            return 0;
-        }
-    }
-
     private static FileSystemSlackDeadLetterRecord ToRecord(SlackDeadLetterEntry entry)
     {
         FileSystemSlackInboundPayload? inbound = null;
@@ -348,9 +293,7 @@ internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, IS
                     CorrelationId: out_.CorrelationId,
                     MessageType: out_.MessageType.ToString(),
                     BlockKitPayload: out_.BlockKitPayload,
-                    ThreadTs: out_.ThreadTs,
-                    MessageTs: out_.MessageTs,
-                    ViewId: out_.ViewId);
+                    ThreadTs: out_.ThreadTs);
                 break;
 
             default:
@@ -445,11 +388,7 @@ internal sealed class FileSystemSlackDeadLetterQueue : ISlackDeadLetterQueue, IS
             CorrelationId: outbound.CorrelationId,
             MessageType: kind,
             BlockKitPayload: outbound.BlockKitPayload,
-            ThreadTs: outbound.ThreadTs)
-        {
-            MessageTs = outbound.MessageTs,
-            ViewId = outbound.ViewId,
-        };
+            ThreadTs: outbound.ThreadTs);
     }
 }
 
@@ -483,21 +422,13 @@ internal sealed record FileSystemSlackInboundPayload(
     string? TriggerId,
     DateTimeOffset ReceivedAt);
 
-/// <summary>
-/// Persisted shape of <see cref="SlackOutboundEnvelope"/>. Stage 6.3
-/// iter 2 added the optional <see cref="MessageTs"/> / <see cref="ViewId"/>
-/// fields so dead-lettered chat.update / views.update envelopes can be
-/// rehydrated with their target references intact for operator-driven
-/// replay.
-/// </summary>
+/// <summary>Persisted shape of <see cref="SlackOutboundEnvelope"/>.</summary>
 internal sealed record FileSystemSlackOutboundPayload(
     string TaskId,
     string CorrelationId,
     string MessageType,
     string BlockKitPayload,
-    string? ThreadTs,
-    string? MessageTs = null,
-    string? ViewId = null);
+    string? ThreadTs);
 
 /// <summary>
 /// DI extensions for <see cref="FileSystemSlackDeadLetterQueue"/>.

@@ -7,13 +7,11 @@
 namespace AgentSwarm.Messaging.Slack.Pipeline;
 
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Transport;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -31,40 +29,45 @@ using Microsoft.Extensions.Logging;
 /// logging.
 /// </para>
 /// <para>
-/// Failure semantics: the pipeline already owns the retry / DLQ
-/// path for handler failures, so a thrown exception from
-/// <see cref="SlackInboundProcessingPipeline.ProcessAsync"/> always
-/// represents an infrastructure surface (idempotency-table write,
-/// audit writer, DLQ backend) that the pipeline could not absorb.
-/// Because <see cref="Queues.ISlackInboundQueue"/> has no
-/// nack/requeue contract, the dequeued envelope is already gone from
-/// the inbound queue when the throw arrives; to honour the story's
-/// FR-005 / FR-007 zero-message-loss guarantee, the ingestor forwards
-/// EVERY non-cancellation pipeline exception (including the explicit
+/// Failure semantics: <see cref="Queues.ISlackInboundQueue"/> has no
+/// nack/requeue contract, so a dequeued envelope is already gone from
+/// the inbound queue when a downstream throw arrives. To honour the
+/// story's FR-005 / FR-007 zero-message-loss guarantee, every
+/// non-cancellation failure -- pipeline lazy-resolution, the explicit
 /// <see cref="SlackInboundDeadLetterEnqueueException"/> raised when
-/// the primary DLQ backend itself failed) to the durable last-resort
-/// <see cref="ISlackInboundEnqueueDeadLetterSink"/> before continuing
-/// the loop. The only exception the ingestor still propagates is
-/// <see cref="OperationCanceledException"/> on shutdown (so
-/// <see cref="BackgroundService.ExecuteAsync"/> exits cleanly).
+/// the primary DLQ backend itself failed, and any other pipeline
+/// exception -- is forwarded to the durable last-resort
+/// <see cref="ISlackInboundEnqueueDeadLetterSink"/> before the loop
+/// continues. <see cref="OperationCanceledException"/> on shutdown is
+/// the only exception still propagated, so
+/// <see cref="BackgroundService.ExecuteAsync"/> exits cleanly.
+/// </para>
+/// <para>
+/// The pipeline is resolved lazily via <see cref="IServiceProvider"/>
+/// (not ctor-injected) so the BackgroundService activates even when
+/// no <c>ISlackCommandHandler</c> / <c>ISlackAppMentionHandler</c> /
+/// <c>ISlackInteractionHandler</c> is registered. A missing-handler
+/// DI failure then surfaces as the FIRST per-envelope
+/// <see cref="InvalidOperationException"/> from the pipeline ctor and
+/// is captured by the resolve-failure catch below.
 /// </para>
 /// </remarks>
 internal sealed class SlackInboundIngestor : BackgroundService
 {
     private readonly ISlackInboundQueue queue;
-    private readonly SlackInboundProcessingPipeline pipeline;
-    private readonly ISlackInboundEnqueueDeadLetterSink dlqFallbackSink;
+    private readonly IServiceProvider services;
     private readonly ILogger<SlackInboundIngestor> logger;
+
+    private SlackInboundProcessingPipeline? cachedPipeline;
+    private ISlackInboundEnqueueDeadLetterSink? cachedDlqFallbackSink;
 
     public SlackInboundIngestor(
         ISlackInboundQueue queue,
-        SlackInboundProcessingPipeline pipeline,
-        ISlackInboundEnqueueDeadLetterSink dlqFallbackSink,
+        IServiceProvider services,
         ILogger<SlackInboundIngestor> logger)
     {
         this.queue = queue ?? throw new ArgumentNullException(nameof(queue));
-        this.pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
-        this.dlqFallbackSink = dlqFallbackSink ?? throw new ArgumentNullException(nameof(dlqFallbackSink));
+        this.services = services ?? throw new ArgumentNullException(nameof(services));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -89,32 +92,66 @@ internal sealed class SlackInboundIngestor : BackgroundService
                     break;
                 }
 
-                // Stage 7.2: bump `slack.inbound.count` for every
-                // envelope drained from the queue, tagged with the
-                // source type so dashboards can split command /
-                // interaction / event traffic. Wrap the per-envelope
-                // pipeline work in a parent `slack.inbound.receive`
-                // span (ActivityKind.Consumer marks the queue-drain
-                // boundary per OTel semantic conventions).
-                SlackTelemetry.InboundCount.Add(
-                    1,
-                    new KeyValuePair<string, object?>(SlackTelemetry.AttributeSourceType, envelope.SourceType.ToString()),
-                    new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, envelope.TeamId ?? string.Empty));
+                // Lazily resolve the pipeline (and last-resort DLQ
+                // sink) so the host can boot even when no Stage 5
+                // handlers are registered. A missing-handler DI
+                // failure surfaces as an InvalidOperationException
+                // from the pipeline ctor; the catch routes the
+                // envelope to the last-resort sink so it is preserved
+                // instead of silently lost.
+                SlackInboundProcessingPipeline? pipeline;
+                ISlackInboundEnqueueDeadLetterSink? fallbackSink;
+                try
+                {
+                    pipeline = this.GetPipeline();
+                    fallbackSink = this.GetDlqFallbackSink();
+                }
+                catch (Exception resolveEx)
+                {
+                    this.logger.LogCritical(
+                        resolveEx,
+                        "SlackInboundIngestor could not resolve the processing pipeline for idempotency_key={IdempotencyKey} source={SourceType}; the most likely cause is missing ISlackCommandHandler / ISlackAppMentionHandler / ISlackInteractionHandler registrations (real Stage 5 handlers or AddSlackInboundDevelopmentHandlerStubs). Forwarding envelope to the last-resort dead-letter sink.",
+                        envelope.IdempotencyKey,
+                        envelope.SourceType);
 
-                using Activity? receiveSpan = SlackTelemetry.StartInboundSpan(
-                    SlackTelemetry.InboundReceiveSpanName,
-                    envelope,
-                    ActivityKind.Consumer);
+                    try
+                    {
+                        ISlackInboundEnqueueDeadLetterSink? sink = this.TryGetDlqFallbackSink();
+                        if (sink is not null)
+                        {
+                            await sink
+                                .RecordDeadLetterAsync(envelope, resolveEx, attemptCount: 0, stoppingToken)
+                                .ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            this.logger.LogCritical(
+                                "SlackInboundIngestor could not resolve the last-resort dead-letter sink either; envelope idempotency_key={IdempotencyKey} source={SourceType} is unrecoverable.",
+                                envelope.IdempotencyKey,
+                                envelope.SourceType);
+                        }
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception sinkEx)
+                    {
+                        this.logger.LogCritical(
+                            sinkEx,
+                            "SlackInboundIngestor last-resort dead-letter sink threw while absorbing a pipeline-resolution failure for idempotency_key={IdempotencyKey} source={SourceType}; envelope is unrecoverable.",
+                            envelope.IdempotencyKey,
+                            envelope.SourceType);
+                    }
 
-                using IDisposable scope = SlackTelemetry.CreateScope(this.logger, envelope);
+                    continue;
+                }
 
                 try
                 {
-                    SlackInboundProcessingOutcome outcome = await this.pipeline
+                    SlackInboundProcessingOutcome outcome = await pipeline
                         .ProcessAsync(envelope, stoppingToken)
                         .ConfigureAwait(false);
-
-                    receiveSpan?.SetTag(SlackTelemetry.AttributeOutcome, outcome.ToString());
 
                     this.logger.LogDebug(
                         "SlackInboundIngestor processed envelope idempotency_key={IdempotencyKey} source={SourceType} outcome={Outcome}.",
@@ -128,20 +165,11 @@ internal sealed class SlackInboundIngestor : BackgroundService
                 }
                 catch (SlackInboundDeadLetterEnqueueException dlqEnqueueEx)
                 {
-                    // The pipeline retried the handler, exhausted its
-                    // budget, then attempted to hand the envelope to
-                    // ISlackDeadLetterQueue -- and the DLQ backend
-                    // itself blew up. Since ISlackInboundQueue has no
-                    // nack/requeue contract the envelope is already
-                    // gone from the inbound queue, so the only way to
-                    // honor the story's no-loss guarantee is to forward
-                    // the envelope to the durable last-resort sink
-                    // (Stage 4.1's ISlackInboundEnqueueDeadLetterSink:
-                    // bounded ring buffer + LogCritical by default,
-                    // upgradeable to FileSystemSlackInboundEnqueueDeadLetterSink
-                    // for JSONL on disk). The sink's docstring promises
-                    // it absorbs its own failures, but we still wrap
-                    // defensively so a sink throw cannot kill the loop.
+                    // The pipeline exhausted its retry budget and
+                    // then the primary DLQ backend itself failed.
+                    // ISlackInboundQueue has no nack contract, so
+                    // forward to the durable last-resort sink to
+                    // preserve at-least-once delivery semantics.
                     this.logger.LogCritical(
                         dlqEnqueueEx,
                         "SlackInboundIngestor DLQ enqueue failed for idempotency_key={IdempotencyKey} source={SourceType} after {AttemptCount} handler attempts; forwarding envelope to last-resort dead-letter sink to preserve at-least-once delivery semantics.",
@@ -151,7 +179,7 @@ internal sealed class SlackInboundIngestor : BackgroundService
 
                     try
                     {
-                        await this.dlqFallbackSink
+                        await fallbackSink
                             .RecordDeadLetterAsync(envelope, dlqEnqueueEx, dlqEnqueueEx.AttemptCount, stoppingToken)
                             .ConfigureAwait(false);
                     }
@@ -170,27 +198,14 @@ internal sealed class SlackInboundIngestor : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    // Iter-5 evaluator item #1: the pipeline only
-                    // throws non-cancellation exceptions when an
-                    // infrastructure surface (idempotency-table
-                    // probe/SaveChanges, audit writer, DLQ backend)
-                    // failed in a way the pipeline itself could not
-                    // absorb -- e.g.
-                    // SlackIdempotencyGuard.TryAcquireAsync propagates
-                    // a transient DbUpdateException that has no
-                    // competing row, rather than silently dropping
-                    // the envelope as a duplicate. Since
-                    // ISlackInboundQueue has no nack/requeue contract
-                    // the envelope is already gone from the inbound
-                    // queue, so just logging and continuing would
-                    // permanently lose the payload (violates the
-                    // story's FR-005 / FR-007 zero-loss expectation).
-                    // Forward the envelope to the durable last-resort
-                    // sink (bounded ring buffer + LogCritical by
-                    // default, upgradeable to JSONL on disk) so an
-                    // operator can replay it after the upstream
-                    // surface recovers. Wrap the forward in its own
-                    // try/catch so a sink throw cannot kill the loop.
+                    // The pipeline propagates non-cancellation
+                    // exceptions only when an infrastructure surface
+                    // (idempotency-table probe/SaveChanges, audit
+                    // writer, DLQ backend) failed in a way the
+                    // pipeline itself could not absorb. Forward to
+                    // the last-resort sink so the envelope is not
+                    // permanently lost -- ISlackInboundQueue has no
+                    // nack/requeue contract.
                     this.logger.LogError(
                         ex,
                         "SlackInboundIngestor pipeline threw unexpectedly for idempotency_key={IdempotencyKey} source={SourceType}; forwarding envelope to last-resort dead-letter sink to preserve at-least-once delivery semantics.",
@@ -199,7 +214,7 @@ internal sealed class SlackInboundIngestor : BackgroundService
 
                     try
                     {
-                        await this.dlqFallbackSink
+                        await fallbackSink
                             .RecordDeadLetterAsync(envelope, ex, attemptCount: 0, stoppingToken)
                             .ConfigureAwait(false);
                     }
@@ -222,5 +237,28 @@ internal sealed class SlackInboundIngestor : BackgroundService
         {
             this.logger.LogInformation("SlackInboundIngestor stopping.");
         }
+    }
+
+    private SlackInboundProcessingPipeline GetPipeline()
+    {
+        // Cache after first successful resolution so subsequent
+        // envelopes do not re-pay the lookup cost. The pipeline is
+        // registered as a singleton so caching is correct.
+        return this.cachedPipeline ??= this.services.GetRequiredService<SlackInboundProcessingPipeline>();
+    }
+
+    private ISlackInboundEnqueueDeadLetterSink GetDlqFallbackSink()
+    {
+        return this.cachedDlqFallbackSink ??= this.services.GetRequiredService<ISlackInboundEnqueueDeadLetterSink>();
+    }
+
+    private ISlackInboundEnqueueDeadLetterSink? TryGetDlqFallbackSink()
+    {
+        // GetService<T>() returns null when the contract is not
+        // registered -- preferred over a broad try/catch around
+        // GetRequiredService<T>() because the null surface is
+        // explicit and cannot mask an unrelated activation failure.
+        return this.cachedDlqFallbackSink
+            ??= this.services.GetService<ISlackInboundEnqueueDeadLetterSink>();
     }
 }

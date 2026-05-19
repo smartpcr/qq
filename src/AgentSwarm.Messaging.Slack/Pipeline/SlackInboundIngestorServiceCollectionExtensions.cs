@@ -47,27 +47,26 @@ public static class SlackInboundIngestorServiceCollectionExtensions
     /// running.
     /// </para>
     /// <para>
-    /// <b>Iter 5 evaluator item #2 (STRUCTURAL fix).</b> Earlier iters
-    /// registered <see cref="NoOpSlackCommandHandler"/>,
+    /// <b>Handler registrations are intentionally OUT-OF-BAND.</b>
+    /// Earlier iters registered <see cref="NoOpSlackCommandHandler"/>,
     /// <see cref="NoOpSlackAppMentionHandler"/>, and
-    /// <see cref="NoOpSlackInteractionHandler"/> as the production
-    /// defaults via <c>TryAddSingleton</c>; a host that called
-    /// <c>AddSlackInboundIngestor</c> and forgot to register real
-    /// Stage 5 handlers would silently ack-and-drop every Slack
-    /// request because the no-op completes the envelope and the
-    /// idempotency guard marks it <c>completed</c>. To eliminate
-    /// that silent-loss class of bug, this extension no longer
-    /// registers the no-op handlers. A host that does not register
-    /// <see cref="ISlackCommandHandler"/> /
+    /// <see cref="NoOpSlackInteractionHandler"/> as production
+    /// defaults; a host that forgot to register real Stage 5 handlers
+    /// would silently ack-and-drop every Slack request because the
+    /// no-op completes the envelope and the idempotency guard marks
+    /// it <c>completed</c>. To eliminate that silent-loss class of
+    /// bug, this extension does NOT register the no-op handlers. A
+    /// host without <see cref="ISlackCommandHandler"/> /
     /// <see cref="ISlackAppMentionHandler"/> /
-    /// <see cref="ISlackInteractionHandler"/> will get a clear
-    /// <see cref="InvalidOperationException"/> at the first envelope
-    /// dispatch (the pipeline resolves the handlers from DI when it
-    /// is constructed) -- a fail-fast surface that a production
-    /// deployment can detect at startup. Development hosts that
-    /// genuinely want the no-op stand-ins (e.g. the Worker before
-    /// Stage 5.1/5.2/5.3 ships) opt in explicitly by additionally
-    /// calling <see cref="AddSlackInboundDevelopmentHandlerStubs"/>.
+    /// <see cref="ISlackInteractionHandler"/> registrations gets an
+    /// <see cref="InvalidOperationException"/> from the pipeline ctor
+    /// the first time <see cref="SlackInboundIngestor"/> lazily
+    /// resolves it for a dequeued envelope; the ingestor forwards
+    /// that envelope to the durable last-resort
+    /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> so the host
+    /// still starts cleanly and the envelope is preserved. Dev
+    /// hosts that want the no-op stand-ins opt in via
+    /// <see cref="AddSlackInboundDevelopmentHandlerStubs"/>.
     /// </para>
     /// </remarks>
     public static IServiceCollection AddSlackInboundIngestor<TContext>(this IServiceCollection services)
@@ -87,23 +86,6 @@ public static class SlackInboundIngestorServiceCollectionExtensions
         // through.
         services.TryAddSingleton<ISlackInboundAuthorizer, SlackInboundAuthorizer>();
 
-        // Stage 8.2 AC-5: the authorizer posts a "rejected" ephemeral
-        // back to the originating user via response_url on the async
-        // pipeline path. The command / interaction dispatch extensions
-        // both register HttpClientSlackEphemeralResponder under TryAdd
-        // already, so a host that wires either of them wins; this
-        // duplicate TryAdd defensively covers a host that wires the
-        // ingestor (and therefore the authorizer) WITHOUT wiring
-        // either dispatch extension -- a Socket-Mode-only deployment
-        // can be in exactly that shape, and an unresolvable
-        // ISlackEphemeralResponder would surface as an opaque DI
-        // failure at the first envelope rejection. The named
-        // HttpClient registration mirrors the one in the dispatch
-        // extensions; AddHttpClient is idempotent on (name) so a
-        // duplicate is harmless.
-        services.AddHttpClient(HttpClientSlackEphemeralResponder.HttpClientName);
-        services.TryAddSingleton<ISlackEphemeralResponder, HttpClientSlackEphemeralResponder>();
-
         // Retry policy. The fast-path / outbound stages also resolve
         // ISlackRetryPolicy; using TryAdd lets either side win and
         // ensures both share the same backoff configuration.
@@ -116,10 +98,9 @@ public static class SlackInboundIngestorServiceCollectionExtensions
         services.TryAddSingleton<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>();
 
         // NOTE: ISlackCommandHandler / ISlackAppMentionHandler /
-        // ISlackInteractionHandler are INTENTIONALLY NOT registered
-        // here -- see the class-level remarks for the iter-5
-        // evaluator-driven rationale. Hosts MUST register real
-        // handlers (Stage 5.1/5.2/5.3) or call
+        // ISlackInteractionHandler are intentionally NOT registered
+        // here (see remarks). Hosts MUST register real handlers
+        // (Stage 5.1/5.2/5.3) or call
         // AddSlackInboundDevelopmentHandlerStubs to opt into the
         // no-op stand-ins.
 

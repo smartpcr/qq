@@ -330,6 +330,91 @@ public sealed class SlackIdempotencyGuardTests : IDisposable
         row.CompletedAt.Should().BeNull("reclaimed lease starts a new attempt");
     }
 
+    [Fact]
+    public async Task TryAcquireAsync_stamps_FirstSeenAt_at_acquisition_time_not_envelope_ReceivedAt()
+    {
+        // Iter-2 evaluator item #1 (LEASE TIMESTAMP BUG): the row's
+        // FirstSeenAt must be the moment the guard inserted it, NOT
+        // the envelope's transport-received timestamp. Otherwise a
+        // backlogged envelope (e.g. queued before a workstream pause)
+        // would be inserted already-stale, and the very next
+        // redelivery would reclaim a lease that the first handler is
+        // still actively running -- producing duplicate task/decision
+        // creation that violates architecture.md §2.6's central dedup
+        // guarantee.
+        SlackIdempotencyGuard<SlackTestDbContext> guard = this.BuildGuardWithStaleThreshold(60);
+        DateTimeOffset acquisitionBefore = DateTimeOffset.UtcNow;
+
+        SlackInboundEnvelope backloggedEnvelope = new(
+            IdempotencyKey: "cmd:T1:U1:/agent:trig-backlog",
+            SourceType: SlackInboundSourceType.Command,
+            TeamId: "T1",
+            ChannelId: "C1",
+            UserId: "U1",
+            RawPayload: "team_id=T1&user_id=U1&command=/agent&trigger_id=trig-backlog",
+            TriggerId: "trig-backlog",
+            ReceivedAt: DateTimeOffset.UtcNow.AddMinutes(-30));
+
+        bool acquired = await guard.TryAcquireAsync(backloggedEnvelope, CancellationToken.None);
+
+        acquired.Should().BeTrue("the key is brand new");
+
+        using IServiceScope scope = this.serviceProvider.CreateScope();
+        SlackInboundRequestRecord row = scope.ServiceProvider
+            .GetRequiredService<SlackTestDbContext>()
+            .InboundRequests.Single();
+        row.FirstSeenAt.Should().BeOnOrAfter(acquisitionBefore,
+            "FirstSeenAt must be stamped at acquisition time, not envelope.ReceivedAt -- otherwise a backlogged envelope would be inserted with an already-stale lease and the next Slack retry would reclaim it while the first handler is still running.");
+        row.FirstSeenAt.Should().BeAfter(backloggedEnvelope.ReceivedAt,
+            "FirstSeenAt MUST NOT be seeded from envelope.ReceivedAt; that is the iter-2 evaluator regression.");
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_does_NOT_reclaim_just_acquired_lease_even_when_envelope_ReceivedAt_is_older_than_threshold()
+    {
+        // Iter-2 evaluator item #1 regression: an envelope queued for
+        // longer than the stale-lease threshold MUST still defer (not
+        // reclaim) on its immediate Slack redelivery. Before the fix,
+        // the freshly-inserted row's FirstSeenAt was set to
+        // envelope.ReceivedAt, so the age check `now - FirstSeenAt`
+        // exceeded the threshold IMMEDIATELY on insert and the second
+        // call reclaimed the active lease -- producing duplicate
+        // handler execution.
+        SlackIdempotencyGuard<SlackTestDbContext> guard = this.BuildGuardWithStaleThreshold(60);
+
+        // ReceivedAt is 30 minutes old -- WELL past the 60-second
+        // stale-lease threshold. If FirstSeenAt were seeded from
+        // ReceivedAt, the row would be stale the instant we insert
+        // it.
+        SlackInboundEnvelope backloggedEnvelope = new(
+            IdempotencyKey: "cmd:T1:U1:/agent:trig-backlog-defer",
+            SourceType: SlackInboundSourceType.Command,
+            TeamId: "T1",
+            ChannelId: "C1",
+            UserId: "U1",
+            RawPayload: "team_id=T1&user_id=U1&command=/agent&trigger_id=trig-backlog-defer",
+            TriggerId: "trig-backlog-defer",
+            ReceivedAt: DateTimeOffset.UtcNow.AddMinutes(-30));
+
+        (await guard.TryAcquireAsync(backloggedEnvelope, CancellationToken.None))
+            .Should().BeTrue("brand-new key acquires");
+
+        // Immediate concurrent Slack retry -- back-to-back with the
+        // insert, so the lease is brand new (< 1 second old). The
+        // central dedup guarantee REQUIRES this to defer, not
+        // reclaim.
+        (await guard.TryAcquireAsync(backloggedEnvelope, CancellationToken.None))
+            .Should().BeFalse(
+                "a redelivery arriving immediately after acquisition MUST defer to the live in-flight lease; reclaiming here would produce duplicate handler execution and break the dedup contract.");
+
+        using IServiceScope scope = this.serviceProvider.CreateScope();
+        SlackInboundRequestRecord row = scope.ServiceProvider
+            .GetRequiredService<SlackTestDbContext>()
+            .InboundRequests.Single();
+        row.ProcessingStatus.Should().Be(SlackInboundRequestProcessingStatus.Processing);
+        row.CompletedAt.Should().BeNull("the first handler is still running -- nothing terminal happened.");
+    }
+
     private SlackIdempotencyGuard<SlackTestDbContext> BuildGuard()
         => new(
             this.serviceProvider.GetRequiredService<IServiceScopeFactory>(),
