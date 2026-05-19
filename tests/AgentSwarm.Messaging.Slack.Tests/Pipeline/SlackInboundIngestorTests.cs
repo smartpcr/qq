@@ -21,6 +21,7 @@ using AgentSwarm.Messaging.Slack.Retry;
 using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -57,8 +58,7 @@ public sealed class SlackInboundIngestorTests
 
         SlackInboundIngestor ingestor = new(
             queue,
-            pipeline,
-            new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance),
+            BuildIngestorServices(pipeline, new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance)),
             NullLogger<SlackInboundIngestor>.Instance);
 
         // Pre-enqueue two envelopes BEFORE starting so the ingestor's
@@ -95,8 +95,7 @@ public sealed class SlackInboundIngestorTests
         ThrowingPipeline pipeline = new();
         SlackInboundIngestor ingestor = new(
             queue,
-            pipeline.Build(),
-            new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance),
+            BuildIngestorServices(pipeline.Build(), new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance)),
             NullLogger<SlackInboundIngestor>.Instance);
 
         await queue.EnqueueAsync(BuildCommandEnvelope("cmd:T1:U1:/agent:trig-bad"));
@@ -134,8 +133,7 @@ public sealed class SlackInboundIngestorTests
 
         SlackInboundIngestor ingestor = new(
             queue,
-            pipeline,
-            new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance),
+            BuildIngestorServices(pipeline, new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance)),
             NullLogger<SlackInboundIngestor>.Instance);
 
         using CancellationTokenSource cts = new();
@@ -169,8 +167,7 @@ public sealed class SlackInboundIngestorTests
         RecordingDeadLetterFallbackSink sink = new();
         SlackInboundIngestor ingestor = new(
             queue,
-            pipeline,
-            sink,
+            BuildIngestorServices(pipeline, sink),
             NullLogger<SlackInboundIngestor>.Instance);
 
         await queue.EnqueueAsync(deadletteredEnvelope);
@@ -226,8 +223,7 @@ public sealed class SlackInboundIngestorTests
         RecordingDeadLetterFallbackSink sink = new();
         SlackInboundIngestor ingestor = new(
             queue,
-            pipeline,
-            sink,
+            BuildIngestorServices(pipeline, sink),
             NullLogger<SlackInboundIngestor>.Instance);
 
         await queue.EnqueueAsync(leakedEnvelope);
@@ -306,8 +302,7 @@ public sealed class SlackInboundIngestorTests
             RecordingDeadLetterFallbackSink sink = new();
             SlackInboundIngestor ingestor = new(
                 queue,
-                pipeline,
-                sink,
+                BuildIngestorServices(pipeline, sink),
                 NullLogger<SlackInboundIngestor>.Instance);
 
             SlackInboundEnvelope leaked = BuildCommandEnvelope("cmd:T1:U1:/agent:fs-dlq-fail");
@@ -379,6 +374,27 @@ public sealed class SlackInboundIngestorTests
 
             await Task.Delay(20);
         }
+    }
+
+    /// <summary>
+    /// Builds a minimal <see cref="IServiceProvider"/> wired with the
+    /// pipeline + fallback sink instances the test wants the ingestor
+    /// to resolve at runtime. Mirrors the iter-2 lazy-resolution
+    /// signature of <see cref="SlackInboundIngestor"/>: the ingestor's
+    /// ctor no longer ctor-injects the pipeline so it can boot even
+    /// when no Stage 5 handlers are registered; the resolution happens
+    /// on the first dequeued envelope. Tests that already build a
+    /// concrete pipeline up-front just register it as a singleton on
+    /// the test-local <see cref="ServiceCollection"/>.
+    /// </summary>
+    private static IServiceProvider BuildIngestorServices(
+        SlackInboundProcessingPipeline pipeline,
+        ISlackInboundEnqueueDeadLetterSink fallbackSink)
+    {
+        ServiceCollection services = new();
+        services.AddSingleton(pipeline);
+        services.AddSingleton(fallbackSink);
+        return services.BuildServiceProvider();
     }
 
     private static SlackInboundEnvelope BuildCommandEnvelope(string key) => new(

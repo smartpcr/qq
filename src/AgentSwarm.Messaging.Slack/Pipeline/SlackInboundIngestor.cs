@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Transport;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -45,23 +46,41 @@ using Microsoft.Extensions.Logging;
 /// <see cref="OperationCanceledException"/> on shutdown (so
 /// <see cref="BackgroundService.ExecuteAsync"/> exits cleanly).
 /// </para>
+/// <para>
+/// <b>Iter-2 evaluator item #2 (lazy pipeline resolution).</b> The
+/// ingestor takes <see cref="IServiceProvider"/> rather than the
+/// pipeline directly so the BackgroundService can be activated by
+/// the host even when no <c>ISlackCommandHandler</c> /
+/// <c>ISlackAppMentionHandler</c> / <c>ISlackInteractionHandler</c>
+/// is registered (i.e. a Production deployment that has opted OUT
+/// of <c>AddSlackInboundDevelopmentHandlerStubs</c> per the iter-2
+/// gate but has not yet wired Stage 5.x real handlers). The
+/// pipeline is resolved lazily on the FIRST dequeued envelope; if
+/// the handler registrations are missing, DI throws
+/// <see cref="InvalidOperationException"/> at that point, the
+/// existing <c>catch (Exception ex)</c> block forwards the envelope
+/// to the durable last-resort sink, and the loop continues so
+/// subsequent failures are also captured. This is the visible
+/// fail-loud surface that replaces the previous silent ack-and-drop
+/// behaviour.
+/// </para>
 /// </remarks>
 internal sealed class SlackInboundIngestor : BackgroundService
 {
     private readonly ISlackInboundQueue queue;
-    private readonly SlackInboundProcessingPipeline pipeline;
-    private readonly ISlackInboundEnqueueDeadLetterSink dlqFallbackSink;
+    private readonly IServiceProvider services;
     private readonly ILogger<SlackInboundIngestor> logger;
+
+    private SlackInboundProcessingPipeline? cachedPipeline;
+    private ISlackInboundEnqueueDeadLetterSink? cachedDlqFallbackSink;
 
     public SlackInboundIngestor(
         ISlackInboundQueue queue,
-        SlackInboundProcessingPipeline pipeline,
-        ISlackInboundEnqueueDeadLetterSink dlqFallbackSink,
+        IServiceProvider services,
         ILogger<SlackInboundIngestor> logger)
     {
         this.queue = queue ?? throw new ArgumentNullException(nameof(queue));
-        this.pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
-        this.dlqFallbackSink = dlqFallbackSink ?? throw new ArgumentNullException(nameof(dlqFallbackSink));
+        this.services = services ?? throw new ArgumentNullException(nameof(services));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -86,9 +105,71 @@ internal sealed class SlackInboundIngestor : BackgroundService
                     break;
                 }
 
+                // Iter-2 evaluator item #2: lazily resolve the pipeline
+                // (and the last-resort DLQ sink) so the host can boot
+                // even when no Stage 5 handlers are registered. A
+                // missing-handler DI failure surfaces below as the
+                // first per-envelope InvalidOperationException, which
+                // the existing catch routes to the last-resort sink so
+                // the envelope is preserved instead of silently lost.
+                SlackInboundProcessingPipeline? pipeline;
+                ISlackInboundEnqueueDeadLetterSink? fallbackSink;
                 try
                 {
-                    SlackInboundProcessingOutcome outcome = await this.pipeline
+                    pipeline = this.GetPipeline();
+                    fallbackSink = this.GetDlqFallbackSink();
+                }
+                catch (Exception resolveEx)
+                {
+                    // The pipeline could not be resolved -- almost
+                    // certainly because the production composition
+                    // root did not register the Stage 5 handlers AND
+                    // did not opt into AddSlackInboundDevelopmentHandlerStubs.
+                    // We MUST NOT silently drop the envelope; try the
+                    // last-resort sink (resolved independently so the
+                    // missing handler does not poison this fallback).
+                    this.logger.LogCritical(
+                        resolveEx,
+                        "SlackInboundIngestor could not resolve the processing pipeline for idempotency_key={IdempotencyKey} source={SourceType}; the most likely cause is missing ISlackCommandHandler / ISlackAppMentionHandler / ISlackInteractionHandler registrations (real Stage 5 handlers or AddSlackInboundDevelopmentHandlerStubs). Forwarding envelope to the last-resort dead-letter sink.",
+                        envelope.IdempotencyKey,
+                        envelope.SourceType);
+
+                    try
+                    {
+                        ISlackInboundEnqueueDeadLetterSink? sink = this.TryGetDlqFallbackSink();
+                        if (sink is not null)
+                        {
+                            await sink
+                                .RecordDeadLetterAsync(envelope, resolveEx, attemptCount: 0, stoppingToken)
+                                .ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            this.logger.LogCritical(
+                                "SlackInboundIngestor could not resolve the last-resort dead-letter sink either; envelope idempotency_key={IdempotencyKey} source={SourceType} is unrecoverable.",
+                                envelope.IdempotencyKey,
+                                envelope.SourceType);
+                        }
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception sinkEx)
+                    {
+                        this.logger.LogCritical(
+                            sinkEx,
+                            "SlackInboundIngestor last-resort dead-letter sink threw while absorbing a pipeline-resolution failure for idempotency_key={IdempotencyKey} source={SourceType}; envelope is unrecoverable.",
+                            envelope.IdempotencyKey,
+                            envelope.SourceType);
+                    }
+
+                    continue;
+                }
+
+                try
+                {
+                    SlackInboundProcessingOutcome outcome = await pipeline
                         .ProcessAsync(envelope, stoppingToken)
                         .ConfigureAwait(false);
 
@@ -127,7 +208,7 @@ internal sealed class SlackInboundIngestor : BackgroundService
 
                     try
                     {
-                        await this.dlqFallbackSink
+                        await fallbackSink
                             .RecordDeadLetterAsync(envelope, dlqEnqueueEx, dlqEnqueueEx.AttemptCount, stoppingToken)
                             .ConfigureAwait(false);
                     }
@@ -175,7 +256,7 @@ internal sealed class SlackInboundIngestor : BackgroundService
 
                     try
                     {
-                        await this.dlqFallbackSink
+                        await fallbackSink
                             .RecordDeadLetterAsync(envelope, ex, attemptCount: 0, stoppingToken)
                             .ConfigureAwait(false);
                     }
@@ -197,6 +278,37 @@ internal sealed class SlackInboundIngestor : BackgroundService
         finally
         {
             this.logger.LogInformation("SlackInboundIngestor stopping.");
+        }
+    }
+
+    private SlackInboundProcessingPipeline GetPipeline()
+    {
+        // Cache after first successful resolution so subsequent
+        // envelopes do not re-pay the lookup cost. The pipeline is
+        // registered as a singleton so caching is correct.
+        return this.cachedPipeline ??= this.services.GetRequiredService<SlackInboundProcessingPipeline>();
+    }
+
+    private ISlackInboundEnqueueDeadLetterSink GetDlqFallbackSink()
+    {
+        return this.cachedDlqFallbackSink ??= this.services.GetRequiredService<ISlackInboundEnqueueDeadLetterSink>();
+    }
+
+    private ISlackInboundEnqueueDeadLetterSink? TryGetDlqFallbackSink()
+    {
+        if (this.cachedDlqFallbackSink is not null)
+        {
+            return this.cachedDlqFallbackSink;
+        }
+
+        try
+        {
+            this.cachedDlqFallbackSink = this.services.GetRequiredService<ISlackInboundEnqueueDeadLetterSink>();
+            return this.cachedDlqFallbackSink;
+        }
+        catch
+        {
+            return null;
         }
     }
 }

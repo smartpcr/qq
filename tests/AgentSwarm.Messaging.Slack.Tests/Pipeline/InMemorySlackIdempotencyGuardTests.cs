@@ -162,6 +162,69 @@ public sealed class InMemorySlackIdempotencyGuardTests
         row.CompletedAt.Should().BeNull("reclaimed lease starts a new attempt");
     }
 
+    [Fact]
+    public async Task TryAcquireAsync_stamps_FirstSeenAt_at_acquisition_time_not_envelope_ReceivedAt()
+    {
+        // Iter-2 evaluator item #1 (LEASE TIMESTAMP BUG): the recorded
+        // FirstSeenAt MUST be the acquisition moment, not the
+        // envelope's transport-received timestamp. Same parity with
+        // SlackIdempotencyGuardTests for the EF backing store.
+        InMemorySlackIdempotencyGuard guard = new();
+        DateTimeOffset acquisitionBefore = DateTimeOffset.UtcNow;
+
+        SlackInboundEnvelope backloggedEnvelope = new(
+            IdempotencyKey: "event:Ev-backlog",
+            SourceType: SlackInboundSourceType.Event,
+            TeamId: "T1",
+            ChannelId: "C1",
+            UserId: "U1",
+            RawPayload: "{}",
+            TriggerId: null,
+            ReceivedAt: DateTimeOffset.UtcNow.AddMinutes(-30));
+
+        bool acquired = await guard.TryAcquireAsync(backloggedEnvelope, CancellationToken.None);
+
+        acquired.Should().BeTrue();
+        InMemorySlackIdempotencyGuard.Entry row = guard.Snapshot["event:Ev-backlog"];
+        row.FirstSeenAt.Should().BeOnOrAfter(acquisitionBefore,
+            "FirstSeenAt must be the acquisition moment, NOT envelope.ReceivedAt -- otherwise a backlogged envelope would be inserted with an already-stale lease.");
+        row.FirstSeenAt.Should().BeAfter(backloggedEnvelope.ReceivedAt,
+            "FirstSeenAt MUST NOT be seeded from envelope.ReceivedAt (iter-2 evaluator regression).");
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_does_NOT_reclaim_just_acquired_lease_even_when_envelope_ReceivedAt_is_older_than_threshold()
+    {
+        // Iter-2 evaluator item #1 regression. See parity test in
+        // SlackIdempotencyGuardTests for the failure-mode rationale.
+        InMemorySlackIdempotencyGuard guard = new(
+            timeProvider: TimeProvider.System,
+            options: Microsoft.Extensions.Options.Options.Create(new AgentSwarm.Messaging.Slack.Configuration.SlackConnectorOptions
+            {
+                Idempotency = { StaleProcessingThresholdSeconds = 60 },
+            }));
+
+        SlackInboundEnvelope backloggedEnvelope = new(
+            IdempotencyKey: "event:Ev-backlog-defer",
+            SourceType: SlackInboundSourceType.Event,
+            TeamId: "T1",
+            ChannelId: "C1",
+            UserId: "U1",
+            RawPayload: "{}",
+            TriggerId: null,
+            ReceivedAt: DateTimeOffset.UtcNow.AddMinutes(-30));
+
+        (await guard.TryAcquireAsync(backloggedEnvelope, CancellationToken.None))
+            .Should().BeTrue("brand-new key acquires");
+        (await guard.TryAcquireAsync(backloggedEnvelope, CancellationToken.None))
+            .Should().BeFalse(
+                "a redelivery arriving immediately after acquisition MUST defer to the live in-flight lease; reclaiming here would produce duplicate handler execution and break the dedup contract.");
+
+        InMemorySlackIdempotencyGuard.Entry row = guard.Snapshot["event:Ev-backlog-defer"];
+        row.ProcessingStatus.Should().Be(SlackInboundRequestProcessingStatus.Processing);
+        row.CompletedAt.Should().BeNull();
+    }
+
     private static SlackInboundEnvelope BuildEnvelope(string key) => new(
         IdempotencyKey: key,
         SourceType: SlackInboundSourceType.Event,

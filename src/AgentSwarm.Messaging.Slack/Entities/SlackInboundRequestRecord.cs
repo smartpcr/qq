@@ -65,7 +65,20 @@ public sealed class SlackInboundRequestRecord
     public string ProcessingStatus { get; set; } = string.Empty;
 
     /// <summary>
-    /// UTC timestamp at which the request was first observed.
+    /// UTC timestamp at which the dedup store first <b>persisted</b>
+    /// this idempotency key -- i.e. the moment the
+    /// <c>SlackIdempotencyGuard.TryAcquireAsync</c> insert succeeded
+    /// (or the reclaim CAS bumped the row). Doubles as the lease-
+    /// acquired-at marker that
+    /// <c>SlackIdempotencyOptions.StaleProcessingThresholdSeconds</c>
+    /// measures against. <b>NOT</b> the transport-layer
+    /// <c>envelope.ReceivedAt</c>: an envelope that sat in the
+    /// inbound queue longer than the stale threshold must NOT be
+    /// inserted with a pre-stale lease, or a concurrent Slack retry
+    /// could reclaim it while the original handler is still running
+    /// (the iter-2 evaluator regression). The envelope's transport-
+    /// received timestamp is audited separately by
+    /// <c>SlackInboundAuditRecorder</c>.
     /// </summary>
     public DateTimeOffset FirstSeenAt { get; set; }
 

@@ -7,6 +7,7 @@ using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 
 namespace AgentSwarm.Messaging.Worker;
 
@@ -27,6 +28,26 @@ public class Program
     /// the host actually reads.
     /// </summary>
     public const string SlackAuditConnectionStringKey = "SlackAudit";
+
+    /// <summary>
+    /// Configuration key (boolean) that gates the iter-2 evaluator
+    /// item #2 opt-in for the no-op Slack handler stand-ins
+    /// (<see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>).
+    /// When this key is unset, the gate defaults to
+    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>:
+    /// development hosts continue to wire the stubs so the ingestor
+    /// remains resolvable before Stage 5.1/5.2/5.3 ships real
+    /// command/app_mention/interaction handlers, while
+    /// Production/Staging/Testing hosts get a fail-fast
+    /// <see cref="InvalidOperationException"/> at the first envelope
+    /// dispatch instead of silently ack-and-dropping every Slack
+    /// request via the no-op completions. Operators can explicitly
+    /// opt in (e.g. for a Production smoke test) by setting this
+    /// key to <c>true</c>; setting it to <c>false</c> forces the
+    /// production fail-fast even on a dev laptop.
+    /// </summary>
+    public const string EnableDevelopmentHandlerStubsKey =
+        "Slack:Inbound:EnableDevelopmentHandlerStubs";
 
     public static void Main(string[] args)
     {
@@ -196,24 +217,36 @@ public class Program
         builder.Services
             .AddSlackInboundIngestor<SlackPersistenceDbContext>();
 
-        // Stage 4.3 iter 6 evaluator item #2 (STRUCTURAL fix):
-        // AddSlackInboundIngestor INTENTIONALLY no longer registers
-        // no-op handler defaults. A production host that resolved
-        // ISlackCommandHandler / ISlackAppMentionHandler /
-        // ISlackInteractionHandler against the silent-completion
-        // stubs would ack-and-drop every Slack request -- a real
-        // no-message-loss bug. Until Stage 5.1/5.2/5.3 ship the real
-        // handlers, the Worker explicitly opts into the development
-        // stand-ins so the ingestor remains resolvable AND any
-        // operator reading this file SEES the explicit opt-in (and
-        // knows to remove it before going to production).
+        // Stage 4.3 iter-2 evaluator item #2 (HARD STOP REGRESSION):
+        // Earlier iters called AddSlackInboundDevelopmentHandlerStubs
+        // UNCONDITIONALLY, which meant the shipped Worker silently
+        // ack-and-dropped every Slack command / app_mention /
+        // interaction envelope through no-op handlers (the no-op
+        // completes the envelope and the idempotency guard marks the
+        // row 'completed', so any Slack retry is silently deduped).
+        // This iter gates the call on an explicit opt-in
+        // (Slack:Inbound:EnableDevelopmentHandlerStubs); the gate
+        // DEFAULTS to true on a Development environment so dev laptops
+        // still boot, and DEFAULTS to false everywhere else so
+        // Production/Staging/Testing hosts that have not yet wired
+        // real Stage 5 handlers fail fast at first envelope dispatch
+        // (the pipeline ctor resolves the handlers from DI; without
+        // them it throws InvalidOperationException at startup
+        // instead of letting the no-op silently dedupe Slack traffic).
+        // An operator can override the gate in either direction by
+        // setting the key explicitly.
         //
-        // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this call
+        // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this gate
         // with the real handler registrations (Stage 5.1 command
         // dispatcher, Stage 5.2 @mention dispatcher, Stage 5.3
-        // interaction -> HumanDecisionEvent dispatcher). The
-        // production Worker must NOT ship the no-op stubs.
-        builder.Services.AddSlackInboundDevelopmentHandlerStubs();
+        // interaction -> HumanDecisionEvent dispatcher) and delete
+        // both the EnableDevelopmentHandlerStubsKey constant and
+        // this opt-in call. The production Worker must NOT ship
+        // the no-op stubs once real handlers exist.
+        if (ShouldEnableDevelopmentHandlerStubs(builder))
+        {
+            builder.Services.AddSlackInboundDevelopmentHandlerStubs();
+        }
 
         // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the
         // durable file-system dead-letter sink for post-ACK enqueue
@@ -302,5 +335,55 @@ public class Program
         });
 
         builder.Services.AddSlackEntityFrameworkAuditWriter<SlackPersistenceDbContext>();
+    }
+
+    /// <summary>
+    /// Resolves the iter-2 evaluator item #2 gate for the no-op
+    /// Slack handler stand-ins. Reads the
+    /// <see cref="EnableDevelopmentHandlerStubsKey"/> configuration
+    /// value as a boolean; if the key is missing or fails to parse,
+    /// defaults to <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The gate is asymmetric on purpose:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item>
+    ///     <description>Development hosts default to <c>true</c> so a
+    ///     dev laptop continues to boot the Worker without requiring
+    ///     real Stage 5.x handlers.</description>
+    ///   </item>
+    ///   <item>
+    ///     <description>Production / Staging / Testing hosts default
+    ///     to <c>false</c> so a deployment that has not yet wired the
+    ///     real Stage 5 handlers fails fast at first envelope dispatch
+    ///     (the pipeline ctor resolves the handlers from DI; without
+    ///     them it throws <see cref="InvalidOperationException"/>)
+    ///     instead of silently ack-and-dropping Slack traffic via the
+    ///     no-op completions.</description>
+    ///   </item>
+    ///   <item>
+    ///     <description>An operator can explicitly opt in (<c>true</c>)
+    ///     or out (<c>false</c>) in any environment via configuration
+    ///     -- the gate is environment-defaulted, not
+    ///     environment-locked. This supports a Production smoke test
+    ///     where the no-op stubs are wired temporarily before the
+    ///     real handlers ship, and equally supports a forced
+    ///     fail-fast on a dev laptop.</description>
+    ///   </item>
+    /// </list>
+    /// </remarks>
+    internal static bool ShouldEnableDevelopmentHandlerStubs(WebApplicationBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        string? raw = builder.Configuration[EnableDevelopmentHandlerStubsKey];
+        if (!string.IsNullOrWhiteSpace(raw) && bool.TryParse(raw, out bool explicitValue))
+        {
+            return explicitValue;
+        }
+
+        return builder.Environment.IsDevelopment();
     }
 }
