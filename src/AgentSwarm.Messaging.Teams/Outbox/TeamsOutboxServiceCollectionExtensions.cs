@@ -33,16 +33,14 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// this helper — the decorator wiring captures the prior registrations and
     /// re-introduces them under marker interfaces
     /// (<see cref="IInnerTeamsProactiveNotifier"/> /
-    /// <see cref="IInnerTeamsMessengerConnector"/>). Iter-3 evaluator critique #3 fix —
-    /// the previous narrative claimed the markers "let the decorator forward to the
-    /// inner registrations", which was misleading: only the
+    /// <see cref="IInnerTeamsMessengerConnector"/>). Only the
     /// <see cref="IInnerTeamsMessengerConnector"/> marker is consumed at runtime, and
     /// only for the single <see cref="IMessengerConnector.ReceiveAsync"/> forwarding
     /// call (inbound events do not flow through the outbox by design).
     /// <see cref="OutboxBackedProactiveNotifier"/> takes NO inner dependency at all —
     /// every send method enqueues directly to <see cref="IMessageOutbox"/>, and the
     /// <see cref="IInnerTeamsProactiveNotifier"/> registration is reserved for
-    /// test/diagnostic resolution of the pre-decoration notifier (e.g. to pin
+    /// test / diagnostic resolution of the pre-decoration notifier (e.g. to pin
     /// underlying send semantics in unit tests that do not start the outbox engine).
     /// <see cref="TeamsOutboxDispatcher"/> consumes neither marker — it owns
     /// <see cref="Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter"/>
@@ -50,14 +48,14 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// <c>CloudAdapter.ContinueConversationAsync</c>.
     /// </para>
     /// <para>
-    /// <b>Direct-send bypass boundary (iter-3 evaluator critique #4 fix).</b>
+    /// <b>Direct-send bypass boundary.</b>
     /// Even though this helper re-exposes the inner concretes under markers, the
     /// concrete <see cref="TeamsMessengerConnector"/> and
     /// <see cref="TeamsProactiveNotifier"/> classes still own direct
-    /// <c>CloudAdapter.ContinueConversationAsync</c> calls in their send methods
-    /// (see <c>implementation-plan.md</c> §6.1 lines 383-384). Without a guard those
-    /// direct paths would silently bypass <see cref="IMessageOutbox.EnqueueAsync"/>
-    /// for any production caller that resolved the concrete type or the marker's
+    /// <c>CloudAdapter.ContinueConversationAsync</c> calls in their send methods.
+    /// Without a guard those direct paths would silently bypass
+    /// <see cref="IMessageOutbox.EnqueueAsync"/> for any production caller that
+    /// resolved the concrete type or the marker's
     /// <see cref="IInnerTeamsMessengerConnector.Inner"/> /
     /// <see cref="IInnerTeamsProactiveNotifier.Inner"/> accessor and called send on
     /// it. To close that bypass, this helper registers
@@ -76,7 +74,7 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// direct-send semantics are preserved unchanged.
     /// </para>
     /// <para>
-    /// <b>Connector source discovery (iter-2 fix).</b>
+    /// <b>Connector source discovery.</b>
     /// <see cref="TeamsServiceCollectionExtensions.AddTeamsMessengerConnector"/> registers
     /// <see cref="IMessengerConnector"/> ONLY as a keyed service
     /// (<see cref="TeamsServiceCollectionExtensions.MessengerKey"/> = <c>"teams"</c>) and
@@ -95,13 +93,12 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// wrapper <b>only when the host originally registered a keyed descriptor</b> — when
     /// the host registered only the concrete <see cref="TeamsMessengerConnector"/>
     /// singleton (without ever asking for the keyed alias), no synthetic keyed alias is
-    /// introduced. This preserves the host's wiring shape and matches the iter-5
-    /// evaluator critique #3.
+    /// introduced. This preserves the host's wiring shape exactly.
     /// </para>
     /// <para>
-    /// <b>Cycle safety (iter-7 structural fix for critique #2).</b> Two cases require
-    /// care when the host registered both an unkeyed <see cref="IMessengerConnector"/>
-    /// FACTORY and a keyed <see cref="IMessengerConnector"/> under
+    /// <b>Cycle safety.</b> Two cases require care when the host registered both an
+    /// unkeyed <see cref="IMessengerConnector"/> FACTORY and a keyed
+    /// <see cref="IMessengerConnector"/> under
     /// <see cref="TeamsServiceCollectionExtensions.MessengerKey"/>:
     /// <list type="bullet">
     ///   <item><description>
@@ -114,9 +111,9 @@ public static class TeamsOutboxServiceCollectionExtensions
     ///   </description></item>
     ///   <item><description>
     ///     <b>Legitimate factory</b> — e.g. <c>sp =&gt; new CustomConnector(...)</c>
-    ///     that does <i>not</i> touch the keyed alias. Iter 6 unconditionally discarded
-    ///     this factory whenever a keyed sibling was present, silently dropping the
-    ///     host's explicit choice; iter-4 critique #2 flagged this regression.
+    ///     that does <i>not</i> touch the keyed alias. Discarding such a factory
+    ///     whenever a keyed sibling is present would silently drop the host's explicit
+    ///     choice.
     ///   </description></item>
     /// </list>
     /// To preserve BOTH host shapes, the decorator captures the unkeyed factory and
@@ -181,24 +178,22 @@ public static class TeamsOutboxServiceCollectionExtensions
         services.TryAddSingleton<OutboxMetrics>();
         services.TryAddSingleton<TokenBucketRateLimiter>();
 
-        // Iter-3 evaluator critique #4 fix — register the TeamsDirectSendBypassGuard
-        // sentinel singleton so the inner concrete TeamsMessengerConnector /
-        // TeamsProactiveNotifier reject every direct send when the outbox engine is
-        // composed. Without the guard, production code that resolved the concrete
-        // type (or the IInnerTeams* marker's Inner accessor) and called a send method
-        // would silently bypass IMessageOutbox.EnqueueAsync, violating the
-        // implementation-plan.md §6.1 lines 383-384 requirement that every send flows
-        // through the outbox. The connectors' DI factories in
-        // TeamsServiceCollectionExtensions resolve this guard as an optional dependency
-        // and assign it via the DirectSendGuard property initializer — so legacy
-        // hosts / tests that do NOT call AddTeamsOutboxEngine keep their direct-send
-        // semantics unchanged (the guard simply isn't in the container). Iter-4
-        // evaluator quality fix: the guard class is `sealed` so it cannot be
-        // subclassed; TryAddSingleton instead lets a host or test pre-register a
-        // pre-built singleton instance (or replace this descriptor with a different
-        // factory) BEFORE AddTeamsOutboxEngine runs and have that registration win,
-        // for the rare scenarios that legitimately need to disable the guard at the
-        // inner-concrete level. Documentation drift fix only — no behaviour change.
+        // Register the TeamsDirectSendBypassGuard sentinel singleton so the inner
+        // concrete TeamsMessengerConnector / TeamsProactiveNotifier reject every
+        // direct send when the outbox engine is composed. Without the guard,
+        // production code that resolved the concrete type (or the IInnerTeams*
+        // marker's Inner accessor) and called a send method would silently bypass
+        // IMessageOutbox.EnqueueAsync, violating the implementation-plan.md §6.1
+        // requirement that every send flows through the outbox. The connectors' DI
+        // factories in TeamsServiceCollectionExtensions resolve this guard as an
+        // optional dependency and assign it via the DirectSendGuard property
+        // initializer — so legacy hosts / tests that do NOT call
+        // AddTeamsOutboxEngine keep their direct-send semantics unchanged (the
+        // guard simply isn't in the container). TryAddSingleton lets a host or test
+        // pre-register a different singleton instance BEFORE AddTeamsOutboxEngine
+        // runs and have that registration win, for the rare scenarios that
+        // legitimately need to disable the guard at the inner-concrete level (the
+        // guard class is `sealed` so subclassing is not the override path).
         services.TryAddSingleton<TeamsDirectSendBypassGuard>();
 
         // Stage 6.2 step 4 — outbound deduplication singleton + background eviction
@@ -312,15 +307,15 @@ public static class TeamsOutboxServiceCollectionExtensions
 
         if (unkeyed is not null)
         {
-            // Iter-7 structural fix for iter-4 evaluator critique #2: replace the iter-6
-            // "discard unkeyed factory when keyed sibling exists" heuristic with an
-            // IServiceProvider interceptor. The interceptor intercepts ONLY the
-            // (IMessengerConnector, MessengerKey) pair and routes it to a pre-rebind
-            // snapshot of the keyed source. Alias factories (sp => sp.GetRequiredKeyedService
-            // ("teams")) get the original concrete instance and never loop through the
-            // wrapper; legitimate factories (sp => new CustomConnector(...)) execute
-            // normally and their result becomes the captured inner, preserving the host's
-            // explicit choice over the keyed registration.
+            // Use an IServiceProvider interceptor to handle the case where the
+            // unkeyed registration is itself a factory and a keyed sibling exists.
+            // The interceptor intercepts ONLY the (IMessengerConnector, MessengerKey)
+            // pair and routes it to a pre-rebind snapshot of the keyed source. Alias
+            // factories (sp => sp.GetRequiredKeyedService("teams")) get the original
+            // concrete instance and never loop through the wrapper; legitimate
+            // factories (sp => new CustomConnector(...)) execute normally and their
+            // result becomes the captured inner, preserving the host's explicit
+            // choice over the keyed registration.
             if (unkeyed.ImplementationFactory is not null && keyedTeams is not null)
             {
                 var capturedUnkeyedFactory = unkeyed.ImplementationFactory;
@@ -494,7 +489,7 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// EXCEPT the single <c>(IMessengerConnector, MessengerKey)</c> pair, which is
     /// served from a pre-rebind snapshot of the host's keyed descriptor. This breaks
     /// the alias-factory cycle without dropping legitimate host-supplied unkeyed
-    /// factories (iter-7 structural fix for iter-4 evaluator critique #2).
+    /// factories.
     /// </summary>
     private sealed class KeyedTeamsConnectorInterceptor : IServiceProvider, IKeyedServiceProvider
     {

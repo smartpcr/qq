@@ -278,8 +278,8 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         // (b) deliver a channel-scoped question into a user's personal chat. Throwing
         // InvalidArgumentMismatch BEFORE we touch the reference store, the renderer,
         // or the network keeps the failure cheap and the audit trail accurate.
-        EnsureTenantMatchesQuestion(tenantId, question);
-        EnsureScopeUserTargeted(userId, question);
+        TeamsQuestionSendGuards.EnsureTenantMatchesQuestion(tenantId, question);
+        TeamsQuestionSendGuards.EnsureScopeUserTargeted(userId, question);
 
         await SendQuestionCoreAsync(
             tenantId,
@@ -382,8 +382,8 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
 
         // Security-relevant consistency guard (iter-2 evaluator feedback #1, #2) —
         // see SendProactiveQuestionAsync for the full rationale.
-        EnsureTenantMatchesQuestion(tenantId, question);
-        EnsureScopeChannelTargeted(channelId, question);
+        TeamsQuestionSendGuards.EnsureTenantMatchesQuestion(tenantId, question);
+        TeamsQuestionSendGuards.EnsureScopeChannelTargeted(channelId, question);
 
         await SendQuestionCoreAsync(
             tenantId,
@@ -428,15 +428,12 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         CancellationToken ct)
     {
         // Defence in depth — every public surface in this class accepts AgentQuestion and
-        // calls into here. Validate() runs again so a malformed question (TargetUserId
-        // and TargetChannelId both null, missing CorrelationId, etc.) fails loudly before
-        // we touch the network. The connector's own SendQuestionAsync does the same.
-        var validationErrors = question.Validate();
-        if (validationErrors.Count > 0)
-        {
-            throw new InvalidOperationException(
-                $"AgentQuestion '{question.QuestionId}' is invalid: {string.Join("; ", validationErrors)}");
-        }
+        // calls into here. Validate() runs again via the shared guard so a malformed
+        // question (TargetUserId and TargetChannelId both null, missing CorrelationId,
+        // etc.) fails loudly before we touch the network. The connector's own
+        // SendQuestionAsync and the outbox-backed decorators call the same helper to
+        // guarantee identical observable failure shapes across every send surface.
+        TeamsQuestionSendGuards.ValidateQuestion(question);
 
         // Step 1a (iter-4 evaluator feedback #1 — outbox-retry idempotency).
         // The Phase 6 outbox engine may replay a proactive send after the first attempt
@@ -505,7 +502,7 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         }
         else
         {
-            EnsureRetryMatchesStoredQuestion(question, existingQuestion);
+            TeamsQuestionSendGuards.EnsureRetryMatchesStoredQuestion(question, existingQuestion);
 
             if (!string.Equals(existingQuestion.Status, AgentQuestionStatuses.Open, StringComparison.Ordinal))
             {
@@ -646,191 +643,6 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         if (string.IsNullOrWhiteSpace(value))
         {
             throw new ArgumentException($"'{paramName}' must be non-null and non-whitespace.", paramName);
-        }
-    }
-
-    /// <summary>
-    /// Tenant-isolation guard. The orchestrator stamps the tenant onto every
-    /// <see cref="AgentQuestion"/> at creation time; a direct call that supplies a
-    /// different <paramref name="tenantId"/> would silently deliver and persist the
-    /// question under the wrong tenant, breaking RBAC and the multi-tenant audit trail
-    /// the story's Security / Compliance rows require. Throws
-    /// <see cref="ArgumentException"/> bound to <c>tenantId</c> so DI and direct callers
-    /// both see a parameter-shaped failure they can attribute. String equality is
-    /// case-sensitive — AAD tenant GUIDs are normalised by the issuer and Azure
-    /// recommends preserving the exact casing of the <c>tid</c> claim.
-    /// </summary>
-    private static void EnsureTenantMatchesQuestion(string tenantId, AgentQuestion question)
-    {
-        if (!string.Equals(tenantId, question.TenantId, StringComparison.Ordinal))
-        {
-            throw new ArgumentException(
-                $"tenantId '{tenantId}' does not match AgentQuestion '{question.QuestionId}' " +
-                $"tenant '{question.TenantId}'. Refusing to send a question through a tenant " +
-                $"different from its own routing metadata — this is a tenant-isolation invariant.",
-                nameof(tenantId));
-        }
-    }
-
-    /// <summary>
-    /// User-scope guard for <see cref="SendProactiveQuestionAsync"/>. Two failure modes:
-    /// (1) the question is channel-scoped (<see cref="AgentQuestion.TargetChannelId"/>
-    /// is non-null) — sending it into a personal chat would mis-route the approval ask
-    /// and leak channel context into a 1:1 thread; (2) the supplied
-    /// <paramref name="userId"/> does not match the question's
-    /// <see cref="AgentQuestion.TargetUserId"/> — sending it to a different user would
-    /// route the approval ask to the wrong person. Both throw
-    /// <see cref="ArgumentException"/> bound to <c>userId</c>.
-    /// </summary>
-    private static void EnsureScopeUserTargeted(string userId, AgentQuestion question)
-    {
-        if (question.TargetChannelId is not null)
-        {
-            throw new ArgumentException(
-                $"AgentQuestion '{question.QuestionId}' is channel-scoped " +
-                $"(TargetChannelId='{question.TargetChannelId}') but SendProactiveQuestionAsync " +
-                $"is the user-scope entry point. Route channel-scoped questions through " +
-                $"SendQuestionToChannelAsync or the NotifyQuestionAsync dispatcher.",
-                nameof(question));
-        }
-
-        if (!string.Equals(userId, question.TargetUserId, StringComparison.Ordinal))
-        {
-            throw new ArgumentException(
-                $"userId '{userId}' does not match AgentQuestion '{question.QuestionId}' " +
-                $"TargetUserId '{question.TargetUserId}'. Refusing to deliver an approval ask " +
-                $"to a user other than the one named on the question.",
-                nameof(userId));
-        }
-    }
-
-    /// <summary>
-    /// Channel-scope guard for <see cref="SendQuestionToChannelAsync"/>. Mirrors
-    /// <see cref="EnsureScopeUserTargeted"/>: rejects user-scoped questions and rejects
-    /// mismatches between the supplied <paramref name="channelId"/> and the question's
-    /// <see cref="AgentQuestion.TargetChannelId"/>.
-    /// </summary>
-    private static void EnsureScopeChannelTargeted(string channelId, AgentQuestion question)
-    {
-        if (question.TargetUserId is not null)
-        {
-            throw new ArgumentException(
-                $"AgentQuestion '{question.QuestionId}' is user-scoped " +
-                $"(TargetUserId='{question.TargetUserId}') but SendQuestionToChannelAsync " +
-                $"is the channel-scope entry point. Route user-scoped questions through " +
-                $"SendProactiveQuestionAsync or the NotifyQuestionAsync dispatcher.",
-                nameof(question));
-        }
-
-        if (!string.Equals(channelId, question.TargetChannelId, StringComparison.Ordinal))
-        {
-            throw new ArgumentException(
-                $"channelId '{channelId}' does not match AgentQuestion '{question.QuestionId}' " +
-                $"TargetChannelId '{question.TargetChannelId}'. Refusing to deliver an approval " +
-                $"ask to a channel other than the one named on the question.",
-                nameof(channelId));
-        }
-    }
-
-    /// <summary>
-    /// Iter-4 evaluator feedback #1 / rubber-duck non-blocking #2 — when an outbox
-    /// retry finds an existing <see cref="AgentQuestion"/> row, every identity / routing
-    /// / payload field on the incoming question MUST match the stored row. Otherwise the
-    /// orchestrator has mutated the question after enqueuing it, which is "card update"
-    /// semantics (not retry) and is not supported by Stage 4.2 — the card delivered to
-    /// Teams would then drift from the row <see cref="Cards.CardActionHandler"/> later
-    /// loads via <see cref="IAgentQuestionStore.GetByIdAsync"/>.
-    /// </summary>
-    /// <remarks>
-    /// Fields compared:
-    ///   <list type="bullet">
-    ///     <item><description>Identity: <c>TenantId</c>, <c>AgentId</c>, <c>TaskId</c>, <c>CorrelationId</c>.</description></item>
-    ///     <item><description>Routing: <c>TargetUserId</c>, <c>TargetChannelId</c>.</description></item>
-    ///     <item><description>Payload: <c>Title</c>, <c>Body</c>, <c>Severity</c>, <c>ExpiresAt</c>, and the <c>AllowedActions</c> list (count + each element's <c>ActionId</c> / <c>Label</c> / <c>Value</c> / <c>RequiresComment</c>).</description></item>
-    ///   </list>
-    /// <c>QuestionId</c> equality is guaranteed because the lookup was keyed by it.
-    /// <c>ConversationId</c>, <c>Status</c>, <c>CreatedAt</c>, and <c>ResolvedAt</c> are
-    /// store-owned lifecycle fields and are NOT compared.
-    /// </remarks>
-    private static void EnsureRetryMatchesStoredQuestion(AgentQuestion incoming, AgentQuestion stored)
-    {
-        static string Norm(string? s) => s ?? string.Empty;
-
-        var mismatches = new List<string>();
-        if (!string.Equals(incoming.TenantId, stored.TenantId, StringComparison.Ordinal))
-        {
-            mismatches.Add($"TenantId (incoming='{incoming.TenantId}', stored='{stored.TenantId}')");
-        }
-
-        if (!string.Equals(incoming.AgentId, stored.AgentId, StringComparison.Ordinal))
-        {
-            mismatches.Add($"AgentId (incoming='{incoming.AgentId}', stored='{stored.AgentId}')");
-        }
-
-        if (!string.Equals(incoming.TaskId, stored.TaskId, StringComparison.Ordinal))
-        {
-            mismatches.Add($"TaskId (incoming='{incoming.TaskId}', stored='{stored.TaskId}')");
-        }
-
-        if (!string.Equals(incoming.CorrelationId, stored.CorrelationId, StringComparison.Ordinal))
-        {
-            mismatches.Add($"CorrelationId (incoming='{incoming.CorrelationId}', stored='{stored.CorrelationId}')");
-        }
-
-        if (!string.Equals(Norm(incoming.TargetUserId), Norm(stored.TargetUserId), StringComparison.Ordinal))
-        {
-            mismatches.Add($"TargetUserId (incoming='{incoming.TargetUserId}', stored='{stored.TargetUserId}')");
-        }
-
-        if (!string.Equals(Norm(incoming.TargetChannelId), Norm(stored.TargetChannelId), StringComparison.Ordinal))
-        {
-            mismatches.Add($"TargetChannelId (incoming='{incoming.TargetChannelId}', stored='{stored.TargetChannelId}')");
-        }
-
-        if (!string.Equals(incoming.Title, stored.Title, StringComparison.Ordinal))
-        {
-            mismatches.Add("Title");
-        }
-
-        if (!string.Equals(incoming.Body, stored.Body, StringComparison.Ordinal))
-        {
-            mismatches.Add("Body");
-        }
-
-        if (!string.Equals(incoming.Severity, stored.Severity, StringComparison.Ordinal))
-        {
-            mismatches.Add($"Severity (incoming='{incoming.Severity}', stored='{stored.Severity}')");
-        }
-
-        if (incoming.ExpiresAt != stored.ExpiresAt)
-        {
-            mismatches.Add($"ExpiresAt (incoming='{incoming.ExpiresAt:o}', stored='{stored.ExpiresAt:o}')");
-        }
-
-        if (incoming.AllowedActions.Count != stored.AllowedActions.Count)
-        {
-            mismatches.Add($"AllowedActions.Count (incoming={incoming.AllowedActions.Count}, stored={stored.AllowedActions.Count})");
-        }
-        else
-        {
-            for (var i = 0; i < incoming.AllowedActions.Count; i++)
-            {
-                var a = incoming.AllowedActions[i];
-                var b = stored.AllowedActions[i];
-                if (!string.Equals(a.ActionId, b.ActionId, StringComparison.Ordinal)
-                    || !string.Equals(a.Label, b.Label, StringComparison.Ordinal)
-                    || !string.Equals(a.Value, b.Value, StringComparison.Ordinal)
-                    || a.RequiresComment != b.RequiresComment)
-                {
-                    mismatches.Add($"AllowedActions[{i}]");
-                }
-            }
-        }
-
-        if (mismatches.Count > 0)
-        {
-            throw new InvalidOperationException(
-                $"AgentQuestion '{incoming.QuestionId}' was already persisted with different metadata than the incoming retry; refusing to send a card whose payload diverges from the stored row that CardActionHandler will load on reply. Mismatched fields: {string.Join(", ", mismatches)}. Stage 4.2 does not support mutating an in-flight question — either preserve the original payload on retry or assign a new QuestionId.");
         }
     }
 

@@ -383,16 +383,51 @@ public sealed class OutboxBackedProactiveNotifierTests
             outbox, store, questionStore,
             NullLogger<OutboxBackedProactiveNotifier>.Instance);
 
-        // Both target fields populated — violates the TargetUserId XOR TargetChannelId
-        // invariant enforced by AgentQuestion.Validate(). The Validate() guard runs first
-        // (matches TeamsProactiveNotifier.SendQuestionCoreAsync ordering), so the surfaced
-        // error is InvalidOperationException with the validation messages.
+        // Both target fields populated — channel-scope-violation on a user entry point.
+        // The shared guards run in the same order as TeamsProactiveNotifier's direct
+        // path (tenant → scope → validate), so EnsureScopeUserTargeted fires first
+        // because TargetChannelId is set, surfacing ArgumentException bound to
+        // "question" before AgentQuestion.Validate() can fire its
+        // InvalidOperationException for the same XOR-violation. Pinning the direct
+        // path's contract here so both surfaces emit identical exception shapes for
+        // identical misuse.
         var invalid = SampleQuestion("q-bad", userId: "user-1") with { TargetChannelId = "channel-1" };
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            notifier.SendProactiveQuestionAsync("tenant-1", "user-1", invalid, CancellationToken.None));
+
+        Assert.Equal("question", ex.ParamName);
+        Assert.Contains("q-bad", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendProactiveQuestionAsync_PayloadInvalidAfterScopeOk_ThrowsInvalidOperation()
+    {
+        // Sibling of the case above — when tenant and scope guards both pass
+        // (the question is correctly user-scoped to the caller-supplied userId
+        // and tenant-matched), an AgentQuestion.Validate() failure must surface
+        // as InvalidOperationException at the third (payload) guard. Pin both the
+        // type and the QuestionId payload so future refactors cannot silently
+        // swap guard order without breaking this test.
+        var store = new RecordingConversationReferenceStore();
+        store.UserReferences[("tenant-1", "user-1")] = NewReference("tenant-1", internalUserId: "user-1");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        // Empty AllowedActions list — AgentQuestion.Validate() rejects this but
+        // none of the scope / tenant guards do.
+        var invalid = SampleQuestion("q-bad-actions", userId: "user-1") with { AllowedActions = Array.Empty<HumanAction>() };
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
             notifier.SendProactiveQuestionAsync("tenant-1", "user-1", invalid, CancellationToken.None));
 
-        Assert.Contains("q-bad", ex.Message);
+        Assert.Contains("q-bad-actions", ex.Message);
         Assert.Empty(outbox.Enqueued);
         Assert.Empty(questionStore.SavedQuestions);
     }

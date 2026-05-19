@@ -1,63 +1,65 @@
 using AgentSwarm.Messaging.Abstractions;
 
-namespace AgentSwarm.Messaging.Teams.Outbox;
+namespace AgentSwarm.Messaging.Teams;
 
 /// <summary>
-/// Shared validation helpers that re-establish the
-/// <see cref="TeamsProactiveNotifier"/> question-send contract on the outbox-backed
-/// decorator path (iter-4 evaluator critique). The direct-send
-/// <see cref="TeamsProactiveNotifier.SendProactiveQuestionAsync"/> /
-/// <see cref="TeamsProactiveNotifier.SendQuestionToChannelAsync"/> entry points run
-/// the following four guards before touching the network:
-/// <list type="number">
-///   <item><description><c>question.Validate()</c> — payload-shape invariants
-///     (required string members, severity / status vocabulary, exactly-one of
-///     <see cref="AgentQuestion.TargetUserId"/> / <see cref="AgentQuestion.TargetChannelId"/>,
-///     non-empty <see cref="AgentQuestion.AllowedActions"/>, non-default
-///     <see cref="AgentQuestion.ExpiresAt"/>).</description></item>
-///   <item><description><c>EnsureTenantMatchesQuestion</c> — the caller-supplied
-///     tenant must equal <see cref="AgentQuestion.TenantId"/>. Tenant-isolation
-///     invariant — sending under a different tenant would mis-attribute the audit
-///     row and the proactive lookup.</description></item>
-///   <item><description><c>EnsureScopeUserTargeted</c> / <c>EnsureScopeChannelTargeted</c>
-///     — the question's routing fields must match the chosen send method's scope
-///     (user-scoped vs channel-scoped) and the caller-supplied identifier.</description></item>
-///   <item><description><c>EnsureRetryMatchesStoredQuestion</c> — on retry (existing
-///     <see cref="IAgentQuestionStore"/> row), the incoming question's identity /
-///     routing / payload must equal the stored row so the Adaptive Card delivered
-///     by the outbox engine does not drift from the row
-///     <c>CardActionHandler.GetByIdAsync(questionId)</c> later loads on approve/reject.
-///     <c>ConversationId</c>, <c>Status</c>, <c>CreatedAt</c>, <c>ResolvedAt</c> are
-///     store-owned lifecycle fields and intentionally NOT compared.</description></item>
-/// </list>
-/// Prior to this helper the outbox-backed decorators only validated
-/// tenant / user / channel nullness before enqueueing, opening a regression where a
-/// caller could enqueue (and pre-save) an AgentQuestion whose
-/// <see cref="AgentQuestion.TenantId"/> /
-/// <see cref="AgentQuestion.TargetUserId"/> / <see cref="AgentQuestion.TargetChannelId"/>
-/// disagreed with the routing supplied to the decorator — producing an outbox row
-/// the dispatcher would deliver under one identity while
-/// <see cref="IAgentQuestionStore"/> persisted the question under another. The
-/// retry-match check is the same parity gap: the pre-existing decorator code
-/// treated any stored <c>Open</c> row as safe even when the orchestrator had
-/// mutated routing or payload fields between attempts.
+/// Single source of truth for the validation / security guards that every
+/// <see cref="AgentQuestion"/> send (direct or outbox-backed) MUST run before the
+/// payload reaches the network or the durable outbox. Used by
+/// <see cref="TeamsProactiveNotifier"/> on the direct path and by
+/// <see cref="Outbox.OutboxBackedProactiveNotifier"/> /
+/// <see cref="Outbox.OutboxBackedMessengerConnector"/> on the outbox-backed path so
+/// the public contract — exception type, parameter name, message shape, and
+/// ordering — is identical across both surfaces. Without a shared helper the two
+/// paths drifted: a caller could observe one exception type on the direct path and a
+/// different type for the same misuse on the outbox-backed path, which silently
+/// breaks downstream <c>catch</c> filters and audit-row attribution.
 /// </summary>
 /// <remarks>
-/// The helper centralises the validation so future Stage 6.1 evolution can extend
-/// every send-side guard in exactly one place. The semantics mirror
-/// <see cref="TeamsProactiveNotifier"/>'s private helpers exactly so the
-/// outbox-backed wrappers and the direct-send concrete path enforce the same
-/// contract — iter-4 evaluator critique #1 ("OutboxBackedProactiveNotifier still
-/// does not preserve TeamsProactiveNotifier's validation/security contract for
-/// question sends").
+/// <para>
+/// <b>Canonical send-time ordering.</b> Both
+/// <c>SendProactiveQuestionAsync</c> and <c>SendQuestionToChannelAsync</c> entry
+/// points MUST invoke the guards in this exact sequence (after the
+/// caller-parameter null / blank checks):
+/// <list type="number">
+///   <item><description><see cref="EnsureTenantMatchesQuestion"/> — tenant
+///     isolation invariant. Throws <see cref="ArgumentException"/> bound to
+///     <c>tenantId</c>.</description></item>
+///   <item><description><see cref="EnsureScopeUserTargeted"/> /
+///     <see cref="EnsureScopeChannelTargeted"/> — scope routing invariant. Throws
+///     <see cref="ArgumentException"/> bound to <c>question</c> (scope mismatch)
+///     or <c>userId</c> / <c>channelId</c> (identifier mismatch).</description></item>
+///   <item><description><see cref="ValidateQuestion"/> — payload-shape invariants
+///     (required string members, severity / status vocabulary, exactly-one of
+///     <see cref="AgentQuestion.TargetUserId"/> /
+///     <see cref="AgentQuestion.TargetChannelId"/>, non-empty
+///     <see cref="AgentQuestion.AllowedActions"/>, non-default
+///     <see cref="AgentQuestion.ExpiresAt"/>). Throws
+///     <see cref="InvalidOperationException"/>.</description></item>
+/// </list>
+/// The tenant / scope guards intentionally precede payload validation so a caller
+/// that passes a mismatched tenant or scope sees an <see cref="ArgumentException"/>
+/// (a parameter-shaped failure they can route to a 400-class response) rather than
+/// a malformed-payload <see cref="InvalidOperationException"/> that would also fire
+/// for the same input.
+/// </para>
+/// <para>
+/// <b>Retry parity.</b> When an existing <see cref="IAgentQuestionStore"/> row is
+/// already present at send time, <see cref="EnsureRetryMatchesStoredQuestion"/>
+/// MUST run before the new send proceeds so a mutated retry does not ship a card
+/// whose payload diverges from the row <c>CardActionHandler.GetByIdAsync</c> loads
+/// on the user's approve / reject reply. <c>ConversationId</c>, <c>Status</c>,
+/// <c>CreatedAt</c>, and <c>ResolvedAt</c> are store-owned lifecycle fields and
+/// are deliberately excluded from the comparison.
+/// </para>
 /// </remarks>
-internal static class OutboxQuestionGuards
+internal static class TeamsQuestionSendGuards
 {
     /// <summary>
-    /// Run <see cref="AgentQuestion.Validate"/> and throw
-    /// <see cref="InvalidOperationException"/> if any errors are reported. Matches
-    /// <see cref="TeamsProactiveNotifier.SendQuestionCoreAsync"/>'s defence-in-depth
-    /// step.
+    /// Run <see cref="AgentQuestion.Validate"/> and surface any errors as
+    /// <see cref="InvalidOperationException"/>. The exception message includes the
+    /// <see cref="AgentQuestion.QuestionId"/> and the joined validation error list
+    /// so audit logs can attribute the failure to a specific question.
     /// </summary>
     public static void ValidateQuestion(AgentQuestion question)
     {
@@ -71,10 +73,12 @@ internal static class OutboxQuestionGuards
     }
 
     /// <summary>
-    /// Tenant-isolation guard — caller-supplied <paramref name="tenantId"/> must
-    /// match <see cref="AgentQuestion.TenantId"/>. Throws <see cref="ArgumentException"/>
-    /// bound to <c>tenantId</c> so misconfigured callers and DI alike see a
-    /// parameter-shaped failure.
+    /// Tenant-isolation guard — the caller-supplied <paramref name="tenantId"/> must
+    /// equal <see cref="AgentQuestion.TenantId"/>. String equality is case-sensitive
+    /// because AAD tenant GUIDs are normalised at the issuer and Azure recommends
+    /// preserving the exact casing of the <c>tid</c> claim. Throws
+    /// <see cref="ArgumentException"/> bound to <c>tenantId</c> so direct callers and
+    /// DI alike see a parameter-shaped failure they can attribute.
     /// </summary>
     public static void EnsureTenantMatchesQuestion(string tenantId, AgentQuestion question)
     {
@@ -82,16 +86,22 @@ internal static class OutboxQuestionGuards
         {
             throw new ArgumentException(
                 $"tenantId '{tenantId}' does not match AgentQuestion '{question.QuestionId}' " +
-                $"tenant '{question.TenantId}'. Refusing to enqueue a question through a tenant " +
+                $"tenant '{question.TenantId}'. Refusing to send a question through a tenant " +
                 $"different from its own routing metadata — this is a tenant-isolation invariant.",
                 nameof(tenantId));
         }
     }
 
     /// <summary>
-    /// User-scope guard for <c>SendProactiveQuestionAsync</c>. Rejects channel-scoped
-    /// questions (<see cref="AgentQuestion.TargetChannelId"/> set) and user-id
-    /// mismatches.
+    /// User-scope guard for the personal-chat entry points. Two failure modes:
+    /// (1) the question is channel-scoped
+    /// (<see cref="AgentQuestion.TargetChannelId"/> is non-null) — delivering it into
+    /// a personal chat would mis-route the approval ask and leak channel context
+    /// into a 1:1 thread; (2) the supplied <paramref name="userId"/> does not match
+    /// <see cref="AgentQuestion.TargetUserId"/> — delivering it to a different user
+    /// would route the approval ask to the wrong person. Both throw
+    /// <see cref="ArgumentException"/> — bound to <c>question</c> for scope mismatches
+    /// and to <c>userId</c> for identifier mismatches.
     /// </summary>
     public static void EnsureScopeUserTargeted(string userId, AgentQuestion question)
     {
@@ -109,16 +119,16 @@ internal static class OutboxQuestionGuards
         {
             throw new ArgumentException(
                 $"userId '{userId}' does not match AgentQuestion '{question.QuestionId}' " +
-                $"TargetUserId '{question.TargetUserId}'. Refusing to enqueue an approval ask " +
+                $"TargetUserId '{question.TargetUserId}'. Refusing to deliver an approval ask " +
                 $"to a user other than the one named on the question.",
                 nameof(userId));
         }
     }
 
     /// <summary>
-    /// Channel-scope guard for <c>SendQuestionToChannelAsync</c>. Rejects user-scoped
-    /// questions (<see cref="AgentQuestion.TargetUserId"/> set) and channel-id
-    /// mismatches.
+    /// Channel-scope guard for the channel entry points. Mirrors
+    /// <see cref="EnsureScopeUserTargeted"/>: rejects user-scoped questions
+    /// (<see cref="AgentQuestion.TargetUserId"/> set) and channel-id mismatches.
     /// </summary>
     public static void EnsureScopeChannelTargeted(string channelId, AgentQuestion question)
     {
@@ -136,34 +146,34 @@ internal static class OutboxQuestionGuards
         {
             throw new ArgumentException(
                 $"channelId '{channelId}' does not match AgentQuestion '{question.QuestionId}' " +
-                $"TargetChannelId '{question.TargetChannelId}'. Refusing to enqueue an approval " +
+                $"TargetChannelId '{question.TargetChannelId}'. Refusing to deliver an approval " +
                 $"ask to a channel other than the one named on the question.",
                 nameof(channelId));
         }
     }
 
     /// <summary>
-    /// Iter-4 evaluator critique — when a stored <see cref="AgentQuestion"/> row is
-    /// already present at pre-enqueue time, every identity / routing / payload field
-    /// on the incoming question MUST match the stored row before we let the second
-    /// enqueue land. Otherwise the orchestrator has mutated the question after the
-    /// first enqueue ("card update" semantics), which is not supported by Stage 4.2
-    /// — the card the dispatcher delivers would drift from the row
-    /// <see cref="Cards.CardActionHandler"/> loads on the user's approve/reject.
+    /// Retry-drift guard — when a stored <see cref="AgentQuestion"/> row is already
+    /// present at send time, every identity / routing / payload field on the incoming
+    /// question MUST match the stored row before the new send proceeds. A mismatch
+    /// means the orchestrator mutated the question between attempts, which is "card
+    /// update" semantics (not retry) and is not supported by the proactive question
+    /// pipeline — the card delivered to Teams would drift from the row
+    /// <c>CardActionHandler.GetByIdAsync</c> loads when the user replies.
     /// </summary>
     /// <remarks>
-    /// Fields compared (mirrors
-    /// <c>TeamsProactiveNotifier.EnsureRetryMatchesStoredQuestion</c> exactly):
+    /// Fields compared:
     /// <list type="bullet">
     ///   <item><description>Identity: <c>TenantId</c>, <c>AgentId</c>, <c>TaskId</c>, <c>CorrelationId</c>.</description></item>
-    ///   <item><description>Routing: <c>TargetUserId</c>, <c>TargetChannelId</c>.</description></item>
+    ///   <item><description>Routing: <c>TargetUserId</c>, <c>TargetChannelId</c> (null vs empty normalised).</description></item>
     ///   <item><description>Payload: <c>Title</c>, <c>Body</c>, <c>Severity</c>, <c>ExpiresAt</c>, and each
-    ///     <c>AllowedActions</c> entry's <c>ActionId</c> / <c>Label</c> / <c>Value</c> / <c>RequiresComment</c>.</description></item>
+    ///     <c>AllowedActions</c> entry's <c>ActionId</c> / <c>Label</c> / <c>Value</c> /
+    ///     <c>RequiresComment</c>.</description></item>
     /// </list>
-    /// <c>QuestionId</c> equality is guaranteed by the caller (the lookup was
-    /// keyed by it). <c>ConversationId</c>, <c>Status</c>, <c>CreatedAt</c>, and
-    /// <c>ResolvedAt</c> are store-owned lifecycle fields and are NOT compared —
-    /// the sanitised pre-save deliberately blanks <c>ConversationId</c> and pins
+    /// <c>QuestionId</c> equality is guaranteed because the lookup was keyed by it.
+    /// <c>ConversationId</c>, <c>Status</c>, <c>CreatedAt</c>, and <c>ResolvedAt</c>
+    /// are store-owned lifecycle fields and are NOT compared — the sanitised
+    /// pre-save deliberately blanks <c>ConversationId</c> and pins
     /// <c>Status = Open</c>, and the dispatcher stamps <c>ConversationId</c> back
     /// only after delivery.
     /// </remarks>
@@ -235,7 +245,10 @@ internal static class OutboxQuestionGuards
         if (mismatches.Count > 0)
         {
             throw new InvalidOperationException(
-                $"AgentQuestion '{incoming.QuestionId}' was already persisted with different metadata than the incoming retry; refusing to enqueue a card whose payload would diverge from the stored row that CardActionHandler will load on reply. Mismatched fields: {string.Join(", ", mismatches)}. Stage 4.2 does not support mutating an in-flight question — either preserve the original payload on retry or assign a new QuestionId.");
+                $"AgentQuestion '{incoming.QuestionId}' was already persisted with different metadata than the incoming retry; " +
+                $"refusing to deliver a card whose payload would diverge from the stored row that CardActionHandler will load on reply. " +
+                $"Mismatched fields: {string.Join(", ", mismatches)}. " +
+                $"Mutating an in-flight question is not supported — preserve the original payload on retry or assign a new QuestionId.");
         }
     }
 }
