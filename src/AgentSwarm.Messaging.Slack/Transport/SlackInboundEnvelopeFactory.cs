@@ -171,7 +171,19 @@ internal sealed class SlackInboundEnvelopeFactory
             UserId: payload.UserId ?? string.Empty,
             RawPayload: body,
             TriggerId: NullIfEmpty(payload.TriggerId),
-            ReceivedAt: receivedAt);
+            ReceivedAt: receivedAt)
+        {
+            // Stage 8.2 AC-5 brief: "rejected during async processing
+            // with an ephemeral error message to the user". The
+            // pipeline-side SlackInboundAuthorizer needs a way to
+            // reach the originating user after the controller has
+            // ACK'd the HTTP request; response_url is the only
+            // Slack-supported channel for that late reply. Capturing
+            // it here on every slash-command envelope means every
+            // BackgroundService-side rejection (Stage 4.3) can post
+            // the ephemeral via ISlackEphemeralResponder.
+            ResponseUrl = NullIfEmpty(payload.ResponseUrl),
+        };
     }
 
     private static SlackInboundEnvelope BuildInteractionEnvelope(string body, DateTimeOffset receivedAt)
@@ -187,6 +199,16 @@ internal sealed class SlackInboundEnvelopeFactory
             RawPayload: body,
             TriggerId: NullIfEmpty(payload.TriggerId),
             ReceivedAt: receivedAt);
+
+        // Block-kit and view_submission payloads also carry a top-level
+        // response_url, but Stage 4.1's SlackInteractionPayload struct
+        // does not surface that field yet. The Stage 8.2 AC-5 brief
+        // wording is slash-command-scoped ("send a slash command from a
+        // channel not in AllowedChannelIds"), so extending the
+        // interaction payload + envelope is intentionally deferred
+        // until an acceptance criterion demands it. The envelope's
+        // ResponseUrl init property remains available for that future
+        // extension without any further envelope-shape change.
     }
 
     private static string DeriveEventKey(SlackEventPayload payload, string body)

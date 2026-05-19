@@ -123,6 +123,162 @@ public sealed class DefaultSlackModalFastPathHandlerTests
             "no trigger_id means views.open cannot succeed; the handler must short-circuit");
     }
 
+    // -----------------------------------------------------------------
+    // Iter-3 evaluator items 1 + 2: the synchronous fast-path MUST reject
+    // /agent review / /agent escalate when the task-id argument is
+    // missing. Previously the handler accepted bare `/agent review`,
+    // burned an idempotency reservation, and opened a modal whose
+    // private_metadata fell back to the envelope's idempotency key --
+    // producing a "task-id" that did not identify any real agent task
+    // and silently breaking the Stage 5.3 view-submission correlation.
+    // These tests pin BOTH halves of the structural fix:
+    //   * `Missing_task_id_for_review_returns_ephemeral_error_without_calling_views_open`
+    //     pins the user-visible HTTP behaviour (200 + ephemeral text).
+    //   * `Missing_task_id_for_review_does_NOT_acquire_idempotency_reservation`
+    //     pins that the pre-validation gate runs BEFORE the durable
+    //     dedup row is reserved, so the user can retry with the
+    //     argument supplied.
+    // Symmetric tests cover the escalate sub-command.
+    // -----------------------------------------------------------------
+
+    [Theory]
+    [InlineData("review")]
+    [InlineData("escalate")]
+    public async Task Missing_task_id_returns_ephemeral_error_without_calling_views_open(string subCommand)
+    {
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views);
+
+        // Bare `/agent review` (or `/agent escalate`) with NO trailing
+        // argument. Trigger_id is supplied so we know any short-circuit
+        // is caused by the missing-argument gate, not by missing trigger.
+        SlackInboundEnvelope envelope = BuildEnvelope(subCommand);
+
+        SlackModalFastPathResult result = await handler.HandleAsync(
+            envelope,
+            new DefaultHttpContext(),
+            CancellationToken.None);
+
+        result.ResultKind.Should().Be(SlackModalFastPathResultKind.Handled,
+            "the handler owns the response so the controller never enqueues a modal command for async processing (trigger_id would expire)");
+        ContentResult content = result.ActionResult.Should().BeOfType<ContentResult>().Subject;
+        content.StatusCode.Should().Be(StatusCodes.Status200OK,
+            "Slack ephemeral responses always use HTTP 200");
+        content.Content.Should().Contain("\"response_type\":\"ephemeral\"");
+        content.Content.Should().Contain("requires a task-id",
+            "the ephemeral text must tell the user exactly what is missing");
+        content.Content.Should().Contain($"/agent {subCommand}",
+            "the ephemeral text must echo the sub-command so the user knows which command failed");
+        content.Content.Should().Contain($"/agent {subCommand} TASK-",
+            "the ephemeral text must include a worked example so the user can copy-paste-edit");
+
+        views.Invocations.Should().Be(0,
+            "a missing task-id MUST short-circuit before views.open is called -- opening a modal with a fake task-id would silently break Stage 5.3 view-submission routing");
+    }
+
+    [Theory]
+    [InlineData("review")]
+    [InlineData("escalate")]
+    public async Task Missing_task_id_does_NOT_acquire_idempotency_reservation(string subCommand)
+    {
+        // The missing-argument gate runs BEFORE the idempotency store
+        // is touched so the user can retry the same Slack command (same
+        // idempotency key) with the task-id supplied. If the handler
+        // reserved a token on the bad-input request, the retry would
+        // ack-and-drop as a duplicate and the user would never see
+        // their modal.
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        RecordingIdempotencyStore store = new() { Plan = SlackFastPathIdempotencyResult.Acquired() };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views, idempotencyStore: store);
+
+        SlackInboundEnvelope envelope = BuildEnvelope(subCommand);
+
+        await handler.HandleAsync(envelope, new DefaultHttpContext(), CancellationToken.None);
+
+        store.AcquireCalls.Should().BeEmpty(
+            "a missing-argument rejection must NOT burn an idempotency reservation -- the user must be able to retry with the same command body");
+        store.ReleaseCalls.Should().BeEmpty();
+        store.MarkCompletedCalls.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData("review")]
+    [InlineData("escalate")]
+    public async Task Missing_task_id_records_modal_open_error_audit_with_missing_argument_detail(string subCommand)
+    {
+        // The missing-argument gate is a user-visible failure mode and
+        // MUST emit a queryable audit row so operators can see (in
+        // aggregate) how often users mis-issue the modal commands. A
+        // silent ILogger line is not enough.
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        InMemorySlackAuditEntryWriter writer = new();
+        SlackModalAuditRecorder recorder = new(writer, NullLogger<SlackModalAuditRecorder>.Instance);
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views, auditRecorder: recorder);
+
+        await handler.HandleAsync(BuildEnvelope(subCommand), new DefaultHttpContext(), CancellationToken.None);
+
+        SlackAuditEntry entry = writer.Entries.Should().ContainSingle().Subject;
+        entry.Outcome.Should().Be(SlackModalAuditRecorder.OutcomeError);
+        entry.CommandText.Should().Be($"/agent {subCommand}",
+            "the audit row carries the sub-command so the operator can group by it");
+        entry.ErrorDetail.Should().Contain("missing required task-id argument",
+            "the audit error_detail must be specific enough to distinguish missing-argument from views.open failures");
+    }
+
+    [Theory]
+    [InlineData("review")]
+    [InlineData("escalate")]
+    public async Task Whitespace_only_task_id_is_treated_as_missing(string subCommand)
+    {
+        // Robustness pin: a Slack user typing `/agent review   ` (with
+        // only trailing whitespace) must be treated the same as a bare
+        // `/agent review`. The parser's ArgumentText helper already
+        // collapses whitespace; this test pins that the fast-path
+        // honours the same contract end-to-end.
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views);
+
+        SlackInboundEnvelope envelope = BuildEnvelope($"{subCommand}   ");
+
+        SlackModalFastPathResult result = await handler.HandleAsync(
+            envelope,
+            new DefaultHttpContext(),
+            CancellationToken.None);
+
+        result.ResultKind.Should().Be(SlackModalFastPathResultKind.Handled);
+        ContentResult content = result.ActionResult.Should().BeOfType<ContentResult>().Subject;
+        content.Content.Should().Contain($"/agent {subCommand}");
+        content.Content.Should().Contain("requires a task-id");
+        views.Invocations.Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData("review")]
+    [InlineData("escalate")]
+    public async Task Task_id_present_proceeds_through_idempotency_and_views_open(string subCommand)
+    {
+        // Counterpart to the missing-task-id tests above: when the
+        // argument IS supplied, the fast-path must reach views.open
+        // exactly as before. This ensures the new validation gate is
+        // not over-broad (e.g., rejecting valid commands).
+        FakeViewsOpenClient views = new() { Result = SlackViewsOpenResult.Success() };
+        RecordingIdempotencyStore store = new() { Plan = SlackFastPathIdempotencyResult.Acquired() };
+        DefaultSlackModalFastPathHandler handler = BuildHandler(views, idempotencyStore: store);
+
+        SlackInboundEnvelope envelope = BuildEnvelope($"{subCommand} TASK-42");
+
+        SlackModalFastPathResult result = await handler.HandleAsync(
+            envelope,
+            new DefaultHttpContext(),
+            CancellationToken.None);
+
+        result.ResultKind.Should().Be(SlackModalFastPathResultKind.Handled);
+        result.ActionResult.Should().BeNull("success uses the controller's default empty 200 ACK");
+        views.Invocations.Should().Be(1, "a well-formed command MUST flow through the fast-path unchanged");
+        store.AcquireCalls.Should().ContainSingle(
+            "the validation gate must permit well-formed commands through to the idempotency reservation");
+    }
+
     [Fact]
     public async Task Missing_configuration_returns_Handled_with_admin_friendly_message()
     {

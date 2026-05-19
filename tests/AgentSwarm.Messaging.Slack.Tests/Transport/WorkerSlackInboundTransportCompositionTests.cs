@@ -7,11 +7,15 @@
 namespace AgentSwarm.Messaging.Slack.Tests.Transport;
 
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using AgentSwarm.Messaging.Slack.Transport;
 using AgentSwarm.Messaging.Worker;
 using FluentAssertions;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Mvc.Controllers;
+using Microsoft.AspNetCore.Mvc.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
@@ -119,17 +123,87 @@ public sealed class WorkerSlackInboundTransportCompositionTests : IDisposable
             "the in-memory sink must be fully evicted so a downstream consumer that resolves the concrete type does not silently use the non-durable fallback");
     }
 
+    [Fact]
+    public void BuildApp_discovers_all_three_slack_inbound_controllers_via_application_part()
+    {
+        // Stage 4.1 iter-2 evaluator item 2: the three Slack inbound
+        // controllers (SlackEventsController, SlackCommandsController,
+        // SlackInteractionsController) live in the
+        // AgentSwarm.Messaging.Slack assembly, not the Worker's entry
+        // assembly. Without an explicit AddApplicationPart call,
+        // MVC's controller-feature scanner can fail to discover them
+        // -- silently. The Worker host calls
+        // AddSlackInboundControllers() on the IMvcBuilder returned by
+        // AddControllers; this test asserts that all three controllers
+        // surface as ControllerActionDescriptor entries through the
+        // composed app's IActionDescriptorCollectionProvider. If a
+        // future refactor drops the AddApplicationPart wiring (or
+        // moves the controllers out of the Slack assembly without
+        // updating the call), this assertion fires at test time
+        // instead of producing 404s in production.
+        WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());
+
+        IActionDescriptorCollectionProvider provider =
+            app.Services.GetRequiredService<IActionDescriptorCollectionProvider>();
+
+        IEnumerable<ControllerActionDescriptor> controllerActions = provider
+            .ActionDescriptors
+            .Items
+            .OfType<ControllerActionDescriptor>();
+
+        HashSet<string> discoveredControllers = new(StringComparer.Ordinal);
+        Dictionary<string, string> discoveredRoutes = new(StringComparer.Ordinal);
+        foreach (ControllerActionDescriptor action in controllerActions)
+        {
+            string typeName = action.ControllerTypeInfo.FullName ?? action.ControllerName;
+            discoveredControllers.Add(typeName);
+            if (action.AttributeRouteInfo?.Template is { } template
+                && !discoveredRoutes.ContainsKey(typeName))
+            {
+                discoveredRoutes[typeName] = template;
+            }
+        }
+
+        discoveredControllers.Should().Contain(
+            typeof(SlackEventsController).FullName!,
+            "Program.BuildApp must register the AgentSwarm.Messaging.Slack assembly as an MVC application part so SlackEventsController surfaces at /api/slack/events");
+        discoveredControllers.Should().Contain(
+            typeof(SlackCommandsController).FullName!,
+            "Program.BuildApp must register the AgentSwarm.Messaging.Slack assembly as an MVC application part so SlackCommandsController surfaces at /api/slack/commands");
+        discoveredControllers.Should().Contain(
+            typeof(SlackInteractionsController).FullName!,
+            "Program.BuildApp must register the AgentSwarm.Messaging.Slack assembly as an MVC application part so SlackInteractionsController surfaces at /api/slack/interactions");
+
+        discoveredRoutes[typeof(SlackEventsController).FullName!].Should().Be(
+            "api/slack/events",
+            "the Events API Stage 4.1 brief pins POST /api/slack/events as the URL verification + event callback route");
+        discoveredRoutes[typeof(SlackCommandsController).FullName!].Should().Be(
+            "api/slack/commands",
+            "the Slash Commands Stage 4.1 brief pins POST /api/slack/commands as the slash-command ACK route");
+        discoveredRoutes[typeof(SlackInteractionsController).FullName!].Should().Be(
+            "api/slack/interactions",
+            "the Interactions Stage 4.1 brief pins POST /api/slack/interactions as the Block Kit + view_submission route");
+    }
+
     private string[] BuildIsolatedArgs()
     {
         // WebApplication.CreateBuilder(args) reads "--Key=Value" CLI
         // overrides into IConfiguration. Both the SQLite audit path and
         // the dead-letter directory are isolated per test instance so
         // xUnit's cross-class parallelization cannot race on either
-        // file system resource.
+        // file system resource. The third override
+        // (Slack:Inbound:Queue:AllowInMemoryInProduction=true) opts the
+        // composition tests out of the Stage 4.1 iter-2 evaluator item 3
+        // durability guard: this test class verifies wiring shape
+        // (dead-letter sink, controller discovery) and intentionally
+        // exercises the default in-memory ISlackInboundQueue. The
+        // guard itself is covered by
+        // SlackInboundProductionDurabilityGuardTests.
         return new[]
         {
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
             $"--Slack:Inbound:DeadLetterDirectory={this.deadLetterDir}",
+            $"--{SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
         };
     }
 }

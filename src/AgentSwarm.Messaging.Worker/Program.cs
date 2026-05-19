@@ -11,21 +11,54 @@ using Microsoft.Extensions.Hosting;
 
 namespace AgentSwarm.Messaging.Worker;
 
+using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Core.Secrets;
+using AgentSwarm.Messaging.Persistence;
+using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Diagnostics;
+using AgentSwarm.Messaging.Slack.Persistence;
+using AgentSwarm.Messaging.Slack.Pipeline;
+using AgentSwarm.Messaging.Slack.Security;
+using AgentSwarm.Messaging.Slack.Transport;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+
 /// <summary>
 /// Entry point for the AgentSwarm messaging gateway host. The host owns the
 /// HTTP surface used by Slack (and other connector) inbound endpoints and
-/// runs the background message-processing pipeline. Stage 3.1 wires in the
-/// <see cref="SlackSignatureValidator"/> middleware so every request to
-/// <c>/api/slack</c> is HMAC-verified before later stages add the
-/// authorization filter, idempotency guard, and command handlers.
+/// runs the background message-processing pipeline.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Stage 8.1 (workstream:
+/// <c>ws-qq-slack-messenger-supp-phase-connector-wiring-and-acceptance-validation-stage-slackconnector-facade-and-di-wiring</c>):
+/// the composition root collapses every per-stage <c>AddSlack*</c> call into
+/// the single <see cref="SlackMessengerServiceCollectionExtensions.AddSlackMessenger(IServiceCollection, IConfiguration)"/>
+/// facade. The cross-platform primitives are now requested through
+/// <see cref="MessagingCoreServiceCollectionExtensions.AddMessagingCore"/> and
+/// <see cref="MessagingPersistenceServiceCollectionExtensions.AddMessagingPersistence"/>
+/// so future connector additions (Telegram, Discord, Teams) inherit the same
+/// host shape without per-connector edits here. The HTTP pipeline calls
+/// (<see cref="SlackSignatureValidator"/> middleware, controllers, health
+/// endpoints, EnsureCreated bootstrap, production durability guard) remain
+/// here because they require <see cref="WebApplication"/>.
+/// </para>
+/// <para>
+/// The host -- not the facade -- owns the SQLite-provider
+/// <see cref="DbContextOptionsBuilder.UseSqlite"/> call so the Slack
+/// assembly stays decoupled from any single EF provider. A future host
+/// that targets PostgreSQL or SQL Server swaps only the registration
+/// here; <see cref="SlackMessengerServiceCollectionExtensions.AddSlackMessenger(IServiceCollection, IConfiguration)"/>
+/// is unchanged.
+/// </para>
+/// </remarks>
 public class Program
 {
     /// <summary>
     /// Configuration key for the SQLite (or other relational) connection
-    /// string backing <see cref="SlackPersistenceDbContext"/>. Exposed as
-    /// a constant so the integration tests assert against the same key
-    /// the host actually reads.
+    /// string backing <see cref="SlackPersistenceDbContext"/>.
     /// </summary>
     public const string SlackAuditConnectionStringKey = "SlackAudit";
 
@@ -65,93 +98,100 @@ public class Program
     public static WebApplication BuildApp(string[] args)
     {
         WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
-        builder.Services.AddRouting();
-        builder.Services.AddSlackConnectorOptions(builder.Configuration);
 
-        // Stage 3.1: register the secret-provider chain BEFORE the
-        // signature middleware so the appsettings
-        // SecretProvider.ProviderType selector is honoured. The Slack
-        // validator uses TryAddSingleton<ISecretProvider, ...> as a
-        // fallback only, so this AddSecretProvider call wins.
+        // MVC routing is host-level, not connector-level.
+        builder.Services.AddRouting();
+
+        // Stage 8.1: cross-platform primitives provided by the Core and
+        // Persistence projects. AddMessagingCore registers TimeProvider.System
+        // (TryAdd, so a test composition root can pre-register a fake clock)
+        // and reserves the Messaging:Core options section. AddMessagingPersistence
+        // is currently a no-op shim reserved for the upstream Persistence
+        // story's cross-platform DbContext + entity configurations; the
+        // Slack-specific SlackPersistenceDbContext is owned by this host
+        // below (so the Slack assembly stays decoupled from any specific
+        // EF provider).
+        builder.Services.AddMessagingCore(builder.Configuration);
+        builder.Services.AddMessagingPersistence(builder.Configuration);
+
+        // Stage 8.1: secret-provider chain. Registered BEFORE
+        // AddSlackMessenger so the AddSlackSignatureValidation call inside
+        // the facade (which TryAddSingletons an InMemorySecretProvider
+        // fallback) does not win over the composite provider configured
+        // via SecretProvider:ProviderType in appsettings.
         builder.Services.AddSecretProvider(builder.Configuration);
 
-        // Stage 3.1: register the durable Slack audit DbContext and EF
-        // writer BEFORE AddSlackSignatureValidation so the EF writer
-        // wins over the in-memory writer that the validator's
-        // TryAddSingleton fallback would otherwise register. Without
-        // this call signature-rejection audit rows are lost on restart.
-        AddSlackAuditPersistence(builder);
+        // Stage 3.1: register the durable Slack audit DbContext BEFORE
+        // AddSlackMessenger so the facade's EF-bound registrations
+        // (audit writer, workspace store, idempotency store, thread
+        // mapping lookup) resolve the SQLite-backed context. Resolve
+        // the connection string LAZILY via the runtime IServiceProvider
+        // so any IConfiguration overrides applied by a
+        // WebApplicationFactory<Program> hook (e.g., the integration
+        // tests' per-test isolated SQLite path) are honoured -- a
+        // builder-time read of builder.Configuration would lock in the
+        // appsettings.json default before the hook runs.
+        builder.Services.AddDbContext<SlackPersistenceDbContext>((sp, opts) =>
+        {
+            IConfiguration cfg = sp.GetRequiredService<IConfiguration>();
+            string? connectionString = cfg.GetConnectionString(SlackAuditConnectionStringKey);
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                connectionString = DefaultSlackAuditConnectionString;
+            }
 
-        // Stage 3.1 (evaluator iter-3 item 1): register the EF-backed
-        // ISlackWorkspaceConfigStore so a restarted Worker can resolve
-        // SlackWorkspaceConfig.SigningSecretRef directly from the
-        // durable slack_workspace_config table -- not from a transient
-        // in-memory dictionary that only survives until the next
-        // restart. RemoveAll + AddSingleton ensures the EF store wins
-        // regardless of the order other extensions are called in.
-        builder.Services.AddSlackEntityFrameworkWorkspaceConfigStore<SlackPersistenceDbContext>();
+            opts.UseSqlite(connectionString);
+        });
 
-        // Stage 3.1 (evaluator iter-3 item 1): register the startup
-        // seeder that upserts every Slack:Workspaces entry from
-        // appsettings into the EF-backed table. The seeder is
-        // idempotent: existing rows are updated in-place (preserving
-        // created_at), missing rows are inserted, and rows that exist
-        // only in the database are left untouched so operators can
-        // manage workspaces outside of appsettings without the seeder
-        // stomping them. This keeps appsettings a convenient bootstrap
-        // source while making the database the source of truth.
-        builder.Services.AddSlackWorkspaceConfigSeeder<SlackPersistenceDbContext>(builder.Configuration);
+        // Stage 8.1: the single Slack connector facade. Composes every
+        // internal Slack registration -- options, persistence (EF audit
+        // writer / workspace store / seeder / idempotency / thread
+        // mapping), signature validation, authorization, inbound
+        // transport + ingestor, command / app-mention / interaction
+        // dispatchers, thread lifecycle, outbound dispatcher +
+        // SlackConnector, file-system queues + DLQs, health checks,
+        // startup diagnostics, telemetry, and the inbound MessengerEvent
+        // buffer SlackConnector.ReceiveAsync drains. The host MUST
+        // register SlackPersistenceDbContext (above) before this call.
+        //
+        // Iter-3 evaluator item 2 fix: the facade NO LONGER installs
+        // a development-default NoOpAgentTaskService stub (the prior
+        // behaviour silently ack'd /agent ask with a synthetic task
+        // when the host forgot a real orchestrator). The Worker is
+        // still in pre-orchestrator-client mode, so we explicitly opt
+        // in to the dev stub here -- the call is observable in the
+        // composition root and a future commit that wires the real
+        // orchestrator simply deletes this single line. Production
+        // hosts that ship the real orchestrator client BEFORE the
+        // dev opt-in get TryAdd semantics (their real registration
+        // wins).
+        builder.Services.AddSlackCommandDispatcherDevelopmentDefaults();
 
-        // Stage 3.1 (evaluator iter-1 item 4): also bind the seed
-        // options so the iter-1 in-memory store remains usable when a
-        // composition root opts out of the EF wiring above. With the
-        // EF store registered first (RemoveAll wins), this call is
-        // effectively a no-op for the canonical Worker host -- but it
-        // keeps the API surface stable for test hosts and downstream
-        // composition roots that prefer pure in-memory wiring.
-        builder.Services.AddSlackWorkspaceConfigStoreFromConfiguration(builder.Configuration);
+        // Iter-4 evaluator item 2 fix: AddSlackMessenger now composes
+        // BOTH AddSlackInboundTransport (Events API) AND
+        // AddSlackSocketModeTransport (Socket Mode) internally. The
+        // Worker previously had to call AddSlackSocketModeTransport
+        // explicitly; that responsibility moved into the facade so
+        // every host that calls AddSlackMessenger automatically wires
+        // ISlackInboundTransportFactory, ISlackSocketModeConnectionFactory,
+        // SlackSocketModeOptions (bound to Slack:SocketMode), and
+        // SlackInboundTransportHostedService -- no per-host duplication.
+        builder.Services.AddSlackMessenger(builder.Configuration);
 
-        // Stage 3.1: register the signature validator together with its
-        // workspace-config store and audit-entry-backed sink. The
-        // extension uses TryAdd*, so any production overrides (the
-        // database-backed workspace store added by Stage 2.3 or the
-        // EntityFrameworkSlackAuditEntryWriter added by the persistence
-        // composition root) registered before this call win.
-        builder.Services.AddSlackSignatureValidation(builder.Configuration);
-
-        // Stage 3.2: register the authorization filter (workspace ->
-        // channel -> user-group ACL) and its supporting services
-        // (ISlackMembershipResolver, ISlackUserGroupClient,
-        // ISlackAuthorizationAuditSink). All registrations use
-        // TryAdd*, so the in-memory fall-backs only apply when no
-        // production override is already present (the EF
-        // ISlackWorkspaceConfigStore and EF ISlackAuditEntryWriter
-        // registered above win for the Worker host).
-        builder.Services.AddSlackAuthorization(builder.Configuration);
-
-        // Stage 3.2: mount the SlackAuthorizationFilter on the MVC
-        // pipeline as a global service filter. Controllers land in
-        // Stage 4.1, but registering the filter at the
-        // composition-root level now (rather than waiting for Stage
-        // 4.1) means every controller added later automatically
-        // inherits the ACL gate without needing to decorate each
-        // controller with [ServiceFilter(typeof(SlackAuthorizationFilter))].
-        // The signature middleware (UseSlackSignatureValidation
-        // below) runs first and stamps HttpContext.Items with the
-        // resolved SlackWorkspaceConfig, which the filter re-uses
-        // to avoid a second workspace lookup.
+        // Stage 3.2 / 4.1: mount the SlackAuthorizationFilter as a global
+        // MVC service filter and opt the AgentSwarm.Messaging.Slack
+        // assembly into MVC's application-part scanner so the three Slack
+        // inbound controllers (Events / Commands / Interactions) surface
+        // at /api/slack/{events,commands,interactions} regardless of
+        // trimming / single-file / AOT publish semantics. The filter and
+        // signature middleware share Slack:Signature:PathPrefix so a
+        // single operator-tunable knob moves both the HMAC gate and the
+        // ACL gate together (no configurable-prefix bypass footgun).
         builder.Services
             .AddControllers(options =>
             {
                 options.Filters.AddService<SlackAuthorizationFilter>();
             })
-            // Stage 4.1: discover the Slack inbound controllers
-            // (SlackEventsController, SlackCommandsController,
-            // SlackInteractionsController) which live in the
-            // AgentSwarm.Messaging.Slack class library. Without this
-            // call MVC's application-part scanner only sees the
-            // Worker entry assembly and would not map the
-            // /api/slack/* routes.
             .AddSlackInboundControllers();
 
         // Stage 4.1: register the inbound HTTP transport services
@@ -260,14 +300,22 @@ public class Program
 
         WebApplication app = builder.Build();
 
+        // Stage 4.1 iter-2 evaluator item 3: fail-fast at host startup
+        // when the resolved ISlackInboundQueue is the in-process
+        // ChannelBasedSlackInboundQueue and the deployment claims to
+        // be Production. Operators who have validated that an
+        // in-memory queue is acceptable for their deployment can
+        // bypass the guard by setting
+        // 'Slack:Inbound:Queue:AllowInMemoryInProduction=true'.
+        app.Services.EnsureDurableInboundQueueForProduction(
+            app.Environment,
+            app.Configuration);
+
         // Stage 3.1: ensure the durable Slack audit schema is provisioned
         // BEFORE the first inbound request. SQLite is the default backing
-        // store (see SlackAuditConnectionStringKey) and the file may not
-        // exist on a fresh deployment; EnsureCreated is the idempotent
-        // bootstrap that gives the EF audit writer a table to insert into.
-        // Without this call the first signature-rejection write would
-        // throw "no such table: slack_audit_entry" and the rejection
-        // would never reach durable storage.
+        // store and the file may not exist on a fresh deployment;
+        // EnsureCreated is the idempotent bootstrap that gives the EF
+        // audit writer a table to insert into.
         using (IServiceScope scope = app.Services.CreateScope())
         {
             SlackPersistenceDbContext ctx =
@@ -277,29 +325,26 @@ public class Program
 
         // Stage 3.1 (evaluator iter-3 item 3): eagerly resolve the
         // composite ISecretProvider so a misconfigured
-        // SecretProvider:ProviderType (e.g. KeyVault without a
-        // registered backend) fails at host start, not at the first
-        // inbound Slack request. CompositeSecretProvider throws
-        // InvalidOperationException for unsupported provider types --
-        // resolving it here surfaces the error in the host start log
-        // where an operator will see it.
+        // SecretProvider:ProviderType (e.g. KeyVault without a registered
+        // backend) fails at host start, not at the first inbound Slack
+        // request.
         _ = app.Services.GetRequiredService<ISecretProvider>();
 
         // Stage 3.1: signature verification middleware. Placed before
-        // endpoint mapping so the inbound Slack routes added by later
-        // stages inherit the HMAC gate; the middleware short-circuits
-        // any path outside SlackSignatureOptions.PathPrefix (default
-        // /api/slack), so the health probes below are not affected.
+        // endpoint mapping so the inbound Slack routes inherit the HMAC
+        // gate; the middleware short-circuits any path outside
+        // SlackSignatureOptions.PathPrefix (default /api/slack), so the
+        // health probes below are not affected.
         app.UseSlackSignatureValidation();
 
-        app.MapGet("/health/live", () => Results.Ok(new { status = "live" }));
-        app.MapGet("/health/ready", () => Results.Ok(new { status = "ready" }));
+        // Stage 7.3: mount the real Slack health-check endpoints
+        // (/health/ready, /health/live) with operator-configurable
+        // paths via Slack:Health:ReadyEndpointPath /
+        // Slack:Health:LiveEndpointPath.
+        app.MapSlackHealthEndpoints();
 
-        // Stage 3.2: map controller endpoints so the
-        // SlackAuthorizationFilter registered as a global MVC filter
-        // above is invoked when Stage 4.1 lands the inbound Slack
-        // controllers. Stage 4.1 only needs to add controller types
-        // -- no further composition-root edits are required.
+        // Map controllers so the SlackAuthorizationFilter applied
+        // globally above is invoked for every controller endpoint.
         app.MapControllers();
 
         return app;

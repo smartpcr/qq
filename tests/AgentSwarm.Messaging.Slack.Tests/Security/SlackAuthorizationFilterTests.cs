@@ -393,6 +393,148 @@ public sealed class SlackAuthorizationFilterTests
     }
 
     [Fact]
+    public async Task Non_slack_path_bypasses_filter_when_default_prefix_is_active()
+    {
+        // Evaluator iter-2 follow-up: the filter is registered as a
+        // global MVC filter so future Slack controllers inherit the
+        // gate. Without path scoping every non-Slack MVC endpoint
+        // (admin APIs, cache invalidation, future controllers
+        // unrelated to Slack) would be rejected as MissingTeamId
+        // because their bodies have no team_id. Default
+        // SlackSignatureOptions.PathPrefix='/api/slack' is the single
+        // source of truth shared with the upstream HMAC middleware --
+        // there is no separate Slack:Authorization:PathPrefix to
+        // drift -- and short-circuits non-Slack paths to next() with
+        // no audit record and no rejection result.
+        Harness h = Harness.Build(allowedChannels: new[] { ChannelId }, allowedGroups: new[] { AllowedGroup });
+
+        // An admin endpoint with no Slack identity fields whatsoever.
+        ActionExecutingContext ctx = BuildJsonContext("/api/admin/cache-invalidate", @"{""scope"":""all""}");
+
+        bool nextInvoked = false;
+        await h.Filter.OnActionExecutionAsync(ctx, () =>
+        {
+            nextInvoked = true;
+            return Task.FromResult<ActionExecutedContext>(null!);
+        });
+
+        nextInvoked.Should().BeTrue("non-Slack paths must pass through the filter without enforcement");
+        ctx.Result.Should().BeNull("the filter must not short-circuit a non-Slack request");
+        h.AuditSink.Records.Should().BeEmpty("no audit record should be emitted for non-Slack paths -- they are out of scope for the Slack ACL");
+        h.WorkspaceStore.LookupCount.Should().Be(0, "the filter must not parse the body or look up a workspace for non-Slack paths");
+    }
+
+    [Fact]
+    public async Task Custom_signature_prefix_scopes_enforcement_to_matching_paths_only()
+    {
+        // Evaluator iter-2 follow-up: SlackAuthorizationFilter now
+        // derives its URL scope from SlackSignatureOptions.PathPrefix
+        // (single source of truth). Operators who mount the connector
+        // under a non-default URL (e.g., '/slack-gateway') by changing
+        // ONLY Slack:Signature:PathPrefix automatically scope the
+        // authorization filter too -- there is no separate
+        // Slack:Authorization:PathPrefix that could drift and create
+        // an authorization-bypass footgun.
+        Harness h = Harness.Build(
+            allowedChannels: new[] { ChannelId },
+            allowedGroups: new[] { AllowedGroup },
+            signatureOptions: new AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions
+            {
+                Enabled = true,
+                PathPrefix = "/slack-gateway",
+            });
+        h.UserGroupClient.SetMembers(TeamId, AllowedGroup, UserId);
+
+        // (a) A path UNDER the configured prefix -- enforced.
+        ActionExecutingContext inScope = BuildCommandContext(
+            teamId: TeamId, channelId: ChannelId, userId: UserId,
+            command: "/agent", text: "ask");
+        inScope.HttpContext.Request.Path = "/slack-gateway/commands";
+
+        bool inScopeNext = false;
+        await h.Filter.OnActionExecutionAsync(inScope, () =>
+        {
+            inScopeNext = true;
+            return Task.FromResult<ActionExecutedContext>(null!);
+        });
+        inScopeNext.Should().BeTrue("an in-scope path with a valid identity must pass through");
+        inScope.HttpContext.Items[SlackAuthorizationFilter.AuthorizedItemKey].Should().Be(true);
+
+        // (b) An unrelated path -- bypassed even with no team_id.
+        ActionExecutingContext outOfScope = BuildJsonContext("/api/operator/diagnostics", @"{""op"":""ping""}");
+        bool outOfScopeNext = false;
+        await h.Filter.OnActionExecutionAsync(outOfScope, () =>
+        {
+            outOfScopeNext = true;
+            return Task.FromResult<ActionExecutedContext>(null!);
+        });
+        outOfScopeNext.Should().BeTrue("paths outside the configured prefix must pass through");
+        outOfScope.Result.Should().BeNull();
+        h.AuditSink.Records.Should().BeEmpty("an out-of-scope path must not emit an audit record");
+
+        // (c) The OLD default prefix is now out of scope too -- if
+        // the iter-2 footgun were back, /api/slack/* would still be
+        // enforced even after the operator moved the signature mount.
+        ActionExecutingContext oldDefault = BuildCommandContext(
+            teamId: TeamId, channelId: ChannelId, userId: UserId,
+            command: "/agent", text: "ask");
+        oldDefault.HttpContext.Request.Path = "/api/slack/commands";
+        bool oldDefaultNext = false;
+        await h.Filter.OnActionExecutionAsync(oldDefault, () =>
+        {
+            oldDefaultNext = true;
+            return Task.FromResult<ActionExecutedContext>(null!);
+        });
+        oldDefaultNext.Should().BeTrue(
+            "the stale default '/api/slack' is correctly OUT of scope once the signature prefix moves; no authorization-bypass footgun on either side");
+        oldDefault.Result.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Path_scope_follows_slack_signature_options_when_signature_prefix_changes_at_runtime()
+    {
+        // Pin the single-source contract: SlackAuthorizationFilter
+        // reads IOptionsMonitor<SlackSignatureOptions>.CurrentValue
+        // on every action, so an IOptionsMonitor that returns a new
+        // PathPrefix on the second call moves the authorization
+        // scope along with it. This is the regression test the
+        // iter-2 evaluator asked for: there is no longer any
+        // Slack:Authorization:PathPrefix that an operator can leave
+        // pointing at the old default while moving the signature
+        // middleware to a new mount.
+        Harness h = Harness.Build(
+            allowedChannels: new[] { ChannelId },
+            allowedGroups: new[] { AllowedGroup },
+            signatureOptions: new AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions
+            {
+                Enabled = true,
+                PathPrefix = "/slack-gateway",
+            });
+        h.UserGroupClient.SetMembers(TeamId, AllowedGroup, UserId);
+
+        // Before reconfiguration, '/api/slack/...' is OUT of scope.
+        ActionExecutingContext stale = BuildCommandContext(
+            teamId: null, channelId: ChannelId, userId: UserId,
+            command: "/agent", text: "ask");
+        stale.HttpContext.Request.Path = "/api/slack/commands";
+        await h.Filter.OnActionExecutionAsync(stale, () => Task.FromResult<ActionExecutedContext>(null!));
+        stale.Result.Should().BeNull("the stale '/api/slack' path is out of scope under PathPrefix='/slack-gateway'");
+        h.AuditSink.Records.Should().BeEmpty();
+
+        // And '/slack-gateway/...' IS in scope -- a missing team_id
+        // produces an audit row (in-scope rejection).
+        ActionExecutingContext live = BuildCommandContext(
+            teamId: null, channelId: ChannelId, userId: UserId,
+            command: "/agent", text: "ask");
+        live.HttpContext.Request.Path = "/slack-gateway/commands";
+        await h.Filter.OnActionExecutionAsync(live, () => Task.FromResult<ActionExecutedContext>(null!));
+        AssertEphemeral200(live.Result, SlackAuthorizationOptions.DefaultRejectionMessage);
+        h.AuditSink.Records.Should().ContainSingle()
+            .Which.Reason.Should().Be(SlackAuthorizationRejectionReason.MissingTeamId,
+                "an in-scope request that omits team_id must be rejected with an audit row");
+    }
+
+    [Fact]
     public async Task Custom_rejection_message_is_json_escaped_in_ephemeral_body()
     {
         // Defense against an operator-supplied string that contains
@@ -524,7 +666,8 @@ public sealed class SlackAuthorizationFilterTests
             IReadOnlyCollection<string> allowedChannels,
             IReadOnlyCollection<string> allowedGroups,
             SlackAuthorizationOptions? options = null,
-            bool enabled = true)
+            bool enabled = true,
+            AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions? signatureOptions = null)
         {
             DateTimeOffset now = DateTimeOffset.FromUnixTimeSeconds(1_714_410_000);
             SlackWorkspaceConfig workspace = new()
@@ -548,6 +691,13 @@ public sealed class SlackAuthorizationFilterTests
             SlackAuthorizationOptions effectiveOptions = options ?? new SlackAuthorizationOptions();
             StaticOptionsMonitor<SlackAuthorizationOptions> optionsMonitor = new(effectiveOptions);
 
+            // Path scope is now derived from SlackSignatureOptions
+            // (single source of truth shared with the HMAC middleware).
+            AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions effectiveSignatureOptions =
+                signatureOptions ?? new AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions();
+            StaticOptionsMonitor<AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions>
+                signatureOptionsMonitor = new(effectiveSignatureOptions);
+
             FixedTimeProvider timeProvider = new(now);
 
             SlackMembershipResolver resolver = new(
@@ -562,6 +712,7 @@ public sealed class SlackAuthorizationFilterTests
                 resolver,
                 auditSink,
                 optionsMonitor,
+                signatureOptionsMonitor,
                 NullLogger<SlackAuthorizationFilter>.Instance,
                 timeProvider);
 

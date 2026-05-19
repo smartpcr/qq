@@ -16,9 +16,11 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 using AgentSwarm.Messaging.Core.Secrets;
 using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Entities;
+using AgentSwarm.Messaging.Slack.Observability;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Logging;
@@ -164,23 +166,116 @@ public sealed class SlackSignatureValidator : IMiddleware
             return;
         }
 
+        // Stage 7.2: every signature-validation pass produces a trace
+        // span so the §6.3 observability model has a parent activity
+        // for the downstream authorization / idempotency / dispatch
+        // children. The span is decorated with the request path and
+        // the resolved team id (post-validation) so dashboards can
+        // group rejections by workspace; the rejection reason is
+        // surfaced as a tag on the failure path.
+        using Activity? span = SlackTelemetry.ActivitySource.StartActivity(
+            SlackTelemetry.SignatureValidationSpanName,
+            ActivityKind.Server);
+        span?.SetTag("http.route", context.Request.Path.Value);
+
+        // Stage 7.2 / architecture.md §6.3: every Slack span must carry a
+        // `correlation_id` attribute so downstream services and log
+        // enrichers can stitch the request together. The signature
+        // validator runs before any envelope is constructed (no
+        // IdempotencyKey yet), so we seed `correlation_id` from the
+        // span's W3C TraceId -- the same id every child span shares,
+        // making it a stable handle for the whole request flow until
+        // the pipeline stamps the envelope-derived key on the
+        // downstream spans.
+        string? correlationId = span?.TraceId.ToString();
+        if (span is not null && correlationId is not null)
+        {
+            span.SetTag(SlackTelemetry.AttributeCorrelationId, correlationId);
+            span.AddBaggage(SlackTelemetry.AttributeCorrelationId, correlationId);
+        }
+
+        // Stage 7.2 step 5 / architecture.md §6.3: every log line emitted
+        // by the signature middleware (and any helper it calls, via
+        // AsyncLocal scope propagation) MUST carry the §6.3 correlation
+        // key set. `correlation_id` is the only key reliably known at
+        // entry; `team_id` becomes available once validation resolves
+        // a workspace and is added via a nested scope below.
+        // task_id / agent_id / channel_id are not in scope at the
+        // signature layer (those are pipeline-side concerns); the
+        // CreateScope helper skips null/empty values so the scope
+        // dictionary only contains what is genuinely available.
+        using IDisposable outerLogScope = SlackTelemetry.CreateScope(
+            this.logger,
+            correlationId: correlationId,
+            taskId: null,
+            agentId: null,
+            teamId: null,
+            channelId: null);
+
         SlackSignatureValidationResult result = await this.ValidateAsync(context, options).ConfigureAwait(false);
+
+        // Stage 7.2 step 5: now that validation has resolved (or failed
+        // to resolve) a workspace, enrich the log scope with team_id
+        // so every subsequent log line carries the workspace handle in
+        // addition to correlation_id. The reject + accept paths below
+        // both fire under this nested scope.
+        string? resolvedTeamId = result.Workspace?.TeamId ?? result.TeamId;
+        using IDisposable enrichedLogScope = SlackTelemetry.CreateScope(
+            this.logger,
+            correlationId: correlationId,
+            taskId: null,
+            agentId: null,
+            teamId: resolvedTeamId,
+            channelId: null);
 
         if (result.Accepted)
         {
             if (result.Workspace is not null)
             {
                 context.Items[WorkspaceItemKey] = result.Workspace;
+                span?.SetTag(SlackTelemetry.AttributeTeamId, result.Workspace.TeamId);
+                span?.AddBaggage(SlackTelemetry.AttributeTeamId, result.Workspace.TeamId);
             }
 
             if (result.IsUrlVerification)
             {
                 context.Items[UrlVerificationItemKey] = true;
+                span?.SetTag(SlackTelemetry.AttributeOutcome, "url_verification");
             }
+            else
+            {
+                span?.SetTag(SlackTelemetry.AttributeOutcome, "accepted");
+            }
+
+            span?.SetStatus(ActivityStatusCode.Ok);
 
             await next(context).ConfigureAwait(false);
             return;
         }
+
+        span?.SetTag(SlackTelemetry.AttributeOutcome, "rejected");
+        span?.SetTag(SlackTelemetry.AttributeRejectionReason, result.Reason.ToString());
+        if (!string.IsNullOrEmpty(result.TeamId))
+        {
+            span?.SetTag(SlackTelemetry.AttributeTeamId, result.TeamId);
+        }
+
+        span?.SetStatus(ActivityStatusCode.Error, result.ErrorDetail);
+
+        // Stage 7.2: every signature-rejection bumps the shared
+        // `slack.auth.rejected_count` counter with a structured
+        // `slack.rejection_reason` tag so signature failures share
+        // the same observability surface as Stage 3.2 ACL
+        // rejections (architecture.md §6.3 lists a single
+        // slack.auth.rejected_count metric for both). The `team_id`
+        // tag is included (empty when the rejection is too early to
+        // know team_id) so dashboards / tests can isolate emissions
+        // by workspace.
+        SlackTelemetry.AuthRejectedCount.Add(
+            1,
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeRejectionReason, result.Reason.ToString()),
+            new KeyValuePair<string, object?>("slack.rejection_stage", "signature"),
+            new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, result.TeamId ?? string.Empty));
 
         await this.RecordRejectionAsync(context, options, result).ConfigureAwait(false);
         await WriteRejectionResponseAsync(context, result).ConfigureAwait(false);
@@ -454,6 +549,21 @@ public sealed class SlackSignatureValidator : IMiddleware
         bool anyMalformedRef = false;
         foreach (SlackWorkspaceConfig workspace in registered)
         {
+            // Stage 7.2 step 5: nested per-workspace scope so the
+            // LogWarning + LogError calls below (and the
+            // TryResolveSigningSecretAsync helper) all carry team_id
+            // alongside the correlation_id propagated from the outer
+            // InvokeAsync scope. Without this nested push the
+            // per-workspace logs would be missing the team_id key the
+            // §6.3 contract mandates.
+            using IDisposable workspaceLogScope = SlackTelemetry.CreateScope(
+                this.logger,
+                correlationId: null,
+                taskId: null,
+                agentId: null,
+                teamId: workspace.TeamId,
+                channelId: null);
+
             SecretResolutionOutcome outcome = await this
                 .TryResolveSigningSecretAsync(workspace, context.RequestAborted)
                 .ConfigureAwait(false);
@@ -518,6 +628,22 @@ public sealed class SlackSignatureValidator : IMiddleware
         SlackWorkspaceConfig workspace,
         CancellationToken ct)
     {
+        // Stage 7.2 step 5: ensure the LogError on the unexpected-exception
+        // catch path below carries team_id in its log scope alongside the
+        // correlation_id flowing from the outer InvokeAsync scope. When
+        // called from the regular (non-url_verification) validation path
+        // this scope is the first place team_id becomes available; when
+        // called from ValidateUrlVerificationAsync the per-workspace
+        // scope above already added team_id, and nested
+        // BeginScope is additive so the duplication is harmless.
+        using IDisposable scope = SlackTelemetry.CreateScope(
+            this.logger,
+            correlationId: null,
+            taskId: null,
+            agentId: null,
+            teamId: workspace?.TeamId,
+            channelId: null);
+
         // Pre-check the reference itself so the secret provider's
         // ArgumentException for null/empty/whitespace does NOT escape as
         // an unhandled 500. Misconfigured workspaces (operator forgot

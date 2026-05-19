@@ -26,7 +26,7 @@ using Microsoft.EntityFrameworkCore;
 /// schema to exercise against SQLite (in-memory or file-backed).
 /// </para>
 /// </remarks>
-public sealed class SlackTestDbContext : DbContext, ISlackInboundRequestRecordDbContext
+public sealed class SlackTestDbContext : DbContext, ISlackInboundRequestRecordDbContext, ISlackThreadMappingDbContext
 {
     /// <summary>
     /// Initialises a new <see cref="SlackTestDbContext"/> with the
@@ -75,6 +75,16 @@ public sealed class SlackTestDbContext : DbContext, ISlackInboundRequestRecordDb
     /// </remarks>
     DbSet<SlackInboundRequestRecord> ISlackInboundRequestRecordDbContext.SlackInboundRequestRecords
         => this.InboundRequests;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Explicit interface implementation so the test context still exposes
+    /// only the descriptive <see cref="ThreadMappings"/> public accessor.
+    /// Stage 6.2's <c>SlackThreadManager&lt;TContext&gt;</c> reaches the
+    /// underlying set through this contract member.
+    /// </remarks>
+    DbSet<SlackThreadMapping> ISlackThreadMappingDbContext.SlackThreadMappings
+        => this.ThreadMappings;
 
     /// <inheritdoc />
     /// <remarks>

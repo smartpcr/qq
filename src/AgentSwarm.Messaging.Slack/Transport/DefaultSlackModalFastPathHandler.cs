@@ -7,8 +7,11 @@
 namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Observability;
+using AgentSwarm.Messaging.Slack.Persistence;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -87,8 +90,21 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
         ArgumentNullException.ThrowIfNull(envelope);
         ArgumentNullException.ThrowIfNull(httpContext);
 
+        // Stage 7.2: synchronous modal fast-path traces every
+        // views.open invocation as a `slack.modal.open` span so
+        // dashboards can split modal latency from the async
+        // outbound dispatch path. The span is decorated with the
+        // §6.3 attribute set sourced from the inbound envelope.
+        using Activity? span = SlackTelemetry.StartInboundSpan(
+            SlackTelemetry.ModalOpenSpanName,
+            envelope,
+            ActivityKind.Server);
+        using IDisposable scope = SlackTelemetry.CreateScope(this.logger, envelope);
+
         if (string.IsNullOrEmpty(envelope.TriggerId))
         {
+            span?.SetTag(SlackTelemetry.AttributeOutcome, "missing_trigger_id");
+            span?.SetStatus(ActivityStatusCode.Error, "missing trigger_id");
             this.logger.LogWarning(
                 "Slack modal fast-path rejected envelope idempotency_key={IdempotencyKey} team_id={TeamId}: missing trigger_id (cannot call views.open).",
                 envelope.IdempotencyKey,
@@ -103,6 +119,8 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
         SlackCommandPayload payload = SlackInboundPayloadParser.ParseCommand(envelope.RawPayload);
         if (string.IsNullOrEmpty(payload.SubCommand))
         {
+            span?.SetTag(SlackTelemetry.AttributeOutcome, "missing_sub_command");
+            span?.SetStatus(ActivityStatusCode.Error, "missing sub-command");
             this.logger.LogWarning(
                 "Slack modal fast-path rejected envelope idempotency_key={IdempotencyKey} team_id={TeamId}: missing sub-command in text='{Text}'.",
                 envelope.IdempotencyKey,
@@ -114,6 +132,44 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
             return SlackModalFastPathResult.Handled(
                 BuildEphemeralError(
                     "Could not open the modal: missing sub-command (expected `/agent review …` or `/agent escalate …`)."));
+        }
+
+        span?.SetTag(SlackTelemetry.AttributeSubCommand, payload.SubCommand);
+
+        // Stage 5.1 iter-3 evaluator item 1 (STRUCTURAL fix): both
+        // /agent review and /agent escalate REQUIRE a task-id argument
+        // -- the modal exists to act on a specific task, and the Stage
+        // 5.3 view-submission handler needs the task-id to route the
+        // resulting HumanDecisionEvent back to the right orchestrator
+        // task. Previously the fast-path silently opened a modal whose
+        // private_metadata fell back to the envelope's idempotency key
+        // (via DefaultSlackModalPayloadBuilder), producing a "task-id"
+        // that did not actually identify any agent task. The fix
+        // pre-validates the argument BEFORE acquiring the idempotency
+        // reservation so missing-argument requests (a) do not burn a
+        // durable dedup row, (b) do not call views.open, and (c)
+        // surface a usable ephemeral error to the invoking user. Tests
+        // pin both review and escalate paths in
+        // DefaultSlackModalFastPathHandlerTests.cs.
+        if (RequiresTaskIdArgument(payload.SubCommand!) && string.IsNullOrWhiteSpace(payload.ArgumentText))
+        {
+            this.logger.LogWarning(
+                "Slack modal fast-path rejected envelope idempotency_key={IdempotencyKey} team_id={TeamId} user_id={UserId}: sub-command '{SubCommand}' requires a task-id argument but none was supplied (text='{Text}').",
+                envelope.IdempotencyKey,
+                envelope.TeamId,
+                envelope.UserId,
+                payload.SubCommand,
+                payload.Text);
+            await this.auditRecorder
+                .RecordErrorAsync(
+                    envelope,
+                    payload.SubCommand!,
+                    "missing required task-id argument.",
+                    ct)
+                .ConfigureAwait(false);
+            return SlackModalFastPathResult.Handled(
+                BuildEphemeralError(
+                    $"`/agent {payload.SubCommand}` requires a task-id (e.g., `/agent {payload.SubCommand} TASK-42`)."));
         }
 
         SlackFastPathIdempotencyResult acquireResult = await this.idempotencyStore
@@ -195,6 +251,8 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
 
         if (viewsResult.IsSuccess)
         {
+            span?.SetTag(SlackTelemetry.AttributeOutcome, "opened");
+            span?.SetStatus(ActivityStatusCode.Ok);
             // Iter-4 fix: transition the durable idempotency row from
             // "reserved" to "modal_opened" so Stage 4.3's async ingestor
             // recognises this row as terminal and does NOT replay the
@@ -247,10 +305,16 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
             // CancellationToken.None and wrap in try/catch so the
             // success path is fully cancellation-safe: a missing audit
             // row is recoverable via log mining, a 5xx is not.
+            //
+            // Stage 7.1 evaluator iter-1 item 3: the serialised view
+            // payload is stamped onto the audit row's
+            // ResponsePayload so the story "Audit" field list is met
+            // for successful modal opens (not just errors).
             try
             {
+                string? serialisedView = SlackAuditPayloadSerializer.Serialize(viewPayload);
                 await this.auditRecorder
-                    .RecordSuccessAsync(envelope, payload.SubCommand!, CancellationToken.None)
+                    .RecordSuccessAsync(envelope, payload.SubCommand!, CancellationToken.None, serialisedView)
                     .ConfigureAwait(false);
             }
             catch (Exception auditEx)
@@ -270,6 +334,8 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
         // async processing because the trigger_id is already expired (or
         // about to expire) and the orchestrator cannot make any progress
         // toward opening a modal once that happens (architecture.md §5.3).
+        span?.SetTag(SlackTelemetry.AttributeOutcome, $"views_open_{viewsResult.Kind}");
+        span?.SetStatus(ActivityStatusCode.Error, viewsResult.Error);
         await this.idempotencyStore.ReleaseAsync(envelope.IdempotencyKey, ct).ConfigureAwait(false);
         string userMessage = viewsResult.Kind switch
         {
@@ -298,6 +364,24 @@ internal sealed class DefaultSlackModalFastPathHandler : ISlackModalFastPathHand
             .ConfigureAwait(false);
 
         return SlackModalFastPathResult.Handled(BuildEphemeralError(userMessage));
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> for sub-commands whose modal
+    /// rendering REQUIRES a task-id argument (currently
+    /// <c>/agent review</c> and <c>/agent escalate</c>).
+    /// </summary>
+    /// <remarks>
+    /// Stage 5.1 iter-3 evaluator item 1: this predicate is the single
+    /// source of truth for the fast-path's missing-argument validation
+    /// gate. Adding a new modal-style sub-command later requires
+    /// extending this method AND adding the matching renderer method on
+    /// <see cref="Rendering.ISlackMessageRenderer"/>.
+    /// </remarks>
+    private static bool RequiresTaskIdArgument(string subCommand)
+    {
+        return string.Equals(subCommand, "review", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(subCommand, "escalate", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

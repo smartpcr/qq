@@ -8,6 +8,8 @@ namespace AgentSwarm.Messaging.Slack.Transport;
 
 using System;
 using System.Collections.Generic;
+using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Pipeline;
 using AgentSwarm.Messaging.Slack.Queues;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
@@ -75,7 +77,9 @@ public static class SlackInboundTransportServiceCollectionExtensions
         // production host registers a durable sink BEFORE this call.
         services.TryAddSingleton<InMemorySlackInboundEnqueueDeadLetterSink>();
         services.TryAddSingleton<ISlackInboundEnqueueDeadLetterSink>(sp =>
-            sp.GetRequiredService<InMemorySlackInboundEnqueueDeadLetterSink>());        // Default modal fast-path handler is a real implementation that
+            sp.GetRequiredService<InMemorySlackInboundEnqueueDeadLetterSink>());
+
+        // Default modal fast-path handler is a real implementation that
         // runs idempotency + views.open synchronously inside the HTTP
         // request lifetime (architecture.md §5.3, tech-spec.md §5.2).
         // Iter-3 (evaluator items 2 + 3) introduces the
@@ -86,6 +90,7 @@ public static class SlackInboundTransportServiceCollectionExtensions
         services.TryAddSingleton<SlackInProcessIdempotencyStore>();
         services.TryAddSingleton<ISlackFastPathIdempotencyStore>(sp =>
             sp.GetRequiredService<SlackInProcessIdempotencyStore>());
+        services.TryAddSingleton<Rendering.ISlackMessageRenderer, Rendering.DefaultSlackMessageRenderer>();
         services.TryAddSingleton<ISlackModalPayloadBuilder, DefaultSlackModalPayloadBuilder>();
 
         // Audit recorder for modal_open entries (architecture.md §5.3
@@ -96,13 +101,60 @@ public static class SlackInboundTransportServiceCollectionExtensions
         // AddSlackSignatureValidation's TryAdd fallback.
         services.TryAddSingleton<SlackModalAuditRecorder>();
 
-        // Named HttpClient registration so the host can layer
-        // resilience handlers (retry, circuit-breaker) on it without
-        // subclassing the client.
+        // Stage 6.4 (evaluator iter-2 item #1, STRUCTURAL): the
+        // production modal fast-path resolves to SlackDirectApiClient
+        // -- the SlackNet-backed implementation that wraps views.open
+        // through ISlackApiClient.Post, shares the per-tier
+        // ISlackRateLimiter singleton with SlackOutboundDispatcher,
+        // and enforces the ~2.5s trigger_id deadline that Slack's
+        // 3-second ACK budget requires. The legacy
+        // HttpClientSlackViewsOpenClient remains in the codebase as a
+        // fall-back for hosts that explicitly register it BEFORE
+        // calling AddSlackInboundTransport (TryAdd lets the earlier
+        // registration win), but the default for every Worker host is
+        // now the SlackNet wrapper -- implementation-plan.md Stage
+        // 6.4 step 1.
+        //
+        // The shared ISlackRateLimiter singleton is TryAdd-registered
+        // here so any host that wires only AddSlackInboundTransport
+        // (e.g., a fast-path-only deployment) still resolves the
+        // direct client. AddSlackOutboundDispatcher uses the same
+        // TryAddSingleton<ISlackRateLimiter, SlackTokenBucketRateLimiter>
+        // call, so whichever extension runs first wins and the second
+        // one becomes a no-op; either way both pipelines bind to the
+        // SAME singleton instance per architecture.md §2.12.
         services.AddHttpClient(HttpClientSlackViewsOpenClient.HttpClientName);
-        services.TryAddSingleton<ISlackViewsOpenClient, HttpClientSlackViewsOpenClient>();
+        services.AddOptions<SlackConnectorOptions>();
+        services.TryAddSingleton<ISlackRateLimiter, SlackTokenBucketRateLimiter>();
+        services.TryAddSingleton<SlackDirectApiClient>();
+        services.TryAddSingleton<ISlackViewsOpenClient>(sp =>
+            sp.GetRequiredService<SlackDirectApiClient>());
+
+        // Stage 5.2: production threaded-reply poster (chat.postMessage)
+        // for the app-mention handler. Registered here -- alongside the
+        // other HTTP-backed Slack Web API clients -- so any host that
+        // wires AddSlackInboundTransport (the Worker, integration
+        // tests with real transport) automatically gets the real HTTP
+        // implementation. The dispatcher extension
+        // (AddSlackCommandDispatcher) keeps a TryAddSingleton NoOp
+        // fall-back so unit-test fixtures that skip the transport
+        // wiring still resolve a non-null binding; because both
+        // registrations use TryAdd, the FIRST extension call wins per
+        // composition. Stage 6.4's consolidated SlackDirectApiClient
+        // can supersede via pre-registration.
+        services.AddHttpClient(Pipeline.HttpClientSlackThreadedReplyPoster.HttpClientName);
+        services.TryAddSingleton<Pipeline.ISlackThreadedReplyPoster, Pipeline.HttpClientSlackThreadedReplyPoster>();
 
         services.TryAddSingleton<ISlackModalFastPathHandler, DefaultSlackModalFastPathHandler>();
+
+        // Register a NO-OP ISlackInteractionFastPathHandler so the
+        // SlackInteractionsController can always resolve a fast-path
+        // even when the host has not opted into the Stage 5.3
+        // interaction dispatcher. Hosts that DO call
+        // AddSlackInteractionDispatcher swap this NoOp out for the
+        // real DefaultSlackInteractionFastPathHandler via
+        // RemoveAll<>+AddSingleton<>.
+        services.TryAddSingleton<ISlackInteractionFastPathHandler, NoOpSlackInteractionFastPathHandler>();
 
         return services;
     }
@@ -276,6 +328,93 @@ public static class SlackInboundTransportServiceCollectionExtensions
             sp.GetRequiredService<FileSystemSlackInboundEnqueueDeadLetterSink>());
 
         return services;
+    }
+
+    /// <summary>
+    /// Configuration key (under the <c>Slack:Inbound:Queue</c>
+    /// section) that an operator can set to <c>true</c> to explicitly
+    /// opt into the in-process <see cref="ChannelBasedSlackInboundQueue"/>
+    /// in a Production environment. Leaving it absent or
+    /// <c>false</c> (the default) makes
+    /// <see cref="EnsureDurableInboundQueueForProduction"/> throw at
+    /// host startup if no durable implementation has been wired,
+    /// preventing accidental message loss on Worker restarts.
+    /// </summary>
+    public const string AllowInMemoryQueueInProductionConfigKey =
+        "Slack:Inbound:Queue:AllowInMemoryInProduction";
+
+    /// <summary>
+    /// Validates -- at host build time, after
+    /// <see cref="Microsoft.AspNetCore.Builder.WebApplication"/> is
+    /// fully composed -- that the resolved
+    /// <see cref="ISlackInboundQueue"/> satisfies the reliability
+    /// contract for the current
+    /// <see cref="IHostEnvironment.EnvironmentName"/>. In Production
+    /// the in-process
+    /// <see cref="ChannelBasedSlackInboundQueue"/> is REJECTED
+    /// (because process restarts drop every buffered envelope,
+    /// violating FR-005 / FR-007 "no message loss" from
+    /// <c>agent_swarm_messenger_user_stories.md</c>) unless the
+    /// operator has explicitly opted in via
+    /// <see cref="AllowInMemoryQueueInProductionConfigKey"/>=true.
+    /// Non-Production environments (Development, Staging, custom
+    /// names) accept the in-memory queue without complaint so local
+    /// dev and CI keep working.
+    /// </summary>
+    /// <remarks>
+    /// Stage 4.1 iter-2 evaluator item 3. The guard is intentionally
+    /// limited to <see cref="ISlackInboundQueue"/> -- the durable
+    /// dead-letter sink is already enforced separately by
+    /// <see cref="AddFileSystemSlackInboundEnqueueDeadLetterSink"/>
+    /// -- so it fires once per host boot and produces a precise
+    /// error message that tells the operator exactly which
+    /// configuration knob unlocks the in-memory default.
+    /// </remarks>
+    /// <param name="services">
+    /// Built service provider (typically
+    /// <see cref="Microsoft.AspNetCore.Builder.WebApplication.Services"/>).
+    /// </param>
+    /// <param name="environment">Host environment metadata.</param>
+    /// <param name="configuration">Host configuration.</param>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the host is running in Production and the
+    /// resolved <see cref="ISlackInboundQueue"/> is the in-process
+    /// <see cref="ChannelBasedSlackInboundQueue"/> without an
+    /// explicit <see cref="AllowInMemoryQueueInProductionConfigKey"/>
+    /// opt-in.
+    /// </exception>
+    public static void EnsureDurableInboundQueueForProduction(
+        this IServiceProvider services,
+        IHostEnvironment environment,
+        IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(environment);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        if (!environment.IsProduction())
+        {
+            return;
+        }
+
+        bool allowInMemory = configuration.GetValue<bool>(AllowInMemoryQueueInProductionConfigKey);
+        if (allowInMemory)
+        {
+            return;
+        }
+
+        ISlackInboundQueue queue = services.GetRequiredService<ISlackInboundQueue>();
+        if (queue is ChannelBasedSlackInboundQueue)
+        {
+            throw new InvalidOperationException(
+                "Slack inbound queue is the in-process ChannelBasedSlackInboundQueue, which is not durable across "
+                + $"process restarts and therefore cannot satisfy FR-005/FR-007 \"no message loss\" in the {environment.EnvironmentName} environment. "
+                + "Register a durable ISlackInboundQueue implementation (e.g., an Azure Service Bus or RabbitMQ-backed queue) "
+                + "BEFORE calling AddSlackInboundTransport(); or, if you have validated that an in-memory queue is acceptable "
+                + $"for this deployment (single-instance, transient workloads, behind retries), set the configuration key "
+                + $"'{AllowInMemoryQueueInProductionConfigKey}=true' to acknowledge the trade-off explicitly. "
+                + "Stage 4.1 iter-2 evaluator item 3.");
+        }
     }
 }
 

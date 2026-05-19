@@ -14,10 +14,17 @@ namespace AgentSwarm.Messaging.Slack.Queues;
 /// <para>
 /// <b>Stage 1.3 contract.</b> The in-process
 /// <see cref="ChannelBasedSlackQueue{T}"/> backs this interface for
-/// development and tests. In production, the swap-in implementation will
-/// be a durable outbox (database-backed, Service Bus, etc.) supplied by
-/// the upstream <c>AgentSwarm.Messaging.Core</c> project per Stage 1.3 of
-/// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>.
+/// development and tests. In production the swap-in implementation is the
+/// disk-backed <see cref="FileSystemSlackOutboundQueue"/> (Stage 6.3
+/// iter 2): the agent-uploaded story attachment's FR-005 (durable
+/// outbound queue, connector restart recovery) and FR-007 ("0 tolerated
+/// message loss") require that an enqueued envelope survives a worker
+/// restart -- the in-process channel queue does NOT meet that bar.
+/// Durable backends additionally implement
+/// <see cref="IAcknowledgeableSlackOutboundQueue"/> so the
+/// <c>SlackOutboundDispatcher</c> can remove the journal entry only
+/// after a TERMINAL disposition (delivered to Slack OR safely
+/// dead-lettered).
 /// </para>
 /// <para>
 /// <c>views.open</c> calls bypass this queue (see architecture.md section

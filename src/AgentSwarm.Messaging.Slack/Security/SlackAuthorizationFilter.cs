@@ -10,6 +10,7 @@ using System;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Configuration;
 using AgentSwarm.Messaging.Slack.Entities;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -100,17 +101,27 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
     private readonly ISlackMembershipResolver membershipResolver;
     private readonly ISlackAuthorizationAuditSink auditSink;
     private readonly IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor;
+    private readonly IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor;
     private readonly ILogger<SlackAuthorizationFilter> logger;
     private readonly TimeProvider timeProvider;
 
     /// <summary>
     /// Initializes a new instance with the supplied dependencies.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="signatureOptionsMonitor"/> is the single source of
+    /// truth for the URL path scope: the filter reads
+    /// <see cref="SlackSignatureOptions.PathPrefix"/> on every request
+    /// so the authorization gate and the upstream HMAC middleware are
+    /// mathematically guaranteed to enforce on the same surface area.
+    /// There is no <c>SlackAuthorizationOptions.PathPrefix</c> by design.
+    /// </remarks>
     public SlackAuthorizationFilter(
         ISlackWorkspaceConfigStore workspaceStore,
         ISlackMembershipResolver membershipResolver,
         ISlackAuthorizationAuditSink auditSink,
         IOptionsMonitor<SlackAuthorizationOptions> optionsMonitor,
+        IOptionsMonitor<SlackSignatureOptions> signatureOptionsMonitor,
         ILogger<SlackAuthorizationFilter> logger,
         TimeProvider? timeProvider = null)
     {
@@ -118,6 +129,7 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         this.membershipResolver = membershipResolver ?? throw new ArgumentNullException(nameof(membershipResolver));
         this.auditSink = auditSink ?? throw new ArgumentNullException(nameof(auditSink));
         this.optionsMonitor = optionsMonitor ?? throw new ArgumentNullException(nameof(optionsMonitor));
+        this.signatureOptionsMonitor = signatureOptionsMonitor ?? throw new ArgumentNullException(nameof(signatureOptionsMonitor));
         this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -137,6 +149,26 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         }
 
         HttpContext http = context.HttpContext;
+
+        // Path scoping (evaluator iter-2 follow-up): the filter is
+        // mounted as a global MVC filter so future Slack controllers
+        // inherit the gate automatically. The path scope is read from
+        // SlackSignatureOptions.PathPrefix -- the SAME option the
+        // upstream HMAC middleware uses -- so the two layers cannot
+        // drift apart. An operator who moves Slack:Signature:PathPrefix
+        // from /api/slack to /slack-gateway moves BOTH the signature
+        // gate and the authorization gate; there is no separate
+        // Slack:Authorization:PathPrefix to forget. Non-Slack MVC
+        // endpoints (admin APIs, cache-invalidation hooks, future
+        // controllers unrelated to Slack) short-circuit out of the
+        // ACL without parsing the body or looking up the workspace.
+        SlackSignatureOptions signatureOptions = this.signatureOptionsMonitor.CurrentValue;
+        if (!PathInScope(http, signatureOptions))
+        {
+            await next().ConfigureAwait(false);
+            return;
+        }
+
         CancellationToken ct = http.RequestAborted;
 
         // Events API url_verification handshakes have no channel /
@@ -195,12 +227,32 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         if (string.IsNullOrWhiteSpace(identity.ChannelId)
             || !IsChannelAllowed(workspace, identity.ChannelId!))
         {
-            await this
-                .RejectAsync(context, identity, SlackAuthorizationRejectionReason.DisallowedChannel,
-                    FormattableString.Invariant(
-                        $"channel '{identity.ChannelId ?? "(none)"}' is not in AllowedChannelIds for team '{workspace.TeamId}'."))
-                .ConfigureAwait(false);
-            return;
+            // Stage 4.1 iter-2 evaluator item 1: view_submission
+            // (modal form submission) payloads are NOT channel-scoped
+            // by Slack's design -- the modal's origin lives in
+            // view.private_metadata, not channel.id. The Stage 3.2 ACL
+            // has no channel context to compare against. Skip the
+            // channel rejection for view_submission so authorized
+            // modal submissions can reach /api/slack/interactions and
+            // be turned into HumanDecisionEvent in Stage 5.3.
+            // Block-actions and other interaction payloads still
+            // carry channel.id and remain subject to the allow-list.
+            if (IsViewSubmissionPayload(identity))
+            {
+                this.logger.LogDebug(
+                    "Slack authorization filter skipping channel ACL for view_submission payload team={TeamId} user={UserId} (modal submissions are not channel-scoped per architecture.md §5.3).",
+                    identity.TeamId,
+                    identity.UserId);
+            }
+            else
+            {
+                await this
+                    .RejectAsync(context, identity, SlackAuthorizationRejectionReason.DisallowedChannel,
+                        FormattableString.Invariant(
+                            $"channel '{identity.ChannelId ?? "(none)"}' is not in AllowedChannelIds for team '{workspace.TeamId}'."))
+                    .ConfigureAwait(false);
+                return;
+            }
         }
 
         if (string.IsNullOrWhiteSpace(identity.UserId))
@@ -267,11 +319,41 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         // Happy path: stamp resolved identity so downstream stages do
         // not re-parse the body.
         http.Items[WorkspaceItemKey] = workspace;
-        http.Items[ChannelIdItemKey] = identity.ChannelId!;
+        if (IsViewSubmissionPayload(identity))
+        {
+            // view_submission payloads have no channel.id by design;
+            // skip stamping the ChannelIdItemKey so a downstream
+            // consumer that probes Items[ChannelIdItemKey] sees the
+            // absent value rather than an empty string masquerading
+            // as a real channel.
+        }
+        else
+        {
+            http.Items[ChannelIdItemKey] = identity.ChannelId!;
+        }
+
         http.Items[UserIdItemKey] = identity.UserId!;
         http.Items[AuthorizedItemKey] = true;
 
         await next().ConfigureAwait(false);
+    }
+
+    private static bool IsViewSubmissionPayload(SlackInboundIdentity identity)
+    {
+        // Slack's view_submission interactive payload is not
+        // channel-scoped -- the modal's origin is conveyed via
+        // view.private_metadata, not channel.id -- so the
+        // authorization filter must skip the channel ACL on this
+        // payload type. The check intentionally matches only the
+        // literal Slack payload type string because the field is null
+        // for the Stage 3.1 form-encoded slash commands and populated
+        // for the Stage 4.1 JSON-parser paths (Events API callbacks
+        // and interactive payloads), which is where Slack surfaces
+        // view_submission per the Block Kit + modal API docs.
+        return string.Equals(
+            identity.PayloadType,
+            "view_submission",
+            StringComparison.Ordinal);
     }
 
     private static bool IsChannelAllowed(SlackWorkspaceConfig workspace, string channelId)
@@ -295,6 +377,26 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
         }
 
         return false;
+    }
+
+    private static bool PathInScope(HttpContext http, SlackSignatureOptions signatureOptions)
+    {
+        // SlackSignatureOptions.PathPrefix is the single source of truth
+        // for the URL scope covered by both the HMAC middleware and
+        // this authorization filter. SlackSignatureValidationServiceCollectionExtensions
+        // enforces a non-empty, leading-'/' value at startup, so any
+        // value reaching this point is already a valid PathString.
+        if (string.IsNullOrWhiteSpace(signatureOptions.PathPrefix))
+        {
+            // Defense-in-depth: a custom composition root that bypasses
+            // the validator (e.g., a test) and leaves PathPrefix empty
+            // means "no scope filter" -- enforce on every action.
+            return true;
+        }
+
+        return http.Request.Path.StartsWithSegments(
+            new PathString(signatureOptions.PathPrefix),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<SlackWorkspaceConfig?> ResolveWorkspaceAsync(HttpContext http, string teamId, CancellationToken ct)
@@ -368,7 +470,7 @@ public sealed class SlackAuthorizationFilter : IAsyncActionFilter
             ? SlackAuthorizationOptions.DefaultRejectionMessage
             : options.RejectionMessage;
 
-        // Slack endpoints MUST return HTTP 200 (architecture.md §2.4
+        // Slack endpoints MUST return HTTP 200 (architecture.md ┬º2.4
         // and the Stage 3.2 brief). The brief explicitly requires
         // rejection to be communicated in the response body as an
         // ephemeral message for every Slack inbound surface
