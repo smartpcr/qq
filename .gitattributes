@@ -1,0 +1,13 @@
+# Repo-wide whitespace rules for `git diff --check`.
+#
+# Default Git whitespace rules are kept (real trailing space, space-before-tab,
+# blank-at-eof). `cr-at-eol` is added so the CR in this Windows-checked-in
+# codebase's CRLF line endings is NOT treated as trailing whitespace on added
+# lines -- it is the line-ending convention, not a defect.
+#
+# Net effect:
+#   * Real trailing spaces      -> still flagged (blank-at-eol).
+#   * Real space-before-tab     -> still flagged (space-before-tab).
+#   * Trailing blank lines      -> still flagged (blank-at-eof).
+#   * CR at end of CRLF lines   -> NOT flagged (cr-at-eol).
+* whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
