@@ -246,6 +246,123 @@ public sealed class SlackInboundIngestorTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_forwards_envelope_to_fallback_sink_when_pipeline_cannot_be_lazily_resolved_from_DI()
+    {
+        // Iter-3 evaluator item #1 (PRIMARY): direct coverage for the
+        // lazy-resolution catch block that iter-2 added inside
+        // SlackInboundIngestor.ExecuteAsync.
+        //
+        // The shipped Worker registers SlackInboundIngestor as a
+        // BackgroundService even when no real Stage 5 handlers are
+        // wired AND the AddSlackInboundDevelopmentHandlerStubs gate
+        // is OFF (Production default). The ingestor must therefore
+        // tolerate a DI graph where SlackInboundProcessingPipeline
+        // cannot be resolved at all (the pipeline ctor requires
+        // ISlackCommandHandler / ISlackAppMentionHandler /
+        // ISlackInteractionHandler, none of which are registered).
+        //
+        // Existing coverage in WorkerHandlerStubGatingTests asserts
+        // direct factory.Services.GetRequiredService<SlackInboundProcessingPipeline>()
+        // throws -- but that does NOT exercise the ingestor's catch
+        // block. This test wires the actual SlackInboundIngestor with
+        // an IServiceProvider that has NO pipeline registration,
+        // enqueues a real envelope, and asserts:
+        //   1) the ingestor does not crash (the BackgroundService
+        //      loop keeps running so a later operator-driven
+        //      handler registration could recover the host);
+        //   2) the original envelope is forwarded to the durable
+        //      last-resort ISlackInboundEnqueueDeadLetterSink so the
+        //      FR-005 / FR-007 zero-message-loss guarantee still
+        //      holds even when the handler set is missing;
+        //   3) the captured exception is the DI resolve failure
+        //      (InvalidOperationException) so operators triaging the
+        //      sink can see the root cause without having to dig
+        //      through the host logs.
+        FakeQueue queue = new();
+        RecordingDeadLetterFallbackSink sink = new();
+        SlackInboundEnvelope envelope = BuildCommandEnvelope("cmd:T1:U1:/agent:trig-no-pipeline");
+
+        // Build a service provider that DELIBERATELY does NOT
+        // register SlackInboundProcessingPipeline (mirroring a
+        // Production Worker that has opted out of the development
+        // handler stubs and not yet shipped Stage 5 handlers). The
+        // fallback sink is registered because the ingestor MUST
+        // still be able to preserve the envelope.
+        ServiceCollection services = new();
+        services.AddSingleton<ISlackInboundEnqueueDeadLetterSink>(sink);
+
+        SlackInboundIngestor ingestor = new(
+            queue,
+            services.BuildServiceProvider(),
+            NullLogger<SlackInboundIngestor>.Instance);
+
+        await queue.EnqueueAsync(envelope);
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        Task run = ingestor.StartAsync(cts.Token);
+
+        await WaitUntilAsync(() => sink.Records.Count >= 1, TimeSpan.FromSeconds(5));
+
+        await ingestor.StopAsync(CancellationToken.None);
+        cts.Cancel();
+        await run;
+
+        sink.Records.Should().HaveCount(1,
+            "the ingestor's lazy-resolution catch block MUST forward the envelope to the durable last-resort sink when SlackInboundProcessingPipeline cannot be resolved from DI; otherwise the envelope is permanently lost");
+        sink.Records[0].Envelope.IdempotencyKey.Should().Be(envelope.IdempotencyKey,
+            "the forwarded envelope MUST be the ORIGINAL envelope (not a copy with stripped fields) so an operator can replay it after Stage 5 handlers ship");
+        sink.Records[0].Envelope.SourceType.Should().Be(envelope.SourceType);
+        sink.Records[0].Envelope.RawPayload.Should().Be(envelope.RawPayload);
+        sink.Records[0].LastException.Should().BeOfType<InvalidOperationException>(
+            "GetRequiredService<SlackInboundProcessingPipeline>() throws InvalidOperationException when the service is not registered, and that root-cause exception MUST be the one captured in the sink");
+        sink.Records[0].AttemptCount.Should().Be(0,
+            "the envelope never made it past DI resolution so no handler attempts were made");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_survives_when_pipeline_cannot_be_resolved_AND_fallback_sink_is_also_missing()
+    {
+        // Iter-3 belt-and-braces companion to the lazy-resolve test:
+        // even if the host has misconfigured BOTH the pipeline AND
+        // the last-resort sink (the worst case for a production
+        // composition root that has skipped the entire ingestion
+        // wiring), the BackgroundService MUST NOT crash the host. It
+        // logs critical, leaves the envelope unrecoverable (the
+        // contract is "best effort to preserve"), and returns to the
+        // dequeue loop so a subsequent operator fix that adds the
+        // missing services recovers normal processing.
+        FakeQueue queue = new();
+        ServiceCollection services = new();
+        SlackInboundIngestor ingestor = new(
+            queue,
+            services.BuildServiceProvider(),
+            NullLogger<SlackInboundIngestor>.Instance);
+
+        await queue.EnqueueAsync(BuildCommandEnvelope("cmd:T1:U1:/agent:trig-no-pipe-no-sink-1"));
+        await queue.EnqueueAsync(BuildCommandEnvelope("cmd:T1:U1:/agent:trig-no-pipe-no-sink-2"));
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        Task run = ingestor.StartAsync(cts.Token);
+
+        // Give the loop enough time to drain both envelopes through
+        // the catch path. There is no observable side-effect to wait
+        // on (the whole point is that the envelope is unrecoverable
+        // when even the sink is missing), so we just give the loop a
+        // generous window and then prove it is still running.
+        await Task.Delay(TimeSpan.FromMilliseconds(300));
+
+        Func<Task> stop = async () =>
+        {
+            await ingestor.StopAsync(CancellationToken.None);
+            cts.Cancel();
+            await run;
+        };
+
+        await stop.Should().NotThrowAsync(
+            "the BackgroundService MUST NOT propagate the resolve failure as an unhandled exception even when the fallback sink itself is missing");
+    }
+
+    [Fact]
     public async Task ExecuteAsync_forwards_envelope_to_fallback_sink_when_FileSystemSlackDeadLetterQueue_throws_persistence_failure()
     {
         // Iter 8 evaluator item #2: the only pre-existing DLQ-failure

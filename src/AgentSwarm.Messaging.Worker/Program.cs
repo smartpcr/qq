@@ -36,15 +36,19 @@ public class Program
     /// When this key is unset, the gate defaults to
     /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>:
     /// development hosts continue to wire the stubs so the ingestor
-    /// remains resolvable before Stage 5.1/5.2/5.3 ships real
+    /// can resolve its pipeline before Stage 5.1/5.2/5.3 ships real
     /// command/app_mention/interaction handlers, while
-    /// Production/Staging/Testing hosts get a fail-fast
-    /// <see cref="InvalidOperationException"/> at the first envelope
-    /// dispatch instead of silently ack-and-dropping every Slack
-    /// request via the no-op completions. Operators can explicitly
-    /// opt in (e.g. for a Production smoke test) by setting this
-    /// key to <c>true</c>; setting it to <c>false</c> forces the
-    /// production fail-fast even on a dev laptop.
+    /// Production/Staging/Testing hosts surface a fail-loud
+    /// <see cref="InvalidOperationException"/> the first time the
+    /// ingestor lazily resolves <see cref="SlackInboundProcessingPipeline"/>
+    /// for an inbound envelope (the BackgroundService captures that
+    /// failure and forwards the envelope to the durable last-resort
+    /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> instead of
+    /// silently ack-and-dropping every Slack request via the no-op
+    /// completions). Operators can explicitly opt in (e.g. for a
+    /// Production smoke test) by setting this key to <c>true</c>;
+    /// setting it to <c>false</c> forces the production fail-loud
+    /// surface even on a dev laptop.
     /// </summary>
     public const string EnableDevelopmentHandlerStubsKey =
         "Slack:Inbound:EnableDevelopmentHandlerStubs";
@@ -227,14 +231,18 @@ public class Program
         // This iter gates the call on an explicit opt-in
         // (Slack:Inbound:EnableDevelopmentHandlerStubs); the gate
         // DEFAULTS to true on a Development environment so dev laptops
-        // still boot, and DEFAULTS to false everywhere else so
-        // Production/Staging/Testing hosts that have not yet wired
-        // real Stage 5 handlers fail fast at first envelope dispatch
-        // (the pipeline ctor resolves the handlers from DI; without
-        // them it throws InvalidOperationException at startup
-        // instead of letting the no-op silently dedupe Slack traffic).
-        // An operator can override the gate in either direction by
-        // setting the key explicitly.
+        // can resolve the ingestor pipeline, and DEFAULTS to false
+        // everywhere else so Production/Staging/Testing hosts that
+        // have not yet wired real Stage 5 handlers surface a fail-loud
+        // InvalidOperationException the FIRST time the
+        // SlackInboundIngestor BackgroundService lazily resolves
+        // SlackInboundProcessingPipeline for an inbound envelope --
+        // the ingestor's catch block then forwards that envelope to
+        // the durable last-resort ISlackInboundEnqueueDeadLetterSink
+        // (the host itself still starts cleanly so health probes,
+        // signature middleware, and the audit schema bootstrap stay
+        // up). An operator can override the gate in either direction
+        // by setting the key explicitly.
         //
         // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this gate
         // with the real handler registrations (Stage 5.1 command
@@ -357,11 +365,15 @@ public class Program
     ///   <item>
     ///     <description>Production / Staging / Testing hosts default
     ///     to <c>false</c> so a deployment that has not yet wired the
-    ///     real Stage 5 handlers fails fast at first envelope dispatch
-    ///     (the pipeline ctor resolves the handlers from DI; without
-    ///     them it throws <see cref="InvalidOperationException"/>)
-    ///     instead of silently ack-and-dropping Slack traffic via the
-    ///     no-op completions.</description>
+    ///     real Stage 5 handlers surfaces a fail-loud
+    ///     <see cref="InvalidOperationException"/> the FIRST time the
+    ///     <see cref="SlackInboundIngestor"/> BackgroundService
+    ///     lazily resolves <see cref="SlackInboundProcessingPipeline"/>
+    ///     for an inbound envelope. The ingestor then forwards that
+    ///     envelope to the durable last-resort
+    ///     <see cref="ISlackInboundEnqueueDeadLetterSink"/> instead
+    ///     of silently ack-and-dropping Slack traffic via the no-op
+    ///     completions. The host itself still starts cleanly.</description>
     ///   </item>
     ///   <item>
     ///     <description>An operator can explicitly opt in (<c>true</c>)

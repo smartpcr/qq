@@ -61,10 +61,16 @@ public static class SlackInboundIngestorServiceCollectionExtensions
     /// <see cref="ISlackCommandHandler"/> /
     /// <see cref="ISlackAppMentionHandler"/> /
     /// <see cref="ISlackInteractionHandler"/> will get a clear
-    /// <see cref="InvalidOperationException"/> at the first envelope
-    /// dispatch (the pipeline resolves the handlers from DI when it
-    /// is constructed) -- a fail-fast surface that a production
-    /// deployment can detect at startup. Development hosts that
+    /// <see cref="InvalidOperationException"/> the FIRST time the
+    /// <see cref="SlackInboundIngestor"/> BackgroundService lazily
+    /// resolves <see cref="SlackInboundProcessingPipeline"/> for an
+    /// inbound envelope (the pipeline ctor injects the handlers
+    /// from DI, so the missing-handler failure surfaces at that
+    /// lazy resolution rather than at host start). The ingestor's
+    /// catch block forwards that envelope to the durable last-resort
+    /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> so the host
+    /// itself still starts cleanly and the unrecoverable envelope
+    /// is preserved instead of silently lost. Development hosts that
     /// genuinely want the no-op stand-ins (e.g. the Worker before
     /// Stage 5.1/5.2/5.3 ships) opt in explicitly by additionally
     /// calling <see cref="AddSlackInboundDevelopmentHandlerStubs"/>.
