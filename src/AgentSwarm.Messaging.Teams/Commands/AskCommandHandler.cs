@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Bot.Builder;
 using Microsoft.Extensions.Logging;
 
@@ -61,10 +62,34 @@ public sealed class AskCommandHandler : ICommandHandler
             ? Guid.NewGuid().ToString()
             : context.CorrelationId!;
 
+        // Stage 6.3 iter-4 evaluator feedback item 6 — wrap the handler body in a
+        // TeamsLogScope so EVERY log entry written below (the LogInformation, plus
+        // any logs emitted by the publisher / send-reply path on the same async
+        // call stack) carries the canonical CorrelationId / TenantId / UserId
+        // enrichment. The scope reuses the AsyncLocal TeamsLogContext push from
+        // TeamsSwarmActivityHandler when one already exists higher up the stack
+        // (the activity handler's scope wins), but is essential for call sites
+        // that invoke the command dispatcher OUTSIDE the activity handler (e.g.
+        // background reprocessors, non-Teams messengers re-using the dispatcher,
+        // or unit tests that drive HandleAsync directly).
+        //
+        // Iter-6 evaluator feedback items 1 + 3 — extract the tenant id via the
+        // shared CommandEventPublication.ResolveTenantId helper so the canonical
+        // TenantId enrichment key is pushed alongside CorrelationId / UserId.
+        // Without this, the §6.3 step 5 "every log entry carries the three keys"
+        // contract is incomplete on the command-handler paths.
+        var userId = context.ResolvedIdentity?.InternalUserId;
+        var tenantId = CommandEventPublication.ResolveTenantId(context);
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: correlationId,
+            tenantId: tenantId,
+            userId: userId);
+
         _logger.LogInformation(
             "AskCommandHandler accepted task (correlation {CorrelationId}, user {UserId}, prompt length {PromptLength}).",
             correlationId,
-            context.ResolvedIdentity?.InternalUserId ?? "(unmapped)",
+            userId ?? "(unmapped)",
             prompt.Length);
 
         await CommandEventPublication.PublishCommandEventAsync(

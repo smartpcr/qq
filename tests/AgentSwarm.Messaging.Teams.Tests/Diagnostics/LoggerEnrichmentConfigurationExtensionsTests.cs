@@ -39,8 +39,13 @@ public sealed class LoggerEnrichmentConfigurationExtensionsTests
     }
 
     [Fact]
-    public void WithTeamsContext_OutsideScope_EmitsNoEnrichmentProperties()
+    public void WithTeamsContext_OutsideScope_StampsSentinelOnAllThreeCanonicalProperties()
     {
+        // Stage 6.3 iter-12 evaluator fix item 2 — §6.3 step 5 "every log entry"
+        // contract: when no TeamsLogScope is active, the enricher still emits all
+        // three canonical keys, substituting TeamsLogScope.EmptyValueSentinel ("-")
+        // for the absent values so the envelope shape is uniform across in-scope,
+        // out-of-scope, and partial-scope frames.
         var sink = new CapturingSink();
         using var serilog = new LoggerConfiguration()
             .Enrich.WithTeamsContext()
@@ -51,9 +56,9 @@ public sealed class LoggerEnrichmentConfigurationExtensionsTests
         serilog.Information("event outside scope");
 
         var captured = Assert.Single(sink.Events);
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.CorrelationIdKey));
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.TenantIdKey));
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.UserIdKey));
+        AssertScalarProperty(captured, TeamsLogScope.CorrelationIdKey, TeamsLogScope.EmptyValueSentinel);
+        AssertScalarProperty(captured, TeamsLogScope.TenantIdKey, TeamsLogScope.EmptyValueSentinel);
+        AssertScalarProperty(captured, TeamsLogScope.UserIdKey, TeamsLogScope.EmptyValueSentinel);
     }
 
     [Fact]

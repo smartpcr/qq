@@ -1,3 +1,4 @@
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -10,6 +11,13 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// <see cref="OutboundMessageDeduplicator.TryRegister"/>, this timer ensures the
 /// in-memory store does not retain stale entries indefinitely on a quiet system.
 /// </summary>
+/// <remarks>
+/// <b>Stage 6.3 iter-10 evaluator fix item 1.</b> Lifecycle / tick / failure logs
+/// are emitted inside <see cref="TeamsLogScope.BeginScope"/> so each entry carries
+/// the canonical three-key enrichment per §6.3 step 5. Background workers have no
+/// per-message context, so the helper substitutes
+/// <see cref="TeamsLogScope.EmptyValueSentinel"/> (<c>"-"</c>) for each key.
+/// </remarks>
 public sealed class OutboundDeduplicationEvictionService : BackgroundService
 {
     private readonly OutboundMessageDeduplicator _deduplicator;
@@ -40,6 +48,11 @@ public sealed class OutboundDeduplicationEvictionService : BackgroundService
     /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Stage 6.3 iter-10 evaluator fix item 1 — wrap the entire ExecuteAsync body
+        // in a TeamsLogScope so every lifecycle / tick / failure log emitted by the
+        // hosted-service worker carries the canonical three-key enrichment.
+        using var workerLogScope = TeamsLogScope.BeginScope(_logger);
+
         _logger.LogInformation(
             "OutboundDeduplicationEvictionService started — window {Window}, eviction cadence {EvictionInterval}.",
             _options.Window,

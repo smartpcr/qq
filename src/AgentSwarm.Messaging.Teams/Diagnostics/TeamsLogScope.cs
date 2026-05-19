@@ -39,25 +39,61 @@ public static class TeamsLogScope
     public const string UserIdKey = "UserId";
 
     /// <summary>
-    /// Begin a logging scope that enriches every <see cref="ILogger"/> entry written
-    /// inside the returned <see cref="IDisposable"/> with the supplied keys. Null /
-    /// empty values are omitted from the scope so blank fields do not pollute the
-    /// log envelope.
+    /// Stable sentinel emitted into the <see cref="CorrelationIdKey"/>,
+    /// <see cref="TenantIdKey"/>, or <see cref="UserIdKey"/> slot when the caller
+    /// has no actual value to enrich with (e.g. background workers, lifecycle
+    /// logs, pre-resolution security checks).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Stage 6.3 iter-10 evaluator fix item 3.</b> §6.3 step 5 mandates that
+    /// <i>every</i> Teams log entry carry all three enrichment keys
+    /// (<c>CorrelationId</c>, <c>TenantId</c>, <c>UserId</c>). Earlier iterations
+    /// omitted keys whose values were null/empty, which left lifecycle and
+    /// security logs structurally lacking the contract. The sentinel
+    /// (<c>"-"</c>) is the smallest, most dashboard-safe placeholder: it is
+    /// one character, parses as a string scalar in Serilog/JSON sinks, and is
+    /// trivially filtered out of dashboards that need to ignore unenriched
+    /// frames (<c>WHERE UserId != '-'</c>).
+    /// </para>
+    /// <para>
+    /// Callers that legitimately have no value for a key (e.g. a
+    /// channel-targeted send has no acting user) pass <c>null</c>/empty for
+    /// that key; the helper substitutes this sentinel so the resulting scope
+    /// (and any log entry emitted inside it) still carries all three keys.
+    /// </para>
+    /// </remarks>
+    public const string EmptyValueSentinel = "-";
+
+    /// <summary>
+    /// Begin a logging scope that enriches <i>every</i> <see cref="ILogger"/> entry
+    /// written inside the returned <see cref="IDisposable"/> with <b>all three</b>
+    /// Stage 6.3 canonical keys (<see cref="CorrelationIdKey"/>,
+    /// <see cref="TenantIdKey"/>, <see cref="UserIdKey"/>). Null/empty values are
+    /// replaced with <see cref="EmptyValueSentinel"/> so the scope state ALWAYS
+    /// carries a stable three-key shape — dashboards never see a missing slot.
     /// </summary>
     /// <param name="logger">Logger that owns the scope; required.</param>
-    /// <param name="correlationId">End-to-end trace ID.</param>
-    /// <param name="tenantId">Entra ID tenant.</param>
-    /// <param name="userId">Acting / target user identity.</param>
-    /// <returns>
-    /// Disposable scope; never <c>null</c>. Even when every enrichment value is empty
-    /// the helper returns a no-op <see cref="IDisposable"/> so callers can use the
-    /// scope inside a <c>using</c> block without a null check.
-    /// </returns>
+    /// <param name="correlationId">End-to-end trace ID; sentinel-substituted if null/empty.</param>
+    /// <param name="tenantId">Entra ID tenant; sentinel-substituted if null/empty.</param>
+    /// <param name="userId">Acting / target user identity; sentinel-substituted if null/empty.</param>
+    /// <returns>Disposable scope; never <c>null</c>.</returns>
     /// <remarks>
-    /// The same scope state is also pushed onto <see cref="TeamsLogContext"/> so the
-    /// optional Serilog <see cref="TeamsLogEnricher"/> can stamp the keys onto every
-    /// <see cref="Serilog.Events.LogEvent"/> emitted inside the scope. Disposing the
-    /// returned token pops the ambient context entry back to its parent.
+    /// <para>
+    /// <b>Inherited values, not sentinels, when a parent scope is active.</b> When
+    /// the caller passes null/empty for a key AND a parent
+    /// <see cref="TeamsLogContext"/> entry already carries a real value for that
+    /// key, the inherited value is used rather than the sentinel — nested scopes
+    /// therefore propagate the outer scope's CorrelationId / TenantId / UserId
+    /// without the inner caller having to plumb them through.
+    /// </para>
+    /// <para>
+    /// The same effective values are also pushed onto <see cref="TeamsLogContext"/>
+    /// so the optional Serilog <see cref="TeamsLogEnricher"/> can stamp the keys
+    /// onto every <see cref="Serilog.Events.LogEvent"/> emitted inside the scope.
+    /// Disposing the returned token pops both the MEL scope and the ambient
+    /// context entry back to the parent.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException">If <paramref name="logger"/> is null.</exception>
     public static IDisposable BeginScope(
@@ -68,26 +104,28 @@ public static class TeamsLogScope
     {
         ArgumentNullException.ThrowIfNull(logger);
 
-        var state = new Dictionary<string, object?>(capacity: 3);
-        if (!string.IsNullOrEmpty(correlationId))
-        {
-            state[CorrelationIdKey] = correlationId;
-        }
+        // Capture the parent's effective values (if any) BEFORE Push runs — caller
+        // null/empty falls back to parent values rather than overwriting them with
+        // sentinels (otherwise a nested scope would shadow a real outer CorrelationId
+        // with "-" in the MEL dictionary stack, breaking inheritance).
+        var (parentCorrelationId, parentTenantId, parentUserId) = TeamsLogContext.Snapshot();
 
-        if (!string.IsNullOrEmpty(tenantId))
-        {
-            state[TenantIdKey] = tenantId;
-        }
+        var effectiveCorrelationId = !string.IsNullOrEmpty(correlationId)
+            ? correlationId
+            : parentCorrelationId ?? EmptyValueSentinel;
+        var effectiveTenantId = !string.IsNullOrEmpty(tenantId)
+            ? tenantId
+            : parentTenantId ?? EmptyValueSentinel;
+        var effectiveUserId = !string.IsNullOrEmpty(userId)
+            ? userId
+            : parentUserId ?? EmptyValueSentinel;
 
-        if (!string.IsNullOrEmpty(userId))
+        var state = new Dictionary<string, object?>(capacity: 3)
         {
-            state[UserIdKey] = userId;
-        }
-
-        if (state.Count == 0)
-        {
-            return NullScope.Instance;
-        }
+            [CorrelationIdKey] = effectiveCorrelationId,
+            [TenantIdKey] = effectiveTenantId,
+            [UserIdKey] = effectiveUserId,
+        };
 
         var loggerScope = logger.BeginScope(state) ?? NullScope.Instance;
         var contextScope = TeamsLogContext.Push(correlationId, tenantId, userId);

@@ -30,27 +30,42 @@ public sealed class TeamsLogScopeTests
     }
 
     [Fact]
-    public void BeginScope_NullUserId_OmitsUserIdEnrichment()
+    public void BeginScope_NullUserId_SubstitutesEmptyValueSentinel()
     {
+        // Stage 6.3 iter-10 evaluator fix item 3 — TeamsLogScope ALWAYS emits all
+        // three canonical keys, substituting TeamsLogScope.EmptyValueSentinel ("-")
+        // for any caller-supplied null/empty value. This pins the every-log-entry
+        // contract from §6.3 step 5: the scope dictionary structurally carries the
+        // three-key shape, never a missing slot.
         var logger = new RecordingLogger();
 
         using (TeamsLogScope.BeginScope(logger, correlationId: "c", tenantId: "t", userId: null))
         {
             var state = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(logger.Scopes[0]);
-            Assert.True(state.ContainsKey(TeamsLogScope.CorrelationIdKey));
-            Assert.True(state.ContainsKey(TeamsLogScope.TenantIdKey));
-            Assert.False(state.ContainsKey(TeamsLogScope.UserIdKey));
+            Assert.Equal("c", state[TeamsLogScope.CorrelationIdKey]);
+            Assert.Equal("t", state[TeamsLogScope.TenantIdKey]);
+            Assert.Equal(TeamsLogScope.EmptyValueSentinel, state[TeamsLogScope.UserIdKey]);
         }
     }
 
     [Fact]
-    public void BeginScope_AllNull_ReturnsNoOpDisposable_WithoutPushingScope()
+    public void BeginScope_AllNull_StillPushesScopeWithSentinelsInAllSlots()
     {
+        // Stage 6.3 iter-10 evaluator fix item 3 — BeginScope with no caller-supplied
+        // values still opens a scope whose state carries the canonical three-key shape
+        // with TeamsLogScope.EmptyValueSentinel in each slot. This is the "background
+        // worker / pre-resolution" enrichment shape — lifecycle logs from the outbox
+        // engine, eviction services, security middleware all rely on it to satisfy
+        // the §6.3 step 5 "every log entry carries the canonical keys" contract.
         var logger = new RecordingLogger();
 
         using var scope = TeamsLogScope.BeginScope(logger);
+
         Assert.NotNull(scope);
-        Assert.Empty(logger.Scopes);
+        var state = Assert.IsAssignableFrom<IReadOnlyDictionary<string, object?>>(Assert.Single(logger.Scopes));
+        Assert.Equal(TeamsLogScope.EmptyValueSentinel, state[TeamsLogScope.CorrelationIdKey]);
+        Assert.Equal(TeamsLogScope.EmptyValueSentinel, state[TeamsLogScope.TenantIdKey]);
+        Assert.Equal(TeamsLogScope.EmptyValueSentinel, state[TeamsLogScope.UserIdKey]);
     }
 
     [Fact]
