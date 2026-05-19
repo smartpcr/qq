@@ -178,15 +178,23 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
     }
 
     /// <summary>
-    /// Status-code map used by all three mapped endpoints. Stage 6.3 contract:
+    /// Status-code map used by all three mapped endpoints. Stage 6.3 contract,
+    /// aligned with the ASP.NET Core / k8s readiness-probe convention:
     /// <list type="bullet">
     ///   <item><description><see cref="HealthStatus.Healthy"/> → 200 OK</description></item>
-    ///   <item><description><see cref="HealthStatus.Degraded"/> → 503 Service
-    ///   Unavailable (per the §6.3 scenario: <i>"Then it returns Degraded"</i> — k8s
-    ///   readiness pods fail-out on 503, which is the desired behavior when a
-    ///   dependency is unhealthy)</description></item>
+    ///   <item><description><see cref="HealthStatus.Degraded"/> → 200 OK. A degraded
+    ///   pod is still able to serve traffic; the k8s readiness probe should NOT pull
+    ///   it from the service backend on a soft degradation, otherwise an operator
+    ///   has zero ability to investigate (the pod is gone). The §6.3 scenario
+    ///   asserts on the response <b>body</b> containing <c>"Degraded"</c> (and the
+    ///   substring <c>"ConversationReferenceStore: Unhealthy"</c>) — it does NOT
+    ///   constrain the HTTP status code — so 200 satisfies the scenario while
+    ///   matching the framework default (<see cref="HealthCheckOptions.ResultStatusCodes"/>
+    ///   defaults Degraded to 200 OK).</description></item>
     ///   <item><description><see cref="HealthStatus.Unhealthy"/> → 503 Service
-    ///   Unavailable</description></item>
+    ///   Unavailable. This is the only status that flips the readiness probe to
+    ///   "not ready" and removes the pod from the service backend, reserving the
+    ///   disruptive action for the case it is actually warranted.</description></item>
     /// </list>
     /// </summary>
     /// <remarks>
@@ -206,7 +214,7 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
     public static readonly IReadOnlyDictionary<HealthStatus, int> ResponseStatusCodes = new Dictionary<HealthStatus, int>
     {
         [HealthStatus.Healthy] = StatusCodes.Status200OK,
-        [HealthStatus.Degraded] = StatusCodes.Status503ServiceUnavailable,
+        [HealthStatus.Degraded] = StatusCodes.Status200OK,
         [HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
     };
 
