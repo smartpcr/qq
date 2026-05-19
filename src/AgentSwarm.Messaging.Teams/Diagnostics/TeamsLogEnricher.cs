@@ -56,10 +56,28 @@ namespace AgentSwarm.Messaging.Teams.Diagnostics;
 /// and the Serilog <see cref="LogEvent"/> property bag.
 /// </para>
 /// <para>
-/// <b>Null/empty handling.</b> Keys whose ambient value is <c>null</c> or empty are
-/// not added — Serilog dashboards therefore do not pollute their template with empty
-/// property slots, and downstream queries that filter on the absence of an
-/// enrichment key keep working.
+/// <b>Every-log-entry contract (§6.3 step 5).</b> The enricher emits ALL THREE
+/// canonical properties — <see cref="TeamsLogScope.CorrelationIdKey"/>,
+/// <see cref="TeamsLogScope.TenantIdKey"/>, <see cref="TeamsLogScope.UserIdKey"/>
+/// — on <i>every</i> <see cref="LogEvent"/>, with no exception. When a
+/// <see cref="TeamsLogScope.BeginScope"/> is active the values come from
+/// <see cref="TeamsLogContext.Snapshot"/>; when no scope is active the enricher
+/// emits <see cref="TeamsLogScope.EmptyValueSentinel"/> (<c>"-"</c>) for all three
+/// slots so the envelope shape is uniform across in-scope, out-of-scope, and
+/// partial-scope frames. This implements <c>implementation-plan.md</c> §6.3 step 5
+/// verbatim ("Serilog enrichers for CorrelationId, TenantId, UserId on every log
+/// entry"). Downstream dashboards see a single stable three-property shape and can
+/// filter the sentinel trivially (e.g. <c>WHERE UserId != '-'</c>).
+/// </para>
+/// <para>
+/// <b>Stage 6.3 iter-12 evaluator fix item 2.</b> Prior to iter-12 the enricher
+/// returned early when <see cref="TeamsLogContext.Snapshot"/> reported no active
+/// scope (i.e. all three values <c>null</c>). That left lifecycle, startup,
+/// background-poll, and security-pre-resolution log entries structurally
+/// uncovered — directly contradicting the §6.3 step 5 wording. The current
+/// implementation always emits all three keys; the sentinel
+/// (<see cref="TeamsLogScope.EmptyValueSentinel"/>) marks frames that genuinely
+/// had no ambient enrichment context.
 /// </para>
 /// </remarks>
 public sealed class TeamsLogEnricher : ILogEventEnricher
@@ -75,22 +93,25 @@ public sealed class TeamsLogEnricher : ILogEventEnricher
 
         var (correlationId, tenantId, userId) = TeamsLogContext.Snapshot();
 
-        if (!string.IsNullOrEmpty(correlationId))
-        {
-            logEvent.AddPropertyIfAbsent(
-                propertyFactory.CreateProperty(TeamsLogScope.CorrelationIdKey, correlationId));
-        }
+        // Stage 6.3 iter-12 evaluator fix item 2 — §6.3 step 5 mandates ALL three
+        // canonical keys on EVERY emitted LogEvent, not just on entries that
+        // happen to be inside a TeamsLogScope. When TeamsLogContext.Snapshot
+        // reports no active scope (all three null) we still emit the canonical
+        // keys, substituting TeamsLogScope.EmptyValueSentinel ("-") in every
+        // slot. The envelope shape is therefore uniform across all three
+        // frame classes (in-scope full triple, in-scope partial triple
+        // sentinel-substituted by TeamsLogScope.BeginScope, no-scope all-sentinel)
+        // — dashboards never see a missing key and never have to special-case
+        // unenriched frames.
+        var effectiveCorrelationId = correlationId ?? TeamsLogScope.EmptyValueSentinel;
+        var effectiveTenantId = tenantId ?? TeamsLogScope.EmptyValueSentinel;
+        var effectiveUserId = userId ?? TeamsLogScope.EmptyValueSentinel;
 
-        if (!string.IsNullOrEmpty(tenantId))
-        {
-            logEvent.AddPropertyIfAbsent(
-                propertyFactory.CreateProperty(TeamsLogScope.TenantIdKey, tenantId));
-        }
-
-        if (!string.IsNullOrEmpty(userId))
-        {
-            logEvent.AddPropertyIfAbsent(
-                propertyFactory.CreateProperty(TeamsLogScope.UserIdKey, userId));
-        }
+        logEvent.AddPropertyIfAbsent(
+            propertyFactory.CreateProperty(TeamsLogScope.CorrelationIdKey, effectiveCorrelationId));
+        logEvent.AddPropertyIfAbsent(
+            propertyFactory.CreateProperty(TeamsLogScope.TenantIdKey, effectiveTenantId));
+        logEvent.AddPropertyIfAbsent(
+            propertyFactory.CreateProperty(TeamsLogScope.UserIdKey, effectiveUserId));
     }
 }

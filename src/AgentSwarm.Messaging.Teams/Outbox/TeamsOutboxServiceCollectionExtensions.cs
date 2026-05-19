@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -178,6 +179,17 @@ public static class TeamsOutboxServiceCollectionExtensions
         services.TryAddSingleton<OutboxMetrics>();
         services.TryAddSingleton<TokenBucketRateLimiter>();
 
+        // Stage 6.1 — direct-send bypass guard singleton. The doc on AddTeamsOutboxEngine
+        // (and the sibling DecorateMessengerConnector / DecorateProactiveNotifier helpers)
+        // promises a `TryAddSingleton<TeamsDirectSendBypassGuard>()` so that the inner
+        // concrete TeamsMessengerConnector / TeamsProactiveNotifier can resolve the guard
+        // through DI and throw on direct invocation that bypasses the outbox engine.
+        // Without this registration the guard is null and direct sends silently slip
+        // around IMessageOutbox.EnqueueAsync — the regression that
+        // TeamsDirectSendBypassGuardTests.AddTeamsOutboxEngine_RegistersTeamsDirectSendBypassGuardSingleton
+        // pins. Idempotent under repeated AddTeamsOutboxEngine composition via TryAdd*.
+        services.TryAddSingleton<TeamsDirectSendBypassGuard>();
+
         // Stage 6.2 step 4 — outbound deduplication singleton + background eviction
         // service. Registered via TryAdd* so hosts that supplied a custom
         // OutboundDeduplicationOptions or replaced the deduplicator with a no-op for
@@ -342,6 +354,11 @@ public static class TeamsOutboxServiceCollectionExtensions
         // GetRequiredService<IMessengerConnector>() resolves to. Stage 6.2 step 4: the
         // wrapper receives the OutboundMessageDeduplicator so duplicate (CorrelationId,
         // ConversationId) sends are suppressed before an OutboxEntry is enqueued.
+        // Stage 6.3 iter-6 evaluator feedback item 2 — also resolves the optional
+        // TeamsConnectorTelemetry singleton so the wrapper increments the canonical
+        // teams.messages.sent counter on every accepted enqueue (the production
+        // path that the in-process TeamsMessengerConnector never sees in the
+        // outbox-engine composition).
         services.AddSingleton<IMessengerConnector>(sp => new OutboxBackedMessengerConnector(
             sp.GetRequiredService<IInnerTeamsMessengerConnector>().Inner,
             sp.GetRequiredService<IMessageOutbox>(),
@@ -350,7 +367,8 @@ public static class TeamsOutboxServiceCollectionExtensions
             sp.GetRequiredService<IAgentQuestionStore>(),
             sp.GetRequiredService<ILogger<OutboxBackedMessengerConnector>>(),
             sp.GetService<TimeProvider>(),
-            sp.GetService<OutboundMessageDeduplicator>()));
+            sp.GetService<OutboundMessageDeduplicator>(),
+            sp.GetService<TeamsConnectorTelemetry>()));
 
         // Rebind the keyed "teams" alias to the wrapper ONLY when the host originally
         // registered a keyed alias (critique #3). The concrete TeamsMessengerConnector

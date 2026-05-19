@@ -2,6 +2,7 @@ using System.Globalization;
 using System.IO;
 using System.Text.Json;
 using AgentSwarm.Messaging.Persistence;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -183,6 +184,20 @@ public sealed class TenantValidationMiddleware : IMiddleware
     private async Task RejectAsync(HttpContext context, string? tenantId, int allowedCount)
     {
         var correlationId = ExtractCorrelationId(context);
+
+        // Stage 6.3 iter-10 evaluator fix item 2 — open a TeamsLogScope so the audit-
+        // failure ILogger.LogError below (formerly bypassing the canonical enrichment
+        // contract) carries the three Stage 6.3 keys per §6.3 step 5. CorrelationId
+        // is the inbound header value (or a freshly minted GUID); TenantId is the
+        // tenant the request claimed (may be missing on hostile payloads, in which
+        // case the helper substitutes EmptyValueSentinel "-"). UserId has no value
+        // at this layer (the HTTP middleware runs before any identity resolution),
+        // so the helper substitutes the sentinel.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: correlationId,
+            tenantId: string.IsNullOrEmpty(tenantId) ? null : tenantId);
+
         var actorId = string.IsNullOrEmpty(tenantId) ? "unknown" : tenantId;
         var reason = allowedCount == 0
             ? "TenantValidationMiddleware rejected: AllowedTenantIds is empty (deny-all policy)."

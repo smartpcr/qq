@@ -115,10 +115,16 @@ public sealed class TeamsMessengerConnectorTelemetryTests
 
         await harness.Connector.SendMessageAsync(message, CancellationToken.None);
 
-        var observation = Assert.Single(counterObservations,
-            o => (string?)o.Tags[TeamsConnectorTelemetry.CorrelationIdTag] == "corr-cnt-1");
+        // Iter-7 evaluator fix item 4 — correlationId is no longer applied to metric
+        // tags so the counter is identified by the bounded messageType + destinationType
+        // tuple. The TeamsMessengerConnector.SendMessageAsync layer is the only counter
+        // emitter in this harness (the test uses the synchronous direct connector — the
+        // outbox-engine composition is not wired here) so we expect exactly one
+        // observation.
+        var observation = Assert.Single(counterObservations);
         Assert.Equal(1L, observation.Value);
-        Assert.Equal("corr-cnt-1", observation.Tags[TeamsConnectorTelemetry.CorrelationIdTag]);
+        Assert.False(observation.Tags.ContainsKey(TeamsConnectorTelemetry.CorrelationIdTag),
+            "correlationId must NOT appear on counter tags — see iter-7 evaluator item 4.");
         Assert.Equal(TeamsConnectorTelemetry.MessageTypeMessengerMessage, observation.Tags[TeamsConnectorTelemetry.MessageTypeTag]);
         Assert.Equal(TeamsConnectorTelemetry.DestinationTypeConversation, observation.Tags[TeamsConnectorTelemetry.DestinationTypeTag]);
     }
@@ -257,9 +263,14 @@ public sealed class TeamsMessengerConnectorTelemetryTests
         Assert.Equal(ActivityStatusCode.Error, span.Status);
 
         // (a) failure-rate denominator — the counter MUST observe the failed attempt.
-        var counter = Assert.Single(counterObservations,
-            o => (string?)o.Tags[TeamsConnectorTelemetry.CorrelationIdTag] == "corr-err-1");
+        // Iter-7 evaluator fix item 4 — correlationId no longer appears on metric tags
+        // so we identify the observation by the bounded classifiers. The Error span
+        // emitted above carries the corr-err-1 correlation tag so trace consumers can
+        // still join failed-send spans to this metric sample via exemplar pointer.
+        var counter = Assert.Single(counterObservations);
         Assert.Equal(1L, counter.Value);
+        Assert.False(counter.Tags.ContainsKey(TeamsConnectorTelemetry.CorrelationIdTag),
+            "correlationId must NOT appear on counter tags — see iter-7 evaluator item 4.");
         Assert.Equal(TeamsConnectorTelemetry.MessageTypeMessengerMessage, counter.Tags[TeamsConnectorTelemetry.MessageTypeTag]);
         Assert.Equal(TeamsConnectorTelemetry.DestinationTypeConversation, counter.Tags[TeamsConnectorTelemetry.DestinationTypeTag]);
 

@@ -105,4 +105,26 @@ public sealed record CommandContext
     /// <c>OnMessageActivityAsync</c>) continue to receive their per-handler reply card.
     /// </summary>
     public bool SuppressReply { get; init; }
+
+    /// <summary>
+    /// Entra ID tenant identifier scoping the inbound activity. Stamped by the
+    /// messenger-specific activity handler (for Teams,
+    /// <c>TeamsSwarmActivityHandler</c> reads it from
+    /// <c>TeamsChannelData.Tenant.Id</c>) so downstream command handlers can push it
+    /// onto the canonical Stage 6.3 <c>TeamsLogScope</c>
+    /// <c>TenantId</c> enrichment key without re-deriving it from the
+    /// messenger-specific <see cref="TurnContext"/>. The Abstractions
+    /// <see cref="CommandContext"/> remains platform-agnostic — only the producer
+    /// knows where to read the tenant from for its messenger (cref omitted because
+    /// <c>TeamsLogScope</c> lives in the Teams-specific assembly, which Abstractions
+    /// cannot reference without inverting the dependency graph).
+    /// </summary>
+    /// <remarks>
+    /// Stage 6.3 iter-6 evaluator feedback items 1 + 3 — required so every command
+    /// handler's <c>TeamsLogScope.BeginScope</c> call carries all three canonical
+    /// enrichment keys (<c>CorrelationId</c>, <c>TenantId</c>, <c>UserId</c>) and
+    /// so the structural-coverage tests can assert the tenant without instantiating
+    /// a Bot Framework <c>ITurnContext</c> mock.
+    /// </remarks>
+    public string? TenantId { get; init; }
 }

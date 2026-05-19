@@ -32,21 +32,35 @@ public sealed class TeamsLogEnricherTests
     }
 
     [Fact]
-    public void Enrich_OutsideScope_AddsNoEnrichmentProperties()
+    public void Enrich_OutsideScope_StampsSentinelOnAllThreeCanonicalProperties()
     {
+        // Stage 6.3 iter-12 evaluator fix item 2 — §6.3 step 5 mandates ALL three
+        // canonical keys (CorrelationId, TenantId, UserId) on EVERY emitted
+        // LogEvent. When no TeamsLogScope is active the enricher emits
+        // TeamsLogScope.EmptyValueSentinel ("-") in every slot so lifecycle,
+        // startup, background-poll, and security-pre-resolution log entries are
+        // structurally covered. Pre-iter-12 the enricher returned early when
+        // TeamsLogContext.Snapshot reported no active scope, which left those
+        // frames missing the canonical envelope.
         using var harness = new SerilogHarness();
 
         harness.Logger.Information("test event outside scope");
 
         var captured = Assert.Single(harness.Captured);
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.CorrelationIdKey));
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.TenantIdKey));
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.UserIdKey));
+        AssertScalarProperty(captured, TeamsLogScope.CorrelationIdKey, TeamsLogScope.EmptyValueSentinel);
+        AssertScalarProperty(captured, TeamsLogScope.TenantIdKey, TeamsLogScope.EmptyValueSentinel);
+        AssertScalarProperty(captured, TeamsLogScope.UserIdKey, TeamsLogScope.EmptyValueSentinel);
     }
 
     [Fact]
-    public void Enrich_OnlyCorrelationIdSet_DoesNotEmitEmptyTenantOrUserSlots()
+    public void Enrich_OnlyCorrelationIdSet_StampsSentinelOnTenantAndUserSlots()
     {
+        // Stage 6.3 iter-10 evaluator fix item 3 — when ANY TeamsLogScope is active
+        // the enricher emits ALL three canonical keys (substituting
+        // TeamsLogScope.EmptyValueSentinel "-" for any value the caller did not
+        // supply). This pins the §6.3 step 5 "every log entry carries CorrelationId,
+        // TenantId, UserId" contract — Serilog sinks see a stable shape regardless
+        // of how partial the caller's scope was.
         using var harness = new SerilogHarness();
         var logger = new RecordingLogger();
 
@@ -57,13 +71,17 @@ public sealed class TeamsLogEnricherTests
 
         var captured = Assert.Single(harness.Captured);
         AssertScalarProperty(captured, TeamsLogScope.CorrelationIdKey, "corr-only");
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.TenantIdKey));
-        Assert.False(captured.Properties.ContainsKey(TeamsLogScope.UserIdKey));
+        AssertScalarProperty(captured, TeamsLogScope.TenantIdKey, TeamsLogScope.EmptyValueSentinel);
+        AssertScalarProperty(captured, TeamsLogScope.UserIdKey, TeamsLogScope.EmptyValueSentinel);
     }
 
     [Fact]
-    public void Enrich_AfterScopeDisposed_ResumesEmittingWithoutProperties()
+    public void Enrich_AfterScopeDisposed_ResumesEmittingWithSentinelOnAllThreeSlots()
     {
+        // Stage 6.3 iter-12 evaluator fix item 2 — once a scope disposes,
+        // subsequent log entries still carry all three canonical keys; the
+        // sentinel marks the post-dispose frames as out-of-scope while
+        // preserving the uniform envelope shape.
         using var harness = new SerilogHarness();
         var logger = new RecordingLogger();
 
@@ -76,7 +94,9 @@ public sealed class TeamsLogEnricherTests
 
         Assert.Equal(2, harness.Captured.Count);
         AssertScalarProperty(harness.Captured[0], TeamsLogScope.CorrelationIdKey, "corr-A");
-        Assert.False(harness.Captured[1].Properties.ContainsKey(TeamsLogScope.CorrelationIdKey));
+        AssertScalarProperty(harness.Captured[1], TeamsLogScope.CorrelationIdKey, TeamsLogScope.EmptyValueSentinel);
+        AssertScalarProperty(harness.Captured[1], TeamsLogScope.TenantIdKey, TeamsLogScope.EmptyValueSentinel);
+        AssertScalarProperty(harness.Captured[1], TeamsLogScope.UserIdKey, TeamsLogScope.EmptyValueSentinel);
     }
 
     [Fact]

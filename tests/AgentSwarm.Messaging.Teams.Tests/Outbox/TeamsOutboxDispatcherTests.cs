@@ -405,18 +405,26 @@ public sealed class TeamsOutboxDispatcherTests
     }
 
     // -----------------------------------------------------------------------------------
-    // Stage 6.3 iter-4 — log-scope enrichment must NOT label channel IDs as UserId.
+    // Stage 6.3 iter-10 evaluator fix item 3 — channel-scoped outbox entries must emit
+    // the canonical three-key (CorrelationId, TenantId, UserId) shape with UserId =
+    // TeamsLogScope.EmptyValueSentinel ("-"); previously the dispatcher omitted the
+    // UserId slot to avoid stamping channel IDs into the user enrichment, but that
+    // contradicted §6.3 step 5's "every log entry" requirement. The iter-10
+    // structural fix swaps "omit the key" for "stamp the sentinel"; this test pins
+    // the new shape.
     // -----------------------------------------------------------------------------------
 
     [Fact]
-    public async Task DispatchAsync_ChannelDestination_OmitsUserIdEnrichment()
+    public async Task DispatchAsync_ChannelDestination_SubstitutesSentinelForUserId()
     {
-        // Iter-4 evaluator feedback item 2 — when DestinationType is Channel, the
-        // destinationId parsed out of "teams://{tenant}/{channelId}/{id}" is a
-        // CHANNEL ID, not a user ID. The dispatcher must not stamp it into the
-        // TeamsLogScope UserId enrichment slot (doing so corrupts user-oriented
-        // dashboards and RBAC queries with channel identifiers that look like user
-        // identifiers). The CorrelationId and TenantId enrichments still apply.
+        // Iter-10 — when DestinationType is Channel, the destinationId parsed out of
+        // "teams://{tenant}/{channelId}/{id}" is a CHANNEL ID, not a user ID. The
+        // dispatcher MUST NOT stamp it into the TeamsLogScope UserId enrichment slot
+        // (the iter-4 STRUCTURAL fix preserves user-oriented dashboards / RBAC
+        // queries from channel-id pollution). Instead, the helper substitutes
+        // TeamsLogScope.EmptyValueSentinel ("-") so the scope structurally carries
+        // all three keys per §6.3 step 5 — dashboards see "UserId=-" on
+        // channel-scoped deliveries.
         var logger = new RecordingScopeLogger<TeamsOutboxDispatcher>();
         var dispatcher = NewDispatcher(
             adapter: new ThrowingCloudAdapter(),
@@ -441,10 +449,13 @@ public sealed class TeamsOutboxDispatcherTests
             s => s.ContainsKey(TeamsLogScope.CorrelationIdKey)
                  && (string?)s[TeamsLogScope.CorrelationIdKey] == "corr-e-channel");
         Assert.Equal("tenant-1", dispatchScope[TeamsLogScope.TenantIdKey]);
-        Assert.False(
+        Assert.True(
             dispatchScope.ContainsKey(TeamsLogScope.UserIdKey),
-            "Channel-scoped outbox entries must not emit the UserId enrichment key. " +
-            $"Found UserId='{(dispatchScope.TryGetValue(TeamsLogScope.UserIdKey, out var v) ? v : null)}'.");
+            "Channel-scoped outbox entries must structurally carry the UserId enrichment key per §6.3 step 5.");
+        Assert.Equal(TeamsLogScope.EmptyValueSentinel, dispatchScope[TeamsLogScope.UserIdKey]);
+        Assert.NotEqual(
+            "19:abc@thread.tacv2",
+            dispatchScope[TeamsLogScope.UserIdKey]);
     }
 
     [Fact]

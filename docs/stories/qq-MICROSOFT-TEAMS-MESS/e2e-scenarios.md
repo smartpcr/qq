@@ -884,10 +884,7 @@ Feature: Performance — Card Delivery SLA
     Given 100 AgentQuestions are published to the outbound queue in a burst
     When the OutboxRetryEngine processes all 100 notifications
     Then at least 95 of the 100 Adaptive Cards are delivered within 3 seconds of queue pickup
-    And the delivery latency for each card is recorded as OpenTelemetry histogram metric `teams.card.delivery.duration_ms` (per tech-spec.md §4.4)
-    # Note: architecture.md §7 uses `teams.card.delivery_latency_ms`; the canonical name
-    # is `teams.card.delivery.duration_ms` per tech-spec.md §4.4 and implementation-plan.md §5.2.
-    # QA should implement one histogram under the tech-spec name.
+    And the delivery latency for each card is recorded as OpenTelemetry histogram metric `teams.card.delivery.duration_ms` (per tech-spec.md §4.4 and architecture.md §8.1)
     And no cards are lost
 
   Scenario: Concurrent text-command load does not degrade card delivery SLA

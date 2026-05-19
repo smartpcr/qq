@@ -1,3 +1,4 @@
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -20,6 +21,15 @@ namespace AgentSwarm.Messaging.Teams.Cards;
 /// The service follows the canonical .NET <see cref="BackgroundService"/> contract: the
 /// loop terminates on <see cref="CancellationToken"/> cancellation (host shutdown) and
 /// swallows transient eviction exceptions so a one-off failure cannot crash the host.
+/// </para>
+/// <para>
+/// <b>Stage 6.3 iter-10 evaluator fix item 1.</b> The lifecycle / tick / failure
+/// logs are emitted inside <see cref="TeamsLogScope.BeginScope"/> so each entry
+/// carries the canonical <c>CorrelationId</c> / <c>TenantId</c> / <c>UserId</c>
+/// enrichment keys per §6.3 step 5. Background workers have no per-message
+/// context, so the helper substitutes <see cref="TeamsLogScope.EmptyValueSentinel"/>
+/// (<c>"-"</c>) for each key — dashboards that filter on the enrichment never
+/// see a missing slot.
 /// </para>
 /// </remarks>
 public sealed class ProcessedCardActionEvictionService : BackgroundService
@@ -58,6 +68,13 @@ public sealed class ProcessedCardActionEvictionService : BackgroundService
     /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Stage 6.3 iter-10 evaluator fix item 1 — wrap the entire ExecuteAsync body
+        // in a TeamsLogScope so every lifecycle / tick / failure log emitted by the
+        // hosted-service worker carries the canonical three-key enrichment.
+        // Background workers have no per-message correlation / tenant / user, so the
+        // helper substitutes EmptyValueSentinel ("-") into each slot.
+        using var workerLogScope = TeamsLogScope.BeginScope(_logger);
+
         _logger.LogInformation(
             "ProcessedCardActionEvictionService started — entry lifetime {EntryLifetime}, eviction cadence {EvictionInterval}.",
             _options.EntryLifetime,

@@ -185,6 +185,29 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         var commandId = action.CommandId ?? string.Empty;
         var actorForAudit = string.IsNullOrEmpty(aadObjectId) ? "unknown" : aadObjectId;
 
+        // Stage 6.3 iter-8 evaluator fix item 2 — open the canonical Stage 6.3
+        // structured-logging scope at the OUTER boundary so every log entry emitted
+        // by this handler (including direct invocations not wrapped by
+        // `TeamsSwarmActivityHandler.OnTurnAsync` — e.g. unit tests, alternate
+        // Bot Framework controllers, or future bypass routes) structurally carries
+        // the canonical `CorrelationId` + `TenantId` + `UserId` enrichment per the
+        // §6.3 step 5 every-log-entry contract. The pre-iter-8 code relied
+        // exclusively on the outer turn-handler scope; once invoked outside that
+        // ambient scope (e.g. integration tests that exercise the handler directly)
+        // log entries would drop tenant/user enrichment entirely.
+        //
+        // `userId` is the raw AAD object ID at this point — the resolver has not yet
+        // run, so the canonical InternalUserId is unknown. The nested scope opened
+        // after `_identityResolver.ResolveAsync` succeeds layers `InternalUserId` on
+        // top so post-resolution logs use the platform-canonical identity while
+        // pre-resolution warnings (e.g. unmapped-user rejections) still get an
+        // identifying user value.
+        using var outerLogScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: correlationId,
+            tenantId: tenantId,
+            userId: aadObjectId);
+
         // (1) Resolve the inbound user identity. Unmapped users are denied without
         // dispatching — message-extension invokes flow through the same identity gate as
         // inbound messages per the story Security requirement and
@@ -264,6 +287,18 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
         var rbacSubject = !string.IsNullOrEmpty(resolvedIdentity.AadObjectId)
             ? resolvedIdentity.AadObjectId
             : aadObjectId;
+
+        // Stage 6.3 iter-8 evaluator fix item 2 — layer the canonical InternalUserId
+        // on top of the outer scope's raw AAD identity now that the resolver has
+        // produced the platform-canonical user identifier. All subsequent log entries
+        // (authorization warnings, empty-payload info, dispatch info, dispatch-failure
+        // error, success audit) inherit this scope's `UserId = InternalUserId` per
+        // the §6.3 every-log-entry enrichment contract.
+        using var resolvedIdentityLogScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: null,
+            tenantId: null,
+            userId: resolvedIdentity.InternalUserId);
 
         var authorization = await _authorizationService
             .AuthorizeAsync(tenantId, rbacSubject, CommandNames.AgentAsk, ct)
@@ -363,6 +398,11 @@ public sealed class MessageExtensionHandler : IMessageExtensionHandler
             ActivityId = activity?.Id,
             Source = MessengerEventSources.MessageAction,
             SuppressReply = true,
+            // Stage 6.3 iter-6 evaluator feedback item 1 — stamp the tenant so
+            // downstream command handlers (the AskCommandHandler the message
+            // extension forwards into) can push the canonical TenantId key onto
+            // their TeamsLogScope without re-deriving it from the turn context.
+            TenantId = tenantId,
         };
 
         // Dispatch is the only step that touches downstream infrastructure (publisher

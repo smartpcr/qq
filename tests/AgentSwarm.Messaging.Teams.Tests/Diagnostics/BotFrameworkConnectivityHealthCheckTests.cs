@@ -147,13 +147,46 @@ public sealed class BotFrameworkConnectivityHealthCheckTests
     }
 
     [Fact]
-    public void Constructor_NullAuthentication_Throws()
+    public void Constructor_NullAuthentication_DoesNotThrow_DegradedAtProbeTime()
     {
-        Assert.Throws<ArgumentNullException>(() => new BotFrameworkConnectivityHealthCheck(
+        // Stage 6.3 iter-9 evaluator fix item 2 — the constructor MUST tolerate null
+        // BotFrameworkAuthentication so hosts that compose AddTeamsDiagnostics() /
+        // AddBotFrameworkConnectivityHealthCheck() BEFORE registering the auth surface
+        // do not get an opaque DI activation failure at first /health probe. The
+        // health check reports Degraded with a descriptive reason at probe time
+        // instead — see CheckHealthAsync_NullAuthentication_ReturnsDegradedWithDescription
+        // for the runtime behaviour pin. This test enforces the constructor contract
+        // (no throw), which is the structural half of the fix.
+        var ex = Record.Exception(() => new BotFrameworkConnectivityHealthCheck(
             adapter: null,
-            botAuthentication: null!,
+            botAuthentication: null,
             messagingOptions: BuildOptionsMonitor(),
             logger: NullLogger<BotFrameworkConnectivityHealthCheck>.Instance));
+        Assert.Null(ex);
+    }
+
+    [Fact]
+    public async Task CheckHealthAsync_NullAuthentication_ReturnsDegradedWithDescription()
+    {
+        // Stage 6.3 iter-9 evaluator fix item 2 — runtime half of the fix: when
+        // BotFrameworkAuthentication is not registered, the health check returns
+        // Degraded with a descriptive reason so operators can diagnose the wiring
+        // gap from the /health JSON body rather than from a DI activation stack
+        // trace at the bot adapter endpoint. Supplies a real CloudAdapter so the
+        // adapter-null branch is bypassed and the auth-null branch is the one
+        // under test.
+        var check = new BotFrameworkConnectivityHealthCheck(
+            adapter: new TeamsMessengerConnectorTests.RecordingCloudAdapter(),
+            botAuthentication: null,
+            messagingOptions: BuildOptionsMonitor(),
+            logger: NullLogger<BotFrameworkConnectivityHealthCheck>.Instance);
+
+        var result = await check.CheckHealthAsync(new HealthCheckContext(), CancellationToken.None);
+
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.NotNull(result.Description);
+        Assert.Contains("BotFrameworkAuthentication", result.Description!, StringComparison.Ordinal);
+        Assert.False((bool)result.Data["botAuthenticationRegistered"]);
     }
 
     [Fact]

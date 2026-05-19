@@ -1202,15 +1202,15 @@ All components emit traces and metrics through `System.Diagnostics.Activity` and
 | Trace span | `ProactiveNotifier` | `messaging.operation=send`, `destination`, `card_type` |
 | Trace span | `OutboxRetryEngine` | `outbox.status`, `outbox.attempt` |
 | Metric (counter) | `CommandParser` | `teams.commands.received` by `command_type` |
-| Metric (histogram) | `ProactiveNotifier` | `teams.card.delivery_latency_ms` |
+| Metric (histogram) | `ProactiveNotifier` | `teams.card.delivery.duration_ms` |
 | Metric (counter) | `TenantValidationMiddleware` | `teams.security.rejections` by `tenant_id` |
 | Metric (counter) | `ActivityDeduplicationMiddleware` | `teams.webhook.duplicates_suppressed` |
-| Metric (gauge) | `OutboxRetryEngine` | `teams.outbox.pending_count` |
+| Metric (gauge) | `OutboxRetryEngine` | `teams.outbox.queue_depth` |
 | Health check | `TeamsMessengerConnector` | Bot Framework connectivity, outbox queue depth |
 
 ### 8.2 Structured Logging
 
-All log entries include `CorrelationId`, `TenantId`, and `AgentId` as scoped properties via `ILogger` and `BeginScope`. Log levels follow .NET conventions: `Information` for successful operations, `Warning` for retries, `Error` for failures, `Critical` for security rejections and dead-letter events.
+All log entries include `CorrelationId`, `TenantId`, and `UserId` as scoped properties via `ILogger` and `BeginScope` (aligned with `implementation-plan.md` §6.3 step 5 and the concrete `TeamsLogScope`/`TeamsLogEnricher` implementation). The `UserId` slot carries the acting / target user identity (AAD object ID or internal user ID, depending on call site); for channel-scoped deliveries with no acting user the enricher emits the stable `-` sentinel so every log entry carries the canonical three-key shape. `AgentId` and `TaskId` remain first-class audit-event fields (see §3.1 `AgentMessage` / `AgentQuestion`, §5 `AuditLogEntry`) but are NOT part of the cross-cutting log-context enrichment set — they appear on the structured-log entries that domain-logically reference them, not as scoped properties on every emitted record. Log levels follow .NET conventions: `Information` for successful operations, `Warning` for retries, `Error` for failures, `Critical` for security rejections and dead-letter events.
 
 ---
 

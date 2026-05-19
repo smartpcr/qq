@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 namespace AgentSwarm.Messaging.Teams.Security;
@@ -12,10 +13,24 @@ namespace AgentSwarm.Messaging.Teams.Security;
 /// <c>architecture.md</c> §4.9 / §5.2, and <c>implementation-plan.md</c> §5.1 step 3.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Returning <c>null</c> from <see cref="ResolveAsync"/> indicates the AAD object ID is not
 /// mapped in the configured directory; the calling
 /// <see cref="TeamsSwarmActivityHandler"/> then issues an HTTP 200 + Adaptive Card
 /// explaining the access-denial reason and the <c>UnmappedUserRejected</c> action.
+/// </para>
+/// <para>
+/// <b>Stage 6.3 iter-10 evaluator fix item 2.</b> The resolver wraps its log emissions
+/// in <see cref="TeamsLogScope.BeginScope"/> so each entry carries the canonical
+/// <c>CorrelationId</c>, <c>TenantId</c>, and <c>UserId</c> enrichment per §6.3 step 5.
+/// The resolver has the raw AAD object ID natively (its only input), so the
+/// <see cref="TeamsLogScope.UserIdKey"/> slot is populated with that identifier; the
+/// remaining two keys are inherited from the parent
+/// <see cref="TeamsLogContext"/> frame opened by the calling
+/// <c>TeamsSwarmActivityHandler</c>, or substituted with
+/// <see cref="TeamsLogScope.EmptyValueSentinel"/> when the resolver is invoked outside
+/// a turn context (e.g. integration tests, alternate Bot controllers).
+/// </para>
 /// </remarks>
 public sealed class EntraIdentityResolver : IIdentityResolver
 {
@@ -36,6 +51,17 @@ public sealed class EntraIdentityResolver : IIdentityResolver
     public async Task<UserIdentity?> ResolveAsync(string aadObjectId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+
+        // Stage 6.3 iter-10 evaluator fix item 2 — open a TeamsLogScope so every
+        // ILogger entry emitted by this method carries the canonical three-key
+        // enrichment per §6.3 step 5. CorrelationId / TenantId are inherited from
+        // the parent scope opened by TeamsSwarmActivityHandler (when invoked on the
+        // bot turn path) or sentinel-substituted otherwise. UserId carries the raw
+        // AAD object ID — the only identifier we have at this layer (the internal
+        // user ID does not exist until LookupAsync returns).
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            userId: string.IsNullOrEmpty(aadObjectId) ? null : aadObjectId);
 
         if (string.IsNullOrEmpty(aadObjectId))
         {

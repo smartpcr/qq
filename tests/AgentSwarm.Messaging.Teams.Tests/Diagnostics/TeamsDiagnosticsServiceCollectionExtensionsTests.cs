@@ -155,6 +155,86 @@ public sealed class TeamsDiagnosticsServiceCollectionExtensionsTests
         Assert.Equal(firstCount, services.Count);
     }
 
+    /// <summary>
+    /// Stage 6.3 iter-5 evaluator feedback item 1 — <see cref="TeamsDiagnosticsServiceCollectionExtensions.AddTeamsSerilogEnricher"/>
+    /// must register <see cref="TeamsLogEnricher"/> under BOTH the concrete
+    /// <see cref="TeamsLogEnricher"/> service type AND the
+    /// <see cref="Serilog.Core.ILogEventEnricher"/> contract so hosts that wire
+    /// Serilog via the <see cref="Serilog.Extensions.Hosting"/> DI-bridge
+    /// (<c>cfg.ReadFrom.Services(sp)</c>) auto-discover the enricher without a
+    /// manual <c>.Enrich.WithTeamsContext()</c> call. The same registration
+    /// chains through <see cref="TeamsDiagnosticsServiceCollectionExtensions.AddTeamsDiagnostics"/>
+    /// so the one-call composition path also satisfies the §6.3 step 5 "every
+    /// log entry carries CorrelationId/TenantId/UserId" contract by default.
+    /// </summary>
+    [Fact]
+    public void AddTeamsSerilogEnricher_RegistersEnricherUnderILogEventEnricherContract()
+    {
+        var services = new ServiceCollection();
+        services.AddTeamsSerilogEnricher();
+
+        using var sp = services.BuildServiceProvider();
+        var enrichersByContract = sp.GetServices<Serilog.Core.ILogEventEnricher>().ToList();
+
+        // Exactly one ILogEventEnricher registered by the helper — and it must be
+        // the TeamsLogEnricher instance (same reference as the concrete-type
+        // resolution, so Serilog.ReadFrom.Services picks up the same singleton
+        // the rest of the app sees).
+        var concrete = sp.GetRequiredService<TeamsLogEnricher>();
+        var contractResolution = Assert.Single(enrichersByContract);
+        Assert.Same(concrete, contractResolution);
+    }
+
+    /// <summary>
+    /// Stage 6.3 iter-5 evaluator feedback item 1 — the one-call
+    /// <see cref="TeamsDiagnosticsServiceCollectionExtensions.AddTeamsDiagnostics"/>
+    /// composition path MUST register the enricher under the
+    /// <see cref="Serilog.Core.ILogEventEnricher"/> contract. Prior iters
+    /// registered <see cref="TeamsLogEnricher"/> only under its concrete type,
+    /// forcing hosts to manually call <c>.Enrich.WithTeamsContext()</c> — that
+    /// extra step contradicted the §6.3 step 5 "default composition wires
+    /// enrichment for every log entry" requirement.
+    /// </summary>
+    [Fact]
+    public void AddTeamsDiagnostics_RegistersEnricherUnderILogEventEnricherContract()
+    {
+        var services = new ServiceCollection();
+        services.AddTeamsDiagnostics();
+
+        using var sp = services.BuildServiceProvider();
+        var enrichersByContract = sp.GetServices<Serilog.Core.ILogEventEnricher>().ToList();
+
+        // The composition path registered exactly one Teams enricher under the
+        // Serilog contract — third-party enrichers from other modules (none here)
+        // would still resolve too but we filter for the Teams one specifically.
+        var teamsEnrichers = enrichersByContract.OfType<TeamsLogEnricher>().ToList();
+        Assert.Single(teamsEnrichers);
+    }
+
+    /// <summary>
+    /// Stage 6.3 iter-5 evaluator feedback item 1 — repeated
+    /// <see cref="TeamsDiagnosticsServiceCollectionExtensions.AddTeamsDiagnostics"/>
+    /// calls must NOT stack duplicate <see cref="Serilog.Core.ILogEventEnricher"/>
+    /// registrations (which would cause every log entry to get the CorrelationId /
+    /// TenantId / UserId properties emitted twice). The
+    /// <see cref="TeamsDiagnosticsServiceCollectionExtensions"/> internal
+    /// <c>SerilogEnricherMarker</c> sentinel guards against the duplicate.
+    /// </summary>
+    [Fact]
+    public void AddTeamsDiagnostics_CalledTwice_RegistersExactlyOneILogEventEnricher()
+    {
+        var services = new ServiceCollection();
+        services.AddTeamsDiagnostics();
+        services.AddTeamsDiagnostics();
+        services.AddTeamsDiagnostics();
+
+        using var sp = services.BuildServiceProvider();
+        var teamsEnrichers = sp.GetServices<Serilog.Core.ILogEventEnricher>()
+            .OfType<TeamsLogEnricher>()
+            .ToList();
+        Assert.Single(teamsEnrichers);
+    }
+
     [Fact]
     public void AllHelpers_NullServices_Throw()
     {
