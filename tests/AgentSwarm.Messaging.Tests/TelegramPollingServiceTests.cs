@@ -232,6 +232,159 @@ public class TelegramPollingServiceTests
     }
 
     // ============================================================
+    // Stage 6.1 iter-4 evaluator item 1 — polling-mode observability
+    // parity with the webhook receive path.
+    // ============================================================
+
+    /// <summary>
+    /// Pins the polling service to emit the canonical
+    /// <c>telegram.messages.received</c> counter for every update it
+    /// processes, with the same <c>event_type</c> tag taxonomy the
+    /// webhook receive path emits (<c>command</c> / <c>text_reply</c> /
+    /// <c>callback_response</c> / <c>unknown</c>). Without this, a
+    /// dashboard summing <c>telegram.messages.received</c> would
+    /// silently miss every dev / CI host running in polling mode.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_EmitsMessagesReceivedCounter_ForEveryUpdate()
+    {
+        var update1 = MakeMessageUpdate(id: 7001, "/status");
+        var update2 = MakeMessageUpdate(id: 7002, "hello");
+
+        var poller = new FakePoller();
+        poller.SeedBatch(new[] { update1, update2 });
+        var pipeline = new FakePipeline();
+
+        using var counterCollector = new CounterTotalsCollector(
+            AgentSwarm.Messaging.Telegram.Diagnostics.TelegramTelemetry.MeterName);
+
+        using var service = CreateService(poller, pipeline, usePolling: true);
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await poller.WaitForUpdatesCallsAsync(2, TimeSpan.FromSeconds(5));
+        // Wait until both pipeline calls have completed so the counter
+        // increments are observed by the listener.
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (pipeline.Calls.Count < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        counterCollector.TotalForTag("telegram.messages.received", "event_type", "command")
+            .Should().BeGreaterThanOrEqualTo(1,
+                "the /status update is a Command — polling mode must emit telegram.messages.received{event_type=command} for parity with the webhook receive path");
+        counterCollector.TotalForTag("telegram.messages.received", "event_type", "text_reply")
+            .Should().BeGreaterThanOrEqualTo(1,
+                "the plain-text reply must emit telegram.messages.received{event_type=text_reply} for parity with the webhook receive path");
+    }
+
+    /// <summary>
+    /// Pins the polling service to emit a Server-kind receive span
+    /// (<see cref="AgentSwarm.Messaging.Telegram.Diagnostics.TelegramTelemetry.ReceiveActivityName"/>)
+    /// for every update, carrying the brief-contract
+    /// <c>CorrelationId</c>/<c>EventId</c>/<c>EventType</c> tags. The
+    /// architecture states every inbound update is traced regardless
+    /// of receive mode; without this span operators using polling for
+    /// local repro would have no entry-point trace to pivot from.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_StartsReceiveSpan_ForEveryUpdate()
+    {
+        var update1 = MakeMessageUpdate(id: 8001, "/status");
+
+        var poller = new FakePoller();
+        poller.SeedBatch(new[] { update1 });
+        var pipeline = new FakePipeline();
+
+        var capturedSpans = new System.Collections.Concurrent.ConcurrentBag<System.Diagnostics.Activity>();
+        using var listener = new System.Diagnostics.ActivityListener
+        {
+            ShouldListenTo = source => source.Name
+                == AgentSwarm.Messaging.Telegram.Diagnostics.TelegramTelemetry.ActivitySourceName,
+            Sample = (ref System.Diagnostics.ActivityCreationOptions<System.Diagnostics.ActivityContext> _)
+                => System.Diagnostics.ActivitySamplingResult.AllDataAndRecorded,
+            SampleUsingParentId = (ref System.Diagnostics.ActivityCreationOptions<string> _)
+                => System.Diagnostics.ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = a =>
+            {
+                if (a.OperationName
+                    == AgentSwarm.Messaging.Telegram.Diagnostics.TelegramTelemetry.ReceiveActivityName)
+                {
+                    capturedSpans.Add(a);
+                }
+            },
+        };
+        System.Diagnostics.ActivitySource.AddActivityListener(listener);
+
+        using var service = CreateService(poller, pipeline, usePolling: true);
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await poller.WaitForUpdatesCallsAsync(2, TimeSpan.FromSeconds(5));
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (capturedSpans.IsEmpty && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        var ourSpan = capturedSpans.FirstOrDefault(a =>
+            (a.GetTagItem(AgentSwarm.Messaging.Telegram.Diagnostics.TelegramTelemetry.EventIdKey) as long?) == 8001L);
+        ourSpan.Should().NotBeNull(
+            "polling service must open a Server-kind receive span carrying the EventId for every processed update — parity with the webhook receive path");
+        ourSpan!.Kind.Should().Be(System.Diagnostics.ActivityKind.Server,
+            "receive spans are Server-kind so end-to-end traces show the update entry point");
+        (ourSpan.GetTagItem(AgentSwarm.Messaging.Telegram.Diagnostics.TelegramTelemetry.CorrelationIdKey) as string)
+            .Should().NotBeNullOrEmpty("the polling receive span must carry CorrelationId so logs and downstream pipeline spans can be stitched against it");
+        (ourSpan.GetTagItem(AgentSwarm.Messaging.Telegram.Diagnostics.TelegramTelemetry.EventTypeKey) as string)
+            .Should().Be("command", "/status maps to a Command event; the receive span's event_type tag must match the counter tag");
+    }
+
+    /// <summary>
+    /// Internal <see cref="System.Diagnostics.Metrics.MeterListener"/>
+    /// helper that aggregates per-instrument-per-tag totals so tests
+    /// can assert "the polling path emitted <c>telegram.messages.received{event_type=command}</c>"
+    /// without leaking measurements from sibling tests. The collector
+    /// is filtered to a single meter name and a single instrument
+    /// per test, which avoids the parallel-test cross-talk that bit
+    /// the iter-3 SpanCollector.
+    /// </summary>
+    private sealed class CounterTotalsCollector : IDisposable
+    {
+        private readonly System.Diagnostics.Metrics.MeterListener _listener;
+        private readonly ConcurrentDictionary<string, long> _totals = new(StringComparer.Ordinal);
+
+        public CounterTotalsCollector(string meterName)
+        {
+            _listener = new System.Diagnostics.Metrics.MeterListener();
+            _listener.InstrumentPublished = (instrument, l) =>
+            {
+                if (string.Equals(instrument.Meter.Name, meterName, StringComparison.Ordinal)
+                    && instrument is System.Diagnostics.Metrics.Counter<long>)
+                {
+                    l.EnableMeasurementEvents(instrument);
+                }
+            };
+            _listener.SetMeasurementEventCallback<long>((instrument, measurement, tags, _) =>
+            {
+                foreach (var tag in tags)
+                {
+                    var key = $"{instrument.Name}|{tag.Key}={tag.Value}";
+                    _totals.AddOrUpdate(key, measurement, (_, prev) => prev + measurement);
+                }
+            });
+            _listener.Start();
+        }
+
+        public long TotalForTag(string instrumentName, string tagKey, string tagValue)
+            => _totals.TryGetValue($"{instrumentName}|{tagKey}={tagValue}", out var v) ? v : 0;
+
+        public void Dispose() => _listener.Dispose();
+    }
+
+    // ============================================================
     // Helpers
     // ============================================================
 

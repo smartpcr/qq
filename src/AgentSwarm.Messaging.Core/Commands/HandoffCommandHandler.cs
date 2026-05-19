@@ -207,8 +207,10 @@ public sealed class HandoffCommandHandler : ICommandHandler
                 UserId = sourceAlias,
                 AgentId = null,
                 Action = AuditAction,
+                EventFamily = AuditEventFamilies.Handoff,
                 Timestamp = now,
                 CorrelationId = correlationId,
+                TenantId = @operator.TenantId,
                 Details = JsonSerializer.Serialize(
                     new HandoffAuditDetails(
                         taskId,

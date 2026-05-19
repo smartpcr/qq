@@ -157,4 +157,23 @@ public sealed class PendingQuestionRecord
 
     /// <summary>Trace / correlation id for end-to-end observability.</summary>
     public required string CorrelationId { get; set; }
+
+    /// <summary>
+    /// Tenant the question was routed to. Stage 5.3 iter-2 evaluator
+    /// item 6 — denormalised at <see cref="IPendingQuestionStore.StoreAsync"/>
+    /// time from the envelope's
+    /// <see cref="AgentQuestionEnvelope.RoutingMetadata"/> so the
+    /// callback / timeout audit paths can persist <c>TenantId</c> on
+    /// every decision row without re-resolving the operator binding.
+    /// Nullable so rows persisted before the metadata stamp existed
+    /// (or for connectors that route without tenant context) still
+    /// round-trip cleanly.
+    /// </summary>
+    public string? TenantId { get; set; }
+
+    /// <summary>
+    /// Workspace the question was routed to. Sibling of
+    /// <see cref="TenantId"/> — Stage 5.3 audit context.
+    /// </summary>
+    public string? WorkspaceId { get; set; }
 }

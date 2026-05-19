@@ -1,6 +1,7 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Core.Commands;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using AgentSwarm.Messaging.Telegram.Pipeline;
 using AgentSwarm.Messaging.Telegram.Pipeline.Stubs;
 using AgentSwarm.Messaging.Telegram.Polling;
@@ -10,6 +11,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Http.Logging;
 using Microsoft.Extensions.Options;
 using Telegram.Bot;
 
@@ -24,8 +26,12 @@ public static class TelegramServiceCollectionExtensions
     /// Registers Telegram options binding (<see cref="TelegramOptions"/>),
     /// the fail-fast validator (<see cref="TelegramOptionsValidator"/>),
     /// the named <see cref="HttpClient"/>, the
-    /// <see cref="TelegramBotClientFactory"/>, a singleton
-    /// <see cref="ITelegramBotClient"/> backed by the factory, the
+    /// <see cref="TelegramBotClientFactory"/> (retained for direct
+    /// one-shot construction sites), the Stage 5.1
+    /// <see cref="RotatingTelegramBotClient"/> proxy, a singleton
+    /// <see cref="ITelegramBotClient"/> resolved THROUGH the proxy so
+    /// vault token rotations propagate on the next API call (per
+    /// architecture.md §10 line 1018 and §11 line 1091), the
     /// Stage 2.2 <see cref="ITelegramUpdatePipeline"/>, the Stage 2.2
     /// in-memory stub implementations of the inbound pipeline's
     /// dependencies, and (Stage 2.5) the long-polling
@@ -45,7 +51,18 @@ public static class TelegramServiceCollectionExtensions
     /// The <see cref="ITelegramBotClient"/> registration is a singleton
     /// (the underlying <c>Telegram.Bot</c> client is thread-safe and
     /// reuses the <see cref="HttpClient"/>), so all senders share the
-    /// same instance.
+    /// same instance. The singleton is the
+    /// <see cref="RotatingTelegramBotClient"/> proxy — every API call
+    /// is forwarded to an inner <see cref="TelegramBotClient"/> that
+    /// is rebuilt whenever <see cref="IOptionsMonitor{T}.OnChange"/>
+    /// fires with a different <see cref="TelegramOptions.BotToken"/>.
+    /// That is how a Key Vault rotation (driven by the
+    /// <see cref="Azure.Extensions.AspNetCore.Configuration.Secrets.AzureKeyVaultConfigurationOptions.ReloadInterval"/>
+    /// wired in <c>Program.cs</c>) reaches every cached
+    /// <see cref="ITelegramBotClient"/> reference without a process
+    /// restart, as required by architecture.md §11 line 1091
+    /// ("The refreshed token is applied to the TelegramBotClient
+    /// instance on the next API call").
     /// </para>
     /// <para>
     /// <b>Stage 2.2 stubs (with Stage 3.1 production swap).</b>
@@ -112,11 +129,54 @@ public static class TelegramServiceCollectionExtensions
 
         services.AddSingleton<IValidateOptions<TelegramOptions>, TelegramOptionsValidator>();
 
-        services.AddHttpClient(TelegramBotClientFactory.HttpClientName);
+        // Stage 6.1 -- the Telegram Bot API embeds the bearer bot
+        // token in the URL path (`/bot{TOKEN}/sendMessage`). The
+        // default Microsoft.Extensions.Http logging handlers
+        // (LoggingHttpMessageHandler + LoggingScopeHttpMessageHandler)
+        // log "Start processing HTTP request {Method} {Uri}" at
+        // Information level and would write that token verbatim to
+        // every operator's logs -- a direct violation of the brief's
+        // "Token excluded from logs" acceptance scenario.
+        //
+        // RemoveAllLoggers() strips BOTH default handlers; AddLogger
+        // attaches our RedactingHttpClientLogger which mirrors the
+        // start/stop/failed log shape but runs every URL through
+        // TelegramHttpRedactor.Redact before formatting. The pairing
+        // is load-bearing: without RemoveAllLoggers first, the
+        // defaults would still emit the raw URL alongside our
+        // redacted line.
+        //
+        // AddLogger<TLogger> resolves TLogger via the service
+        // provider on every HTTP message handler build, so the
+        // logger MUST be registered separately. Transient mirrors the
+        // lifetime contract of the default Microsoft.Extensions.Http
+        // logging handlers (one per pipeline build); the logger has
+        // no per-request state so the choice is safe.
+        services.TryAddTransient<RedactingHttpClientLogger>();
+        services.AddHttpClient(TelegramBotClientFactory.HttpClientName)
+            .RemoveAllLoggers()
+            .AddLogger<RedactingHttpClientLogger>();
 
         services.AddSingleton<TelegramBotClientFactory>();
+
+        // Stage 5.1 secret-rotation wiring. The proxy is registered as
+        // its own concrete singleton so a future test or diagnostic
+        // can resolve it directly, and as the ITelegramBotClient
+        // singleton so every existing consumer
+        // (TelegramMessageSender, TelegramBotClientUpdatePoller,
+        // CallbackQueryHandler, QuestionTimeoutService, the webhook
+        // registration service, the polling service) automatically
+        // observes vault rotations on the next API call. The proxy
+        // ctor subscribes to IOptionsMonitor<TelegramOptions>.OnChange
+        // — that is the contract architecture.md §11 line 1091 calls
+        // out ("the refreshed token is applied to the
+        // TelegramBotClient instance on the next API call"). Without
+        // this indirection the singleton ITelegramBotClient would
+        // capture the FIRST-seen token at activation time and ignore
+        // every subsequent vault refresh until process restart.
+        services.AddSingleton<RotatingTelegramBotClient>();
         services.AddSingleton<ITelegramBotClient>(sp =>
-            sp.GetRequiredService<TelegramBotClientFactory>().Create());
+            sp.GetRequiredService<RotatingTelegramBotClient>());
 
         // Stage 4.3 — IDeduplicationService.
         //
@@ -157,31 +217,18 @@ public static class TelegramServiceCollectionExtensions
         services.TryAddSingleton<IPendingQuestionStore, InMemoryPendingQuestionStore>();
 
         services.AddSingleton<IPendingDisambiguationStore, InMemoryPendingDisambiguationStore>();
-        // Stage 3.1: production TelegramCommandParser replaces the
-        // Stage 2.2 StubCommandParser at registration time. Singleton
-        // lifetime because the parser is stateless.
-        services.AddSingleton<ICommandParser, TelegramCommandParser>();
-        // Stage 3.2: production CommandRouter replaces the Stage 2.2
-        // StubCommandRouter. The router accepts every
-        // IEnumerable<ICommandHandler> registered below and dispatches
-        // by ICommandHandler.CommandName at the boundary.
-        services.AddSingleton<ICommandRouter, CommandRouter>();
 
-        // Stage 3.2 command handlers. Registered individually so the
-        // CommandRouter constructor receives all nine through
-        // IEnumerable<ICommandHandler> injection. Singleton lifetime —
-        // handlers are stateless beyond their injected dependencies
-        // (ISwarmCommandBus, IPendingQuestionStore, IOperatorRegistry,
-        // ITaskOversightRepository, IAuditLogger, TimeProvider).
-        services.AddSingleton<ICommandHandler, StartCommandHandler>();
-        services.AddSingleton<ICommandHandler, StatusCommandHandler>();
-        services.AddSingleton<ICommandHandler, AgentsCommandHandler>();
-        services.AddSingleton<ICommandHandler, AskCommandHandler>();
-        services.AddSingleton<ICommandHandler, ApproveCommandHandler>();
-        services.AddSingleton<ICommandHandler, RejectCommandHandler>();
-        services.AddSingleton<ICommandHandler, PauseCommandHandler>();
-        services.AddSingleton<ICommandHandler, ResumeCommandHandler>();
-        services.AddSingleton<ICommandHandler, HandoffCommandHandler>();
+        // Stage 6.3 iter-3 evaluator item 1 — the Stage 3.1/3.2/3.3
+        // command-processing surface (ICommandParser, ICommandRouter,
+        // all nine ICommandHandler implementations, ICallbackHandler)
+        // is delegated to the public AddCommandProcessing() extension
+        // method so the Worker host (Program.cs) can call it
+        // explicitly per the Stage 6.3 brief. AddCommandProcessing()
+        // is idempotent (TryAddSingleton + TryAddEnumerable), so
+        // re-invoking it from the Worker after AddTelegram is a
+        // no-op that satisfies the brief's "call services.AddCommandProcessing()"
+        // requirement without producing duplicate registrations.
+        services.AddCommandProcessing();
 
         // Stage 3.2: no-op audit logger as the TryAdd fallback so the
         // approve / reject / handoff handlers can take a hard
@@ -192,15 +239,30 @@ public static class TelegramServiceCollectionExtensions
         // hit the database — last-wins semantics on Replace().
         services.TryAddSingleton<IAuditLogger, NullAuditLogger>();
 
+        // Stage 5.3 iter-9 evaluator item 2 — no-op fallback sink
+        // as the TryAdd default so TelegramUpdatePipeline can take a
+        // hard IAuditFallbackSink dependency in dev / unit-test
+        // bootstraps that skip the persistence module.
+        // AddMessagingPersistence REPLACES this with the file-backed
+        // FileAuditFallbackSink so production hosts get a durable
+        // backstop when the primary audit DB throws — last-wins
+        // semantics on Replace(). Pairing PersistentAuditLogger with
+        // the no-op fallback would silently violate Stage 5.3's
+        // "log every inbound command" contract on any audit-DB
+        // outage, which is exactly why AddMessagingPersistence
+        // always replaces this binding.
+        services.TryAddSingleton<IAuditFallbackSink, NullAuditFallbackSink>();
+
         // Stage 3.3 swapped StubCallbackHandler for the production
         // CallbackQueryHandler. The handler depends on
         // IPendingQuestionStore + ISwarmCommandBus + IAuditLogger +
         // IDeduplicationService + ITelegramBotClient + TimeProvider —
-        // all five already registered above. Last-wins semantics on
-        // AddSingleton means a re-call of AddTelegram (test
-        // bootstraps) keeps the production binding; explicit
-        // overrides must call services.Replace() AFTER AddTelegram.
-        services.AddSingleton<ICallbackHandler, CallbackQueryHandler>();
+        // all five already registered above. The actual registration
+        // now lives in AddCommandProcessing() (called from this
+        // method's body above and re-callable from Program.cs); the
+        // line below is intentionally REMOVED to avoid a duplicate
+        // descriptor that would otherwise leak into IEnumerable<ICallbackHandler>
+        // resolutions.
         // TimeProvider.System is the production default; tests register a
         // FakeTimeProvider via TryAddSingleton-replacement before AddTelegram.
         services.TryAddSingleton(TimeProvider.System);
@@ -373,6 +435,160 @@ public static class TelegramServiceCollectionExtensions
             services.AddSingleton<IHostedService>(sp =>
                 sp.GetRequiredService<TelegramPollingService>());
         }
+
+        return services;
+    }
+
+    /// <summary>
+    /// Stage 6.3 — explicit in-memory <see cref="IOutboundQueue"/>
+    /// composition switch for dev / local hosts. The Worker's
+    /// production composition wires
+    /// <c>AddMessagingPersistence(...)</c> BEFORE <c>AddTelegram(...)</c>,
+    /// which <see cref="ServiceCollectionDescriptorExtensions.Replace(IServiceCollection, ServiceDescriptor)"/>s
+    /// <see cref="IOutboundQueue"/> with the EF-backed
+    /// <c>PersistentOutboundQueue</c>. Hosts that want the
+    /// brief-mandated "in-memory queue" for
+    /// <c>appsettings.Development.json</c> call this method AFTER
+    /// the persistence + Telegram registrations so the
+    /// last-Replace-wins semantics swap the durable queue back to
+    /// the in-process <see cref="InMemoryOutboundQueue"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The brief (Stage 6.3, second-to-last bullet) explicitly
+    /// requires <c>appsettings.Development.json</c> to select the
+    /// in-memory queue. The dev queue lives behind the
+    /// <c>internal</c> visibility of
+    /// <see cref="InMemoryOutboundQueue"/>; this extension is the
+    /// public composition surface that lets the Worker
+    /// (which lives in a sibling assembly without
+    /// <c>InternalsVisibleTo</c>) make the swap without leaking
+    /// the dev type itself.
+    /// </para>
+    /// <para>
+    /// <b>Side-effect-free for hosts that do not call it.</b>
+    /// Production hosts (and any host that leaves
+    /// <c>OutboundQueue:Mode</c> unset or set to
+    /// <c>Persistent</c>) never invoke this method, so the
+    /// <see cref="ServiceCollectionDescriptorExtensions.Replace(IServiceCollection, ServiceDescriptor)"/>
+    /// call here cannot accidentally regress the durable outbox.
+    /// </para>
+    /// </remarks>
+    /// <param name="services">The DI container being composed.</param>
+    /// <returns>
+    /// The same <paramref name="services"/> instance for chaining.
+    /// </returns>
+    public static IServiceCollection UseInMemoryOutboundQueue(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        // Replace (not TryAdd) — at this composition order
+        // AddMessagingPersistence has already registered the
+        // PersistentOutboundQueue singleton; only Replace will
+        // unseat it.
+        services.Replace(ServiceDescriptor.Singleton<IOutboundQueue, InMemoryOutboundQueue>());
+        return services;
+    }
+
+    /// <summary>
+    /// Stage 6.3 (iter-3 evaluator item 1) — public composition
+    /// seam for the Telegram command-processing surface. Registers
+    /// <see cref="ICommandParser"/>, <see cref="ICommandRouter"/>,
+    /// every <see cref="ICommandHandler"/> implementation for the
+    /// nine supported commands (<c>/start</c>, <c>/status</c>,
+    /// <c>/agents</c>, <c>/ask</c>, <c>/approve</c>, <c>/reject</c>,
+    /// <c>/pause</c>, <c>/resume</c>, <c>/handoff</c>), and the
+    /// <see cref="ICallbackHandler"/> that consumes inline-keyboard
+    /// button presses. The Stage 6.3 brief explicitly names this
+    /// extension as a Worker-host composition surface
+    /// (<c>services.AddCommandProcessing()</c>), so this method is
+    /// callable from <c>Program.cs</c> alongside
+    /// <see cref="AddTelegram(IServiceCollection, IConfiguration)"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Idempotency.</b> All registrations use
+    /// <see cref="ServiceCollectionDescriptorExtensions.TryAddSingleton{TService,TImplementation}(IServiceCollection)"/>
+    /// and
+    /// <see cref="ServiceCollectionDescriptorExtensions.TryAddEnumerable(IServiceCollection, IEnumerable{ServiceDescriptor})"/>
+    /// so calling this method multiple times — for example, once
+    /// indirectly via <see cref="AddTelegram(IServiceCollection, IConfiguration)"/>
+    /// and once explicitly from the Worker host — produces no
+    /// duplicate descriptors. Each (service-type,
+    /// implementation-type) pair is added exactly once across all
+    /// calls.
+    /// </para>
+    /// <para>
+    /// <b>Why this is a separate method from
+    /// <see cref="AddTelegram(IServiceCollection, IConfiguration)"/>.</b>
+    /// The Stage 6.3 brief explicitly enumerates the
+    /// command-processing registrations as a discrete composition
+    /// surface so a Worker host can opt into command processing
+    /// independent of the inbound pipeline / outbound queue /
+    /// hosted services that <c>AddTelegram</c> bundles. For
+    /// example, a unit-test bootstrap that wants to exercise
+    /// <c>ICommandRouter</c> in isolation calls only
+    /// <c>AddCommandProcessing()</c> without paying the
+    /// configuration-binding cost of <c>AddTelegram</c>.
+    /// </para>
+    /// <para>
+    /// <b>Composition order.</b> Handlers depend on
+    /// <see cref="ISwarmCommandBus"/>, <see cref="IPendingQuestionStore"/>,
+    /// <see cref="IOperatorRegistry"/>,
+    /// <see cref="ITaskOversightRepository"/>, and
+    /// <see cref="IAuditLogger"/>. Those abstractions are
+    /// registered by <see cref="AddTelegram(IServiceCollection, IConfiguration)"/>
+    /// (with stub fallbacks via TryAddSingleton, replaced by
+    /// production siblings via AddMessagingPersistence). When this
+    /// method is called from a host that has not also called
+    /// <c>AddTelegram</c> and <c>AddMessagingPersistence</c>, the
+    /// caller is responsible for supplying those abstractions
+    /// before the container is built.
+    /// </para>
+    /// </remarks>
+    /// <param name="services">The DI container being composed.</param>
+    /// <returns>
+    /// The same <paramref name="services"/> instance for chaining.
+    /// </returns>
+    public static IServiceCollection AddCommandProcessing(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        // Stage 3.1 production TelegramCommandParser replaces the
+        // Stage 2.2 StubCommandParser at registration time.
+        // TryAddSingleton — tests/hosts that pre-register an
+        // ICommandParser before calling AddCommandProcessing win;
+        // the production default is preserved otherwise.
+        services.TryAddSingleton<ICommandParser, TelegramCommandParser>();
+
+        // Stage 3.2 production CommandRouter replaces the Stage 2.2
+        // StubCommandRouter. The router accepts every
+        // IEnumerable<ICommandHandler> registered below and
+        // dispatches by ICommandHandler.CommandName at the boundary.
+        services.TryAddSingleton<ICommandRouter, CommandRouter>();
+
+        // Stage 3.2 command handlers. TryAddEnumerable adds each
+        // (service-type, implementation-type) pair exactly once
+        // across all calls, so re-invocation from the Worker host
+        // does not produce a duplicate handler that the router
+        // would dispatch twice for a single command.
+        services.TryAddEnumerable(new[]
+        {
+            ServiceDescriptor.Singleton<ICommandHandler, StartCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, StatusCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, AgentsCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, AskCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, ApproveCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, RejectCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, PauseCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, ResumeCommandHandler>(),
+            ServiceDescriptor.Singleton<ICommandHandler, HandoffCommandHandler>(),
+        });
+
+        // Stage 3.3 production CallbackQueryHandler. Wired through
+        // ICallbackHandler so the inbound pipeline (which depends
+        // on the interface, not the concrete type) can resolve it.
+        services.TryAddSingleton<ICallbackHandler, CallbackQueryHandler>();
 
         return services;
     }

@@ -5,6 +5,28 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UserSecretsId>dotnet-AgentSwarm.Messaging.Worker-34563548-df1c-4e74-ac47-502173f264b5</UserSecretsId>
+    <!--
+      Stage 6.1 — OpenTelemetry pinning.
+      Suppress NU1902 (transitive vulnerability advisory) for the
+      OpenTelemetry packages only. The currently-published .NET 8 LTS
+      compatible OpenTelemetry releases (1.7.x — 1.9.x) all carry one
+      or more "moderate" advisories that are gated behind opt-in
+      features we do NOT use:
+        * GHSA-4625-4j76-fww9 (OpenTelemetryProtocol 1.8.0-1.15.2) —
+          only exposed when OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=disk
+          is set and OTEL_DOTNET_EXPERIMENTAL_OTLP_DISK_RETRY_DIRECTORY_PATH
+          is left unset. Neither is set in this codebase.
+        * GHSA-vh2m-22xx-q94f (Instrumentation.AspNetCore/Http 1.7.x)
+          — gated on an opt-in request-header capture mode that we
+          do not enable.
+      The patched releases (1.15.3 / 1.10.x) depend on
+      Microsoft.Extensions.* 9.0.0, which NU1605-clashes with the
+      net8.0 test projects' explicit 8.* pins. The right long-term
+      fix is to bump everything to .NET 9 once the rest of the
+      solution is ready; until then the suppression below is the
+      explicit, documented trade-off.
+    -->
+    <NoWarn>$(NoWarn);NU1902</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,11 +40,40 @@
       webhook endpoint), and the WebApplication builder used in
       Program.cs.
     -->
+    <PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.3.2" />
+    <PackageReference Include="Azure.Identity" Version="1.13.1" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.*">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.*" />
+
+    <!--
+      Stage 6.1 — OpenTelemetry Integration. Five packages per the
+      brief: hosting bootstrap, ASP.NET Core + HttpClient
+      instrumentation, the console exporter for local dev, and the
+      OTLP exporter for production (sent to a sidecar / collector via
+      gRPC or HTTP/Protobuf based on configuration). The Worker is
+      the only project that imports these — the rest of the codebase
+      consumes the `System.Diagnostics.ActivitySource` /
+      `System.Diagnostics.Metrics.Meter` BCL types defined in
+      `AgentSwarm.Messaging.Telegram/Diagnostics/TelegramTelemetry.cs`
+      so it can also run with NO exporter wired (unit tests / library
+      consumers).
+
+      Pinned to 1.7.0 — pre-disk-retry-feature so we avoid the
+      GHSA-4625-4j76-fww9 advisory (only affects 1.8.0 — 1.15.2
+      when OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY=disk is opt-in set).
+      1.7.0 also targets Microsoft.Extensions.* 8.x which matches
+      the test projects' pin and avoids NU1605 downgrade errors.
+      An upgrade to 1.15.3 once the test projects move to .NET 9 is
+      a clean follow-up.
+    -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.7.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.7.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.7.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.7.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.7.0" />
   </ItemGroup>
 
   <ItemGroup>

@@ -41,15 +41,60 @@ public interface IPendingQuestionStore
         long telegramMessageId,
         CancellationToken ct);
 
-    /// <summary>Transitions the question to <see cref="PendingQuestionStatus.Answered"/>.</summary>
-    Task MarkAnsweredAsync(string questionId, CancellationToken ct);
+    /// <summary>
+    /// <para>
+    /// <b>Atomic claim primitive.</b> Transitions the question to
+    /// <see cref="PendingQuestionStatus.Answered"/> via a single
+    /// row-level conditional update (provider-neutral; implemented via
+    /// EF Core's <c>ExecuteUpdateAsync</c> against the persistent
+    /// store, and
+    /// <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}.TryUpdate"/>
+    /// against the in-memory stub).
+    /// </para>
+    /// <para>
+    /// Returns <see langword="true"/> only when THIS caller actually
+    /// moved the row from <see cref="PendingQuestionStatus.Pending"/>
+    /// or <see cref="PendingQuestionStatus.AwaitingComment"/> to
+    /// <see cref="PendingQuestionStatus.Answered"/>. Returns
+    /// <see langword="false"/> when the row is missing or already in a
+    /// terminal state (e.g. <c>QuestionTimeoutService</c> won the
+    /// claim between the callback handler's snapshot read and the
+    /// mark, or a duplicate webhook delivery already terminal-d the
+    /// row). <c>CallbackQueryHandler</c> calls this method
+    /// <b>BEFORE</b> publishing
+    /// <see cref="HumanDecisionEvent"/> so the cross-process
+    /// callback-vs-timeout race is closed: only the winning
+    /// claimant publishes (Stage 5.3 iter-3 evaluator item 7).
+    /// </para>
+    /// </summary>
+    Task<bool> MarkAnsweredAsync(string questionId, CancellationToken ct);
 
     /// <summary>
-    /// Transitions the question to <see cref="PendingQuestionStatus.AwaitingComment"/>.
-    /// Invoked by the callback handler when the tapped action requires a
-    /// follow-up comment.
+    /// <para>
+    /// <b>Atomic claim primitive.</b> Transitions the question to
+    /// <see cref="PendingQuestionStatus.AwaitingComment"/> via a
+    /// single row-level conditional update — the only legal source
+    /// state for this transition is
+    /// <see cref="PendingQuestionStatus.Pending"/>. Invoked by the
+    /// callback handler when the tapped action has
+    /// <see cref="HumanAction.RequiresComment"/> set.
+    /// </para>
+    /// <para>
+    /// Returns <see langword="true"/> only when THIS caller actually
+    /// moved the row to
+    /// <see cref="PendingQuestionStatus.AwaitingComment"/>. Returns
+    /// <see langword="false"/> when the row is missing or had already
+    /// been transitioned by another process (typically
+    /// <see cref="PendingQuestionStatus.TimedOut"/> by a sweep, or
+    /// <see cref="PendingQuestionStatus.Answered"/> by a duplicate
+    /// callback delivery). Callers MUST branch on the returned bool
+    /// and skip the "please send a comment" prompt when this returns
+    /// <see langword="false"/> so the operator does not get prompted
+    /// for text against a question the system has already defaulted
+    /// (Stage 5.3 iter-3 evaluator item 7).
+    /// </para>
     /// </summary>
-    Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct);
+    Task<bool> MarkAwaitingCommentAsync(string questionId, CancellationToken ct);
 
     /// <summary>
     /// <para>
@@ -135,6 +180,54 @@ public interface IPendingQuestionStore
     Task<bool> TryRevertTimedOutClaimAsync(
         string questionId,
         PendingQuestionStatus revertTo,
+        CancellationToken ct);
+
+    /// <summary>
+    /// <para>
+    /// <b>Compensation primitive.</b> Conditionally transitions a row
+    /// from <see cref="PendingQuestionStatus.Answered"/> back to
+    /// <see cref="PendingQuestionStatus.Pending"/> in a single
+    /// row-level CAS-style update. The complement of
+    /// <see cref="MarkAnsweredAsync"/> — together they let
+    /// <c>CallbackQueryHandler</c> /
+    /// <c>DecisionCommandHandlers</c> hold an atomic claim for the
+    /// duration of a publish+audit attempt and release it (so a
+    /// retry — webhook redelivery, operator re-tap, slash-command
+    /// re-issue — can re-process the same question) when the
+    /// publish or audit throws. Without this compensation step a
+    /// claim-first ordering would permanently drop a decision on
+    /// the first publish/audit failure (Stage 5.3 iter-3 evaluator
+    /// items 6 + 7 combined).
+    /// </para>
+    /// <para>
+    /// Returns <see langword="true"/> only when THIS caller actually
+    /// moved the row from <see cref="PendingQuestionStatus.Answered"/>
+    /// back to <see cref="PendingQuestionStatus.Pending"/>. Returns
+    /// <see langword="false"/> when the row is missing or is no
+    /// longer in <see cref="PendingQuestionStatus.Answered"/>
+    /// (e.g. a parallel process already progressed it). The CAS
+    /// guarantees no clobber of any state-transition another
+    /// caller has already performed.
+    /// </para>
+    /// </summary>
+    Task<bool> TryRevertAnsweredClaimAsync(
+        string questionId,
+        CancellationToken ct);
+
+    /// <summary>
+    /// <para>
+    /// <b>Compensation primitive.</b> Conditionally transitions a row
+    /// from <see cref="PendingQuestionStatus.AwaitingComment"/> back
+    /// to <see cref="PendingQuestionStatus.Pending"/> in a single
+    /// row-level CAS-style update. Paired with
+    /// <see cref="MarkAwaitingCommentAsync"/>: if the post-claim
+    /// "please send a comment" prompt fails to send, the handler
+    /// releases the claim so the operator's next tap can re-claim
+    /// the slot.
+    /// </para>
+    /// </summary>
+    Task<bool> TryRevertAwaitingCommentClaimAsync(
+        string questionId,
         CancellationToken ct);
 
     /// <summary>

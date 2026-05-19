@@ -10,11 +10,15 @@ using Microsoft.Extensions.Options;
 namespace AgentSwarm.Messaging.Telegram.Auth;
 
 /// <summary>
-/// Stage 3.4 ΓÇö production <see cref="IUserAuthorizationService"/>
+/// Stage 3.4 -- production <see cref="IUserAuthorizationService"/>
 /// implementation backed by the persistent
-/// <see cref="IOperatorRegistry"/>. Replaces the iter-5 in-memory
-/// <see cref="ConfiguredOperatorAuthorizationService"/> when the
-/// persistence layer is wired.
+/// <see cref="IOperatorRegistry"/>. The sole supported
+/// <see cref="IUserAuthorizationService"/> implementation in the
+/// Telegram project. (The iter-5 in-memory
+/// <c>ConfiguredOperatorAuthorizationService</c> was deleted in
+/// Stage 5.2 iter-4 -- the registry-backed two-tier contract here is
+/// now the only Telegram authorization path; future replacements MUST
+/// implement the same fail-closed contract.)
 /// </summary>
 /// <remarks>
 /// <para>
@@ -22,36 +26,34 @@ namespace AgentSwarm.Messaging.Telegram.Auth;
 /// <see cref="IOperatorRegistry.GetBindingsAsync"/> for the inbound
 /// (<c>TelegramUserId</c>, <c>TelegramChatId</c>) pair and populates
 /// <see cref="AuthorizationResult.Bindings"/> with the full result
-/// list. The pipeline then handles cardinality: zero bindings ΓåÆ
-/// unauthorized rejection; one binding ΓåÆ build
+/// list. The pipeline then handles cardinality: zero bindings ->
+/// unauthorized rejection; one binding -> build
 /// <see cref="AgentSwarm.Messaging.Abstractions.AuthorizedOperator"/>
-/// directly; multiple bindings ΓåÆ present workspace disambiguation
-/// via inline keyboard (per architecture.md ┬º4.3 and the
+/// directly; multiple bindings -> present workspace disambiguation
+/// via inline keyboard (per architecture.md section 4.3 and the
 /// e2e-scenarios multi-workspace flow).
 /// </para>
 /// <para>
 /// <b>Tier 1 (<c>/start</c> onboarding).</b> The algorithm follows
-/// architecture.md ┬º7.1 (lines 1042ΓÇô1065) and implementation-plan.md
-/// Stage 3.4 step 4:
+/// architecture.md section 7.1 (lines 1042-1065) and implementation-plan.md
+/// Stage 3.4 step 4 / Stage 5.2 step 2:
 /// <list type="number">
 ///   <item><description>If the inbound user id is not in
-///   <see cref="TelegramOptions.AllowedUserIds"/>, deny with a
-///   structured reason and log the attempt (the Stage 3.4 brief
-///   "respond with an 'unauthorized' message and log the attempt").
-///   When <see cref="TelegramOptions.AllowedUserIds"/> is empty, the
-///   gate is FAIL-CLOSED by default
-///   (<see cref="TelegramOptions.RequireAllowlistForOnboarding"/>
-///   defaults to <c>true</c>) so a production deployment that
-///   forgets to populate the allowlist rejects every <c>/start</c>
-///   attempt instead of silently authorising every Telegram user
-///   who DMs the bot. Dev / integration-test fixtures that need the
-///   prior open-by-default semantics must explicitly set
-///   <c>Telegram:RequireAllowlistForOnboarding=false</c>.</description></item>
+///   <see cref="TelegramOptions.AllowedUserIds"/> -- including the
+///   case where <see cref="TelegramOptions.AllowedUserIds"/> is
+///   empty -- deny with a structured reason and log the attempt
+///   (Stage 5.2 brief: <c>AllowedUserIds</c> is the single source
+///   of truth for onboarding; users not in the list are rejected,
+///   and there is no escape hatch). A production deployment that
+///   forgets to populate the allowlist therefore rejects every
+///   <c>/start</c> attempt instead of silently authorising every
+///   Telegram user who DMs the bot -- fail-closed by construction,
+///   no opt-out flag.</description></item>
 ///   <item><description>If the user IS in the allowlist but no entry
 ///   exists in <see cref="TelegramOptions.UserTenantMappings"/>,
-///   deny with a structured reason ΓÇö the operator cannot be onboarded
+///   deny with a structured reason -- the operator cannot be onboarded
 ///   without a tenant/workspace assignment, and silently registering
-///   under a fabricated tenant would breach the architecture.md ┬º7.1
+///   under a fabricated tenant would breach the architecture.md section 7.1
 ///   "all required fields populated" contract.</description></item>
 ///   <item><description>Build one
 ///   <see cref="OperatorRegistration"/> value object per
@@ -61,12 +63,12 @@ namespace AgentSwarm.Messaging.Telegram.Auth;
 ///   persistent registry's
 ///   (<see cref="PersistentOperatorRegistry"/>) override wraps every
 ///   upsert in one <c>IDbContextTransaction</c> so the batch is
-///   atomic ΓÇö a <c>(OperatorAlias, TenantId)</c> unique-index
+///   atomic -- a <c>(OperatorAlias, TenantId)</c> unique-index
 ///   collision on row N rolls back rows 1..N-1 instead of leaving
 ///   the operator in a partial-onboarding state. The per-row upsert
 ///   semantics inside the batch also make this idempotent: replays
 ///   of <c>/start</c> refresh the existing rows instead of inserting
-///   duplicates. (Stage 3.4 iter-3 evaluator item 2 ΓÇö replaces the
+///   duplicates. (Stage 3.4 iter-3 evaluator item 2 -- replaces the
 ///   prior per-row <see cref="IOperatorRegistry.RegisterAsync"/>
 ///   loop, which could leave partial bindings on a constraint
 ///   violation.)</description></item>
@@ -81,7 +83,7 @@ namespace AgentSwarm.Messaging.Telegram.Auth;
 /// </list>
 /// </para>
 /// <para>
-/// <b>ChatType derivation.</b> Stage 3.4 ΓÇö the new
+/// <b>ChatType derivation.</b> Stage 3.4 -- the new
 /// <see cref="IUserAuthorizationService.OnboardAsync"/> entry point
 /// carries the raw Telegram chat-type token (one of <c>"private"</c>,
 /// <c>"group"</c>, <c>"supergroup"</c>, <c>"channel"</c>) sourced
@@ -96,23 +98,23 @@ namespace AgentSwarm.Messaging.Telegram.Auth;
 /// <see cref="IUserAuthorizationService.AuthorizeAsync"/> entry
 /// point is invoked for <c>/start</c> (older callers, contract
 /// tests), the parser defaults to <see cref="ChatType.Private"/>
-/// ΓÇö matching the e2e-scenarios "private chat operator" baseline
-/// and the historical
-/// <see cref="ConfiguredOperatorAuthorizationService"/> convention.
+/// -- matching the e2e-scenarios "private chat operator" baseline
+/// and the historical Stage 3.4 onboarding convention.
 /// </para>
 /// <para>
-/// <b>Layering.</b> Lives in the Telegram project (alongside
-/// <see cref="ConfiguredOperatorAuthorizationService"/>) because it
-/// reads <see cref="TelegramOptions"/> for both
+/// <b>Layering.</b> Lives in the Telegram project because it reads
+/// <see cref="TelegramOptions"/> for both
 /// <see cref="TelegramOptions.AllowedUserIds"/> and
 /// <see cref="TelegramOptions.UserTenantMappings"/>. The Persistence
 /// project cannot reference the Telegram project (it would create
 /// a dependency cycle); the
 /// <see cref="ServiceCollectionExtensions.AddMessagingPersistence"/>
 /// extension registers this type via <c>AddSingleton</c> last-wins so
-/// it supersedes the worker host's
-/// <see cref="ConfiguredOperatorAuthorizationService"/> TryAdd
-/// fallback when persistence is wired.
+/// it supersedes any host-level TryAdd fallback when persistence is
+/// wired. (The iter-5
+/// <c>ConfiguredOperatorAuthorizationService</c> that previously
+/// occupied the host TryAdd fallback slot was deleted in Stage 5.2
+/// iter-4.)
 /// </para>
 /// </remarks>
 public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
@@ -138,19 +140,39 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
         string? commandName,
         CancellationToken ct)
     {
-        return await AuthorizeCoreAsync(externalUserId, chatId, commandName, chatType: null, ct)
+        return await AuthorizeAsync(externalUserId, chatId, commandName, chatType: null, ct)
             .ConfigureAwait(false);
     }
 
     /// <inheritdoc />
     /// <remarks>
-    /// Stage 3.4 ΓÇö preferred entry point for the <c>/start</c>
-    /// onboarding path: carries the inbound Telegram chat-type token
-    /// so the freshly-created
-    /// <see cref="OperatorBinding.ChatType"/> reflects the real chat
-    /// kind (Private / Group / Supergroup) instead of the
-    /// <see cref="ChatType.Private"/> default the pre-Stage-3.4
-    /// signature was forced to assume.
+    /// Stage 5.2 (iter-3) -- unified two-tier authorization entry
+    /// point invoked by the pipeline for every inbound command.
+    /// Internally routes on <paramref name="commandName"/>: Tier 1
+    /// (allowlist + onboarding) when <c>commandName == "start"</c>,
+    /// Tier 2 (binding lookup) otherwise. The
+    /// <paramref name="chatType"/> token is only consulted on
+    /// Tier 1; Tier 2 reads the chat type from the existing
+    /// <see cref="OperatorBinding.ChatType"/>.
+    /// </remarks>
+    public async Task<AuthorizationResult> AuthorizeAsync(
+        string externalUserId,
+        string chatId,
+        string? commandName,
+        string? chatType,
+        CancellationToken ct)
+    {
+        return await AuthorizeCoreAsync(externalUserId, chatId, commandName, chatType, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Stage 3.4 convenience entry point retained for back-compat
+    /// with direct callers and unit tests written against the
+    /// pre-Stage-5.2 onboarding API. Forwards to the unified
+    /// 5-arg <see cref="AuthorizeAsync(string,string,string?,string?,CancellationToken)"/>
+    /// with <c>commandName == "start"</c>.
     /// </remarks>
     public async Task<AuthorizationResult> OnboardAsync(
         string externalUserId,
@@ -158,7 +180,7 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
         string? chatType,
         CancellationToken ct)
     {
-        return await AuthorizeCoreAsync(externalUserId, chatId, commandName: "start", chatType, ct)
+        return await AuthorizeAsync(externalUserId, chatId, commandName: "start", chatType, ct)
             .ConfigureAwait(false);
     }
 
@@ -238,31 +260,50 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
         var allowedUserIds = current.AllowedUserIds;
         var allowlistConfigured = allowedUserIds is { Count: > 0 };
 
-        // Iter-5 evaluator item 2 ΓÇö fail-closed when the allowlist is
-        // unset. The default value of RequireAllowlistForOnboarding is
-        // `true` (production), so a deployment that forgets to populate
-        // Telegram:AllowedUserIds rejects every /start instead of
-        // silently authorising every Telegram user who DMs the bot.
-        // Dev / integration-test fixtures that rely on the prior
-        // open-by-default behaviour must explicitly opt in by setting
-        // Telegram:RequireAllowlistForOnboarding=false.
-        if (!allowlistConfigured && current.RequireAllowlistForOnboarding)
+        // Stage 5.2 (iter-4 evaluator item 1) -- single, unconditional
+        // allowlist gate. The earlier RequireAllowlistForOnboarding
+        // opt-out was removed because it weakened the brief's
+        // "AllowedUserIds is the single source of truth for the
+        // onboarding allowlist" contract: a deployment that left the
+        // list empty would silently authorise every Telegram user who
+        // DMs the bot if the opt-out got flipped. The new contract:
+        // EVERY /start that is not in AllowedUserIds is denied,
+        // including the empty-list case. There is no escape hatch.
+        // Dev / integration-test fixtures must populate
+        // Telegram:AllowedUserIds with the user IDs they want to
+        // onboard, exactly like production.
+        //
+        // LOG LEVEL: the empty-allowlist case is logged at ERROR (not
+        // Warning) on purpose. The fail-closed denial is correct
+        // *behaviour*, but the *condition* -- a production deployment
+        // shipped without any operator IDs configured -- is
+        // unambiguously a deployment configuration gap that no live
+        // /start should ever encounter. It is global (every /start
+        // denied) rather than per-user, and operators commonly alert
+        // on ERROR-level log signals to catch exactly this class of
+        // mis-deploy. The peer "blank UserTenantMappings entry"
+        // branch below uses LogError for the same reason; the
+        // per-user "not on the allowlist" / "no UserTenantMappings"
+        // branches stay at LogWarning because those are normal
+        // authorization decisions for individual users. Do NOT
+        // downgrade this back to LogWarning without also updating
+        // the ops alerting playbook.
+        if (!allowlistConfigured)
         {
             _logger.LogError(
-                "/start denied ΓÇö Telegram:AllowedUserIds is empty AND Telegram:RequireAllowlistForOnboarding is true (the fail-closed default). User {TelegramUserId} from chat {TelegramChatId} cannot onboard. Populate AllowedUserIds for production or set RequireAllowlistForOnboarding=false for dev/test fixtures.",
+                "/start denied -- Telegram:AllowedUserIds is empty. User {TelegramUserId} from chat {TelegramChatId} cannot onboard because the allowlist contains no authorised user IDs. This indicates a deployment configuration gap -- populate Telegram:AllowedUserIds with the operator IDs allowed to onboard.",
                 userId,
                 chatIdValue);
             return Deny(
-                "Telegram:AllowedUserIds is empty AND Telegram:RequireAllowlistForOnboarding is true. "
-                + "The Stage 3.4 onboarding gate is fail-closed by default: populate AllowedUserIds with "
-                + "the operators allowed to onboard, OR set RequireAllowlistForOnboarding=false in "
-                + "dev/integration-test fixtures.");
+                $"User {userId} cannot onboard: Telegram:AllowedUserIds is empty. "
+                + "Stage 5.2 makes AllowedUserIds the single source of truth for /start onboarding; "
+                + "populate it with the Telegram user IDs allowed to onboard.");
         }
 
-        if (allowlistConfigured && !allowedUserIds!.Contains(userId))
+        if (!allowedUserIds!.Contains(userId))
         {
             _logger.LogWarning(
-                "Unauthorized /start attempt ΓÇö user {TelegramUserId} from chat {TelegramChatId} is not in Telegram:AllowedUserIds.",
+                "Unauthorized /start attempt -- user {TelegramUserId} from chat {TelegramChatId} is not in Telegram:AllowedUserIds.",
                 userId,
                 chatIdValue);
             return Deny(
@@ -273,14 +314,14 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
         if (mapping is null || mapping.Count == 0)
         {
             _logger.LogWarning(
-                "/start denied ΓÇö user {TelegramUserId} is in the allowlist but has no Telegram:UserTenantMappings entry; cannot create an OperatorBinding without a tenant/workspace assignment.",
+                "/start denied -- user {TelegramUserId} is in the allowlist but has no Telegram:UserTenantMappings entry; cannot create an OperatorBinding without a tenant/workspace assignment.",
                 userId);
             return Deny(
                 $"User {userId} is allowed to onboard but has no Telegram:UserTenantMappings entry. "
                 + "Add a UserTenantMappings entry with TenantId, WorkspaceId, Roles, and OperatorAlias for this user.");
         }
 
-        // Iter-2 evaluator item 3 ΓÇö fail-fast on partially invalid
+        // Iter-2 evaluator item 3 -- fail-fast on partially invalid
         // multi-workspace mappings. Previously we silently skipped
         // entries with blank TenantId/WorkspaceId, which let a
         // partially invalid configuration authorize the user with
@@ -289,7 +330,7 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
         // TelegramOptionsValidator now rejects this shape at host
         // startup, so reaching this branch at runtime means the
         // options were mutated post-startup via IOptionsMonitor
-        // reload ΓÇö surface the misconfiguration as a denial rather
+        // reload -- surface the misconfiguration as a denial rather
         // than authorize with a partial binding set.
         for (var i = 0; i < mapping.Count; i++)
         {
@@ -300,7 +341,7 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
                 || string.IsNullOrWhiteSpace(entry.OperatorAlias))
             {
                 _logger.LogError(
-                    "/start denied ΓÇö Telegram:UserTenantMappings[{TelegramUserId}][{Index}] has blank TenantId/WorkspaceId/OperatorAlias; refusing to onboard partially.",
+                    "/start denied -- Telegram:UserTenantMappings[{TelegramUserId}][{Index}] has blank TenantId/WorkspaceId/OperatorAlias; refusing to onboard partially.",
                     userId,
                     i);
                 return Deny(
@@ -311,7 +352,7 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
             }
         }
 
-        // Stage 3.4 iter-3 (evaluator item 2) ΓÇö atomic batch upsert.
+        // Stage 3.4 iter-3 (evaluator item 2) -- atomic batch upsert.
         // Previously we iterated mapping entries and called the
         // single-row IOperatorRegistry registration entry point one
         // at a time. If entry [N] failed (e.g. the operator_bindings
@@ -323,7 +364,7 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
         // iter-2 blank-field fail-fast was meant to prevent.
         // RegisterManyAsync wraps every upsert in one transaction
         // and rolls back ALL inserts if any entry fails
-        // (architecture.md ┬º3.1 atomicity requirement for /start
+        // (architecture.md section 3.1 atomicity requirement for /start
         // onboarding).
         var registrations = new List<OperatorRegistration>(capacity: mapping.Count);
         for (var i = 0; i < mapping.Count; i++)
@@ -345,39 +386,50 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
             });
         }
 
+        // Stage 5.2 (iter-4 evaluator item 1) -- let operational
+        // failures propagate. The earlier shape caught every non-
+        // cancellation exception from RegisterManyAsync and converted
+        // it into an AuthorizationResult denial; that suppressed
+        // legitimate retry/redelivery for transient DB failures
+        // (deadlock, connection drop, pool exhaustion, EF Core
+        // optimistic-concurrency etc.) because the pipeline at
+        // TelegramUpdatePipeline.ExecuteAsync treats denials as
+        // "handled" short-circuits that do NOT release the dedup
+        // reservation -- onboarding for that update would be dropped
+        // permanently, leaving the operator unable to /start without
+        // operator intervention.
+        //
+        // The new contract: log an ERROR so the persistence failure
+        // is observable, then re-throw. The pipeline's outer try/catch
+        // (TelegramUpdatePipeline.cs release-on-throw guard) catches
+        // the throw, calls IDeduplicationService.ReleaseReservationAsync
+        // so the next live re-delivery is processed normally
+        // (Stage 2.2 Scenario 4), then re-throws so the webhook
+        // controller marks the InboundUpdate row as Failed and the
+        // Stage 2.4 recovery sweep retries. The /start eventually
+        // succeeds once the transient condition clears.
+        //
+        // The previous "common cause: alias collision" hint is now
+        // surfaced exclusively via the ERROR log: an alias collision
+        // IS terminal and replay won't help, but operationally it's
+        // far rarer than a transient DB blip, and the cost of
+        // surfacing it as an exception (operator sees a generic
+        // server-error reply once and the recovery sweep eventually
+        // gives up) is much lower than the cost of swallowing every
+        // transient blip as a permanent denial.
         try
         {
             await _registry.RegisterManyAsync(registrations, ct).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // The transaction has already rolled back via the
-            // PersistentOperatorRegistry's using-disposal contract
-            // (no rows persisted from this /start). Log a structured
-            // ERROR so the operator can correlate the registry
-            // failure with the denial they see in Telegram, then
-            // deny the entire /start ΓÇö half-onboarded state is
-            // worse than no onboarding because subsequent commands
-            // would route to a subset of workspaces with no
-            // operator-visible signal.
             _logger.LogError(
                 ex,
-                "/start denied ΓÇö RegisterManyAsync failed for user {TelegramUserId} chat {TelegramChatId} after staging {BindingCount} workspace binding(s); transaction rolled back, no rows persisted.",
+                "/start onboarding for user {TelegramUserId} chat {TelegramChatId} failed in RegisterManyAsync after staging {BindingCount} workspace binding(s); transaction rolled back, no rows persisted. Re-throwing so the pipeline's release-on-throw guard frees the dedup reservation and the update is retried via webhook redelivery or the Stage 2.4 InboundUpdate sweep.",
                 userId,
                 chatIdValue,
                 registrations.Count);
-            // Iter-N review fix (security) -- do NOT include ex.Message in the
-            // user-facing DenialReason: it flows through AuthorizationResult.DenialReason
-            // into the bot reply and DB exceptions can leak constraint names, table
-            // names, or (depending on provider) connection-string fragments to the
-            // Telegram operator. The full exception is already captured on the
-            // preceding _logger.LogError(ex, ...) call; operators correlate via logs.
-            return Deny(
-                $"User {userId} onboarding failed due to a persistence error. "
-                + "All workspace bindings were rolled back atomically; no rows were persisted. "
-                + "Common cause: a (OperatorAlias, TenantId) collision with another operator's binding "
-                + "(per architecture.md lines 116-119 alias uniqueness). "
-                + "See server logs for diagnostic detail.");
+            throw;
         }
 
         // Re-query to return the persistent records (with their real
@@ -420,8 +472,8 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
     /// <summary>
     /// Resolves a user's <see cref="TelegramOptions.UserTenantMappings"/>
     /// entry by the canonical numeric string key (per architecture.md
-    /// ┬º7.1: "12345"), falling back to InvariantCulture-formatted
-    /// long ΓåÆ string for tolerance against configuration providers
+    /// section 7.1: "12345"), falling back to InvariantCulture-formatted
+    /// long -> string for tolerance against configuration providers
     /// that surface keys via different culture rules.
     /// </summary>
     private static IReadOnlyList<TelegramUserTenantMapping>? ResolveUserMapping(
@@ -464,8 +516,7 @@ public sealed class TelegramUserAuthorizationService : IUserAuthorizationService
     /// <summary>
     /// Returns <c>true</c> when <paramref name="commandName"/> is the
     /// <c>/start</c> onboarding command. Case-insensitive and tolerates
-    /// the optional leading slash (matches
-    /// <see cref="ConfiguredOperatorAuthorizationService.IsStartCommand"/>).
+    /// the optional leading slash.
     /// </summary>
     internal static bool IsStartCommand(string? commandName)
     {

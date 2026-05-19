@@ -8,6 +8,7 @@ namespace AgentSwarm.Messaging.Worker;
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text.Json;
 using System.Threading;
@@ -15,12 +16,25 @@ using System.Threading.Tasks;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Persistence;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using AgentSwarm.Messaging.Telegram.Sending;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Telegram.Bot.Exceptions;
+
+// `global::` qualifier required: the file-scoped
+// `namespace AgentSwarm.Messaging.Worker;` declaration places this
+// using directive inside the `AgentSwarm.Messaging.Worker` namespace
+// scope, where `Telegram` resolves to the sibling
+// `AgentSwarm.Messaging.Telegram` (which lacks a `Bot` sub-namespace)
+// rather than the global `Telegram.Bot` SDK namespace. This is a
+// pre-existing build break in PR #93 that surfaces only after PR
+// #92's missing `DbSet<ProcessedEvent>` is restored (Persistence
+// compiles → Worker is reached → the namespace clash is exposed).
+// `global::` pins resolution to the root namespace so
+// `ApiRequestException` binds to the Telegram.Bot SDK type.
+using global::Telegram.Bot.Exceptions;
 
 /// <summary>
 /// Stage 4.1 — drains the durable outbox by dispatching outbound
@@ -313,6 +327,46 @@ public sealed class OutboundQueueProcessor : BackgroundService
 
     private async Task ProcessMessageAsync(int workerId, OutboundMessage message, CancellationToken ct)
     {
+        // Stage 6.1 — wrap the entire dequeue → send → mark iteration
+        // in a Consumer-kind span so trace consumers can stitch the
+        // worker's HTTP call (HttpClient instrumentation child span)
+        // back to the queue claim that triggered it. Tag the span
+        // with the source type and chat id read off the message so
+        // dashboards can filter queue traffic without joining
+        // separate metric streams.
+        //
+        // Iter-2 evaluator item 1 — production queue path now uses
+        // StartQueueDrainSpan; the helper was previously only covered
+        // by unit tests.
+        using var queueDrainActivity = TelegramTelemetry.StartQueueDrainSpan(
+            message.CorrelationId,
+            message.MessageId);
+        var agentIdForSpan = AgentIdExtractor.TryExtract(message);
+        queueDrainActivity?.SetTag(TelegramTelemetry.OutboundSourceKey, message.SourceType.ToString());
+        queueDrainActivity?.SetTag(TelegramTelemetry.OtelMessagingOutboundSourceKey, message.SourceType.ToString());
+        queueDrainActivity?.SetTag(TelegramTelemetry.TelegramChatIdKey, message.ChatId);
+        queueDrainActivity?.SetTag(TelegramTelemetry.OtelMessagingTelegramChatIdKey, message.ChatId);
+        if (!string.IsNullOrEmpty(agentIdForSpan))
+        {
+            queueDrainActivity?.SetTag(TelegramTelemetry.AgentIdKey, agentIdForSpan);
+            queueDrainActivity?.SetTag(TelegramTelemetry.OtelMessagingAgentIdKey, agentIdForSpan);
+        }
+
+        // Iter-2 evaluator item 2 — open the canonical structured-
+        // logging scope for the dequeue iteration so every log line
+        // the worker emits while processing THIS row carries
+        // CorrelationId / AgentId / TelegramUserId / CommandName
+        // properties under their brief contract names. AgentId is
+        // sourced from the message; TelegramUserId is unavailable on
+        // the outbound row (the outbox is "send to chat", not "send
+        // to user") so the helper omits it.
+        using var logScope = TelegramTelemetry.BeginCanonicalLogScope(
+            _logger,
+            correlationId: message.CorrelationId,
+            agentId: agentIdForSpan,
+            telegramUserId: null,
+            commandName: null);
+
         // Queue dwell: enqueue-to-dequeue interval. Always emitted —
         // independent of send outcome — so dashboards can spot a
         // backlog even when downstream sends are failing.
@@ -395,6 +449,27 @@ public sealed class OutboundQueueProcessor : BackgroundService
                     new KeyValuePair<string, object?>("source_type", message.SourceType.ToString()));
             }
 
+            // Stage 6.1 iter-2 evaluator item 5 — diagnostic
+            // retry_latency_ms for sends whose AttemptCount was
+            // non-zero at the moment of success (i.e. one or more
+            // prior retries preceded this success). Distinct from
+            // first_attempt_latency_ms (excludes retries) and
+            // all_attempts_latency_ms (includes everything) so
+            // dashboards can answer "how long do retried sends
+            // actually take" without subtraction.
+            if (!isFirstAttempt)
+            {
+                _metrics.RetryLatencyMs.Record(
+                    totalMs,
+                    new KeyValuePair<string, object?>("severity", message.Severity.ToString()),
+                    new KeyValuePair<string, object?>("source_type", message.SourceType.ToString()),
+                    new KeyValuePair<string, object?>("rate_limited", sendResult.RateLimited.ToString().ToLowerInvariant()));
+            }
+
+            queueDrainActivity?.SetStatus(ActivityStatusCode.Ok);
+            queueDrainActivity?.SetTag("messaging.outbound.telegram_message_id", sendResult.TelegramMessageId);
+            queueDrainActivity?.SetTag("messaging.outbound.rate_limited", sendResult.RateLimited);
+
             await ExecuteShutdownSafeBookkeepingAsync(
                 token => _queue.MarkSentAsync(message.MessageId, sendResult.TelegramMessageId, token),
                 operationName: "MarkSentAsync",
@@ -415,6 +490,7 @@ public sealed class OutboundQueueProcessor : BackgroundService
         }
         catch (PendingQuestionPersistenceException ex)
         {
+            queueDrainActivity?.SetStatus(ActivityStatusCode.Error, "pending_question_persistence_failed");
             // Telegram message was delivered; only the durable pending-
             // question store write failed. Recovery: rehydrate the
             // envelope from SourceEnvelopeJson and retry the StoreAsync
@@ -428,6 +504,7 @@ public sealed class OutboundQueueProcessor : BackgroundService
         }
         catch (TelegramSendFailedException ex)
         {
+            queueDrainActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             await HandleSendFailedAsync(workerId, message, ex, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -442,6 +519,7 @@ public sealed class OutboundQueueProcessor : BackgroundService
         }
         catch (Exception ex)
         {
+            queueDrainActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             // Iter-2 evaluator item 1 — non-TelegramSendFailedException
             // failures must ALSO route through the Stage 4.2 DLQ +
             // alert path once the retry budget is exhausted. Without
@@ -817,6 +895,22 @@ public sealed class OutboundQueueProcessor : BackgroundService
                 message.CorrelationId);
             return;
         }
+
+        // Stage 6.1 iter-2 evaluator item 5 — emit the canonical
+        // telegram.messages.dead_lettered counter once the audit
+        // ledger row is durably written. Tagged with
+        // failure_category and source_type so dashboards can split
+        // runtime DLQ traffic by both the originating intent
+        // (Question / Alert / StatusUpdate / CommandAck) and the
+        // failure mode (Permanent / TransientTransport / …). Emitted
+        // BEFORE Step 2 (alert) and Step 3 (outbox flip) so a partial
+        // failure on either still leaves the counter consistent with
+        // the persisted ledger row.
+        TelegramTelemetry.MessagesDeadLetteredCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("failure_category", category.ToString()),
+            new KeyValuePair<string, object?>("source_type", message.SourceType.ToString()),
+            new KeyValuePair<string, object?>("severity", message.Severity.ToString()));
 
         // Step 2 — fire the secondary-channel alert. Failure here
         // does NOT block the outbox transition; alert sink outages

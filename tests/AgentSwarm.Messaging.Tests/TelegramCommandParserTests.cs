@@ -12,15 +12,15 @@ using Moq;
 namespace AgentSwarm.Messaging.Tests;
 
 /// <summary>
-/// Stage 3.1 — <see cref="TelegramCommandParser"/>.
+/// Stage 3.1 -- <see cref="TelegramCommandParser"/>.
 ///
 /// Pins the brief's three test scenarios verbatim:
 /// <list type="number">
-///   <item>Parse standard command — <c>/ask build release notes</c> →
+///   <item>Parse standard command -- <c>/ask build release notes</c> ->
 ///         <c>CommandName=ask</c>, <c>Arguments=[build, release, notes]</c>.</item>
-///   <item>Strip bot mention — <c>/status@MyBot</c> →
+///   <item>Strip bot mention -- <c>/status@MyBot</c> ->
 ///         <c>CommandName=status</c> with no leftover <c>@MyBot</c>.</item>
-///   <item>Empty argument rejected — <c>/ask</c> →
+///   <item>Empty argument rejected -- <c>/ask</c> ->
 ///         <c>IsValid=false</c> with usage help mentioning the
 ///         missing task description.</item>
 /// </list>
@@ -38,7 +38,7 @@ public class TelegramCommandParserTests
     private readonly TelegramCommandParser _parser = new();
 
     // ============================================================
-    // Brief Scenario 1 — Parse standard command
+    // Brief Scenario 1 -- Parse standard command
     // ============================================================
 
     [Fact]
@@ -62,7 +62,7 @@ public class TelegramCommandParserTests
     public void Parse_AskCommand_PreservesMultiWordArgumentTextInRawText()
     {
         // The story brief and e2e-scenarios.md both pin the AC
-        // "/ask build release notes for Solution12" → a work item with
+        // "/ask build release notes for Solution12" -> a work item with
         // title "build release notes for Solution12". The parser tokenises
         // for downstream introspection but the verbatim payload must be
         // recoverable from RawText.
@@ -75,7 +75,7 @@ public class TelegramCommandParserTests
     }
 
     // ============================================================
-    // Brief Scenario 2 — Strip bot mention
+    // Brief Scenario 2 -- Strip bot mention
     // ============================================================
 
     [Fact]
@@ -98,7 +98,7 @@ public class TelegramCommandParserTests
     public void Parse_BotMentionWithArguments_StripsMentionAndKeepsArgsIntact()
     {
         // Stage 3.2's HandoffCommandHandler parses "/handoff TASK-99 @alice"
-        // — the @alice operator alias is NOT a bot mention and must NOT be
+        // -- the @alice operator alias is NOT a bot mention and must NOT be
         // stripped. Only the @ suffix on the HEAD token is removed.
         var parsed = _parser.Parse("/handoff@MyBot TASK-99 @alice");
 
@@ -124,7 +124,7 @@ public class TelegramCommandParserTests
     }
 
     // ============================================================
-    // Brief Scenario 3 — Empty argument rejected
+    // Brief Scenario 3 -- Empty argument rejected
     // ============================================================
 
     [Fact]
@@ -187,11 +187,11 @@ public class TelegramCommandParserTests
     [InlineData("/resume")]
     public void Parse_NonAskCommandsWithoutArguments_AreNotRejectedByParser(string messageText)
     {
-        // Implementation-plan.md §3.2 explicitly assigns argument-shape
+        // Implementation-plan.md section 3.2 explicitly assigns argument-shape
         // validation for /handoff (and by extension /approve, /reject,
         // /pause, /resume) to the corresponding command handler so it
         // can return a handler-specific usage-help message. Only /ask is
-        // the parser-level rejection case from §3.1 — keeping the parser
+        // the parser-level rejection case from section 3.1 -- keeping the parser
         // narrow avoids duplicating usage-help wording in two layers.
         var parsed = _parser.Parse(messageText);
 
@@ -202,7 +202,7 @@ public class TelegramCommandParserTests
     }
 
     // ============================================================
-    // Edge cases — non-command messages, unknown commands, empty / null
+    // Edge cases -- non-command messages, unknown commands, empty / null
     // ============================================================
 
     [Fact]
@@ -270,7 +270,7 @@ public class TelegramCommandParserTests
     [Fact]
     public void Parse_BotMentionOnlyWithNoCommandName_IsRejected()
     {
-        // Defensive: "/@MyBot" is malformed — there is no command name
+        // Defensive: "/@MyBot" is malformed -- there is no command name
         // before the mention suffix. The parser must not synthesise an
         // empty command name as if it were valid.
         var parsed = _parser.Parse("/@MyBot");
@@ -290,7 +290,7 @@ public class TelegramCommandParserTests
 
         parsed.IsValid.Should().BeTrue();
         parsed.CommandName.Should().Be(expectedCommandName,
-            "downstream dispatchers pattern-match on the lower-case TelegramCommands constants — the parser must normalise so each callsite does not need OrdinalIgnoreCase comparisons");
+            "downstream dispatchers pattern-match on the lower-case TelegramCommands constants -- the parser must normalise so each callsite does not need OrdinalIgnoreCase comparisons");
     }
 
     [Fact]
@@ -328,7 +328,7 @@ public class TelegramCommandParserTests
     }
 
     // ============================================================
-    // Contract pin — the parser implements the abstraction
+    // Contract pin -- the parser implements the abstraction
     // ============================================================
 
     [Fact]
@@ -337,18 +337,18 @@ public class TelegramCommandParserTests
         // Stage 1.3 defined ICommandParser in the Abstractions project so
         // the inbound pipeline does not depend on a specific parser.
         // Stage 3.1 ships TelegramCommandParser as the production
-        // implementation — pinning the inheritance relationship here
+        // implementation -- pinning the inheritance relationship here
         // catches accidental abstraction removal in a refactor.
         typeof(ICommandParser).IsAssignableFrom(typeof(TelegramCommandParser))
             .Should().BeTrue();
     }
 
     // ============================================================
-    // Pipeline + DI integration — iter-2 evaluator item 2.
+    // Pipeline + DI integration -- iter-2 evaluator item 2.
     //
     // The brief's "empty argument rejected" scenario is satisfied by
     // the parser returning IsValid=false, but the real reliability
-    // guarantee is that the inbound pipeline HONORS that signal —
+    // guarantee is that the inbound pipeline HONORS that signal --
     // i.e. an invalid parse must NOT reach ICommandRouter, must NOT
     // create a work item, and must surface an operator-facing
     // denial. The tests below pin that contract at the pipeline
@@ -438,13 +438,13 @@ public class TelegramCommandParserTests
         // (see Parse_AskWithNoArguments_IsRejectedWithUsageHelp above)
         // but TelegramUpdatePipeline currently discards it and surfaces
         // the generic PipelineResponses.CommandNotRecognized string
-        // instead (see TelegramUpdatePipeline.cs ~line 357 — the
+        // instead (see TelegramUpdatePipeline.cs ~line 357 -- the
         // ValidationError is logged via _logger.LogWarning but never
         // returned as ResponseText). That is a known UX gap to be
         // closed in a follow-up pipeline-stage PR (propagate
         // parsed.ValidationError into the Denial(...) call when it is
         // non-empty). This test deliberately does NOT pin the exact
-        // response text — pinning the generic "Command not recognized"
+        // response text -- pinning the generic "Command not recognized"
         // string here would enshrine the gap as expected behaviour and
         // contradict the brief. The assertion below only verifies the
         // contract that is unambiguously correct today: SOMETHING
@@ -455,7 +455,7 @@ public class TelegramCommandParserTests
         // test below, which is currently skipped until the pipeline
         // patch lands.
         result.ResponseText.Should().NotBeNullOrWhiteSpace(
-            "the pipeline must surface SOME operator-facing denial when the parser returns IsValid=false (exact wording intentionally not pinned — see note above)");
+            "the pipeline must surface SOME operator-facing denial when the parser returns IsValid=false (exact wording intentionally not pinned -- see note above)");
 
         result.CorrelationId.Should().Be("trace-iter2-pipeline-regression",
             "the original CorrelationId must be preserved on the denial so the operator's audit log can correlate the rejection with the inbound event");
@@ -466,7 +466,7 @@ public class TelegramCommandParserTests
                 It.IsAny<AuthorizedOperator>(),
                 It.IsAny<CancellationToken>()),
             Times.Never,
-            "an invalid parse MUST NOT reach the command router — strict-mode mock would also have thrown on any call");
+            "an invalid parse MUST NOT reach the command router -- strict-mode mock would also have thrown on any call");
 
         // The "/ask creates a work item" acceptance criterion has its
         // contrapositive form here: a router that is never invoked
@@ -480,7 +480,7 @@ public class TelegramCommandParserTests
         // Companion to
         // Pipeline_InvalidAskCommandWithRealParser_BypassesRouterAndReturnsDenial:
         // same harness, but asserts the BRIEF'S Scenario 3 user-facing
-        // contract — the operator must see usage help mentioning the
+        // contract -- the operator must see usage help mentioning the
         // missing task description, not a generic "Command not
         // recognized" string. This test is intentionally Skip'd until
         // the pipeline patch propagates parsed.ValidationError; it
@@ -548,7 +548,7 @@ public class TelegramCommandParserTests
         result.ResponseText.Should().Contain("/ask",
             "story brief Scenario 3: the operator-facing rejection must reference the command that failed");
         result.ResponseText.Should().Contain("task description",
-            "story brief Scenario 3: the operator-facing rejection must mention the missing task description as usage help — currently this fails because the pipeline returns PipelineResponses.CommandNotRecognized and drops parsed.ValidationError");
+            "story brief Scenario 3: the operator-facing rejection must mention the missing task description as usage help -- currently this fails because the pipeline returns PipelineResponses.CommandNotRecognized and drops parsed.ValidationError");
     }
 
     [Fact]
@@ -595,8 +595,11 @@ public class TelegramCommandParserTests
             RegisteredAt = DateTimeOffset.UtcNow,
         };
         var authzMock = new Mock<IUserAuthorizationService>();
+        // Stage 5.2 (iter-3) -- pipeline calls the unified 5-arg
+        // AuthorizeAsync overload for every command. Stub that
+        // overload so the bindings flow through to the router.
         authzMock.Setup(a => a.AuthorizeAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new AuthorizationResult
             {
                 IsAuthorized = true,

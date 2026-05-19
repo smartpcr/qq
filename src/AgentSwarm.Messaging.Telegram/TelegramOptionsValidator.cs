@@ -20,31 +20,31 @@ namespace AgentSwarm.Messaging.Telegram;
 /// failure message to a list; <see cref="Validate"/> returns
 /// <see cref="ValidateOptionsResult.Fail(IEnumerable{string})"/> with
 /// every failure so the operator sees ALL problems at once instead of
-/// having to iterate (fix one → restart → discover the next). This is
+/// having to iterate (fix one -> restart -> discover the next). This is
 /// pinned by the <c>MultipleFailures_AllAppearInFailureMessage</c>
 /// test in <c>TelegramOptionsValidatorWebhookTests</c>.
 /// </para>
 /// <para>
 /// <b>Rules.</b>
 /// <list type="bullet">
-///   <item><description><b>BotToken</b> — required, non-blank.
+///   <item><description><b>BotToken</b> -- required, non-blank.
 ///   Story brief Authentication row.</description></item>
 ///   <item><description><b>WebhookUrl + UsePolling mutually exclusive</b>
-///   — architecture.md §7.1 and implementation-plan.md §209: webhook
+///   -- architecture.md section 7.1 and implementation-plan.md section 209: webhook
 ///   and polling are different receive modes; both enabled produces
 ///   undefined behaviour.</description></item>
 ///   <item><description><b>WebhookUrl must be HTTPS absolute URI</b>
-///   (iter-5 evaluator item 2) — Telegram Bot API rejects non-HTTPS
+///   (iter-5 evaluator item 2) -- Telegram Bot API rejects non-HTTPS
 ///   webhook URLs at <c>setWebhook</c>; failing fast at host startup
 ///   converts a confusing 4xx-at-first-startup into an obvious
 ///   <c>OptionsValidationException</c> at boot.</description></item>
-///   <item><description><b>SecretToken required when webhook mode</b> —
-///   architecture.md §11.3: the <c>X-Telegram-Bot-Api-Secret-Token</c>
+///   <item><description><b>SecretToken required when webhook mode</b> --
+///   architecture.md section 11.3: the <c>X-Telegram-Bot-Api-Secret-Token</c>
 ///   header is the only authentication on the public webhook endpoint;
 ///   running webhook mode without a secret would let any caller who
 ///   knows the URL POST forged updates.</description></item>
 ///   <item><description><b>PollingTimeoutSeconds in [1, 50] when polling</b>
-///   — Telegram <c>getUpdates</c> caps the server-side long-poll
+///   -- Telegram <c>getUpdates</c> caps the server-side long-poll
 ///   timeout at 50 seconds; values &lt;= 0 degrade to short-poll and
 ///   burn the API quota with tight requests, values &gt; 50 are
 ///   rejected by Telegram. Only enforced when
@@ -53,7 +53,7 @@ namespace AgentSwarm.Messaging.Telegram;
 ///   the <c>ResolvePollingTimeout</c> contract in
 ///   <see cref="Polling.TelegramPollingService"/>).</description></item>
 ///   <item><description><b>OperatorBindings TenantId/WorkspaceId</b>
-///   non-blank — see
+///   non-blank -- see
 ///   <see cref="TelegramOperatorBindingOptions"/>: a binding with a
 ///   blank tenant/workspace would silently coalesce all operators
 ///   into a default tenant boundary.</description></item>
@@ -61,7 +61,7 @@ namespace AgentSwarm.Messaging.Telegram;
 /// </para>
 /// <para>
 /// <b>What is NOT validated here.</b> The "no receive mode" shape
-/// (no webhook URL, no polling) is allowed — integration tests and
+/// (no webhook URL, no polling) is allowed -- integration tests and
 /// CI smoke runs need it to register the bot client + pipeline
 /// without an active receive loop. The <c>NoReceiveMode_IsAllowed_ForUnitTestsAndCi</c>
 /// test pins this.
@@ -94,14 +94,14 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
         if (webhookUrlSet && options.UsePolling)
         {
             failures.Add(
-                "Telegram:WebhookUrl and Telegram:UsePolling are mutually exclusive — "
+                "Telegram:WebhookUrl and Telegram:UsePolling are mutually exclusive -- "
                 + "set one or the other, not both. Webhook mode is the production "
                 + "receive path; polling is for local/dev only.");
         }
 
         if (webhookUrlSet)
         {
-            // Iter-5 evaluator item 2 — Telegram Bot API webhooks are
+            // Iter-5 evaluator item 2 -- Telegram Bot API webhooks are
             // HTTPS-only. A non-absolute URI (relative path), a
             // malformed string, or a non-https scheme would be rejected
             // by `setWebhook` at first startup; failing here surfaces
@@ -113,7 +113,7 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                 failures.Add(
                     "Telegram:WebhookUrl must be an absolute URI "
                     + "(e.g. https://example.com/api/telegram/webhook). "
-                    + "Relative paths and non-URI strings are rejected — "
+                    + "Relative paths and non-URI strings are rejected -- "
                     + "Telegram Bot API requires an absolute callback URL.");
             }
             else if (!string.Equals(parsed.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
@@ -154,6 +154,17 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                 + $"Configured value: {options.PollingTimeoutSeconds}.");
         }
 
+        // Stage 5.2 iter-4 -- TelegramOptions.OperatorBindings was
+        // retired alongside the iter-5 ConfiguredOperatorAuthorizationService
+        // (deleted) and is marked [Obsolete] for backward-compatible
+        // config-shape tolerance. We still validate the shape so a
+        // configuration that ships a non-empty OperatorBindings array
+        // surfaces the structural defect (blank tenant/workspace) at
+        // startup rather than silently being ignored. The CS0618
+        // suppression below acknowledges the deliberate read of the
+        // obsolete property -- it would otherwise fail the
+        // TreatWarningsAsErrors build.
+#pragma warning disable CS0618
         if (options.OperatorBindings is { Count: > 0 })
         {
             for (var i = 0; i < options.OperatorBindings.Count; i++)
@@ -178,13 +189,14 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                 }
             }
         }
+#pragma warning restore CS0618
 
-        // Stage 2.7 — same TenantId/WorkspaceId guard applies to the
+        // Stage 2.7 -- same TenantId/WorkspaceId guard applies to the
         // DevOperators directory consumed by StubOperatorRegistry. A
         // blank tenant would silently coalesce subscription bootstrap
         // into a single "" tenant, suppressing real per-tenant streams;
         // a blank workspace would break the alert fallback's
-        // GetByWorkspaceAsync resolution (§5.6).
+        // GetByWorkspaceAsync resolution (section 5.6).
         if (options.DevOperators is { Count: > 0 })
         {
             for (var i = 0; i < options.DevOperators.Count; i++)
@@ -205,12 +217,12 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                     failures.Add(
                         $"Telegram:DevOperators[{i}].WorkspaceId must be non-blank. "
                         + "A blank workspace id would break alert fallback routing via "
-                        + "IOperatorRegistry.GetByWorkspaceAsync (architecture.md §5.6).");
+                        + "IOperatorRegistry.GetByWorkspaceAsync (architecture.md section 5.6).");
                 }
             }
         }
 
-        // Stage 3.4 (iter-2 evaluator item 3) — UserTenantMappings is
+        // Stage 3.4 (iter-2 evaluator item 3) -- UserTenantMappings is
         // the Tier 1 onboarding source of truth for
         // TelegramUserAuthorizationService. A partially invalid
         // multi-workspace mapping (one valid entry + one entry with
@@ -232,7 +244,7 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                     failures.Add(
                         "Telegram:UserTenantMappings has an entry with a blank user-id key. "
                         + "Each key must be the Telegram user id as a numeric string "
-                        + "(per architecture.md §7.1).");
+                        + "(per architecture.md section 7.1).");
                     continue;
                 }
 
@@ -253,7 +265,7 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                 {
                     failures.Add(
                         $"Telegram:UserTenantMappings[\"{key}\"] must contain at least one "
-                        + "TelegramUserTenantMapping entry — empty arrays cannot onboard the user.");
+                        + "TelegramUserTenantMapping entry -- empty arrays cannot onboard the user.");
                     continue;
                 }
 
@@ -282,7 +294,7 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                             $"Telegram:UserTenantMappings[\"{key}\"][{i}].WorkspaceId must be "
                             + "non-blank. A blank workspace id would silently coalesce all "
                             + "onboarded operators into a single workspace, breaking the "
-                            + "multi-workspace disambiguation prompt (architecture.md §4.3).");
+                            + "multi-workspace disambiguation prompt (architecture.md section 4.3).");
                     }
 
                     if (string.IsNullOrWhiteSpace(entry.OperatorAlias))
@@ -290,30 +302,30 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                         failures.Add(
                             $"Telegram:UserTenantMappings[\"{key}\"][{i}].OperatorAlias must "
                             + "be non-blank. The /handoff @alias resolver uses the alias as "
-                            + "the lookup key (architecture.md §4.3); a blank alias would "
+                            + "the lookup key (architecture.md section 4.3); a blank alias would "
                             + "make the operator unreachable via /handoff.");
                     }
                 }
             }
 
-            // Stage 3.4 (iter-3 evaluator item 1) — the
+            // Stage 3.4 (iter-3 evaluator item 1) -- the
             // operator_bindings table has a UNIQUE index on
             // (OperatorAlias, TenantId) (architecture.md lines
             // 116-119: a `/handoff @alias` lookup in a given tenant
             // must resolve to exactly one operator). Two
             // UserTenantMappings entries that share the same
-            // (OperatorAlias, TenantId) — whether under the SAME
+            // (OperatorAlias, TenantId) -- whether under the SAME
             // Telegram user (an operator with multiple workspace
             // bindings re-using one alias) or under DIFFERENT
             // Telegram users (two operators colliding on one alias)
-            // — would let host startup succeed and then crash the
+            // -- would let host startup succeed and then crash the
             // first /start that hits the unique index, leaving the
             // operator with a partial onboarding state. Detect both
             // shapes here so misconfiguration surfaces at startup.
             //
             // Iter-4 doc correction: the prior comment claimed the
             // persistence layer's HasMaxLength call applies SQLite
-            // COLLATE NOCASE — that was wrong. OperatorAlias is
+            // COLLATE NOCASE -- that was wrong. OperatorAlias is
             // declared as TEXT(128) with no explicit collation, so
             // SQLite uses its default BINARY (case-sensitive)
             // collation and the unique index would technically
@@ -326,10 +338,10 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
             // distinct bindings would break /handoff @alice (which
             // would resolve to only one of them) and confuse the
             // operator. The validator is intentionally STRICTER
-            // than the DB on this axis — defense-in-depth against
+            // than the DB on this axis -- defense-in-depth against
             // a common configuration mistake. Tenant ids are
             // compared case-sensitively because tenant ids are
-            // opaque identifiers (architecture.md §3.1) and any
+            // opaque identifiers (architecture.md section 3.1) and any
             // visible-only case difference indicates two distinct
             // tenants, not a typo.
             var aliasOwners = new Dictionary<(string Tenant, string Alias), List<string>>(
@@ -382,7 +394,7 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
                     + "\"@alice-beta\") OR consolidate the duplicate entries into one row.");
             }
 
-            // Stage 3.4 iter-4 — the operator_bindings table also has
+            // Stage 3.4 iter-4 -- the operator_bindings table also has
             // a UNIQUE index on (TelegramUserId, TelegramChatId,
             // WorkspaceId). At /start time TelegramChatId is the chat
             // the operator typed /start in, so for a single user
@@ -400,9 +412,9 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
             // at the first /start.
             //
             // The check is per-user (the outer dictionary is keyed
-            // by user id) — different users CAN legitimately share
+            // by user id) -- different users CAN legitimately share
             // a workspace (that is the multi-operator-per-workspace
-            // pattern from architecture.md §4.3). The collision only
+            // pattern from architecture.md section 4.3). The collision only
             // matters within a single user's mapping list.
             foreach (var pair in options.UserTenantMappings)
             {
@@ -464,12 +476,12 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
     /// <remarks>
     /// Iter-4 doc correction: the prior comment claimed this comparer
     /// "matches the SQLite collation applied to OperatorAlias by the
-    /// persistence layer" — that was wrong.
+    /// persistence layer" -- that was wrong.
     /// <see cref="OperatorBindingConfiguration"/> declares
     /// <c>OperatorAlias</c> as <c>TEXT(128)</c> with no explicit
     /// collation, so SQLite uses BINARY (case-sensitive). This
     /// comparer is intentionally MORE strict than the DB on the alias
-    /// axis — see the rationale block in
+    /// axis -- see the rationale block in
     /// <see cref="TelegramOptionsValidator.Validate(string?, TelegramOptions)"/>
     /// near the <c>aliasOwners</c> dictionary construction.
     /// </remarks>
@@ -487,15 +499,15 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
     }
 
     /// <summary>
-    /// Rate-limit configuration is load-bearing for the §10.4 burst
+    /// Rate-limit configuration is load-bearing for the section 10.4 burst
     /// envelope and for the documented Telegram per-bot / per-chat
     /// soft caps. Zero or negative values would have been silently
     /// clamped by <see cref="Sending.TokenBucketTelegramRateLimiter"/>'s
-    /// <c>Math.Max(1, …)</c> guards, hiding a configuration error
+    /// <c>Math.Max(1, ...)</c> guards, hiding a configuration error
     /// behind a "default-feeling" runtime behaviour. We fail fast at
     /// host startup instead so the operator notices the misconfiguration
     /// immediately. <see langword="null"/> <paramref name="options"/>
-    /// is accepted — <see cref="TelegramOptions.RateLimits"/> defaults
+    /// is accepted -- <see cref="TelegramOptions.RateLimits"/> defaults
     /// to a fresh <see cref="Sending.RateLimitOptions"/> instance via
     /// the property initialiser, but a future hand-constructed
     /// <see cref="TelegramOptions"/> could leave it null; that case is
@@ -513,7 +525,7 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
             failures.Add(
                 "Telegram:RateLimits:GlobalPerSecond must be > 0 (token-bucket refill rate, tokens per second). "
                 + $"Configured value: {options.GlobalPerSecond}. A non-positive value silently clamped at runtime "
-                + "would mask the configuration error and degrade the §10.4 burst SLO envelope.");
+                + "would mask the configuration error and degrade the section 10.4 burst SLO envelope.");
         }
 
         if (options.GlobalBurstCapacity <= 0)
@@ -538,7 +550,7 @@ internal sealed class TelegramOptionsValidator : IValidateOptions<TelegramOption
             failures.Add(
                 "Telegram:RateLimits:PerChatBurstCapacity must be > 0 (per-chat token-bucket capacity). "
                 + $"Configured value: {options.PerChatBurstCapacity}. A non-positive value silently clamped "
-                + "at runtime would mask the configuration error and degrade the §10.4 D-BURST envelope.");
+                + "at runtime would mask the configuration error and degrade the section 10.4 D-BURST envelope.");
         }
     }
 }

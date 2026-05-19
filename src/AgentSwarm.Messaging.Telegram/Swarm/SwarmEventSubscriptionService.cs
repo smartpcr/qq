@@ -344,15 +344,33 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
             chatId = parsed;
         }
 
+        // Resolve the operator binding for this routing decision so we
+        // can stamp BOTH TenantId and WorkspaceId onto the envelope.
+        // Stage 5.3 iter-3 evaluator item 5 — the fallback / explicit
+        // paths previously passed `workspaceId: null` so callback /
+        // timeout audit rows had no workspace context. Look up the
+        // tenant's active bindings ONCE here and select the right one:
+        //   * explicit chatId → the binding whose TelegramChatId matches;
+        //   * fallback        → the first active binding for the tenant.
+        // The selected binding's WorkspaceId then flows through
+        // StampRouting → PendingQuestionRecord → HumanResponseAuditEntry.
+        var bindings = await _operatorRegistry
+            .GetByTenantAsync(tenantId, ct)
+            .ConfigureAwait(false);
+
+        OperatorBinding? selectedBinding = null;
+        if (chatId is not null)
+        {
+            selectedBinding = bindings.FirstOrDefault(b =>
+                b.IsActive && b.TelegramChatId == chatId.Value);
+        }
+
         if (chatId is null)
         {
             // Fall back to the tenant's first active binding so questions
             // with no explicit routing still reach a human operator. The
             // selected chat id is stamped back into RoutingMetadata so
             // the downstream connector can route the outbound message.
-            var bindings = await _operatorRegistry
-                .GetByTenantAsync(tenantId, ct)
-                .ConfigureAwait(false);
             var first = bindings.FirstOrDefault(b => b.IsActive);
             if (first is null)
             {
@@ -365,9 +383,16 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
             }
 
             chatId = first.TelegramChatId;
+            selectedBinding = first;
         }
 
-        var enriched = StampChatId(envelope, chatId.Value);
+        // Workspace stamping: prefer the binding's WorkspaceId (the
+        // authoritative source per architecture.md §3.1), but fall
+        // back to a caller-supplied RoutingMetadata key so a test
+        // double or upstream router can still pin the value when no
+        // binding exists. Tenant uses the per-loop tenant id verbatim.
+        var workspaceId = selectedBinding?.WorkspaceId;
+        var enriched = StampRouting(envelope, chatId.Value, tenantId, workspaceId);
 
         _logger.LogInformation(
             "SwarmEventSubscriptionService routing AgentQuestionEvent. Tenant={TenantId} QuestionId={QuestionId} AgentId={AgentId} ChatId={ChatId} CorrelationId={CorrelationId}",
@@ -650,11 +675,23 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
     /// Returns a copy of <paramref name="envelope"/> whose
     /// <see cref="AgentQuestionEnvelope.RoutingMetadata"/> has the
     /// resolved <see cref="TelegramMessengerConnector.TelegramChatIdMetadataKey"/>
-    /// set to <paramref name="chatId"/>. Existing routing metadata is
-    /// preserved so callers can carry their own context through to the
-    /// connector.
+    /// set to <paramref name="chatId"/> and, when supplied, the Stage 5.3
+    /// audit-context keys <see cref="TelegramMessengerConnector.TenantIdMetadataKey"/>
+    /// and <see cref="TelegramMessengerConnector.WorkspaceIdMetadataKey"/>
+    /// set so that
+    /// <see cref="IPendingQuestionStore.StoreAsync"/> can denormalise
+    /// them onto the row and the downstream callback / timeout audit
+    /// paths can persist <c>TenantId</c> on every decision audit row
+    /// (Stage 5.3 iter-2 evaluator item 6). Existing routing metadata
+    /// is preserved so callers can carry their own context through to
+    /// the connector; if the caller already supplied a TenantId /
+    /// WorkspaceId on the envelope, those values win.
     /// </summary>
-    private static AgentQuestionEnvelope StampChatId(AgentQuestionEnvelope envelope, long chatId)
+    private static AgentQuestionEnvelope StampRouting(
+        AgentQuestionEnvelope envelope,
+        long chatId,
+        string? tenantId,
+        string? workspaceId)
     {
         var routing = new Dictionary<string, string>(StringComparer.Ordinal);
         if (envelope.RoutingMetadata is not null)
@@ -666,6 +703,18 @@ public sealed class SwarmEventSubscriptionService : BackgroundService
         }
         routing[TelegramMessengerConnector.TelegramChatIdMetadataKey] =
             chatId.ToString(CultureInfo.InvariantCulture);
+
+        if (!string.IsNullOrEmpty(tenantId)
+            && !routing.ContainsKey(TelegramMessengerConnector.TenantIdMetadataKey))
+        {
+            routing[TelegramMessengerConnector.TenantIdMetadataKey] = tenantId;
+        }
+
+        if (!string.IsNullOrEmpty(workspaceId)
+            && !routing.ContainsKey(TelegramMessengerConnector.WorkspaceIdMetadataKey))
+        {
+            routing[TelegramMessengerConnector.WorkspaceIdMetadataKey] = workspaceId;
+        }
 
         return envelope with { RoutingMetadata = routing };
     }

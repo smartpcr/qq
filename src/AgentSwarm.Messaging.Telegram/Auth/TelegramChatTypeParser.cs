@@ -10,7 +10,7 @@ using System;
 using AgentSwarm.Messaging.Core;
 
 /// <summary>
-/// Stage 3.4 — parses the raw lowercase chat-type token surfaced on
+/// Stage 3.4 -- parses the raw lowercase chat-type token surfaced on
 /// <see cref="AgentSwarm.Messaging.Abstractions.MessengerEvent.ChatType"/>
 /// (one of <c>"private"</c>, <c>"group"</c>, <c>"supergroup"</c>,
 /// <c>"channel"</c>) into the Core
@@ -23,17 +23,20 @@ using AgentSwarm.Messaging.Core;
 /// <c>Telegram.Bot.Types.Enums.ChatType</c> enum surfaced by the
 /// <see cref="Webhook.TelegramUpdateMapper.FormatChatType"/> formatter:
 /// <list type="bullet">
-///   <item><description><c>"private"</c> → <see cref="ChatType.Private"/></description></item>
-///   <item><description><c>"group"</c> → <see cref="ChatType.Group"/></description></item>
-///   <item><description><c>"supergroup"</c> → <see cref="ChatType.Supergroup"/></description></item>
-///   <item><description><c>"channel"</c> → <see cref="ChatType.Supergroup"/>
-///   (channels are a broadcast surface — they share the multi-member
+///   <item><description><c>"private"</c> -> <see cref="ChatType.Private"/></description></item>
+///   <item><description><c>"group"</c> -> <see cref="ChatType.Group"/></description></item>
+///   <item><description><c>"supergroup"</c> -> <see cref="ChatType.Supergroup"/></description></item>
+///   <item><description><c>"channel"</c> -> <see cref="ChatType.Supergroup"/>
+///   (channels are a broadcast surface -- they share the multi-member
 ///   threat model with supergroups so the binding's authorization
 ///   semantics match.)</description></item>
 ///   <item><description>Anything else (including <see langword="null"/>
-///   / blank) → <see cref="ChatType.Private"/>. The default matches
+///   / blank) -> <see cref="ChatType.Private"/>. The default matches
 ///   the historical
-///   <see cref="ConfiguredOperatorAuthorizationService"/> convention
+///   <see cref="TelegramUserAuthorizationService"/> default
+///   (Stage 3.4: <c>/start</c> Updates that come in without a chat
+///   type field -- older fixtures, contract tests -- should default to
+///   private)
 ///   and the e2e-scenarios "private chat operator" baseline so a
 ///   connector that has not been updated to populate
 ///   <c>MessengerEvent.ChatType</c> continues to onboard private-chat

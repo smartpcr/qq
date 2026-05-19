@@ -159,6 +159,36 @@ public sealed class FakeTelegramApi : IDisposable
                 }));
     }
 
+    /// <summary>
+    /// Configures the fake so every <c>getMe</c> request returns HTTP
+    /// 500. Used by the Stage 6.2 <c>/healthz</c> integration tests
+    /// to simulate the "Telegram API unreachable" scenario — the
+    /// <see cref="AgentSwarm.Messaging.Telegram.Diagnostics.TelegramBotHealthCheck"/>
+    /// must report <c>Unhealthy</c> when getMe fails. Implemented as
+    /// a high-priority overlay so the default 200 stub stays in
+    /// place for any test that resets state mid-run.
+    /// </summary>
+    /// <remarks>
+    /// The default getMe stub is registered without an explicit
+    /// <see cref="WireMock.RequestBuilders.IRequestBuilder.AtPriority"/>
+    /// call, which means WireMock.Net treats it as priority
+    /// <see cref="int.MaxValue"/> (lowest). The overlay below uses
+    /// priority 0 — strictly lower than any value used elsewhere in
+    /// the fake — so it always wins.
+    /// </remarks>
+    public void StubGetMeFailure()
+    {
+        _server
+            .Given(Request.Create()
+                .WithPath(new WildcardMatcher("/bot*/getMe"))
+                .UsingPost())
+            .AtPriority(0)
+            .RespondWith(Response.Create()
+                .WithStatusCode(500)
+                .WithHeader("Content-Type", ContentTypeJson)
+                .WithBody("{\"ok\":false,\"error_code\":500,\"description\":\"Internal Server Error\"}"));
+    }
+
     public void Dispose() => _server.Stop();
 
     private void RegisterDefaultStubs()

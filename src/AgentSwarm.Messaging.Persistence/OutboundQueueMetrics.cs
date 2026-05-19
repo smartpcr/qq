@@ -86,6 +86,17 @@ public sealed class OutboundQueueMetrics : System.IDisposable
     /// <summary>Architecture.md §10.4 canonical histogram name (queue dwell diagnostic).</summary>
     public const string QueueDwellMsName = "telegram.send.queue_dwell_ms";
 
+    /// <summary>
+    /// Implementation-plan Stage 6.1 canonical histogram name —
+    /// diagnostic latency for sends that required at least one
+    /// retry. Measured from <see cref="Abstractions.OutboundMessage.CreatedAt"/>
+    /// (enqueue) to the post-send timestamp on the successful
+    /// follow-up attempt. Distinct from
+    /// <see cref="FirstAttemptLatencyMsName"/>, which excludes
+    /// retries.
+    /// </summary>
+    public const string RetryLatencyMsName = "telegram.send.retry_latency_ms";
+
     private readonly Meter _meter;
 
     /// <summary>
@@ -124,6 +135,11 @@ public sealed class OutboundQueueMetrics : System.IDisposable
             QueueDwellMsName,
             unit: "ms",
             description: "Diagnostic: enqueue → dequeue interval. Tracks queue backlog under burst.");
+
+        RetryLatencyMs = _meter.CreateHistogram<double>(
+            RetryLatencyMsName,
+            unit: "ms",
+            description: "Diagnostic: enqueue → Telegram HTTP 200 for sends that required at least one retry (AttemptCount > 0 at success).");
     }
 
     /// <summary>
@@ -158,6 +174,19 @@ public sealed class OutboundQueueMetrics : System.IDisposable
     /// distributions.
     /// </summary>
     public Histogram<double> QueueDwellMs { get; }
+
+    /// <summary>
+    /// Diagnostic histogram per implementation-plan Stage 6.1.
+    /// Recorded on every successful send whose
+    /// <see cref="Abstractions.OutboundMessage.AttemptCount"/> was
+    /// non-zero at the moment of success — i.e. one or more retries
+    /// preceded the success. The acceptance gate
+    /// <see cref="FirstAttemptLatencyMs"/> deliberately excludes
+    /// retried sends; this histogram captures them so dashboards can
+    /// surface "how long do retried sends actually take" without
+    /// polluting the SLO.
+    /// </summary>
+    public Histogram<double> RetryLatencyMs { get; }
 
     public void Dispose()
     {

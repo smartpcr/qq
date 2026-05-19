@@ -35,6 +35,14 @@ internal sealed class InMemoryPendingQuestionStore : IPendingQuestionStore
                 ?.Value;
         }
 
+        // Stage 5.3 iter-2 evaluator item 6 — denormalise tenant /
+        // workspace from the envelope's RoutingMetadata so the callback
+        // and timeout audit paths can read them off PendingQuestion
+        // without a registry round-trip. Stamped upstream by
+        // SwarmEventSubscriptionService when the tenant context exists
+        // at routing time.
+        ExtractRoutingTenant(envelope, out var tenantId, out var workspaceId);
+
         var record = new PendingQuestion
         {
             QuestionId = question.QuestionId,
@@ -52,10 +60,37 @@ internal sealed class InMemoryPendingQuestionStore : IPendingQuestionStore
             CorrelationId = question.CorrelationId,
             Status = PendingQuestionStatus.Pending,
             StoredAt = DateTimeOffset.UtcNow,
+            TenantId = tenantId,
+            WorkspaceId = workspaceId,
         };
 
         _byQuestionId[question.QuestionId] = record;
         return Task.CompletedTask;
+    }
+
+    private static void ExtractRoutingTenant(
+        AgentQuestionEnvelope envelope,
+        out string? tenantId,
+        out string? workspaceId)
+    {
+        tenantId = null;
+        workspaceId = null;
+        if (envelope.RoutingMetadata is null)
+        {
+            return;
+        }
+
+        if (envelope.RoutingMetadata.TryGetValue("TenantId", out var rawTenant)
+            && !string.IsNullOrWhiteSpace(rawTenant))
+        {
+            tenantId = rawTenant;
+        }
+
+        if (envelope.RoutingMetadata.TryGetValue("WorkspaceId", out var rawWorkspace)
+            && !string.IsNullOrWhiteSpace(rawWorkspace))
+        {
+            workspaceId = rawWorkspace;
+        }
     }
 
     public Task<PendingQuestion?> GetAsync(string questionId, CancellationToken ct)
@@ -74,16 +109,51 @@ internal sealed class InMemoryPendingQuestionStore : IPendingQuestionStore
         return Task.FromResult<PendingQuestion?>(record);
     }
 
-    public Task MarkAnsweredAsync(string questionId, CancellationToken ct)
+    public Task<bool> MarkAnsweredAsync(string questionId, CancellationToken ct)
     {
-        Mutate(questionId, current => current with { Status = PendingQuestionStatus.Answered });
-        return Task.CompletedTask;
+        // Compare-and-swap mirror of the EF
+        // ExecuteUpdateAsync(WHERE Status IN (Pending, AwaitingComment))
+        // — only succeed when the row is still in a non-terminal state.
+        // Two concurrent callbacks (or a callback racing a timeout
+        // claim) therefore see exactly ONE true; the loser sees false
+        // and skips its publish/audit (Stage 5.3 iter-3 evaluator
+        // item 7).
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.Pending &&
+            current.Status != PendingQuestionStatus.AwaitingComment)
+        {
+            return Task.FromResult(false);
+        }
+
+        var updated = current with { Status = PendingQuestionStatus.Answered };
+        var claimed = _byQuestionId.TryUpdate(questionId, updated, current);
+        return Task.FromResult(claimed);
     }
 
-    public Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
+    public Task<bool> MarkAwaitingCommentAsync(string questionId, CancellationToken ct)
     {
-        Mutate(questionId, current => current with { Status = PendingQuestionStatus.AwaitingComment });
-        return Task.CompletedTask;
+        // Compare-and-swap mirror of the EF
+        // ExecuteUpdateAsync(WHERE Status == Pending). Pending is the
+        // only legal source state — a callback that arrives after a
+        // timeout sweep claimed the row sees false here and skips the
+        // comment prompt (Stage 5.3 iter-3 evaluator item 7).
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.Pending)
+        {
+            return Task.FromResult(false);
+        }
+
+        var updated = current with { Status = PendingQuestionStatus.AwaitingComment };
+        var claimed = _byQuestionId.TryUpdate(questionId, updated, current);
+        return Task.FromResult(claimed);
     }
 
     public Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
@@ -145,6 +215,47 @@ internal sealed class InMemoryPendingQuestionStore : IPendingQuestionStore
         }
 
         var reverted = current with { Status = revertTo };
+        var success = _byQuestionId.TryUpdate(questionId, reverted, current);
+        return Task.FromResult(success);
+    }
+
+    public Task<bool> TryRevertAnsweredClaimAsync(
+        string questionId,
+        CancellationToken ct)
+    {
+        // CAS mirror of the persistent store's
+        // ExecuteUpdateAsync(WHERE Status == Answered) — only revert
+        // when the row is still in the Answered state we claimed.
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.Answered)
+        {
+            return Task.FromResult(false);
+        }
+
+        var reverted = current with { Status = PendingQuestionStatus.Pending };
+        var success = _byQuestionId.TryUpdate(questionId, reverted, current);
+        return Task.FromResult(success);
+    }
+
+    public Task<bool> TryRevertAwaitingCommentClaimAsync(
+        string questionId,
+        CancellationToken ct)
+    {
+        if (!_byQuestionId.TryGetValue(questionId, out var current))
+        {
+            return Task.FromResult(false);
+        }
+
+        if (current.Status != PendingQuestionStatus.AwaitingComment)
+        {
+            return Task.FromResult(false);
+        }
+
+        var reverted = current with { Status = PendingQuestionStatus.Pending };
         var success = _byQuestionId.TryUpdate(questionId, reverted, current);
         return Task.FromResult(success);
     }

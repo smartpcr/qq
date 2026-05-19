@@ -12,10 +12,12 @@ using Microsoft.Extensions.Options;
 namespace AgentSwarm.Messaging.Tests;
 
 /// <summary>
-/// Stage 3.4 — pins the brief's five Test Scenarios for
-/// <see cref="TelegramUserAuthorizationService"/> (the production
-/// <see cref="IUserAuthorizationService"/> that supersedes the
-/// iter-5 <see cref="ConfiguredOperatorAuthorizationService"/>).
+/// Stage 3.4 -- pins the brief's five Test Scenarios for
+/// <see cref="TelegramUserAuthorizationService"/> (the sole supported
+/// production <see cref="IUserAuthorizationService"/> in the Telegram
+/// project -- the iter-5 in-memory
+/// <c>ConfiguredOperatorAuthorizationService</c> was deleted in
+/// Stage 5.2 iter-4 as part of the retire-from-supported-surface fix).
 /// The service is exercised against the REAL
 /// <see cref="PersistentOperatorRegistry"/> + an in-memory SQLite
 /// connection so the upsert, restart-persistence, and tenant-scoped
@@ -60,13 +62,13 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     [Fact]
     public async Task Scenario_AuthorizedUserMapped_StartReturnsAuthorizedWithBinding()
     {
-        // Brief Test Scenario: "Authorized user mapped — Given
+        // Brief Test Scenario: "Authorized user mapped -- Given
         // Telegram user 12345 is in the allowlist mapped to
         // operator op-1 in tenant t-1, When /start is received,
         // Then AuthorizationResult.IsAuthorized is true and
         // OperatorId is op-1." (We map the brief's "OperatorId"
         // to OperatorAlias because that is the persisted handle
-        // per architecture.md §3.1 / OperatorBinding.OperatorAlias.)
+        // per architecture.md section 3.1 / OperatorBinding.OperatorAlias.)
         var svc = NewService(new TelegramOptions
         {
             AllowedUserIds = new List<long> { 12345L },
@@ -107,7 +109,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     [Fact]
     public async Task Scenario_UnauthorizedUserRejected_DenialReasonPopulated()
     {
-        // Brief Test Scenario: "Unauthorized user rejected —
+        // Brief Test Scenario: "Unauthorized user rejected --
         // Given Telegram user 99999 is not in the allowlist,
         // When any command is received, Then ...IsAuthorized is
         // false and DenialReason is populated."
@@ -152,7 +154,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     [Fact]
     public async Task Scenario_BindingPersistsAcrossRestart_StatusAuthorizedAfterServiceRestart()
     {
-        // Brief Test Scenario: "Binding persists across restart —
+        // Brief Test Scenario: "Binding persists across restart --
         // Given Telegram user 12345 sends /start and an
         // OperatorBinding row is created, When the service
         // restarts and user 12345 sends /status from the same
@@ -180,10 +182,10 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
             "12345", "67890", "/start", CancellationToken.None);
         startResult.IsAuthorized.Should().BeTrue();
 
-        // "Restart" — build a brand-new authz service over the same
+        // "Restart" -- build a brand-new authz service over the same
         // persistent registry (same SqliteConnection). The new
         // service has an EMPTY UserTenantMappings on purpose: the
-        // restart must NOT rely on configuration to re-authorize —
+        // restart must NOT rely on configuration to re-authorize --
         // only on the persistent OperatorBinding row.
         var svcAfter = NewService(new TelegramOptions
         {
@@ -204,13 +206,13 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     public async Task Scenario_AliasLookupResolvesWithinTenant_NullCrossTenant()
     {
         // Brief Test Scenario: "Alias lookup resolves binding
-        // within tenant — Given an OperatorBinding exists with
+        // within tenant -- Given an OperatorBinding exists with
         // OperatorAlias=@operator-1 in TenantId=acme, When
         // GetByAliasAsync(\"@operator-1\", \"acme\") is called,
         // Then the correct OperatorBinding is returned ...; when
         // GetByAliasAsync(\"@operator-1\", \"other-tenant\") is
         // called, Then null is returned because alias resolution
-        // is tenant-scoped per architecture.md lines 116–119."
+        // is tenant-scoped per architecture.md lines 116-119."
         var svc = NewService(new TelegramOptions
         {
             AllowedUserIds = new List<long> { 100L },
@@ -239,13 +241,13 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
         var crossTenant = await _registry.GetByAliasAsync(
             "@operator-1", "other-tenant", CancellationToken.None);
         crossTenant.Should().BeNull(
-            "alias resolution must be tenant-scoped (architecture.md lines 116-119) — @operator-1 in tenant acme MUST NOT resolve in tenant other-tenant");
+            "alias resolution must be tenant-scoped (architecture.md lines 116-119) -- @operator-1 in tenant acme MUST NOT resolve in tenant other-tenant");
     }
 
     [Fact]
     public async Task Scenario_MultiWorkspaceBindingsReturned_ContainsBothBindings()
     {
-        // Brief Test Scenario: "Multi-workspace bindings returned —
+        // Brief Test Scenario: "Multi-workspace bindings returned --
         // Given Telegram user 12345 in chat 67890 has active
         // bindings in workspaces ws-alpha and ws-beta, When
         // TelegramUserAuthorizationService.AuthorizeAsync is called
@@ -284,7 +286,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
         startResult.Bindings.Should().HaveCount(2,
             "/start must create one OperatorBinding per UserTenantMappings entry (one per workspace)");
 
-        // Now the non-/start command — this is the test scenario.
+        // Now the non-/start command -- this is the test scenario.
         var statusResult = await svc.AuthorizeAsync(
             "12345", "67890", "/status", CancellationToken.None);
 
@@ -299,8 +301,8 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     {
         // Defensive: allowlist permits onboarding but no
         // UserTenantMappings entry means the operator cannot be
-        // assigned a tenant/workspace — silent fabrication would
-        // violate the architecture.md §7.1 "all required fields
+        // assigned a tenant/workspace -- silent fabrication would
+        // violate the architecture.md section 7.1 "all required fields
         // populated" contract.
         var svc = NewService(new TelegramOptions
         {
@@ -351,7 +353,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     public async Task Authorize_StartReplay_IsIdempotent_DoesNotDuplicateBindings()
     {
         // Replay of /start must NOT create duplicate
-        // OperatorBindings — the upsert in PersistentOperatorRegistry
+        // OperatorBindings -- the upsert in PersistentOperatorRegistry
         // is what guarantees this, but the authz service is the
         // entry point so we exercise it end-to-end here.
         var svc = NewService(new TelegramOptions
@@ -394,7 +396,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
         cts.Cancel();
 
         // A cancelled token on Tier 2 must propagate through the
-        // registry SELECT — the operation should throw rather
+        // registry SELECT -- the operation should throw rather
         // than silently authorize (or silently deny without
         // executing the query).
         Func<Task> act = () => svc.AuthorizeAsync(
@@ -403,7 +405,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     }
 
     // ============================================================
-    // Stage 3.4 iter-2 evaluator item 1 — OnboardAsync ChatType
+    // Stage 3.4 iter-2 evaluator item 1 -- OnboardAsync ChatType
     // ============================================================
 
     [Theory]
@@ -413,7 +415,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     [InlineData("channel", ChatType.Supergroup)]
     public async Task OnboardAsync_RecordsChatTypeFromTelegramUpdate(string raw, ChatType expected)
     {
-        // Iter-2 evaluator item 1 — the new OnboardAsync entry point
+        // Iter-2 evaluator item 1 -- the new OnboardAsync entry point
         // plumbs the real Telegram chat-type token through to the
         // persisted OperatorBinding.ChatType so group / supergroup /
         // channel onboardings no longer collapse to Private.
@@ -455,7 +457,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     {
         // Forward-compat: any future Telegram chat-type token that
         // isn't in the conversion table also falls back to Private
-        // rather than throwing — operators get onboarded, the
+        // rather than throwing -- operators get onboarded, the
         // misclassification is logged at the mapper level.
         var svc = NewService(BuildAllowedOptions());
 
@@ -476,8 +478,8 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
         // type; calling it directly for /start (older callers,
         // contract tests, the default-interface-method fallback in
         // IUserAuthorizationService) must default to Private to
-        // match the historical ConfiguredOperatorAuthorizationService
-        // behaviour.
+        // match the historical Stage 3.4 onboarding convention (the
+        // private-chat operator baseline in e2e-scenarios).
         var svc = NewService(BuildAllowedOptions());
 
         var result = await svc.AuthorizeAsync(
@@ -491,13 +493,13 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     }
 
     // ============================================================
-    // Stage 3.4 iter-2 evaluator item 3 — partial-mapping fail-fast
+    // Stage 3.4 iter-2 evaluator item 3 -- partial-mapping fail-fast
     // ============================================================
 
     [Fact]
     public async Task OnboardAsync_PartialMapping_FailsFast_DoesNotAuthorizeWithSurvivingEntries()
     {
-        // Iter-2 evaluator item 3 — a multi-workspace mapping with
+        // Iter-2 evaluator item 3 -- a multi-workspace mapping with
         // one valid entry and one entry with a blank WorkspaceId
         // MUST deny the entire /start. The previous "skip invalid
         // entries" behaviour authorized the operator with FEWER
@@ -534,12 +536,12 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
         result.DenialReason.Should().NotBeNullOrWhiteSpace();
         result.Bindings.Should().BeEmpty();
 
-        // Defense-in-depth: nothing in the registry was inserted —
+        // Defense-in-depth: nothing in the registry was inserted --
         // the fail-fast check runs BEFORE any RegisterAsync call so
         // the database is not left half-populated.
         var stored = await _registry.GetBindingsAsync(12345, 67890, CancellationToken.None);
         stored.Should().BeEmpty(
-            "fail-fast must run before any RegisterAsync — otherwise a retried /start would leave a partial binding set");
+            "fail-fast must run before any RegisterAsync -- otherwise a retried /start would leave a partial binding set");
     }
 
     private static TelegramOptions BuildAllowedOptions() => new()
@@ -560,24 +562,20 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     };
 
     // ============================================================
-    // Stage 3.4 iter-5 evaluator item 2 — fail-closed allowlist
+    // Stage 5.2 -- single-source-of-truth allowlist
     // ============================================================
 
     [Fact]
-    public async Task Onboard_DeniesEmptyAllowlist_WhenRequireAllowlistForOnboardingIsTrue()
+    public async Task Onboard_DeniesEmptyAllowlist_AlwaysFailsClosed()
     {
-        // Iter-5 evaluator item 2 — the brief mandates "checks the
-        // allowlist first". An empty allowlist with the default
-        // RequireAllowlistForOnboarding=true must FAIL CLOSED:
-        // /start is rejected even for users that would otherwise
-        // pass the (now-irrelevant) UserTenantMappings lookup,
-        // because a production deployment that forgets to populate
-        // AllowedUserIds would otherwise silently authorise every
-        // Telegram user who DMs the bot.
+        // Stage 5.2 (iter-4 evaluator item 1) -- the brief mandates
+        // AllowedUserIds is the SINGLE source of truth for onboarding
+        // and users not in the list (including the empty-list case)
+        // are rejected. No opt-out flag exists; the gate is
+        // fail-closed by construction.
         var svc = NewService(new TelegramOptions
         {
             AllowedUserIds = new List<long>(),
-            RequireAllowlistForOnboarding = true,
             UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
             {
                 ["12345"] = new()
@@ -596,9 +594,9 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
             "12345", "67890", "/start", CancellationToken.None);
 
         result.IsAuthorized.Should().BeFalse(
-            "an empty AllowedUserIds list under the fail-closed default must deny /start even if a UserTenantMappings entry exists");
+            "an empty AllowedUserIds list MUST deny /start unconditionally -- no opt-out, no escape hatch");
         result.DenialReason.Should().Contain("AllowedUserIds");
-        result.DenialReason.Should().Contain("RequireAllowlistForOnboarding");
+        result.DenialReason.Should().Contain("empty");
         result.Bindings.Should().BeEmpty();
 
         // Defense-in-depth: the fail-closed gate runs BEFORE any
@@ -608,52 +606,16 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Onboard_AllowsEmptyAllowlist_WhenRequireAllowlistForOnboardingIsFalse()
-    {
-        // Iter-5 evaluator item 2 (negative case) — dev / integration-
-        // test fixtures that explicitly opt out of the fail-closed
-        // default by setting RequireAllowlistForOnboarding=false get
-        // the prior open-by-default behaviour. The UserTenantMappings
-        // lookup remains authoritative for who actually gets a
-        // binding (a user with no mapping is still denied later), but
-        // the empty-allowlist gate alone does not block /start.
-        var svc = NewService(new TelegramOptions
-        {
-            AllowedUserIds = new List<long>(),
-            RequireAllowlistForOnboarding = false,
-            UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
-            {
-                ["12345"] = new()
-                {
-                    new TelegramUserTenantMapping
-                    {
-                        TenantId = "t-1",
-                        WorkspaceId = "ws-prod",
-                        OperatorAlias = "@alice",
-                    },
-                },
-            },
-        });
-
-        var result = await svc.AuthorizeAsync(
-            "12345", "67890", "/start", CancellationToken.None);
-
-        result.IsAuthorized.Should().BeTrue(
-            "with RequireAllowlistForOnboarding=false, an empty allowlist falls through to UserTenantMappings and authorises if a mapping exists");
-        result.Bindings.Should().HaveCount(1);
-    }
-
-    [Fact]
     public async Task Onboard_DeniesUnlistedUser_WhenAllowlistPopulated()
     {
-        // Iter-5 evaluator item 2 (regression case) — when the
-        // allowlist IS populated, an unlisted user is denied
-        // regardless of RequireAllowlistForOnboarding. The new
-        // setting only changes the EMPTY-allowlist semantics.
+        // Stage 5.2 (iter-4 evaluator item 1) -- when the allowlist is
+        // populated, an unlisted user is denied. The single source of
+        // truth for "may this user onboard?" is membership in
+        // AllowedUserIds; a stale UserTenantMappings entry for an
+        // attacker user id MUST NOT authorise them.
         var svc = NewService(new TelegramOptions
         {
             AllowedUserIds = new List<long> { 12345L },
-            RequireAllowlistForOnboarding = false,
             UserTenantMappings = new Dictionary<string, List<TelegramUserTenantMapping>>
             {
                 ["99999"] = new()
@@ -672,7 +634,7 @@ public sealed class TelegramUserAuthorizationServiceTests : IAsyncLifetime
             "99999", "67890", "/start", CancellationToken.None);
 
         result.IsAuthorized.Should().BeFalse(
-            "a populated allowlist that does NOT contain the inbound user must deny, regardless of RequireAllowlistForOnboarding");
+            "a populated allowlist that does NOT contain the inbound user must deny");
         result.DenialReason.Should().Contain("99999");
         result.DenialReason.Should().Contain("AllowedUserIds");
     }

@@ -61,8 +61,17 @@ public sealed class QuestionTimeoutServiceTests
 
         harness.EditTextRequests.Should().HaveCount(1);
         var edit = harness.EditTextRequests[0];
-        edit.Text.Should().Be("⏰ Timed out — default action applied: skip",
-            "the workstream test-scenarios pin the edit body to the DefaultActionId string verbatim — NOT the action label — so 'DefaultActionId=skip' renders as 'applied: skip'");
+        // Stage 5.3 iter-6 evaluator item 4 — the workstream-wide
+        // acceptance criterion "All messages include trace/correlation
+        // ID" applies to the timeout edit too. The body keeps the
+        // pinned "⏰ Timed out — default action applied: {DefaultActionId}"
+        // prefix (verbatim DefaultActionId, NOT the action label) and
+        // appends "\n(trace: {CorrelationId})" mirroring the
+        // CallbackQueryHandler.CorrelationFooterFormat shape so an
+        // operator sees the same trace footer on timeout-closed and
+        // decision-closed questions alike.
+        edit.Text.Should().Be("⏰ Timed out — default action applied: skip\n(trace: trace-1)",
+            "the workstream test-scenarios pin the edit body to the DefaultActionId string verbatim — NOT the action label — and Stage 5.3 iter-6 evaluator item 4 requires the trace footer so the operator can join the timeout notification to logs/audit rows without first looking up the original question");
         edit.MessageId.Should().Be(1001);
         edit.ReplyMarkup.Should().BeNull(
             "the inline keyboard must be removed on timeout so a late tap cannot fire another decision");
@@ -92,7 +101,11 @@ public sealed class QuestionTimeoutServiceTests
         harness.PublishedDecisions[0].ActionValue.Should().Be("__timeout__");
 
         harness.EditTextRequests.Should().HaveCount(1);
-        harness.EditTextRequests[0].Text.Should().Be("⏰ Timed out — no default action");
+        // Stage 5.3 iter-6 evaluator item 4 — trace footer must be
+        // present on the no-default branch too; the message changes
+        // shape (no "applied:" segment) but the footer rule is
+        // identical.
+        harness.EditTextRequests[0].Text.Should().Be("⏰ Timed out — no default action\n(trace: trace-1)");
 
         var row = await harness.Store.GetAsync("q-1", default);
         row!.Status.Should().Be(PendingQuestionStatus.TimedOut);
@@ -232,6 +245,59 @@ public sealed class QuestionTimeoutServiceTests
     }
 
     [Fact]
+    public async Task SweepOnceAsync_AuditFailsBeforePublish_RevertsRowToPriorStatusForNextSweep_AndPublishNeverRuns()
+    {
+        // Stage 5.3 iter-8 evaluator item 3 — pin AUDIT-FIRST
+        // ordering for the timeout sweep. Closes the "publish-
+        // succeeds → audit-fails → outbound HumanDecisionEvent
+        // escaped without a durable audit_logs row" gap that the
+        // Stage 5.3 brief mandate "log every outbound decision
+        // event with full context" forbids.
+        //
+        // Pre-iter-8 behaviour: publish ran FIRST, then audit.
+        // A failed audit AFTER a successful publish meant the
+        // bus event had already escaped — the audit row was
+        // permanently lost relative to the published event.
+        //
+        // Post-iter-8 behaviour (this test pins): audit runs
+        // FIRST. A failed audit short-circuits the try/catch
+        // BEFORE publish, so the bus event is NEVER published
+        // alongside a missing audit row. The shared revert
+        // restores Status=Pending so the next sweep retries
+        // BOTH the audit and the publish — at-least-once
+        // delivery of the audit row WITHOUT ever allowing a
+        // publish-without-audit window.
+        var harness = BuildHarness(failAuditForQuestionId: "q-1");
+        await harness.SeedAsync(questionId: "q-1", defaultActionId: "skip", defaultActionLabel: "Skip");
+
+        await harness.Service.SweepOnceAsync(default);
+
+        var afterFirstSweep = await harness.Store.GetAsync("q-1", default);
+        afterFirstSweep!.Status.Should().Be(
+            PendingQuestionStatus.Pending,
+            "audit failed first, publish never ran, but the service MUST still revert the TimedOut claim back to the prior status (Pending) so the next sweep retries — otherwise the row is stuck terminal with no audit row AND no publish");
+        harness.AuditEntries.Should().BeEmpty(
+            "the failing audit threw before the captured-entries list got the entry; sanity check that the audit mock and the harness agree");
+        harness.PublishedDecisions.Should().BeEmpty(
+            "Stage 5.3 iter-8 evaluator item 3 (AUDIT-FIRST): a failed audit MUST short-circuit BEFORE publish — otherwise an outbound HumanDecisionEvent escapes without a durable audit_logs row");
+
+        harness.AllowAuditForQuestionId("q-1");
+        await harness.Service.SweepOnceAsync(default);
+
+        harness.AuditEntries.Should().HaveCount(
+            1,
+            "the second sweep is what proves at-least-once delivery of the audit row: the row was sweep-eligible because the first sweep's revert restored Status=Pending; the retry now lands a durable audit_logs entry as Stage 5.3 requires");
+        harness.AuditEntries[0].QuestionId.Should().Be("q-1");
+        harness.PublishedDecisions.Should().HaveCount(
+            1,
+            "Stage 5.3 iter-8 evaluator item 3: publish runs EXACTLY once because audit-first short-circuited the first attempt before publish; the retry publishes one event paired with one audit row. The Stage 5.3 brief's 'log every outbound decision' guarantee holds because every published event has a paired durable audit row");
+        var afterSecondSweep = await harness.Store.GetAsync("q-1", default);
+        afterSecondSweep!.Status.Should().Be(
+            PendingQuestionStatus.TimedOut,
+            "the successful retry completes the lifecycle — the row reaches the terminal TimedOut state");
+    }
+
+    [Fact]
     public async Task TryRevertTimedOutClaimAsync_OnInMemoryStub_IsCompareAndSwapAtomic()
     {
         // Direct atomic-primitive contract test: revert wins only when
@@ -260,7 +326,8 @@ public sealed class QuestionTimeoutServiceTests
     // -----------------------------------------------------------------
     private static Harness BuildHarness(
         bool throwOnEdit = false,
-        string? failPublishForQuestionId = null)
+        string? failPublishForQuestionId = null,
+        string? failAuditForQuestionId = null)
     {
         var time = new FakeTimeProvider(BaseTime);
         var store = new InMemoryPendingQuestionStore();
@@ -273,6 +340,16 @@ public sealed class QuestionTimeoutServiceTests
         if (failPublishForQuestionId is not null)
         {
             failingPublishIds.Add(failPublishForQuestionId);
+        }
+
+        // Stage 5.3 iter-4 evaluator item 1 — symmetric flip-set for
+        // audit-fail tests so we can prove at-least-once delivery of
+        // the audit row when the writer transiently throws and then
+        // recovers (mirrors the publish-fail flip-set above).
+        var failingAuditIds = new HashSet<string>(StringComparer.Ordinal);
+        if (failAuditForQuestionId is not null)
+        {
+            failingAuditIds.Add(failAuditForQuestionId);
         }
 
         var publishedDecisions = new List<HumanDecisionEvent>();
@@ -296,6 +373,19 @@ public sealed class QuestionTimeoutServiceTests
         audit.Setup(a => a.LogHumanResponseAsync(It.IsAny<HumanResponseAuditEntry>(), It.IsAny<CancellationToken>()))
             .Returns<HumanResponseAuditEntry, CancellationToken>((e, _) =>
             {
+                // Stage 5.3 iter-4 evaluator item 1 — symmetric flip-set for
+                // audit-fail tests so we can prove at-least-once delivery of
+                // the audit row when the writer transiently throws and then
+                // recovers. With the iter-8 AUDIT-FIRST ordering the
+                // AuditFailsBeforePublish scenario uses this to confirm
+                // publish never runs alongside a failed audit.
+                lock (failingAuditIds)
+                {
+                    if (failingAuditIds.Contains(e.QuestionId ?? string.Empty))
+                    {
+                        throw new InvalidOperationException("simulated audit failure (test fixture)");
+                    }
+                }
                 auditEntries.Add(e);
                 return Task.CompletedTask;
             });
@@ -341,6 +431,7 @@ public sealed class QuestionTimeoutServiceTests
             AuditEntries = auditEntries,
             EditTextRequests = editRequests,
             FailingPublishIds = failingPublishIds,
+            FailingAuditIds = failingAuditIds,
         };
     }
 
@@ -353,12 +444,21 @@ public sealed class QuestionTimeoutServiceTests
         public required List<HumanResponseAuditEntry> AuditEntries { get; init; }
         public required List<EditMessageTextRequest> EditTextRequests { get; init; }
         public required HashSet<string> FailingPublishIds { get; init; }
+        public required HashSet<string> FailingAuditIds { get; init; }
 
         public void AllowPublishForQuestionId(string questionId)
         {
             lock (FailingPublishIds)
             {
                 FailingPublishIds.Remove(questionId);
+            }
+        }
+
+        public void AllowAuditForQuestionId(string questionId)
+        {
+            lock (FailingAuditIds)
+            {
+                FailingAuditIds.Remove(questionId);
             }
         }
 

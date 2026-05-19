@@ -26,19 +26,20 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("TEXT");
 
+                    b.Property<long?>("AlertSentAt")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("AlertStatus")
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("TEXT");
-
-                    b.Property<long?>("AlertSentAt")
-                        .HasColumnType("INTEGER");
 
                     b.Property<int>("AttemptCount")
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("AttemptTimestamps")
                         .IsRequired()
+                        .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT")
                         .HasDefaultValue("[]");
 
@@ -58,6 +59,7 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.Property<string>("ErrorHistory")
                         .IsRequired()
+                        .ValueGeneratedOnAdd()
                         .HasColumnType("TEXT")
                         .HasDefaultValue("[]");
 
@@ -89,6 +91,7 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.Property<string>("ReplayStatus")
                         .IsRequired()
+                        .ValueGeneratedOnAdd()
                         .HasMaxLength(32)
                         .HasColumnType("TEXT")
                         .HasDefaultValue("None");
@@ -110,6 +113,9 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("AgentId")
+                        .HasDatabaseName("ix_dead_letter_messages_agent_id");
+
                     b.HasIndex("CorrelationId")
                         .HasDatabaseName("ix_dead_letter_messages_correlation_id");
 
@@ -120,14 +126,11 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                         .IsUnique()
                         .HasDatabaseName("ux_dead_letter_messages_original_message_id");
 
-                    b.HasIndex("AlertStatus", "Severity")
-                        .HasDatabaseName("ix_dead_letter_messages_alert_status_severity");
-
-                    b.HasIndex("AgentId")
-                        .HasDatabaseName("ix_dead_letter_messages_agent_id");
-
                     b.HasIndex("ReplayStatus")
                         .HasDatabaseName("ix_dead_letter_messages_replay_status");
+
+                    b.HasIndex("AlertStatus", "Severity")
+                        .HasDatabaseName("ix_dead_letter_messages_alert_status_severity");
 
                     b.ToTable("dead_letter_messages", (string)null);
                 });
@@ -430,68 +433,6 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
                     b.ToTable("task_oversights", (string)null);
                 });
 
-            modelBuilder.Entity("AgentSwarm.Messaging.Persistence.AuditLogEntry", b =>
-                {
-                    b.Property<Guid>("EntryId")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Action")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ActionValue")
-                        .HasMaxLength(64)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("AgentId")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Comment")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CorrelationId")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Details")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("EntryKind")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("MessageId")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("QuestionId")
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.Property<long>("Timestamp")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("UserId")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("EntryId");
-
-                    b.HasIndex("CorrelationId")
-                        .HasDatabaseName("ix_audit_log_entries_correlation_id");
-
-                    b.HasIndex("Timestamp")
-                        .HasDatabaseName("ix_audit_log_entries_timestamp");
-
-                    b.HasIndex("UserId")
-                        .HasDatabaseName("ix_audit_log_entries_user_id");
-
-                    b.ToTable("audit_log_entries", (string)null);
-                });
-
             modelBuilder.Entity("AgentSwarm.Messaging.Persistence.PendingQuestionRecord", b =>
                 {
                     b.Property<string>("QuestionId")
@@ -542,6 +483,12 @@ namespace AgentSwarm.Messaging.Persistence.Migrations
 
                     b.Property<long>("TelegramMessageId")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("TenantId")
+                        .HasMaxLength(128);
+
+                    b.Property<string>("WorkspaceId")
+                        .HasMaxLength(128);
 
                     b.HasKey("QuestionId");
 

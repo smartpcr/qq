@@ -59,16 +59,6 @@ public class MessagingDbContext : DbContext
     public DbSet<TaskOversight> TaskOversights => Set<TaskOversight>();
 
     /// <summary>
-    /// <see cref="DbSet{TEntity}"/> backing the messenger gateway's
-    /// audit trail (Stage 3.2 iter-2 evaluator item 5). Single
-    /// discriminated table — both general <c>AuditEntry</c> and
-    /// typed <c>HumanResponseAuditEntry</c> writes share storage,
-    /// distinguished by <see cref="AuditLogEntry.EntryKind"/>.
-    /// Configured via <see cref="AuditLogEntryConfiguration"/>.
-    /// </summary>
-    public DbSet<AuditLogEntry> AuditLogEntries => Set<AuditLogEntry>();
-
-    /// <summary>
     /// <see cref="DbSet{TEntity}"/> backing the operator identity
     /// mapping table (Stage 3.4). One row per
     /// <c>(TelegramUserId, TelegramChatId, WorkspaceId)</c> binding;
@@ -110,9 +100,36 @@ public class MessagingDbContext : DbContext
     /// </summary>
     public DbSet<DeadLetterMessage> DeadLetterMessages => Set<DeadLetterMessage>();
 
+    /// <summary>
+    /// <see cref="DbSet{TEntity}"/> backing the Stage 4.3 inbound
+    /// deduplication sliding-window table. Written and read by
+    /// <see cref="PersistentDeduplicationService"/>; purged by
+    /// <see cref="DeduplicationCleanupService"/>. The schema is fixed
+    /// by <see cref="ProcessedEventConfiguration"/> and applied via
+    /// <see cref="OnModelCreating"/>'s assembly-scan, plus the
+    /// <c>20260601000007_AddProcessedEvents</c> migration. This DbSet
+    /// declaration is the missing piece that was dropped during the
+    /// Stage 4.3 deduplication merge (PR #92): every reference site
+    /// in <see cref="PersistentDeduplicationService"/> and
+    /// <see cref="DeduplicationCleanupService"/> calls
+    /// <c>db.ProcessedEvents</c>, so without this property the entire
+    /// Persistence assembly fails to compile (14 errors).
+    /// </summary>
+    public DbSet<ProcessedEvent> ProcessedEvents => Set<ProcessedEvent>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
-        modelBuilder.ApplyConfigurationsFromAssembly(typeof(MessagingDbContext).Assembly);
+
+        // Stage 5.3 — exclude AuditLogEntryConfiguration so the
+        // audit table lives exclusively in AuditDbContext (and its
+        // dedicated ConnectionStrings:AuditDb store). The
+        // assembly scan would otherwise pick the configuration up
+        // and re-create audit_logs inside MessagingDbContext's
+        // operational database, defeating the Stage 5.3 brief's
+        // storage-isolation intent.
+        modelBuilder.ApplyConfigurationsFromAssembly(
+            typeof(MessagingDbContext).Assembly,
+            type => type != typeof(AuditLogEntryConfiguration));
     }
 }

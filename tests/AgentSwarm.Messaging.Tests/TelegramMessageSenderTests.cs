@@ -251,14 +251,20 @@ public sealed class TelegramMessageSenderTests
         public Task<PendingQuestion?> GetByTelegramMessageAsync(long telegramChatId, long telegramMessageId, CancellationToken ct)
             => Task.FromResult<PendingQuestion?>(null);
 
-        public Task MarkAnsweredAsync(string questionId, CancellationToken ct) => Task.CompletedTask;
+        public Task<bool> MarkAnsweredAsync(string questionId, CancellationToken ct) => Task.FromResult(true);
 
-        public Task MarkAwaitingCommentAsync(string questionId, CancellationToken ct) => Task.CompletedTask;
+        public Task<bool> MarkAwaitingCommentAsync(string questionId, CancellationToken ct) => Task.FromResult(true);
 
         public Task<bool> MarkTimedOutAsync(string questionId, CancellationToken ct)
             => Task.FromResult(false);
 
         public Task<bool> TryRevertTimedOutClaimAsync(string questionId, PendingQuestionStatus revertTo, CancellationToken ct)
+            => Task.FromResult(false);
+
+        public Task<bool> TryRevertAnsweredClaimAsync(string questionId, CancellationToken ct)
+            => Task.FromResult(false);
+
+        public Task<bool> TryRevertAwaitingCommentClaimAsync(string questionId, CancellationToken ct)
             => Task.FromResult(false);
 
         public Task RecordSelectionAsync(string questionId, string selectedActionId, string selectedActionValue, long respondentUserId, CancellationToken ct)

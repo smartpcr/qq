@@ -67,7 +67,17 @@ public sealed class CallbackQueryHandlerTests
         audit.QuestionId.Should().Be(QuestionId);
         audit.ActionValue.Should().Be("approve");
         audit.AgentId.Should().Be("agent-deploy");
-        audit.MessageId.Should().Be(MessageId.ToString(CultureInfo.InvariantCulture));
+        // Stage 5.3 iter-4 evaluator item 2 — the audit MessageId
+        // must match the callback (per the scenario "AuditLogEntry
+        // exists with Action=approve, MessageId matching the
+        // callback"). The connector populates evt.CallbackId from
+        // Telegram's CallbackQuery.Id; that id is the platform-
+        // native "message id of the human reply" per
+        // HumanResponseAuditEntry.MessageId's contract. The
+        // original question's Telegram message_id is preserved
+        // in DecisionAuditDetails.TelegramMessageIdNumeric (asserted
+        // below in CallbackResponse_AuditRow_CarriesTenantIdAndDecisionDetailsJson).
+        audit.MessageId.Should().Be("cb-1");
         audit.UserId.Should().Be(RespondentUserId.ToString(CultureInfo.InvariantCulture));
         audit.CorrelationId.Should().Be(CorrelationId);
 
@@ -80,6 +90,113 @@ public sealed class CallbackQueryHandlerTests
         harness.AnswerCallbackRequests.Should().ContainSingle();
         harness.AnswerCallbackRequests[0].CallbackQueryId.Should().Be("cb-1");
         harness.AnswerCallbackRequests[0].Text.Should().Be(CallbackQueryHandler.DecisionShownLabelPrefix + "Approve");
+    }
+
+    // ============================================================
+    // Stage 5.3 iter-2 evaluator item 6:
+    // Callback / decision audit rows MUST carry the full
+    // tenant/workspace context — TenantId on the row plus a
+    // DecisionAuditDetails JSON payload identifying the source edge.
+    // ============================================================
+
+    [Fact]
+    public async Task CallbackResponse_AuditRow_CarriesTenantIdAndDecisionDetailsJson()
+    {
+        var harness = await CallbackHarness.BuildAsync(
+            tenantId: "t-acme",
+            workspaceId: "w-prod");
+        var evt = harness.BuildCallback("cb-tenant-1", QuestionId, "approve");
+
+        var result = await harness.Handler.HandleAsync(evt, default);
+
+        result.Success.Should().BeTrue();
+        harness.AuditEntries.Should().HaveCount(1);
+        var audit = harness.AuditEntries[0];
+        audit.TenantId.Should().Be("t-acme",
+            "Stage 5.3 iter-2 evaluator item 6: the callback decision audit row MUST carry the tenant the PendingQuestion was stamped with");
+        audit.Details.Should().NotBeNullOrWhiteSpace(
+            "Stage 5.3 iter-2 evaluator item 6: the decision row MUST carry a Details JSON payload with workspace + chat + source context");
+        audit.Details.Should().Contain("\"workspaceId\":\"w-prod\"",
+            "the Details JSON must include the workspace identifier the operator is scoped to");
+        audit.Details.Should().Contain("\"telegramChatId\":" + ChatId.ToString(CultureInfo.InvariantCulture),
+            "the Details JSON must include the chat id the decision was rendered into");
+        audit.Details.Should().Contain("\"source\":\"" + CallbackQueryHandler.DecisionSourceCallback + "\"",
+            "the Details JSON must tag source='callback' so forensic queries can pivot on the originating edge of the decision");
+        audit.Details.Should().Contain("\"telegramMessageIdNumeric\":" + MessageId.ToString(CultureInfo.InvariantCulture),
+            "the Details JSON must include the numeric telegram message id so joins back to the rendered question are O(1)");
+    }
+
+    [Fact]
+    public async Task CallbackResponse_CommentReply_AuditRow_CarriesTenantIdAndCommentSource()
+    {
+        var harness = await CallbackHarness.BuildAsync(
+            tenantId: "t-tenant-comment",
+            workspaceId: "w-comment");
+        var tap = harness.BuildCallback("cb-comment-1", QuestionId, "comment");
+        await harness.Handler.HandleAsync(tap, default);
+        harness.AuditEntries.Should().BeEmpty(
+            "the inline button press for a RequiresComment action does NOT emit an audit row yet — the audit fires on the follow-up text reply");
+
+        var reply = new MessengerEvent
+        {
+            EventId = "tg-update-comment-1",
+            EventType = EventType.TextReply,
+            UserId = RespondentUserId.ToString(CultureInfo.InvariantCulture),
+            ChatId = ChatId.ToString(CultureInfo.InvariantCulture),
+            Timestamp = DateTimeOffset.UtcNow,
+            CorrelationId = CorrelationId,
+            Payload = "the rollout is unsafe right now",
+        };
+        var result = await harness.Handler.HandleAsync(reply, default);
+
+        result.Success.Should().BeTrue();
+        harness.AuditEntries.Should().HaveCount(1);
+        var audit = harness.AuditEntries[0];
+        audit.TenantId.Should().Be("t-tenant-comment",
+            "Stage 5.3 iter-2 evaluator item 6: the comment-fallback audit row MUST carry the tenant the PendingQuestion was stamped with");
+        audit.Comment.Should().Be("the rollout is unsafe right now");
+        // Stage 5.3 iter-4 evaluator item 2 — the comment-reply
+        // path's audit MessageId must match the operator's inbound
+        // text message, not the original question. evt.EventId is
+        // the Telegram-update-derived id of the reply itself.
+        audit.MessageId.Should().Be("tg-update-comment-1",
+            "Stage 5.3 iter-4 evaluator item 2: the comment-reply audit row's MessageId must match the operator's inbound text message (evt.EventId from the TextReply MessengerEvent), not the original question's Telegram message_id");
+        audit.Details.Should().NotBeNullOrWhiteSpace();
+        audit.Details.Should().Contain("\"workspaceId\":\"w-comment\"");
+        audit.Details.Should().Contain("\"source\":\"" + CallbackQueryHandler.DecisionSourceComment + "\"",
+            "the comment-reply Details JSON tags source='comment' so forensic queries can distinguish the follow-up reply from the original button tap");
+        audit.Details.Should().Contain("\"telegramMessageIdNumeric\":" + MessageId.ToString(CultureInfo.InvariantCulture),
+            "the Details JSON must still carry the original question's Telegram message_id so a forensic query can join the comment-reply audit row back to the rendered question");
+    }
+
+    // ============================================================
+    // Stage 5.3 iter-4 evaluator item 2 (explicit pin):
+    // "Callback decision audit MessageId does not match the
+    // callback token from the processed MessengerEvent ... Store
+    // evt.CallbackId as MessageId or include it explicitly in
+    // Details and test it." We test the CallbackId-on-MessageId
+    // shape directly so a regression that re-routes the column
+    // back to TelegramMessageId is caught here even if the
+    // top-level scenario test ever drifts.
+    // ============================================================
+
+    [Fact]
+    public async Task CallbackResponse_AuditMessageId_MatchesEvtCallbackIdNotPendingTelegramMessageId()
+    {
+        const string callbackIdFromTelegram = "telegram-cbq-id-9999";
+        var harness = await CallbackHarness.BuildAsync();
+        var evt = harness.BuildCallback(callbackIdFromTelegram, QuestionId, "approve");
+
+        await harness.Handler.HandleAsync(evt, default);
+
+        harness.AuditEntries.Should().HaveCount(1);
+        var audit = harness.AuditEntries[0];
+        audit.MessageId.Should().Be(callbackIdFromTelegram,
+            "Stage 5.3 iter-4 evaluator item 2: the callback decision audit row's MessageId MUST be the inbound callback_query_id (evt.CallbackId), so the audit_logs row joins directly to the processed MessengerEvent (the Stage 5.3 acceptance scenario says 'MessageId matching the callback').");
+        audit.MessageId.Should().NotBe(MessageId.ToString(CultureInfo.InvariantCulture),
+            "the audit MessageId MUST NOT be the original question's Telegram message_id — that lives in DecisionAuditDetails.TelegramMessageIdNumeric for forensic join-back to the rendered question.");
+        audit.Details.Should().Contain("\"telegramMessageIdNumeric\":" + MessageId.ToString(CultureInfo.InvariantCulture),
+            "the original question's Telegram message_id is preserved in Details so forensic queries can still correlate the decision audit row to the rendered question.");
     }
 
     // ============================================================
@@ -268,8 +385,20 @@ public sealed class CallbackQueryHandlerTests
         await first.Should().ThrowAsync<InvalidOperationException>(
             "publish failure must propagate so the pipeline can release-on-throw");
 
-        harness.PublishedDecisions.Should().BeEmpty();
-        harness.AuditEntries.Should().BeEmpty();
+        harness.PublishedDecisions.Should().BeEmpty(
+            "publish was injected to fail on the first call so the captured-events list is empty");
+        // Stage 5.3 iter-8 evaluator item 3 — AUDIT-FIRST ordering:
+        // audit runs BEFORE publish, so a publish failure leaves a
+        // durable audit_logs row from the first attempt. The Stage
+        // 5.3 brief mandate "log every outbound decision event with
+        // full context" is honoured because the only failure modes
+        // are (a) audit-then-publish both succeed → 1 audit + 1
+        // publish (canonical), or (b) audit succeeds + publish
+        // fails → 1 audit on the failed attempt + at-least-once
+        // retry. There is NO failure mode where a publish escapes
+        // without an audit row paired in front of it.
+        harness.AuditEntries.Should().HaveCount(1,
+            "Stage 5.3 iter-8 evaluator item 3: audit ran BEFORE publish, so the audit row from the failed attempt is durable even though publish threw — the brief's 'log every outbound decision event' guarantee requires the audit row to land before the bus publish, not after");
 
         // Second delivery — DIFFERENT CallbackId (Telegram never reuses
         // ids across deliveries), SAME (QuestionId, RespondentUserId).
@@ -281,7 +410,8 @@ public sealed class CallbackQueryHandlerTests
         result.Success.Should().BeTrue();
         harness.PublishedDecisions.Should().HaveCount(1,
             "iter-1 evaluator item 3 — the retry MUST publish (composite slot was released on the prior exception)");
-        harness.AuditEntries.Should().HaveCount(1);
+        harness.AuditEntries.Should().HaveCount(2,
+            "Stage 5.3 iter-8 evaluator item 3 (AUDIT-FIRST): the retry audits AGAIN before publishing, so there are two audit rows for the same decision — one from the failed attempt, one from the success. Consumer-side dedup on QuestionId+ActionValue handles the bounded duplicate; the persist-every-decision guarantee is preserved because every publish has a paired durable audit row");
         var stored = await harness.Store.GetAsync(QuestionId, default);
         stored!.Status.Should().Be(PendingQuestionStatus.Answered);
     }
@@ -289,8 +419,13 @@ public sealed class CallbackQueryHandlerTests
     [Fact]
     public async Task CallbackResponse_AuditFailureReleasesBothReservations_AndRetrySucceeds()
     {
-        // Defence-in-depth — also test the failure point AFTER publish
-        // (audit throws). The release path must still cover both slots.
+        // Stage 5.3 iter-8 evaluator item 3 — AUDIT-FIRST symmetry:
+        // a failing audit on the first attempt MUST short-circuit
+        // BEFORE publish so the bus event NEVER escapes without a
+        // durable audit_logs row. Pre-iter-8 ordering published
+        // first then audited (so an audit failure left the event
+        // already on the bus); post-iter-8 ordering audits first
+        // so an audit failure cleanly aborts and no publish runs.
         var harness = await CallbackHarness.BuildAsync(failAuditOnFirstCall: true);
         var firstTap = harness.BuildCallback("cb-audit-1", QuestionId, "approve");
         var retryTap = harness.BuildCallback("cb-audit-2", QuestionId, "approve");
@@ -298,19 +433,181 @@ public sealed class CallbackQueryHandlerTests
         Func<Task> first = () => harness.Handler.HandleAsync(firstTap, default);
         await first.Should().ThrowAsync<InvalidOperationException>();
 
-        // Note: publish DID fire on the first attempt (audit threw
-        // AFTER publish). The retry will publish AGAIN — that is the
-        // intended at-least-once retry contract; the orchestrator-side
-        // idempotency on QuestionId+ActionValue is the dedupe layer for
-        // that semantic. The test asserts the SLOT released, not that
-        // publish only fired once.
+        // Stage 5.3 iter-8 evaluator item 3 — AUDIT-FIRST: with the
+        // new ordering the audit runs BEFORE publish, so the failed
+        // audit on the first attempt means publish never ran. The
+        // bus event did NOT escape — the Stage 5.3 'log every
+        // outbound decision event with full context' guarantee
+        // holds because there is no published event without a
+        // paired audit row.
+        harness.PublishedDecisions.Should().BeEmpty(
+            "Stage 5.3 iter-8 evaluator item 3 (AUDIT-FIRST): the failing audit short-circuited BEFORE publish — no bus event escaped without a paired audit row");
+        harness.AuditEntries.Should().BeEmpty(
+            "the audit mock was injected to throw on the first call so the captured-entries list is empty (the audit-write attempt never reached the success branch that records the entry)");
+
         var result = await harness.Handler.HandleAsync(retryTap, default);
 
         result.Success.Should().BeTrue();
-        harness.PublishedDecisions.Should().HaveCount(2,
-            "publish fired on the failed attempt AND on the retry — at-least-once is the contract");
+        harness.PublishedDecisions.Should().HaveCount(1,
+            "Stage 5.3 iter-8 evaluator item 3 (AUDIT-FIRST): publish ran EXACTLY once on the successful retry; the first attempt never published because audit failed first");
         harness.AuditEntries.Should().HaveCount(1,
-            "audit only succeeded on the retry");
+            "audit only succeeded on the retry — the first attempt's audit threw before recording the entry, so only the retry's row is captured");
+    }
+
+    // ============================================================
+    // Stage 5.3 iter-3 evaluator item 7 — claim-before-publish race
+    // safety. A concurrent timeout sweep that terminal-s the row
+    // between the callback handler's GetAsync read and its
+    // MarkAnsweredAsync attempt must cause the callback to short-
+    // circuit (issue 'Already responded', mark composite dedup
+    // processed, NOT publish, NOT audit). The fix is the atomic CAS
+    // in MarkAnsweredAsync that returns false when the row is no
+    // longer Pending; this test simulates that race by directly
+    // calling MarkTimedOutAsync on the store between Store and
+    // HandleAsync.
+    // ============================================================
+
+    [Fact]
+    public async Task CallbackResponse_LosesAtomicClaim_DoesNotPublishOrAudit()
+    {
+        var harness = await CallbackHarness.BuildAsync(questionId: "Q-race");
+
+        // Simulate "QuestionTimeoutService won the race" by
+        // terminal-ing the row directly via the same atomic primitive
+        // the sweep uses in production.
+        var timedOutWon = await harness.Store.MarkTimedOutAsync("Q-race", default);
+        timedOutWon.Should().BeTrue();
+
+        var lateTap = harness.BuildCallback("cb-race-1", "Q-race", "approve");
+        var result = await harness.Handler.HandleAsync(lateTap, default);
+
+        result.Success.Should().BeTrue("a lost claim is a successful no-op, not an error");
+        harness.PublishedDecisions.Should().BeEmpty(
+            "iter-3 evaluator item 7 — the callback MUST NOT publish a decision after losing the atomic claim");
+        harness.AuditEntries.Should().BeEmpty(
+            "iter-3 evaluator item 7 — the callback MUST NOT audit a decision it did not publish");
+        harness.AnswerCallbackRequests.Should().ContainSingle();
+        harness.AnswerCallbackRequests[0].Text.Should().Be(CallbackQueryHandler.AlreadyRespondedText);
+
+        // Row is still TimedOut — the callback did NOT overwrite it.
+        var stored = await harness.Store.GetAsync("Q-race", default);
+        stored!.Status.Should().Be(PendingQuestionStatus.TimedOut);
+
+        // Stage 5.3 iter-5 evaluator item 2 — a callback that loses
+        // the atomic Answered claim MUST NOT mutate the human-
+        // selection metadata on the now-TimedOut row. The prior
+        // ordering (RecordSelectionAsync BEFORE the claim CAS) wrote
+        // SelectedActionId / SelectedActionValue / RespondentUserId
+        // onto the timed-out row even though no decision was
+        // accepted — a forensic landmine that made TimedOut rows
+        // look like the operator had approved them. After the fix,
+        // RecordSelectionAsync runs only on the winning side of the
+        // claim CAS, so a lost-race callback leaves the row exactly
+        // as the timeout sweep saw it.
+        stored.SelectedActionId.Should().BeNull(
+            "Stage 5.3 iter-5 evaluator item 2 — the lost-race callback MUST NOT write SelectedActionId onto a TimedOut row (RecordSelectionAsync must run AFTER the atomic claim CAS, not before)");
+        stored.SelectedActionValue.Should().BeNull(
+            "Stage 5.3 iter-5 evaluator item 2 — the lost-race callback MUST NOT write SelectedActionValue onto a TimedOut row");
+        stored.RespondentUserId.Should().BeNull(
+            "Stage 5.3 iter-5 evaluator item 2 — the lost-race callback MUST NOT write RespondentUserId onto a TimedOut row");
+    }
+
+    [Fact]
+    public async Task CallbackResponse_RequiresComment_LosesAtomicClaim_DoesNotPromptOrPublish()
+    {
+        var harness = await CallbackHarness.BuildAsync(questionId: "Q-race-comment");
+
+        // Pre-claim the row as TimedOut via the same atomic primitive
+        // the sweep would use, then send a callback that selects an
+        // action with RequiresComment=true. The claim CAS in
+        // MarkAwaitingCommentAsync must return false, the handler must
+        // short-circuit with 'Already responded', and the operator must
+        // never get prompted for a comment that cannot be applied.
+        var timedOutWon = await harness.Store.MarkTimedOutAsync("Q-race-comment", default);
+        timedOutWon.Should().BeTrue();
+
+        var lateTap = harness.BuildCallback("cb-race-comment", "Q-race-comment", "comment");
+        var result = await harness.Handler.HandleAsync(lateTap, default);
+
+        result.Success.Should().BeTrue();
+        harness.PublishedDecisions.Should().BeEmpty();
+        harness.AuditEntries.Should().BeEmpty();
+        // No "please send a comment" prompt was sent — operator is not
+        // misled into typing a reply against a settled question.
+        harness.AnswerCallbackRequests.Should().ContainSingle();
+        harness.AnswerCallbackRequests[0].Text.Should().Be(CallbackQueryHandler.AlreadyRespondedText);
+
+        // Stage 5.3 iter-5 evaluator item 2 — symmetric assertion for
+        // the RequiresComment branch. A callback that loses the atomic
+        // AwaitingComment claim must leave the timed-out row's
+        // selection metadata untouched. The prior ordering
+        // (RecordSelectionAsync BEFORE the MarkAwaitingComment CAS)
+        // wrote SelectedActionId / SelectedActionValue /
+        // RespondentUserId onto the TimedOut row even though no
+        // decision was accepted; after the fix, RecordSelectionAsync
+        // runs only on the winning side of the claim CAS so the
+        // timed-out row carries no spurious human-selection data.
+        var stored = await harness.Store.GetAsync("Q-race-comment", default);
+        stored!.Status.Should().Be(PendingQuestionStatus.TimedOut);
+        stored.SelectedActionId.Should().BeNull(
+            "Stage 5.3 iter-5 evaluator item 2 — RequiresComment branch must also gate RecordSelectionAsync on the MarkAwaitingComment claim winning");
+        stored.SelectedActionValue.Should().BeNull();
+        stored.RespondentUserId.Should().BeNull();
+    }
+
+    // ============================================================
+    // Stage 5.3 iter-5 evaluator item 1 — RequiresComment branch
+    // MUST revert the AwaitingComment claim when any post-claim
+    // side effect (prompt, message edit, callback ack, dedup-seal)
+    // throws. Without the revert, a single transient Telegram /
+    // network hiccup permanently strands the question: Status is
+    // AwaitingComment so no callback can re-claim it via
+    // MarkAwaitingCommentAsync (only Pending is a legal source
+    // state), and no text reply can complete it because the prompt
+    // the operator was supposed to see never sent.
+    // ============================================================
+
+    [Fact]
+    public async Task CallbackResponse_RequiresComment_PromptSendFails_RevertsAwaitingCommentClaimAndPropagates()
+    {
+        var harness = await CallbackHarness.BuildAsync(failPromptOnFirstCall: true);
+        var tap = harness.BuildCallback("cb-comment-prompt-fail", QuestionId, "comment");
+
+        Func<Task> act = () => harness.Handler.HandleAsync(tap, default);
+        await act.Should().ThrowAsync<InvalidOperationException>(
+            "Stage 5.3 iter-5 evaluator item 1 — a failed prompt MUST propagate so the pipeline can release its EventId reservation");
+
+        harness.PublishedDecisions.Should().BeEmpty(
+            "RequiresComment defers HumanDecisionEvent emission until the text reply; the failed prompt path must not publish");
+        harness.AuditEntries.Should().BeEmpty();
+
+        // Stage 5.3 iter-5 evaluator item 1 — the AwaitingComment
+        // claim MUST have been reverted to Pending so a retry
+        // (webhook redelivery, operator re-tap) can re-claim the row.
+        // The prior code left Status=AwaitingComment forever after a
+        // post-claim failure, which permanently stranded the question.
+        var stored = await harness.Store.GetAsync(QuestionId, default);
+        stored!.Status.Should().Be(
+            PendingQuestionStatus.Pending,
+            "Stage 5.3 iter-5 evaluator item 1 — the post-claim side-effect failure MUST trigger TryRevertAwaitingCommentClaimAsync so the row is sweep-eligible (and re-claimable by a retry) again. Without the revert, Status stays AwaitingComment and no retry can MarkAwaitingComment again because Pending is the only legal source state for that CAS");
+
+        // The retry must succeed end-to-end — confirms the revert
+        // actually restored the row to a claimable state AND the
+        // dedup slots were released by the outer catch.
+        harness.AllowPromptSends();
+        var retry = harness.BuildCallback("cb-comment-prompt-retry", QuestionId, "comment");
+        var result = await harness.Handler.HandleAsync(retry, default);
+
+        result.Success.Should().BeTrue();
+        var afterRetry = await harness.Store.GetAsync(QuestionId, default);
+        afterRetry!.Status.Should().Be(
+            PendingQuestionStatus.AwaitingComment,
+            "the retry must complete the lifecycle — RequiresComment branch transitions the now-Pending row to AwaitingComment on the second attempt");
+        afterRetry.SelectedActionValue.Should().Be("comment");
+        afterRetry.RespondentUserId.Should().Be(RespondentUserId);
+        harness.SendMessageRequests.Should().HaveCount(
+            1,
+            "the prompt fired exactly once on the retry (the failed first attempt threw before the captured list grew)");
     }
 
     // ============================================================
@@ -739,6 +1036,14 @@ public sealed class CallbackQueryHandlerTests
         public required List<SendMessageRequest> SendMessageRequests { get; init; }
         public required IDistributedCache ReplayCache { get; init; }
 
+        // Stage 5.3 iter-5 evaluator item 1 — mutable flag so the
+        // prompt-fails-revert test can flip "fail prompt" → "allow
+        // prompt" between attempts to prove the retry path succeeds
+        // end-to-end after the revert restores the row to Pending.
+        public required Action AllowPromptSendsAction { get; init; }
+
+        public void AllowPromptSends() => AllowPromptSendsAction();
+
         public MessengerEvent BuildCallback(
             string callbackId,
             string questionId = QuestionId,
@@ -775,7 +1080,10 @@ public sealed class CallbackQueryHandlerTests
             DateTimeOffset? expiresAt = null,
             bool failPublishOnFirstCall = false,
             bool failAuditOnFirstCall = false,
-            IDistributedCache? replayCache = null)
+            bool failPromptOnFirstCall = false,
+            IDistributedCache? replayCache = null,
+            string? tenantId = null,
+            string? workspaceId = null)
         {
             var store = new InMemoryPendingQuestionStore();
             var dedup = new InMemoryDeduplicationService();
@@ -806,6 +1114,16 @@ public sealed class CallbackQueryHandlerTests
                 ExpiresAt = expiresAt ?? DateTimeOffset.Parse("2025-01-01T01:00:00Z", CultureInfo.InvariantCulture),
                 CorrelationId = CorrelationId,
             };
+
+            // Stage 5.3 iter-2 evaluator item 6 — stamp tenant /
+            // workspace onto RoutingMetadata so the
+            // InMemoryPendingQuestionStore denormalises them onto
+            // PendingQuestion.TenantId / WorkspaceId and the audit
+            // path can write the full context onto the row.
+            var routing = new Dictionary<string, string>();
+            if (tenantId is not null) routing["TenantId"] = tenantId;
+            if (workspaceId is not null) routing["WorkspaceId"] = workspaceId;
+
             await store.StoreAsync(
                 new AgentQuestionEnvelope
                 {
@@ -816,6 +1134,7 @@ public sealed class CallbackQueryHandlerTests
                     // drives the "Default action if no response: …"
                     // line in the post-decision edit body.
                     ProposedDefaultActionId = "approve",
+                    RoutingMetadata = routing,
                 },
                 ChatId,
                 MessageId,
@@ -857,6 +1176,14 @@ public sealed class CallbackQueryHandlerTests
             var sendMessageRequests = new List<SendMessageRequest>();
             var client = new Mock<ITelegramBotClient>(MockBehavior.Strict);
 
+            // Stage 5.3 iter-5 evaluator item 1 — mutable flag so the
+            // prompt-fails-revert test can flip the failing condition
+            // off for the retry attempt. Boxed so the closure in the
+            // SendMessageRequest branch and the AllowPromptSends
+            // helper see the same backing field.
+            var promptShouldFail = failPromptOnFirstCall;
+            Action allowPromptSends = () => promptShouldFail = false;
+
             client.Setup(c => c.SendRequest(
                     It.IsAny<IRequest<bool>>(),
                     It.IsAny<CancellationToken>()))
@@ -883,6 +1210,16 @@ public sealed class CallbackQueryHandlerTests
                             editReplyMarkupRequests.Add(editMarkup);
                             break;
                         case SendMessageRequest send:
+                            // Stage 5.3 iter-5 evaluator item 1 — fail the
+                            // prompt BEFORE recording it in the captured
+                            // list so the test can prove the revert path
+                            // (a) propagates the exception, (b) reverts the
+                            // AwaitingComment claim, (c) leaves the
+                            // captured list empty for the failed attempt.
+                            if (promptShouldFail)
+                            {
+                                throw new InvalidOperationException("simulated prompt send failure (test fixture)");
+                            }
                             sendMessageRequests.Add(send);
                             break;
                     }
@@ -912,6 +1249,7 @@ public sealed class CallbackQueryHandlerTests
                 EditReplyMarkupRequests = editReplyMarkupRequests,
                 SendMessageRequests = sendMessageRequests,
                 ReplayCache = replayCache,
+                AllowPromptSendsAction = allowPromptSends,
             };
         }
     }

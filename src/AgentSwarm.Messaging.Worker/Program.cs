@@ -3,15 +3,21 @@ using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Telegram;
 using AgentSwarm.Messaging.Telegram.Auth;
+using AgentSwarm.Messaging.Telegram.Diagnostics;
 using AgentSwarm.Messaging.Telegram.Webhook;
 using AgentSwarm.Messaging.Worker;
+using AgentSwarm.Messaging.Worker.Configuration;
+using AgentSwarm.Messaging.Worker.Observability;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 // =============================================================
-// AgentSwarm.Messaging.Worker — production host for the Telegram
+// AgentSwarm.Messaging.Worker -- production host for the Telegram
 // messenger receive path. Iter-5 wires the workstream's
 // "Webhook Receiver Endpoint" deliverables together:
 //
@@ -24,21 +30,23 @@ using Microsoft.Extensions.Options;
 //
 //   * AddMessagingPersistence wires MessagingDbContext + the
 //     DatabaseInitializer hosted service, AND replaces the in-memory
-//     stubs with their persistent siblings — including
+//     stubs with their persistent siblings -- including
 //     PersistentOperatorRegistry (Stage 3.4) which becomes the
 //     IOperatorRegistry backing the IUserAuthorizationService below.
 //
 //   * AddTelegram wires TelegramOptions (including OperatorBindings,
 //     DevOperators, and UserTenantMappings), the bot client, the
 //     inbound pipeline, and the Stage 2.2 stubs. UserTenantMappings
-//     (architecture.md §7.1 lines 636-650) is the source of truth
+//     (architecture.md section 7.1 lines 636-650) is the source of truth
 //     for /start onboarding consumed by TelegramUserAuthorizationService.
 //
 //   * The host registers TelegramUserAuthorizationService (Stage 3.4)
-//     as the IUserAuthorizationService implementation, superseding
-//     the earlier iter-5 ConfiguredOperatorAuthorizationService that
-//     read static OperatorBindings from configuration. The new
-//     implementation reads from the persistent IOperatorRegistry
+//     as the IUserAuthorizationService implementation. The earlier
+//     iter-5 ConfiguredOperatorAuthorizationService that read static
+//     OperatorBindings from configuration was deleted in Stage 5.2
+//     iter-4 (retire-from-supported-surface), so the registry-backed
+//     two-tier authz is now the only Telegram authorization path.
+//     The implementation reads from the persistent IOperatorRegistry
 //     for Tier 2 runtime authorization (binding lookup on every
 //     non-/start command) and from Telegram:UserTenantMappings for
 //     Tier 1 /start onboarding (one OperatorBinding row per
@@ -54,7 +62,7 @@ using Microsoft.Extensions.Options;
 //
 //   * The dispatcher, recovery startup, and recovery sweep are
 //     registered as hosted services in dependency order:
-//     recovery-startup runs FIRST (one-shot Processing→Received
+//     recovery-startup runs FIRST (one-shot Processing->Received
 //     reset), then the dispatcher and recovery sweep can begin
 //     claiming rows.
 //
@@ -64,19 +72,197 @@ using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// =============================================================
+// Stage 5.1 -- Secret Management Integration.
+//
+// Azure Key Vault is layered onto the configuration pipeline AFTER
+// the defaults established by WebApplication.CreateBuilder (JSON
+// files + environment variables + command-line + User Secrets in
+// Development) so vault values take precedence over local sources.
+// The provider is only added when `KeyVault:Uri` resolves to an
+// absolute URI; an unset / blank value leaves the host on
+// User-Secrets-and-env-vars only (the local-dev path documented in
+// docs/stories/qq-TELEGRAM-MESSENGER-S/dev-setup.md).
+//
+// `TelegramKeyVaultSecretManager` performs the brief's required
+// flat-secret-name -> nested-configuration-key mapping
+// (TelegramBotToken -> Telegram:BotToken) and acts as an allowlist
+// so a shared vault cannot silently bleed unrelated secrets into
+// the host configuration.
+//
+// `DefaultAzureCredential` is the standard token chain used by the
+// Azure SDKs: it tries (in order) Workload Identity, Managed
+// Identity, Visual Studio / VS Code, Azure CLI, and PowerShell so
+// the same code path works in AKS, App Service, and on a
+// developer's laptop without code changes.
+//
+// `ReloadInterval` enables the periodic Key Vault refresh required
+// by architecture.md section 10 (line 1018) and the section 11 Security model
+// (line 1091): every `Telegram:SecretRefreshIntervalMinutes`
+// (default 5) the provider re-fetches secrets from the vault, fires
+// IConfiguration's change-token, and `IOptionsMonitor<TelegramOptions>`
+// re-binds Telegram:BotToken so rotation takes effect without a
+// process restart -- per tech-spec.md R-5.
+//
+// The wiring is registered as an `IHostBuilder.ConfigureAppConfiguration`
+// callback on `builder.Host` rather than a synchronous read of
+// `builder.Configuration["KeyVault:Uri"]` at top-level Program code.
+// `ConfigureAppConfiguration` callbacks fire in registration order
+// during `builder.Build()`. In production this is fine because
+// `KeyVault:Uri` is supplied by appsettings / environment variables
+// / command-line, all of which were attached to the builder's
+// configuration BEFORE Program.cs's top-level statements ran. In
+// the integration suite, the test fixture's own
+// `ConfigureAppConfiguration` callback (which sets in-memory
+// `KeyVault:Uri = https://fake-vault...`) is registered AFTER
+// Program.cs's callback, so by the time the bootstrap callback
+// fires the test override is NOT YET visible. To bridge that gap
+// without abandoning the callback shape (and the production
+// guarantee that any approved source can supply the URI), the
+// bootstrap consults
+// `TelegramKeyVaultBootstrap.OverrideKeyVaultUri` -- an
+// `AsyncLocal<string?>` test seam that mirrors the existing
+// `OverrideSecretClientFactory` seam -- BEFORE falling back to
+// `configuration["KeyVault:Uri"]`. Production code never sets the
+// override and so observes identical behaviour to a bare
+// configuration read; tests use the seam to drive the brief's
+// "Worker starts with Key Vault URI configured" scenario end-to-end
+// without spawning the worker out-of-process or fighting the
+// callback queue.
+//
+// `ASP0013` is the .NET 8 analyzer warning that prefers
+// `WebApplicationBuilder.Configuration` over
+// `builder.Host.ConfigureAppConfiguration`. That suggestion is the
+// right default for a synchronous one-shot read, but the
+// deferred-callback shape here is what allows the bootstrap to
+// observe the FULLY-MERGED configuration at Build time (rather
+// than the pre-callback snapshot a synchronous read would see).
+// Suppressing ASP0013 here is therefore intentional and surgical --
+// limited to this single registration where the deferred-callback
+// shape is load-bearing.
+// =============================================================
+#pragma warning disable ASP0013
+builder.Host.ConfigureAppConfiguration((context, config) =>
+{
+    TelegramKeyVaultBootstrap.TryAddTelegramKeyVault(config, context.Configuration);
+});
+#pragma warning restore ASP0013
+
 // EF Core + Telegram + webhook receiver (channel, processor, endpoint).
 builder.Services.AddMessagingPersistence(builder.Configuration);
 builder.Services.AddTelegram(builder.Configuration);
+// Stage 6.3 iter-3 evaluator item 1 — the brief lists
+// services.AddCommandProcessing() as a discrete Worker-host
+// composition surface ("call services.AddCommandProcessing() to
+// register CommandRouter, all ICommandHandler implementations,
+// CallbackQueryHandler, TelegramCommandParser"). AddTelegram
+// already invokes AddCommandProcessing internally so the inbound
+// pipeline composes end-to-end whether a host calls this method
+// or not; the explicit call here makes the Worker's surface match
+// the brief verbatim. AddCommandProcessing uses TryAddSingleton
+// + TryAddEnumerable so the double-invocation is idempotent
+// (zero additional descriptors).
+builder.Services.AddCommandProcessing();
 builder.Services.AddTelegramWebhook();
+
+// Stage 6.3 — IOutboundQueue composition switch (brief: "register
+// IOutboundQueue persistent or in-memory based on environment").
+//
+// AddMessagingPersistence above has Replace()'d IOutboundQueue with
+// the EF-backed PersistentOutboundQueue (durable outbox with WAL
+// fsync per message). Production hosts want exactly that; dev /
+// local hosts the brief asks to run on the bounded in-memory
+// Channel<OutboundMessage>-backed implementation so a developer's
+// laptop never accumulates a stale messaging.db full of in-flight
+// rows from interrupted runs.
+//
+// Selection rule, in order of precedence:
+//   1. Explicit `OutboundQueue:Mode` configuration value
+//      (`InMemory` / `Persistent`) — operator-supplied override, wins
+//      unconditionally. Comparison is case-insensitive.
+//   2. Implicit by environment — Development => InMemory, all other
+//      environments (Production, Staging, Integration, custom) =>
+//      Persistent. This matches appsettings.Development.json's
+//      explicit `OutboundQueue:Mode = "InMemory"` so the host
+//      composes the same shape whether the operator sets the key
+//      or leaves it at its environment default.
+//
+// `UseInMemoryOutboundQueue()` is a `Replace()` so it correctly
+// unseats the persistent registration AddMessagingPersistence
+// installed seconds ago; calling it BEFORE AddMessagingPersistence
+// would silently no-op.
+var configuredQueueMode = builder.Configuration["OutboundQueue:Mode"];
+var useInMemoryOutboundQueue = string.Equals(configuredQueueMode, "InMemory", StringComparison.OrdinalIgnoreCase)
+    || (string.IsNullOrWhiteSpace(configuredQueueMode) && builder.Environment.IsDevelopment());
+if (useInMemoryOutboundQueue)
+{
+    builder.Services.UseInMemoryOutboundQueue();
+}
+
+// =============================================================
+// Stage 6.3 -- PRODUCTION DEPLOYMENT REQUIREMENT (ISwarmCommandBus).
+//
+// AddTelegram registers IOperatorRegistry, ITaskOversightRepository,
+// and ISwarmCommandBus via TryAddSingleton so the inbound pipeline
+// can boot end-to-end before a host wires the concrete production
+// replacements. AddMessagingPersistence (above) Replace()'s the
+// first TWO with their EF-backed siblings
+// (PersistentOperatorRegistry, PersistentTaskOversightRepository)
+// so a default Production worker resolves both to durable
+// implementations.
+//
+// THERE IS NO CONCRETE ISwarmCommandBus IN THIS STORY'S SCOPE.
+// The brief calls the swarm transport adapter "out of scope" --
+// the StubSwarmCommandBus registration that AddTelegram installs
+// is the only one this assembly ships. A Production deployment
+// MUST register the concrete swarm-side bus BEFORE
+// `var app = builder.Build();` below or the StubGuardHealthCheck
+// fail-closes /healthz with HTTP 503. There is NO acknowledgement
+// path -- the Stage 6.3 brief mandates the guard prevent
+// production deployments from running with stubs.
+//
+//     using Microsoft.Extensions.DependencyInjection;
+//     using Microsoft.Extensions.DependencyInjection.Extensions;
+//     using AgentSwarm.Messaging.Abstractions;
+//     using Contoso.AgentSwarm.SwarmBus;   // your concrete adapter
+//
+//     builder.Services.Replace(
+//         ServiceDescriptor.Singleton<ISwarmCommandBus,
+//             ContosoSwarmCommandBus>());
+//
+// Replace() (not TryAdd) is required so the TryAdd from
+// AddTelegram is unseated. The same shape works for tests that
+// want to inject a fake.
+//
+// Operators can confirm /healthz reports the guard as Healthy
+// once their bus is wired by polling `/healthz` and inspecting
+// the entry under `entries.stub_guard` -- a Healthy entry whose
+// `data.swarmCommandBus` value is the operator's adapter
+// FullName proves the registration won the last-Replace race.
+// =============================================================
+
+// Stage 6.1 -- OpenTelemetry tracing + metrics. Registers the custom
+// ActivitySource AgentSwarm.Messaging.Telegram (plus AspNetCore and
+// HttpClient instrumentation), the Meter AgentSwarm.Messaging.Telegram
+// (plus the pre-existing AgentSwarm.Messaging.Outbound meter), and
+// the observable telegram.queue.depth / telegram.dlq.depth gauges.
+// Exporters are gated by configuration: the Console exporter ships
+// out-of-the-box in Development for developer feedback; the OTLP
+// exporter activates when an endpoint is configured (either via
+// OpenTelemetry:OtlpEndpoint or the OTEL_EXPORTER_OTLP_ENDPOINT env
+// var). The HTTP-client instrumentation hook redacts the bot token
+// out of any api.telegram.org URL tag so spans never leak the
+// secret. See OpenTelemetrySetup.cs for the full wiring.
+builder.Services.AddTelegramOpenTelemetry(builder.Configuration, builder.Environment);
 
 // Stage 6.3: a minimal /healthz endpoint is mapped below so the
 // Dockerfile HEALTHCHECK has something to poll. Phase 6 (observability)
 // will replace this with a real composite check (Telegram getMe,
-// queue depth, dead-letter depth, database) — for now the bare
+// queue depth, dead-letter depth, database) -- for now the bare
 // AddHealthChecks() registration gives us a 200-OK liveness probe
 // without depending on services that don't exist yet.
 //
-// Stage 4.2 — `dead_letter_messages` depth check chained onto the
+// Stage 4.2 -- `dead_letter_messages` depth check chained onto the
 // canonical AddHealthChecks() registration so the existing /healthz
 // liveness probe upgrades from a static "200 OK" to a live
 // "is the operator drowning in dead-letters?" signal. The check
@@ -86,12 +272,75 @@ builder.Services.AddTelegramWebhook();
 // PersistentDeadLetterQueue registered via AddMessagingPersistence
 // above, so by the time the health check runs the EF-backed depth
 // is what surfaces.
+// Stage 6.2 -- Health Checks and Liveness. Three composite-friendly
+// checks fan in to the ASP.NET Core health-check pipeline so the
+// `/healthz` JSON response surfaces a single rolled-up status plus
+// per-check detail per the brief:
+//
+//   * TelegramBotHealthCheck -- calls Telegram's `getMe` through
+//     the singleton ITelegramBotClient with a hard 5-second
+//     timeout; Healthy iff the bot identity is returned in time.
+//     Tagged `telegram` so operators can filter for messenger
+//     health independently.
+//
+//   * OutboundQueueHealthCheck -- composite probe over the durable
+//     outbox depth (Pending + Sending) and the dead-letter queue
+//     depth. Reports Degraded when the outbox depth exceeds
+//     OutboundQueue:DegradedDepthThreshold (default 1000) and
+//     Unhealthy when the DLQ depth exceeds
+//     DeadLetterQueue:UnhealthyThreshold. Tagged `outbound` and
+//     `dead_letter` so the legacy DLQ probe filters still match.
+//
+//   * DatabaseHealthCheck -- verifies both MessagingDbContext and
+//     AuditDbContext are reachable AND their schemas are in place
+//     by running a Take(1) probe against the canonical DbSet of
+//     each. Tagged `database` and `audit` so audit operators can
+//     pivot on the audit signal independently.
+//
+// The legacy Stage 4.2 DeadLetterQueueHealthCheck registration is
+// retained alongside as a defense-in-depth signal -- both reach
+// the same DLQ row count via IDeadLetterQueue.CountAsync so they
+// cannot diverge, and operator dashboards that already pivot on
+// the Stage 4.2 check name (`outbound_dead_letter_queue_depth`)
+// keep working unchanged.
+// Stage 6.3 -- StubGuardHealthCheck is the production-readiness
+// gate that fails /healthz when ASPNETCORE_ENVIRONMENT=Production
+// AND any of the three swarm-side abstractions
+// (IOperatorRegistry, ITaskOversightRepository, ISwarmCommandBus)
+// resolve to their dev/test stub implementations. In non-Production
+// environments the check is intentionally a no-op so integration
+// tests and `dotnet run` Development hosts that legitimately rely
+// on the stubs are not regressed. The check is tagged `stub_guard`
+// so operator dashboards can pivot on it independently from the
+// other liveness signals.
+//
+// Stage 6.3 iter-3 evaluator items 1-3 -- the brief mandates the
+// guard is fail-closed: any stub in Production -> Unhealthy with
+// no acknowledgement / bypass path. Production deployments wire a
+// concrete ISwarmCommandBus via services.Replace() (see the
+// comment block above this one); the Docker image's HEALTHCHECK
+// directive intentionally fails for the stock image so an
+// operator who forgot to wire the production bus sees the
+// container reported Unhealthy by Docker / Kubernetes before
+// traffic is routed.
 builder.Services.AddHealthChecks()
     .AddCheck<DeadLetterQueueHealthCheck>(
         DeadLetterQueueHealthCheck.Name,
-        tags: new[] { "dead_letter", "outbound" });
+        tags: new[] { "dead_letter", "outbound" })
+    .AddCheck<TelegramBotHealthCheck>(
+        TelegramBotHealthCheck.Name,
+        tags: new[] { "telegram", "liveness" })
+    .AddCheck<OutboundQueueHealthCheck>(
+        OutboundQueueHealthCheck.Name,
+        tags: new[] { "outbound", "dead_letter" })
+    .AddCheck<DatabaseHealthCheck>(
+        DatabaseHealthCheck.Name,
+        tags: new[] { "database", "audit" })
+    .AddCheck<StubGuardHealthCheck>(
+        StubGuardHealthCheck.Name,
+        tags: new[] { "stub_guard", "production_readiness" });
 
-// IUserAuthorizationService — iter-5 evaluator item 1 + Stage 3.4
+// IUserAuthorizationService -- iter-5 evaluator item 1 + Stage 3.4
 // onboarding. AddTelegram intentionally does NOT register one to
 // keep the loud-failure semantic at the library level. The Worker
 // registers TelegramUserAuthorizationService (Stage 3.4) via
@@ -103,16 +352,18 @@ builder.Services.AddHealthChecks()
 // own scope-per-call pattern), so scoping it would create a
 // needless captive-dependency conflict with the singleton pipeline.
 //
-// TelegramUserAuthorizationService supersedes the iter-5
+// TelegramUserAuthorizationService is the sole supported Telegram
+// IUserAuthorizationService: the iter-5
 // ConfiguredOperatorAuthorizationService that read static
-// OperatorBindings from configuration: it now reads from the
-// persistent IOperatorRegistry (PersistentOperatorRegistry from
-// AddMessagingPersistence) for Tier 2 runtime authorization, and
-// from Telegram:UserTenantMappings configuration for Tier 1
-// /start onboarding (per architecture.md §7.1).
+// OperatorBindings from configuration was deleted in Stage 5.2
+// iter-4. It reads from the persistent IOperatorRegistry
+// (PersistentOperatorRegistry from AddMessagingPersistence) for
+// Tier 2 runtime authorization, and from Telegram:UserTenantMappings
+// configuration for Tier 1 /start onboarding (per architecture.md
+// section 7.1).
 builder.Services.TryAddSingleton<IUserAuthorizationService, TelegramUserAuthorizationService>();
 
-// IAlertService — iter-4 evaluator item 6. The Telegram sender's
+// IAlertService -- iter-4 evaluator item 6. The Telegram sender's
 // dead-letter path (TelegramMessageSender.EmitDeadLetterAlertAsync)
 // resolves IAlertService as an optional dependency; without a
 // registered concrete the alert path falls back to the sender's own
@@ -120,7 +371,7 @@ builder.Services.TryAddSingleton<IUserAuthorizationService, TelegramUserAuthoriz
 // dedicated alert sink. Register the LoggingAlertService default
 // here via TryAddSingleton so a later out-of-band channel
 // (Slack / PagerDuty / second-bot) wired in a future stage can
-// replace it without touching this file. Singleton lifetime — the
+// replace it without touching this file. Singleton lifetime -- the
 // service has no per-request state; logger injection is the only
 // dependency.
 builder.Services.TryAddSingleton<IAlertService, LoggingAlertService>();
@@ -129,9 +380,9 @@ builder.Services.TryAddSingleton<IAlertService, LoggingAlertService>();
 // scoped MessagingDbContext.
 builder.Services.AddScoped<IInboundUpdateStore, PersistentInboundUpdateStore>();
 
-// Background services: order MATTERS at runtime — IHostedService
+// Background services: order MATTERS at runtime -- IHostedService
 // instances start in registration order. Recovery startup runs FIRST
-// (one-shot Processing→Received reset BEFORE the dispatcher/sweep
+// (one-shot Processing->Received reset BEFORE the dispatcher/sweep
 // begin claiming rows); the dispatcher and recovery sweep can then
 // start safely.
 builder.Services.AddHostedService<InboundUpdateRecoveryStartup>();
@@ -159,7 +410,7 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
         maxRetries = parsedMax;
     }
 
-    // Iter-5 evaluator item 3 — periodic stale-Processing reclaim.
+    // Iter-5 evaluator item 3 -- periodic stale-Processing reclaim.
     // The default (30 minutes) is far above the story's 2-second P95
     // SLA, so a healthy long-running handler is never falsely reset.
     // Operators tune this via InboundRecovery:StaleProcessingThresholdSeconds
@@ -182,7 +433,7 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
         TimeSpan.FromSeconds(staleSeconds));
 });
 
-// Stage 4.1 — durable outbox drainer. Spawns
+// Stage 4.1 -- durable outbox drainer. Spawns
 // OutboundQueue:ProcessorConcurrency (default 10) independent worker
 // tasks that dequeue from the PersistentOutboundQueue replaced into
 // the container by AddMessagingPersistence above, dispatch through
@@ -195,9 +446,9 @@ builder.Services.AddHostedService<InboundRecoverySweep>(sp =>
 // OutboundQueueMetrics. The processor must be registered AFTER
 // AddMessagingPersistence (binds OutboundQueueOptions + replaces
 // IOutboundQueue with the persistent impl) and AFTER AddTelegram
-// (registers IMessageSender → TelegramMessageSender).
+// (registers IMessageSender -> TelegramMessageSender).
 //
-// Stage 4.2 — explicit factory so the new RetryPolicy options,
+// Stage 4.2 -- explicit factory so the new RetryPolicy options,
 // IDeadLetterQueue, and IAlertService are wired into the processor's
 // long ctor. Without the factory the DI activator would fall back
 // to the legacy 5-arg ctor (Random isn't registered as a DI service)
@@ -219,6 +470,35 @@ builder.Services.AddHostedService<OutboundQueueProcessor>(sp =>
 
 var app = builder.Build();
 
+// =============================================================
+// Stage 5.1, step 4 -- secret-source validation.
+//
+// Runs BEFORE `app.Run()` so a misconfigured deployment fails
+// startup synchronously with a clear, source-by-source diagnostic
+// instead of getting deep into hosted-service start and surfacing
+// the failure as a generic OptionsValidationException. Logs at
+// Warning level when the token is missing (listing every source
+// it inspected and why each one did not provide the value) and
+// throws an InvalidOperationException to halt startup. The
+// existing `TelegramOptionsValidator` ValidateOnStart() hook is
+// retained as defence in depth.
+// =============================================================
+var secretValidatorLogger = app.Services
+    .GetRequiredService<ILoggerFactory>()
+    .CreateLogger("AgentSwarm.Messaging.Worker.SecretManagement");
+// Capture KeyVault:Uri AFTER builder.Build() so the validator's
+// diagnostic line reports the value that was effectively applied --
+// i.e. including overrides supplied by WebApplicationFactory's
+// ConfigureAppConfiguration callbacks and any post-Build env/User
+// Secrets layers. Reading from `app.Configuration` (the host's
+// finalized IConfiguration) is the canonical post-Build read.
+var keyVaultUriForDiagnostic = app.Configuration["KeyVault:Uri"];
+TelegramSecretSourceValidator.EnsureBotTokenConfigured(
+    app.Configuration,
+    app.Environment,
+    keyVaultUriForDiagnostic,
+    secretValidatorLogger);
+
 // Routing + endpoint. UseRouting is required when the host uses the
 // minimal-API endpoint conventions; MapTelegramWebhook attaches the
 // TelegramWebhookSecretFilter to the route so unauthenticated POSTs
@@ -226,10 +506,33 @@ var app = builder.Build();
 app.UseRouting();
 app.MapTelegramWebhook();
 
-// Liveness probe consumed by the Dockerfile HEALTHCHECK and the
-// Stage 7.1 integration-test fixture. Kept on the bare
-// AddHealthChecks() registration above so the endpoint is always
-// reachable even before Phase 6 adds the composite check.
-app.MapHealthChecks("/healthz");
+// Stage 6.2 -- /healthz liveness probe consumed by the Dockerfile
+// HEALTHCHECK, Kubernetes liveness/readiness probes, and the
+// Stage 7.1 integration-test fixture. Wires the five registered
+// health checks (DeadLetterQueueHealthCheck, TelegramBotHealthCheck,
+// OutboundQueueHealthCheck, DatabaseHealthCheck, StubGuardHealthCheck)
+// into a structured JSON response per the brief's "expose at
+// `/healthz` with JSON detail output" requirement. The Stage 6.2
+// HealthCheckJsonResponseWriter serialises the HealthReport into
+// { status, totalDuration, entries } where `entries` lists each
+// check's status, description, duration, tags, and data
+// dictionary -- enough for an operator runbook or dashboard to
+// pivot on the failing check by name.
+//
+// Stage 6.3 -- StubGuardHealthCheck is the fifth check in the list
+// above. In Production it returns Unhealthy when IOperatorRegistry,
+// ITaskOversightRepository, or ISwarmCommandBus still resolve to
+// their dev-mode stubs; in every other environment (Development,
+// Staging, Integration, custom) it is a no-op that returns Healthy
+// so the integration-test fixture's /healthz probe stays green.
+//
+// The HTTP status code rules out of MapHealthChecks are unchanged
+// from the framework default: Healthy/Degraded -> 200 OK,
+// Unhealthy -> 503 Service Unavailable. The body's `status`
+// field is still the canonical machine-readable signal.
+app.MapHealthChecks("/healthz", new HealthCheckOptions
+{
+    ResponseWriter = HealthCheckJsonResponseWriter.WriteAsync,
+});
 
 app.Run();

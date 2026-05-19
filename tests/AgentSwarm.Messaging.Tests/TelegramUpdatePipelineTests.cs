@@ -10,9 +10,9 @@ using Moq;
 namespace AgentSwarm.Messaging.Tests;
 
 /// <summary>
-/// Stage 2.2 — Inbound Update Pipeline.
+/// Stage 2.2 -- Inbound Update Pipeline.
 ///
-/// Pins the contract per implementation-plan.md §132 and §147 (the
+/// Pins the contract per implementation-plan.md section 132 and section 147 (the
 /// authoritative source after the iter-1 evaluator's contract pin):
 /// 1. Pipeline routes <see cref="EventType.Command"/> to <see cref="ICommandRouter"/>.
 /// 2. Pipeline routes <see cref="EventType.CallbackResponse"/> to <see cref="ICallbackHandler"/>.
@@ -27,14 +27,14 @@ namespace AgentSwarm.Messaging.Tests;
 ///    UNCAUGHT crash (process exits before the catch block runs)
 ///    neither call executes and the reservation persists, so the
 ///    Stage 2.4 InboundUpdate sweep is the canonical crash-recovery
-///    route — this asymmetry is what closes the "two pods both run the
+///    route -- this asymmetry is what closes the "two pods both run the
 ///    handler on a crash" race while still satisfying the brief's
 ///    live-retry-on-throw scenario.
 /// 5. <see cref="IDeduplicationService.MarkProcessedAsync"/> IS called exactly
-///    once when the handler returns successfully — a subsequent delivery of
+///    once when the handler returns successfully -- a subsequent delivery of
 ///    the same <c>EventId</c> is short-circuited as a duplicate.
 /// 6. Concurrent <see cref="IDeduplicationService.TryReserveAsync"/> calls
-///    award the handler invocation to exactly one caller (plan §146) — the
+///    award the handler invocation to exactly one caller (plan section 146) -- the
 ///    release-on-throw path runs sequentially after the winner's handler
 ///    completes, so the atomic-winner-per-burst guarantee is preserved.
 ///
@@ -130,8 +130,13 @@ public class TelegramUpdatePipelineTests
     public async Task Pipeline_RejectsUnauthorized_WhenZeroBindings_AndDoesNotInvokeHandler()
     {
         var harness = new Harness();
+        // Stage 5.2 (iter-3) -- the pipeline calls the 5-arg
+        // AuthorizeAsync(externalUserId, chatId, commandName,
+        // chatType, ct) overload for every command. Stub that
+        // overload here so the unauthorized response is delivered
+        // through the pipeline's single authorization call site.
         harness.AuthzStub.Setup(s => s.AuthorizeAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new AuthorizationResult
             {
                 IsAuthorized = false,
@@ -164,7 +169,7 @@ public class TelegramUpdatePipelineTests
     }
 
     // ============================================================
-    // Brief scenario #4: handler throws → MarkProcessedAsync NOT called
+    // Brief scenario #4: handler throws -> MarkProcessedAsync NOT called
     // ============================================================
 
     [Fact]
@@ -195,7 +200,7 @@ public class TelegramUpdatePipelineTests
         harness.DedupStub.Verify(
             d => d.MarkProcessedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Never,
-            "MarkProcessedAsync MUST NOT be called when the handler throws — the recovery sweep depends on the event being re-deliverable");
+            "MarkProcessedAsync MUST NOT be called when the handler throws -- the recovery sweep depends on the event being re-deliverable");
 
         // Brief Step 2 / Scenario 4: the pipeline MUST release the
         // reservation on a caught handler exception so the next live
@@ -266,9 +271,9 @@ public class TelegramUpdatePipelineTests
         second.Handled.Should().BeTrue("the second delivery is fully processed");
         second.Succeeded.Should().BeTrue("the retry succeeded");
         second.ResponseText.Should().Be("second-attempt-ok",
-            "the second delivery is processed by the handler — NOT short-circuited at the dedup gate (brief Scenario 4)");
+            "the second delivery is processed by the handler -- NOT short-circuited at the dedup gate (brief Scenario 4)");
         routerInvocations.Should().Be(2,
-            "Stage 2.2 brief Scenario 4: a subsequent delivery of evt-1 must be processed normally after the first delivery's handler threw — the router is invoked twice (once for the throwing first attempt, once for the successful retry)");
+            "Stage 2.2 brief Scenario 4: a subsequent delivery of evt-1 must be processed normally after the first delivery's handler threw -- the router is invoked twice (once for the throwing first attempt, once for the successful retry)");
 
         // After a successful retry MarkProcessed was called, so the
         // reservation is now sticky and a third delivery would short-
@@ -321,7 +326,7 @@ public class TelegramUpdatePipelineTests
     [Fact]
     public async Task Pipeline_TryReserveAwardsExactlyOneConcurrentCaller()
     {
-        // implementation-plan.md §146 "Dedup atomically awards exactly one
+        // implementation-plan.md section 146 "Dedup atomically awards exactly one
         // concurrent caller": with N concurrent pipeline invocations of the
         // same EventId, exactly ONE handler invocation occurs; the rest
         // short-circuit at the TryReserveAsync gate.
@@ -369,7 +374,7 @@ public class TelegramUpdatePipelineTests
         var results = await Task.WhenAll(tasks);
 
         routerInvocations.Should().Be(1,
-            "implementation-plan §146: the atomic TryReserveAsync gate must award the handler invocation to exactly one concurrent caller");
+            "implementation-plan section 146: the atomic TryReserveAsync gate must award the handler invocation to exactly one concurrent caller");
         results.Count(r => r.Handled).Should().Be(concurrency,
             "every caller (winner and losers) returns Handled=true; losers are 'handled' by the duplicate short-circuit");
         results.Count(r => r.ResponseText == "ok").Should().Be(1,
@@ -377,7 +382,7 @@ public class TelegramUpdatePipelineTests
     }
 
     // ============================================================
-    // Brief scenario #5: success → MarkProcessedAsync called once;
+    // Brief scenario #5: success -> MarkProcessedAsync called once;
     //                    second delivery short-circuits
     // ============================================================
 
@@ -420,7 +425,7 @@ public class TelegramUpdatePipelineTests
         // Second delivery: the dedup gate is TryReserveAsync (not the
         // racy IsProcessedAsync probe). MarkProcessedAsync defensively
         // populated _reservations during the first delivery, so the
-        // second TryReserveAsync TryAdd returns false → short-circuit.
+        // second TryReserveAsync TryAdd returns false -> short-circuit.
         var second = await harness.Pipeline.ProcessAsync(evt, CancellationToken.None);
         second.Handled.Should().BeTrue();
         second.ResponseText.Should().BeNull(
@@ -466,7 +471,7 @@ public class TelegramUpdatePipelineTests
     }
 
     // ============================================================
-    // InMemoryDeduplicationService — race-freedom (iter-2 evaluator item 1)
+    // InMemoryDeduplicationService -- race-freedom (iter-2 evaluator item 1)
     // ============================================================
 
     [Fact]
@@ -486,7 +491,7 @@ public class TelegramUpdatePipelineTests
         await dedup.MarkProcessedAsync("evt-race-1", CancellationToken.None);
 
         // After completion, another caller racing through the gate must
-        // see false — even though the first caller is "done" and
+        // see false -- even though the first caller is "done" and
         // hypothetically no longer "owns" the slot.
         var secondReserve = await dedup.TryReserveAsync("evt-race-1", CancellationToken.None);
         secondReserve.Should().BeFalse(
@@ -558,7 +563,7 @@ public class TelegramUpdatePipelineTests
         }
 
         totalSecondaryWinners.Should().Be(0,
-            "no TryReserveAsync after the initial winner may ever return true — the iter-3 impl removes the probe-then-add race window that the iter-2 evaluator flagged");
+            "no TryReserveAsync after the initial winner may ever return true -- the iter-3 impl removes the probe-then-add race window that the iter-2 evaluator flagged");
     }
 
     // ============================================================
@@ -591,7 +596,7 @@ public class TelegramUpdatePipelineTests
     {
         // Two concurrent callbacks racing on the same token: only one may
         // see the entry. The other receives null. Without atomic remove
-        // both callers could re-issue the original command — exactly the
+        // both callers could re-issue the original command -- exactly the
         // double-execution risk Stage 2.2 must prevent.
         var time = new TestTimeProvider(new DateTimeOffset(2024, 06, 15, 12, 00, 00, TimeSpan.Zero));
         var store = new InMemoryPendingDisambiguationStore(time);
@@ -620,7 +625,7 @@ public class TelegramUpdatePipelineTests
         }
 
         winners.Should().Be(100,
-            "exactly one winner per token across 100 token races — never two, never zero");
+            "exactly one winner per token across 100 token races -- never two, never zero");
     }
 
     [Fact]
@@ -644,7 +649,7 @@ public class TelegramUpdatePipelineTests
         time.Advance(TimeSpan.FromMinutes(2));
 
         var taken = await store.TakeAsync("tok-expired", CancellationToken.None);
-        taken.Should().BeNull("expired entries must not resolve — Stage 3.3 reports the callback as expired");
+        taken.Should().BeNull("expired entries must not resolve -- Stage 3.3 reports the callback as expired");
     }
 
     [Fact]
@@ -709,11 +714,11 @@ public class TelegramUpdatePipelineTests
     [Fact]
     public async Task Pipeline_Command_WhenMultipleBindings_PromptsWorkspaceSelection_WithInlineKeyboard()
     {
-        // architecture.md §4.3 + e2e-scenarios.md "workspace disambiguation
+        // architecture.md section 4.3 + e2e-scenarios.md "workspace disambiguation
         // via inline keyboard": multi-binding commands return a prompt
         // composed of intro text + one inline-keyboard button per workspace.
         // Each button's callback_data is `ws:<token>:<index>` (iter-4
-        // robustness fix — formerly embedded the raw workspace id, which
+        // robustness fix -- formerly embedded the raw workspace id, which
         // was unsafe for long ids or ids containing `:`). The short
         // server-side `token` references a stored PendingDisambiguation
         // row that carries the original raw command, correlation id, and
@@ -777,7 +782,7 @@ public class TelegramUpdatePipelineTests
                 "indices must be 0-based and contiguous so Stage 3.3 can index directly into CandidateWorkspaceIds");
 
         // The store now carries a single entry with the original command
-        // context — Stage 3.3's TakeAsync(token) will recover it.
+        // context -- Stage 3.3's TakeAsync(token) will recover it.
         var sharedToken = tokens[0];
         var stored = await harness.DisambiguationStore.TakeAsync(sharedToken, CancellationToken.None);
         stored.Should().NotBeNull(
@@ -807,16 +812,16 @@ public class TelegramUpdatePipelineTests
     public async Task Pipeline_NonAgentsCommand_WithMultipleBindings_PromptsForDisambiguation()
     {
         // Stage 3.4 iter-2 evaluator item 2 (supersedes the Stage 3.2
-        // "/agents-only" scoping) — the multi-workspace disambiguation
+        // "/agents-only" scoping) -- the multi-workspace disambiguation
         // prompt MUST cover EVERY multi-binding command (`/ask`,
         // `/status`, `/pause`, `/handoff`, `/approve`, `/reject`,
         // `/resume`, and `/agents` with no args). The only fall-through
         // exceptions are `/agents WORKSPACE` (explicit arg routed to
         // AgentsCommandHandler) and `/start` (just created the
-        // bindings — see Pipeline_StartCommand_WithMultipleBindings_*
+        // bindings -- see Pipeline_StartCommand_WithMultipleBindings_*
         // below). This pins the widened gate so a regression that
-        // re-scopes the branch back to /agents-only — silently routing
-        // other commands to authz.Bindings[0] — surfaces immediately.
+        // re-scopes the branch back to /agents-only -- silently routing
+        // other commands to authz.Bindings[0] -- surfaces immediately.
         var harness = new Harness();
         harness.AuthorizeWith(
             harness.MakeBinding(workspaceId: "factory-1"),
@@ -839,20 +844,20 @@ public class TelegramUpdatePipelineTests
             "You have access to multiple workspaces*",
             "the widened disambiguation gate now covers /ask (and every non-/start, non-/agents-with-arg command) for multi-binding operators per Stage 3.4 evaluator item 2");
         result.ResponseButtons.Should().NotBeEmpty(
-            "every multi-binding non-/start non-/agents-with-arg command MUST emit a workspace inline keyboard per architecture.md §4.3");
+            "every multi-binding non-/start non-/agents-with-arg command MUST emit a workspace inline keyboard per architecture.md section 4.3");
         harness.RouterStub.Verify(
             r => r.RouteAsync(
                 It.IsAny<ParsedCommand>(),
                 It.IsAny<AuthorizedOperator>(),
                 It.IsAny<CancellationToken>()),
             Times.Never,
-            "router must not run before the operator selects a workspace — that was the iter-1 silent-routing bug");
+            "router must not run before the operator selects a workspace -- that was the iter-1 silent-routing bug");
     }
 
     [Fact]
     public async Task Pipeline_AgentsCommand_WithExplicitWorkspaceArg_AndMultipleBindings_FallsThroughToRouter()
     {
-        // Stage 3.2 iter-2 evaluator item 1 (sub-case) — the
+        // Stage 3.2 iter-2 evaluator item 1 (sub-case) -- the
         // disambiguation gate also requires Arguments.Count == 0, so
         // `/agents WORKSPACE` from a multi-binding operator must reach
         // the router (which delegates to AgentsCommandHandler's
@@ -897,7 +902,7 @@ public class TelegramUpdatePipelineTests
     }
 
     // ============================================================
-    // Stage 3.4 iter-2 evaluator item 2 — widened disambig coverage
+    // Stage 3.4 iter-2 evaluator item 2 -- widened disambig coverage
     // ============================================================
 
     [Theory]
@@ -911,7 +916,7 @@ public class TelegramUpdatePipelineTests
         string commandName,
         string rawCommand)
     {
-        // Iter-2 evaluator item 2 — the widened gate covers EVERY
+        // Iter-2 evaluator item 2 -- the widened gate covers EVERY
         // command, not just /agents-no-args. /status, /handoff,
         // /pause, /resume, /approve, /reject from a multi-binding
         // operator must surface the workspace prompt rather than
@@ -947,12 +952,20 @@ public class TelegramUpdatePipelineTests
     }
 
     [Fact]
-    public async Task Pipeline_StartCommand_RoutesThroughOnboardAsync_WithChatType()
+    public async Task Pipeline_StartCommand_RoutesThroughUnifiedAuthorizeAsync_WithCommandNameAndChatType()
     {
-        // Iter-2 evaluator item 1 — the pipeline must invoke the new
-        // OnboardAsync entry point (NOT AuthorizeAsync) for /start so
-        // the raw chat-type token carried on MessengerEvent.ChatType
-        // flows into the persisted OperatorBinding.
+        // Stage 5.2 (iter-3) -- the pipeline must route /start through
+        // the SINGLE unified AuthorizeAsync(commandName, chatType)
+        // entry point so the commandName parameter alone drives the
+        // Tier 1 vs Tier 2 distinction (brief: "the commandName
+        // parameter enables the Tier 1/Tier 2 distinction without
+        // requiring separate pipeline branches"). The raw chat-type
+        // token from MessengerEvent.ChatType must still flow through
+        // so the persisted OperatorBinding records the real chat
+        // kind -- supersedes the prior Stage 3.4 OnboardAsync split
+        // entry shape, which is now retained as a back-compat
+        // convenience method on the interface that simply forwards
+        // to AuthorizeAsync(commandName="start", chatType).
         var harness = new Harness();
         harness.AuthorizeWith(harness.MakeBinding(workspaceId: "ws-1"));
         harness.ParserStub.Setup(p => p.Parse("/start"))
@@ -989,19 +1002,19 @@ public class TelegramUpdatePipelineTests
 
         result.Handled.Should().BeTrue();
         harness.AuthzStub.Verify(
-            s => s.OnboardAsync("100", "200", "supergroup", It.IsAny<CancellationToken>()),
+            s => s.AuthorizeAsync("100", "200", TelegramCommands.Start, "supergroup", It.IsAny<CancellationToken>()),
             Times.Once,
-            "/start must route through OnboardAsync with the raw chat-type token so the binding's ChatType reflects the real chat kind");
+            "/start must route through the unified 5-arg AuthorizeAsync(commandName=\"start\", chatType=\"supergroup\") entry point so the binding's ChatType reflects the real chat kind (Stage 5.2 unified entry + Stage 3.4 chat-type fidelity)");
         harness.AuthzStub.Verify(
-            s => s.AuthorizeAsync(It.IsAny<string>(), It.IsAny<string>(), "start", It.IsAny<CancellationToken>()),
+            s => s.OnboardAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()),
             Times.Never,
-            "/start must NOT route through AuthorizeAsync(commandName=\"start\") any more — the OnboardAsync entry point carries the chat-type token");
+            "the pipeline must NOT invoke the back-compat OnboardAsync entry directly -- every command (including /start) goes through the single AuthorizeAsync call site per the Stage 5.2 brief");
     }
 
     [Fact]
     public async Task Pipeline_StartCommand_WithMultipleBindings_DoesNotPrompt()
     {
-        // Iter-2 evaluator item 2 (sub-case) — /start onboarding
+        // Iter-2 evaluator item 2 (sub-case) -- /start onboarding
         // creates the bindings; the operator hasn't issued a real
         // command yet, so showing the workspace selector here would
         // confuse them. Only NON-/start commands trigger the gate.
@@ -1033,18 +1046,18 @@ public class TelegramUpdatePipelineTests
 
         result.Handled.Should().BeTrue();
         result.ResponseText.Should().Be("welcome",
-            "/start must reach the router even with multiple bindings — the prompt is for subsequent commands");
+            "/start must reach the router even with multiple bindings -- the prompt is for subsequent commands");
         result.ResponseButtons.Should().BeEmpty();
     }
 
     [Fact]
     public async Task Pipeline_MultiWorkspacePrompt_GeneratesUniqueTokenPerInvocation()
     {
-        // Two separate disambiguation prompts must NOT share a token —
+        // Two separate disambiguation prompts must NOT share a token --
         // otherwise the second prompt's callback would consume (and
         // resolve to) the first prompt's pending entry. The pipeline's
         // generator is RandomNumberGenerator-backed; this test pins the
-        // "two prompts ⇒ two distinct rows" invariant.
+        // "two prompts => two distinct rows" invariant.
         var harness = new Harness();
         harness.AuthorizeWith(
             harness.MakeBinding(workspaceId: "factory-1"),
@@ -1105,7 +1118,7 @@ public class TelegramUpdatePipelineTests
         var result = await act.Should().NotThrowAsync(
             "the wire format must not embed user-controlled workspace ids; embedding the integer index keeps the format unambiguous regardless of id content");
 
-        // Each callback_data must split cleanly into exactly 3 parts —
+        // Each callback_data must split cleanly into exactly 3 parts --
         // a workspace id containing `:` would have produced 5+ parts
         // under the iter-3 wire format.
         result.Subject.ResponseButtons.Should().AllSatisfy(b =>
@@ -1132,7 +1145,7 @@ public class TelegramUpdatePipelineTests
         // verbatim must still produce valid buttons. The index encoding
         // makes callback_data length depend on the binding count, not
         // on the workspace id length.
-        var longButValidId = new string('w', 60); // 60 ASCII bytes — fits Label's 64-byte cap, would have blown the iter-3 callback_data cap (3+12+1+60 = 76 > 64)
+        var longButValidId = new string('w', 60); // 60 ASCII bytes -- fits Label's 64-byte cap, would have blown the iter-3 callback_data cap (3+12+1+60 = 76 > 64)
         var harness = new Harness();
         harness.AuthorizeWith(
             harness.MakeBinding(workspaceId: longButValidId),
@@ -1150,7 +1163,7 @@ public class TelegramUpdatePipelineTests
             CancellationToken.None);
 
         result.ResponseButtons.Should().HaveCount(2);
-        // The index encoding bounds callback_data at 3 + 12 + 1 + ⌈log10(N)⌉
+        // The index encoding bounds callback_data at 3 + 12 + 1 + ceil(log10(N))
         // ASCII bytes regardless of workspace id length.
         result.ResponseButtons.Should().AllSatisfy(b =>
             System.Text.Encoding.UTF8.GetByteCount(b.CallbackData)
@@ -1181,7 +1194,7 @@ public class TelegramUpdatePipelineTests
     }
 
     // ============================================================
-    // Role enforcement (architecture.md §9)
+    // Role enforcement (architecture.md section 9)
     // ============================================================
 
     [Fact]
@@ -1418,7 +1431,7 @@ public class TelegramUpdatePipelineTests
         var result = await harness.Pipeline.ProcessAsync(evt, CancellationToken.None);
 
         result.Handled.Should().BeFalse(
-            "PipelineResult.Handled is `false` only when the event type is unrecognized — see PipelineResult XML doc");
+            "PipelineResult.Handled is `false` only when the event type is unrecognized -- see PipelineResult XML doc");
         result.ResponseText.Should().Be(PipelineResponses.UnknownEventType);
         result.CorrelationId.Should().Be(evt.CorrelationId);
 
@@ -1428,7 +1441,7 @@ public class TelegramUpdatePipelineTests
             "Unknown events must short-circuit BEFORE authz so that the bot does not leak authorization status to senders of malformed payloads");
         harness.DedupStub.Verify(d => d.TryReserveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Never,
-            "Unknown events must NOT consume a reservation slot — the cache is reserved for actionable events");
+            "Unknown events must NOT consume a reservation slot -- the cache is reserved for actionable events");
         harness.DedupStub.Verify(d => d.MarkProcessedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Never);
     }
@@ -1463,7 +1476,7 @@ public class TelegramUpdatePipelineTests
     }
 
     // ============================================================
-    // Structured stage logging — every stage emits a log entry with
+    // Structured stage logging -- every stage emits a log entry with
     // CorrelationId, EventId, and Stage state-properties so an
     // observability tool can reconstruct the per-event pipeline path
     // end-to-end (the Stage 2.2 brief's "structured log entries at each
@@ -1544,8 +1557,11 @@ public class TelegramUpdatePipelineTests
     public async Task Pipeline_UnauthorizedRejection_EmitsAuthorizeDeniedLog_WithReason()
     {
         var harness = new Harness();
+        // Stage 5.2 (iter-3) -- the pipeline calls the 5-arg
+        // AuthorizeAsync overload; stub it so the denial log carries
+        // the upstream provider's reason.
         harness.AuthzStub.Setup(s => s.AuthorizeAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new AuthorizationResult
             {
                 IsAuthorized = false,
@@ -1570,12 +1586,14 @@ public class TelegramUpdatePipelineTests
         deniedEntry.GetValue<string>("EventId").Should().Be(evt.EventId);
         deniedEntry.GetValue<string>("Reason").Should().Be("user not in allowlist",
             "denial reason from AuthorizationResult must surface in the structured log so audit consumers can identify why an event was rejected");
-        deniedEntry.GetValue<string>("UserId").Should().Be(evt.UserId);
-        deniedEntry.GetValue<string>("ChatId").Should().Be(evt.ChatId);
+        deniedEntry.GetValue<string>("TelegramUserId").Should().Be(evt.UserId,
+            "Stage 6.1 brief: the warning log must carry the Telegram numeric user id under the canonical TelegramUserId property name");
+        deniedEntry.GetValue<string>("TelegramChatId").Should().Be(evt.ChatId,
+            "Stage 6.1 brief: the warning log must carry the Telegram numeric chat id under the canonical TelegramChatId property name");
     }
 
     // ============================================================
-    // Stage 2.2 hybrid retry contract — Success=false (return) is
+    // Stage 2.2 hybrid retry contract -- Success=false (return) is
     // TERMINAL:
     //   - Pipeline calls MarkProcessedAsync exactly once even when
     //     the routed handler returns CommandResult.Success=false (the
@@ -1639,7 +1657,7 @@ public class TelegramUpdatePipelineTests
         result.Handled.Should().BeTrue(
             "the pipeline 'handled' the event by routing the handler and surfacing its failure to the operator");
         result.Succeeded.Should().BeFalse(
-            "Succeeded must reflect the routed handler's CommandResult.Success — observability and audit consumers depend on this distinction even though the dedup marker is symmetric");
+            "Succeeded must reflect the routed handler's CommandResult.Success -- observability and audit consumers depend on this distinction even though the dedup marker is symmetric");
         result.ResponseText.Should().Be("swarm offline",
             "the operator must see the handler's failure text; we do not silently swallow the message");
         result.ErrorCode.Should().Be("swarm.unavailable",
@@ -1648,10 +1666,10 @@ public class TelegramUpdatePipelineTests
 
         harness.DedupStub.Verify(d => d.MarkProcessedAsync(evt.EventId, It.IsAny<CancellationToken>()),
             Times.Once,
-            "Success=false is TERMINAL — MarkProcessedAsync MUST be called so live re-deliveries short-circuit and the operator is not pestered with the same failure response on every webhook redelivery (only throw is retryable)");
+            "Success=false is TERMINAL -- MarkProcessedAsync MUST be called so live re-deliveries short-circuit and the operator is not pestered with the same failure response on every webhook redelivery (only throw is retryable)");
         harness.DedupStub.Verify(d => d.ReleaseReservationAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Never,
-            "Success=false MUST NOT release the reservation — release is exclusively the throw path's recovery primitive");
+            "Success=false MUST NOT release the reservation -- release is exclusively the throw path's recovery primitive");
 
         // Structured log: failure is surfaced with the error code.
         var failureEntry = harness.LogCapture.Entries
@@ -1668,7 +1686,7 @@ public class TelegramUpdatePipelineTests
     {
         // Iter-3 evaluator item 2 (rubber-duck non-blocking #1): a handler
         // that returns Success=false WITHOUT a ResponseText would otherwise
-        // produce an empty operator reply — the operator would have no way
+        // produce an empty operator reply -- the operator would have no way
         // to know the action failed. The pipeline substitutes a generic
         // fallback so a definitive failure indication is always surfaced.
         var harness = new Harness();
@@ -1699,11 +1717,11 @@ public class TelegramUpdatePipelineTests
         result.Handled.Should().BeTrue();
         result.Succeeded.Should().BeFalse();
         result.ResponseText.Should().Be(PipelineResponses.HandlerFailureFallback,
-            "a Success=false reply with no ResponseText must surface a generic failure message — operators must never see an empty reply for a failed command");
+            "a Success=false reply with no ResponseText must surface a generic failure message -- operators must never see an empty reply for a failed command");
         result.ErrorCode.Should().Be("internal-error");
         harness.DedupStub.Verify(d => d.MarkProcessedAsync(evt.EventId, It.IsAny<CancellationToken>()),
             Times.Once,
-            "Success=false is TERMINAL even when the handler omitted ResponseText — MarkProcessedAsync still runs so live re-deliveries short-circuit");
+            "Success=false is TERMINAL even when the handler omitted ResponseText -- MarkProcessedAsync still runs so live re-deliveries short-circuit");
     }
 
     [Fact]
@@ -1761,11 +1779,11 @@ public class TelegramUpdatePipelineTests
         second.Handled.Should().BeTrue("the duplicate short-circuit returns Handled=true");
         second.ResponseText.Should().BeNull();
         routerInvocations.Should().Be(1,
-            "Success=false is TERMINAL — the second delivery must short-circuit at the dedup gate; live retries against the same EventId would otherwise hammer a downstream handler that just reported failure");
+            "Success=false is TERMINAL -- the second delivery must short-circuit at the dedup gate; live retries against the same EventId would otherwise hammer a downstream handler that just reported failure");
 
         // The processed marker IS set because Success=false is now
         // terminal. This makes the dedup gate sticky beyond the pure
-        // reservation TTL — once Stage 4.3 substitutes the cache-backed
+        // reservation TTL -- once Stage 4.3 substitutes the cache-backed
         // dedup, the processed marker is what survives the reservation
         // window.
         var probed = await dedup.IsProcessedAsync(evt.EventId, CancellationToken.None);
@@ -1815,12 +1833,15 @@ public class TelegramUpdatePipelineTests
         // IsAuthorized boolean AND a non-empty Bindings list. If a
         // buggy/compromised IUserAuthorizationService returns
         // IsAuthorized=false alongside a stale binding list, the
-        // pipeline must STILL deny — never construct an AuthorizedOperator
+        // pipeline must STILL deny -- never construct an AuthorizedOperator
         // from a binding the provider explicitly disclaimed.
         var harness = new Harness();
         var staleBinding = harness.MakeBinding(workspaceId: "stale-workspace");
+        // Stage 5.2 (iter-3) -- pipeline calls the 5-arg AuthorizeAsync
+        // overload; stub it so the stale-binding scenario reaches the
+        // pipeline's defense-in-depth IsAuthorized check.
         harness.AuthzStub.Setup(s => s.AuthorizeAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new AuthorizationResult
             {
                 IsAuthorized = false,
@@ -1917,7 +1938,7 @@ public class TelegramUpdatePipelineTests
     /// <summary>
     /// Builds a real <see cref="TelegramUpdatePipeline"/> with mockable
     /// dependencies. <see cref="DedupStub"/> defaults to <c>IsProcessedAsync
-    /// → false</c> and a no-op <c>MarkProcessedAsync</c> so the happy path
+    /// -> false</c> and a no-op <c>MarkProcessedAsync</c> so the happy path
     /// runs without per-test setup.
     /// </summary>
     private sealed class Harness
@@ -1928,7 +1949,7 @@ public class TelegramUpdatePipelineTests
         public Mock<ICommandRouter> RouterStub { get; }
         public Mock<ICallbackHandler> CallbackStub { get; }
         public Mock<IPendingQuestionStore> PendingStub { get; }
-        // Real in-memory store — the multi-workspace tests need to verify
+        // Real in-memory store -- the multi-workspace tests need to verify
         // the stored entry's contents (token, original raw command,
         // correlation id), and rolling a separate Mock surface that
         // captures arguments would just re-implement the same logic.
@@ -1941,7 +1962,7 @@ public class TelegramUpdatePipelineTests
         public Harness(IDeduplicationService? dedup = null)
         {
             DedupStub = new Mock<IDeduplicationService>(MockBehavior.Strict);
-            // The pipeline's atomic gate is TryReserveAsync — default to
+            // The pipeline's atomic gate is TryReserveAsync -- default to
             // "true" (winner) so the happy path runs without per-test setup.
             DedupStub.Setup(d => d.TryReserveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(true);
@@ -1957,7 +1978,7 @@ public class TelegramUpdatePipelineTests
                 .Returns(Task.CompletedTask);
             // IsProcessedAsync is part of the contract surface but the
             // pipeline does NOT call it (the racy check-then-act pattern is
-            // explicitly disallowed per implementation-plan.md §132). Wire
+            // explicitly disallowed per implementation-plan.md section 132). Wire
             // a sane default so an accidental call surfaces as a specific
             // verification failure.
             DedupStub.Setup(d => d.IsProcessedAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
@@ -1991,26 +2012,43 @@ public class TelegramUpdatePipelineTests
 
         public void AuthorizeWith(params OperatorBinding[] bindings)
         {
+            var result = new AuthorizationResult
+            {
+                IsAuthorized = bindings.Length > 0,
+                Bindings = bindings,
+            };
+
+            // Stage 5.2 (iter-3) -- the pipeline now invokes the 5-arg
+            // AuthorizeAsync(externalUserId, chatId, commandName,
+            // chatType, ct) overload unconditionally for every
+            // command, including /start. Mock that overload here so
+            // every pipeline test gets the stubbed bindings on the
+            // single call site the pipeline actually uses.
+            AuthzStub.Setup(s => s.AuthorizeAsync(
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(result);
+
+            // Back-compat: continue to stub the 4-arg AuthorizeAsync
+            // because direct unit tests of IUserAuthorizationService
+            // consumers (ConnectorContractTests etc.) still target
+            // the 4-arg signature.
             AuthzStub.Setup(s => s.AuthorizeAsync(
                     It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync(new AuthorizationResult
-                {
-                    IsAuthorized = bindings.Length > 0,
-                    Bindings = bindings,
-                });
+                .ReturnsAsync(result);
 
-            // Stage 3.4 — the pipeline now routes /start through
-            // OnboardAsync. Moq does not invoke the default-interface-
-            // method implementation on a proxied mock; explicitly
-            // stub it so /start pipeline tests get the same bindings
-            // as non-/start tests by default.
+            // OnboardAsync is now a back-compat convenience entry
+            // point on the interface; the pipeline no longer routes
+            // /start through it. Continue to stub it so direct
+            // OnboardAsync callers (if any tests still exercise the
+            // pre-Stage-5.2 onboarding API) get the same stubbed
+            // bindings.
             AuthzStub.Setup(s => s.OnboardAsync(
                     It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync(new AuthorizationResult
-                {
-                    IsAuthorized = bindings.Length > 0,
-                    Bindings = bindings,
-                });
+                .ReturnsAsync(result);
         }
 
         public OperatorBinding MakeBinding(
@@ -2066,7 +2104,7 @@ public class TelegramUpdatePipelineTests
     /// and exposes the structured state properties as a queryable list.
     /// Used to assert that the pipeline emits the brief-mandated structured
     /// stage logs (with <c>CorrelationId</c>, <c>EventId</c>, and
-    /// <c>Stage</c> properties) — see test
+    /// <c>Stage</c> properties) -- see test
     /// <c>Pipeline_HappyPath_EmitsStructuredStageLogs_WithCorrelationIdAndEventId</c>.
     /// </summary>
     private sealed class CapturingLogger<T> : ILogger<T>

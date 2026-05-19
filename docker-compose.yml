@@ -68,6 +68,16 @@ services:
       ConnectionStrings__MessagingDb: Data Source=/data/messaging.db
       ConnectionStrings__AuditDb: Data Source=/data/audit.db
       MessagingDb__UseMigrations: "true"
+      # Stage 6.1 -- OpenTelemetry. When OTEL_EXPORTER_OTLP_ENDPOINT
+      # is set in the host env (or via .env), the worker activates the
+      # OTLP exporter for both traces and metrics. Leave the variable
+      # unset and the host runs with no OTLP exporter (Console
+      # exporter is still enabled by appsettings.Development.json so
+      # developer-mode runs see spans in stdout). Operators wiring an
+      # external collector point this at e.g. http://otel-collector:4317.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OpenTelemetry__ServiceName: agentswarm-messaging-worker
+      OpenTelemetry__ServiceVersion: ${WORKER_VERSION:-1.0.0}
     volumes:
       - worker-data:/data
     healthcheck:
