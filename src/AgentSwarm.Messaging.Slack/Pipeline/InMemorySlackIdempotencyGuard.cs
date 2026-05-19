@@ -83,11 +83,22 @@ internal sealed class InMemorySlackIdempotencyGuard : ISlackIdempotencyGuard
         ct.ThrowIfCancellationRequested();
 
         DateTimeOffset now = this.timeProvider.GetUtcNow();
-        DateTimeOffset firstSeenAtForFresh = envelope.ReceivedAt == default ? now : envelope.ReceivedAt;
+
+        // Iter-2 evaluator item #1 (LEASE TIMESTAMP BUG): FirstSeenAt
+        // MUST be the acquisition time, NEVER envelope.ReceivedAt. The
+        // stale-lease check below compares (now - existing.FirstSeenAt)
+        // against StaleProcessingThresholdSeconds; if FirstSeenAt were
+        // seeded from envelope.ReceivedAt and the envelope had been
+        // queued longer than the threshold, the row would be inserted
+        // already-stale and a concurrent Slack retry could reclaim the
+        // live lease while the first handler is still running --
+        // producing duplicate task/decision creation. The transport
+        // already audits envelope.ReceivedAt separately, so stamping
+        // FirstSeenAt at acquisition loses nothing.
         Entry fresh = new(
             SourceType: envelope.SourceType,
             ProcessingStatus: SlackInboundRequestProcessingStatus.Processing,
-            FirstSeenAt: firstSeenAtForFresh,
+            FirstSeenAt: now,
             CompletedAt: null);
 
         // First, try to insert a brand-new row. TryAdd returns true

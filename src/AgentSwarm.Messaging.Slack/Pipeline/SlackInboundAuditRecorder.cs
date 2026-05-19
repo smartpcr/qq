@@ -183,17 +183,9 @@ internal sealed class SlackInboundAuditRecorder
         SlackAuditEntry entry = new()
         {
             Id = id,
-
-            // Stage 8.2 (AC-6): inbound interactions (block_actions /
-            // view_submission) inherit the business correlation id
-            // resolved by the handler from the thread mapping, not
-            // their per-click `interact:<...>` envelope key. When no
-            // handler stamps a value (events, slash commands, or an
-            // interaction without a resolvable thread mapping), the
-            // recorder falls back to envelope.IdempotencyKey unchanged
-            // so the inbound slash_command / app_mention / event rows
-            // still anchor on their derived idempotency key.
-            CorrelationId = ResolveCorrelationId(envelope, id),
+            CorrelationId = string.IsNullOrEmpty(envelope.IdempotencyKey)
+                ? id
+                : envelope.IdempotencyKey,
             AgentId = null,
             TaskId = null,
             ConversationId = conversationId,
@@ -232,35 +224,5 @@ internal sealed class SlackInboundAuditRecorder
                 envelope.TeamId,
                 envelope.UserId);
         }
-    }
-
-    /// <summary>
-    /// Picks the value persisted into
-    /// <see cref="SlackAuditEntry.CorrelationId"/> for an inbound row.
-    /// Stage 8.2 (AC-6): the
-    /// <see cref="SlackInteractionHandler"/> stamps the resolved
-    /// business correlation id via
-    /// <see cref="SlackInboundResolvedCorrelationContext"/> after it
-    /// reads the thread mapping; that value -- when present -- wins
-    /// so the inbound interaction row joins the originating slash
-    /// command and the agent's outbound rows under a single
-    /// correlation id. Falls back to the envelope-derived idempotency
-    /// key (the historical behaviour) and finally to the row id when
-    /// neither is available.
-    /// </summary>
-    private static string ResolveCorrelationId(SlackInboundEnvelope envelope, string rowId)
-    {
-        string? resolved = SlackInboundResolvedCorrelationContext.Get();
-        if (!string.IsNullOrEmpty(resolved))
-        {
-            return resolved!;
-        }
-
-        if (!string.IsNullOrEmpty(envelope.IdempotencyKey))
-        {
-            return envelope.IdempotencyKey!;
-        }
-
-        return rowId;
     }
 }

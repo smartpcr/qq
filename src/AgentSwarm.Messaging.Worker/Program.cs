@@ -1,8 +1,13 @@
-// -----------------------------------------------------------------------
-// <copyright file="Program.cs" company="Microsoft Corp.">
-//     Copyright (c) Microsoft Corp. All rights reserved.
-// </copyright>
-// -----------------------------------------------------------------------
+using AgentSwarm.Messaging.Core.Secrets;
+using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Persistence;
+using AgentSwarm.Messaging.Slack.Pipeline;
+using AgentSwarm.Messaging.Slack.Queues;
+using AgentSwarm.Messaging.Slack.Security;
+using AgentSwarm.Messaging.Slack.Transport;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 
 namespace AgentSwarm.Messaging.Worker;
 
@@ -58,10 +63,23 @@ public class Program
     public const string SlackAuditConnectionStringKey = "SlackAudit";
 
     /// <summary>
-    /// Default SQLite connection string used when the host's
-    /// configuration does not supply <see cref="SlackAuditConnectionStringKey"/>.
+    /// Configuration key (boolean) that gates the opt-in for the
+    /// no-op Slack handler stand-ins
+    /// (<see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>).
+    /// When unset, defaults to
+    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>:
+    /// Development hosts wire the stubs so the ingestor pipeline
+    /// resolves on a dev laptop; Production / Staging / Testing
+    /// hosts surface a fail-loud
+    /// <see cref="InvalidOperationException"/> from the pipeline ctor
+    /// the first time the ingestor lazily resolves it (the ingestor
+    /// then forwards the envelope to the last-resort
+    /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> instead of
+    /// silently ack-and-dropping it). Operators can explicitly opt
+    /// in (<c>true</c>) or out (<c>false</c>) per environment.
     /// </summary>
-    public const string DefaultSlackAuditConnectionString = "Data Source=slack-audit.db";
+    public const string EnableDevelopmentHandlerStubsKey =
+        "Slack:Inbound:EnableDevelopmentHandlerStubs";
 
     public static void Main(string[] args)
     {
@@ -176,6 +194,110 @@ public class Program
             })
             .AddSlackInboundControllers();
 
+        // Stage 4.1: register the inbound HTTP transport services
+        // (envelope factory, in-process ISlackInboundQueue, default
+        // modal fast-path handler). The TryAdd-style bindings let a
+        // future composition root swap in durable queue implementations
+        // (Service Bus, SQL outbox/inbox) supplied by
+        // AgentSwarm.Messaging.Core without changing this call site.
+        builder.Services.AddSlackInboundTransport();
+
+        // Stage 4.2: register the Socket Mode WebSocket transport
+        // services (connection factory, transport-factory selector,
+        // SlackSocketModeOptions) AND the
+        // SlackInboundTransportHostedService that enumerates
+        // ISlackWorkspaceConfigStore on host boot and starts the
+        // appropriate transport per workspace. Binding builder.Configuration
+        // exposes the Slack:SocketMode section so operators can override
+        // reconnect bounds, ACK timeout, and receive-buffer size from
+        // appsettings.json / environment variables without rebuilding.
+        builder.Services.AddSlackSocketModeTransport(builder.Configuration);
+
+        // Stage 4.1 (evaluator iter-3 item 2): swap the default
+        // in-process-only ISlackFastPathIdempotencyStore for the
+        // durable two-level composite (in-process L1 + EF L2 backed by
+        // the slack_inbound_request_record table). Without this call
+        // the modal fast-path falls back to in-memory dedup that does
+        // not survive a process restart, allowing a Slack retry that
+        // crosses a deployment to open a second modal for the same
+        // trigger_id.
+        builder.Services
+            .AddSlackFastPathDurableIdempotency<SlackPersistenceDbContext>();
+
+        // Stage 4.3 iter 6 evaluator item #2: opt the Worker into the
+        // disk-backed dead-letter queue BEFORE the ingestor wires its
+        // own TryAdd<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>
+        // default. The in-memory default loses every exhausted-retry
+        // envelope on a process restart, which contradicts the story's
+        // FR-005 / FR-007 zero-loss requirement and the operator
+        // attachment's "Reliability" cell. The directory is configurable
+        // via Slack:Inbound:DeadLetterQueueDirectory and defaults to a
+        // relative "data/slack-dead-letter" path so the wiring is never
+        // accidentally skipped.
+        string dlqDir = builder.Configuration["Slack:Inbound:DeadLetterQueueDirectory"]
+            ?? "data/slack-dead-letter";
+        if (!string.IsNullOrWhiteSpace(dlqDir))
+        {
+            builder.Services.AddFileSystemSlackDeadLetterQueue(dlqDir);
+        }
+
+        // Stage 4.3 (workstream:
+        // ws-qq-slack-messenger-supp-phase-inbound-transport-stage-inbound-ingestor-and-deduplication):
+        // register the SlackInboundIngestor BackgroundService and the
+        // full processing pipeline (EF-backed idempotency guard,
+        // envelope authorizer, retry policy, in-memory DLQ,
+        // routing-by-source-type, audit recorder). Without this call
+        // envelopes pushed onto ISlackInboundQueue by Stage 4.1 /
+        // 4.2 transports would accumulate forever -- the BackgroundService
+        // is the dedicated drainer required by Stage 4.3 of
+        // implementation-plan.md. Must follow
+        // AddSlackFastPathDurableIdempotency so the guard's EF
+        // SlackInboundRequestRecord wiring is already in DI.
+        builder.Services
+            .AddSlackInboundIngestor<SlackPersistenceDbContext>();
+
+        // Gate the no-op handler stand-ins on
+        // Slack:Inbound:EnableDevelopmentHandlerStubs (defaults: true
+        // in Development, false elsewhere). Production / Staging /
+        // Testing hosts without real Stage 5 handlers therefore fail
+        // loudly the first time the ingestor lazily resolves the
+        // pipeline; the resolve-failure envelope is forwarded to the
+        // last-resort ISlackInboundEnqueueDeadLetterSink so nothing
+        // is lost. The host itself still starts cleanly so health
+        // probes, signature middleware, and the audit schema
+        // bootstrap remain available. Operators override the gate
+        // explicitly via configuration.
+        //
+        // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this gate
+        // with real handler registrations (5.1 command dispatcher,
+        // 5.2 @mention dispatcher, 5.3 interaction -> HumanDecisionEvent
+        // dispatcher) and delete both the constant and the opt-in
+        // call. The production Worker MUST NOT ship the no-op stubs
+        // once real handlers exist.
+        if (ShouldEnableDevelopmentHandlerStubs(builder))
+        {
+            builder.Services.AddSlackInboundDevelopmentHandlerStubs();
+        }
+
+        // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the
+        // durable file-system dead-letter sink for post-ACK enqueue
+        // failures. The default registration inside
+        // AddSlackInboundTransport is InMemorySlackInboundEnqueueDeadLetterSink,
+        // which loses captured envelopes on process restart -- the
+        // operator-uploaded story attachment's FR-005 / FR-007
+        // "no message loss" requirements (and the iter-4 evaluator)
+        // require durable persistence so a worker restart cannot
+        // erase the recovery log. Hosts configure the destination via
+        // Slack:Inbound:DeadLetterDirectory; the default value points
+        // at a relative "data/slack-inbound-dead-letter" path so a
+        // missing config does NOT silently fall back to in-memory.
+        string deadLetterDir = builder.Configuration["Slack:Inbound:DeadLetterDirectory"]
+            ?? "data/slack-inbound-dead-letter";
+        if (!string.IsNullOrWhiteSpace(deadLetterDir))
+        {
+            builder.Services.AddFileSystemSlackInboundEnqueueDeadLetterSink(deadLetterDir);
+        }
+
         WebApplication app = builder.Build();
 
         // Stage 4.1 iter-2 evaluator item 3: fail-fast at host startup
@@ -226,5 +348,50 @@ public class Program
         app.MapControllers();
 
         return app;
+    }
+
+    private static void AddSlackAuditPersistence(WebApplicationBuilder builder)
+    {
+        // Resolve the connection string LAZILY via the runtime
+        // IServiceProvider so any IConfiguration overrides applied by a
+        // WebApplicationFactory<Program> hook (e.g., the Stage 3.1
+        // integration tests' per-test isolated SQLite path) are honoured
+        // -- a builder-time read of builder.Configuration would lock in
+        // the appsettings.json default before the hook runs.
+        builder.Services.AddDbContext<SlackPersistenceDbContext>((sp, opts) =>
+        {
+            IConfiguration cfg = sp.GetRequiredService<IConfiguration>();
+            string? connectionString = cfg.GetConnectionString(SlackAuditConnectionStringKey);
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                connectionString = "Data Source=slack-audit.db";
+            }
+
+            opts.UseSqlite(connectionString);
+        });
+
+        builder.Services.AddSlackEntityFrameworkAuditWriter<SlackPersistenceDbContext>();
+    }
+
+    /// <summary>
+    /// Resolves the opt-in gate for the no-op Slack handler stand-ins.
+    /// Reads the <see cref="EnableDevelopmentHandlerStubsKey"/> value
+    /// as a boolean; if absent or unparseable, defaults to
+    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>.
+    /// The gate is environment-defaulted, not environment-locked, so
+    /// an operator can force the stubs on in Production for a smoke
+    /// test or force them off on a dev laptop for a fail-fast check.
+    /// </summary>
+    internal static bool ShouldEnableDevelopmentHandlerStubs(WebApplicationBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        string? raw = builder.Configuration[EnableDevelopmentHandlerStubsKey];
+        if (!string.IsNullOrWhiteSpace(raw) && bool.TryParse(raw, out bool explicitValue))
+        {
+            return explicitValue;
+        }
+
+        return builder.Environment.IsDevelopment();
     }
 }
