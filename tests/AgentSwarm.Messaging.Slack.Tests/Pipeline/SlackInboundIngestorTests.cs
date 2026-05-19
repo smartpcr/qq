@@ -149,20 +149,20 @@ public sealed class SlackInboundIngestorTests
     [Fact]
     public async Task ExecuteAsync_forwards_envelope_to_fallback_sink_when_pipeline_throws_SlackInboundDeadLetterEnqueueException()
     {
-        // Iter 3 evaluator item #1: if the DLQ backend itself fails
-        // after the handler exhausted its retry budget, the
-        // ingestor's outer catch USED to swallow the throw, leaving
-        // the dequeued envelope completely lost (ISlackInboundQueue
-        // has no nack/requeue). The fix: forward the envelope to the
-        // last-resort ISlackInboundEnqueueDeadLetterSink so the
-        // payload is durably observable (bounded ring buffer +
-        // LogCritical by default; upgradeable to JSONL on disk).
+        // If the DLQ backend itself fails after the handler exhausts
+        // its retry budget, the ingestor's outer catch USED to swallow
+        // the throw, leaving the dequeued envelope completely lost
+        // (ISlackInboundQueue has no nack/requeue). The fix: forward
+        // the envelope to the last-resort
+        // ISlackInboundEnqueueDeadLetterSink so the payload is
+        // durably observable (bounded ring buffer + LogCritical by
+        // default; upgradeable to JSONL on disk).
         FakeQueue queue = new();
         SlackInboundEnvelope deadletteredEnvelope = BuildCommandEnvelope("cmd:T1:U1:/agent:trig-dlq-fail");
 
         // Pipeline is wired so the handler always throws AND the DLQ
-        // backend throws, exercising the exact code path the iter-3
-        // fix targets.
+        // backend throws, exercising the exact code path the fallback
+        // sink protects.
         SlackInboundProcessingPipeline pipeline = BuildPipelineThatThrowsOnDlqEnqueue();
 
         RecordingDeadLetterFallbackSink sink = new();
@@ -192,8 +192,8 @@ public sealed class SlackInboundIngestorTests
     [Fact]
     public async Task ExecuteAsync_forwards_envelope_to_fallback_sink_when_pipeline_throws_generic_exception_outside_DLQ_path()
     {
-        // Iter 6 evaluator item #1: when the pipeline propagates an
-        // exception that is NOT the DLQ-enqueue specific one (e.g.,
+        // When the pipeline propagates an exception that is NOT the
+        // DLQ-enqueue specific one (e.g.,
         // SlackIdempotencyGuard.TryAcquireAsync re-throws a transient
         // DbUpdateException with no competing row, per
         // SlackIdempotencyGuardDbFailureTests), the ingestor's
@@ -362,15 +362,15 @@ public sealed class SlackInboundIngestorTests
     [Fact]
     public async Task ExecuteAsync_forwards_envelope_to_fallback_sink_when_FileSystemSlackDeadLetterQueue_throws_persistence_failure()
     {
-        // Iter 8 evaluator item #2: the only pre-existing DLQ-failure
-        // coverage uses a synthetic ThrowingDeadLetterQueue. This test
-        // proves the same fallback contract holds end-to-end against
-        // the REAL FileSystemSlackDeadLetterQueue: a sharing-violation
-        // on the JSONL append (modeled by holding an exclusive write
-        // lock on the target file) MUST propagate through the queue
-        // -> pipeline -> ingestor chain to land the envelope in the
-        // last-resort ISlackInboundEnqueueDeadLetterSink. Without this
-        // end-to-end pin, the structural fix in
+        // The synthetic ThrowingDeadLetterQueue covers the unit-level
+        // contract; this end-to-end test proves the same fallback
+        // contract holds against the REAL FileSystemSlackDeadLetterQueue.
+        // A sharing-violation on the JSONL append (modeled by holding
+        // an exclusive write lock on the target file) MUST propagate
+        // through the queue -> pipeline -> ingestor chain to land the
+        // envelope in the last-resort
+        // ISlackInboundEnqueueDeadLetterSink. Without this end-to-end
+        // pin, the structural fix in
         // FileSystemSlackDeadLetterQueue.EnqueueAsync could regress
         // silently because no test exercises the real wire path.
         string tempDir = Path.Combine(
@@ -493,13 +493,13 @@ public sealed class SlackInboundIngestorTests
     /// <summary>
     /// Builds a minimal <see cref="IServiceProvider"/> wired with the
     /// pipeline + fallback sink instances the test wants the ingestor
-    /// to resolve at runtime. Mirrors the iter-2 lazy-resolution
-    /// signature of <see cref="SlackInboundIngestor"/>: the ingestor's
-    /// ctor no longer ctor-injects the pipeline so it can boot even
-    /// when no Stage 5 handlers are registered; the resolution happens
-    /// on the first dequeued envelope. Tests that already build a
-    /// concrete pipeline up-front just register it as a singleton on
-    /// the test-local <see cref="ServiceCollection"/>.
+    /// to resolve at runtime. Mirrors the lazy-resolution signature of
+    /// <see cref="SlackInboundIngestor"/>: the ingestor's ctor does
+    /// NOT ctor-inject the pipeline so it can boot even when no Stage
+    /// 5 handlers are registered; resolution happens on the first
+    /// dequeued envelope. Tests that already build a concrete pipeline
+    /// up-front just register it as a singleton on the test-local
+    /// <see cref="ServiceCollection"/>.
     /// </summary>
     private static IServiceProvider BuildIngestorServices(
         SlackInboundProcessingPipeline pipeline,
@@ -760,7 +760,7 @@ public sealed class SlackInboundIngestorTests
     /// transient DB failure without a competing row MUST propagate
     /// (per <c>SlackIdempotencyGuardDbFailureTests</c>) rather than
     /// silently dropping the envelope as a duplicate. Used by the
-    /// iter-6 catch-all-forwarding test.
+    /// generic catch-all forwarding test.
     /// </summary>
     private sealed class ThrowingGuard : ISlackIdempotencyGuard
     {

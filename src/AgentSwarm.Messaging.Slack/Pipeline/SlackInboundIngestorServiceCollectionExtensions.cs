@@ -48,15 +48,15 @@ public static class SlackInboundIngestorServiceCollectionExtensions
     /// </para>
     /// <para>
     /// <b>Handler registrations are intentionally OUT-OF-BAND.</b>
-    /// Earlier iters registered <see cref="NoOpSlackCommandHandler"/>,
+    /// Registering <see cref="NoOpSlackCommandHandler"/>,
     /// <see cref="NoOpSlackAppMentionHandler"/>, and
-    /// <see cref="NoOpSlackInteractionHandler"/> as production
-    /// defaults; a host that forgot to register real Stage 5 handlers
-    /// would silently ack-and-drop every Slack request because the
-    /// no-op completes the envelope and the idempotency guard marks
-    /// it <c>completed</c>. To eliminate that silent-loss class of
-    /// bug, this extension does NOT register the no-op handlers. A
-    /// host without <see cref="ISlackCommandHandler"/> /
+    /// <see cref="NoOpSlackInteractionHandler"/> as production defaults
+    /// would mean a host that forgot to register real Stage 5 handlers
+    /// silently acks-and-drops every Slack request because the no-op
+    /// completes the envelope and the idempotency guard marks it
+    /// <c>completed</c>. To eliminate that silent-loss class of bug,
+    /// this extension does NOT register the no-op handlers. A host
+    /// without <see cref="ISlackCommandHandler"/> /
     /// <see cref="ISlackAppMentionHandler"/> /
     /// <see cref="ISlackInteractionHandler"/> registrations gets an
     /// <see cref="InvalidOperationException"/> from the pipeline ctor
@@ -64,8 +64,8 @@ public static class SlackInboundIngestorServiceCollectionExtensions
     /// resolves it for a dequeued envelope; the ingestor forwards
     /// that envelope to the durable last-resort
     /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> so the host
-    /// still starts cleanly and the envelope is preserved. Dev
-    /// hosts that want the no-op stand-ins opt in via
+    /// still starts cleanly and the envelope is preserved. Dev hosts
+    /// that want the no-op stand-ins opt in via
     /// <see cref="AddSlackInboundDevelopmentHandlerStubs"/>.
     /// </para>
     /// </remarks>
