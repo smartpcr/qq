@@ -178,26 +178,37 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
     }
 
     /// <summary>
-    /// Status-code map used by all three mapped endpoints. Stage 6.3 contract,
-    /// aligned with the ASP.NET Core / k8s readiness-probe convention:
+    /// Status-code map used by all three mapped endpoints. Stage 6.3 contract:
     /// <list type="bullet">
     ///   <item><description><see cref="HealthStatus.Healthy"/> → 200 OK</description></item>
-    ///   <item><description><see cref="HealthStatus.Degraded"/> → 200 OK. A degraded
-    ///   pod is still able to serve traffic; the k8s readiness probe should NOT pull
-    ///   it from the service backend on a soft degradation, otherwise an operator
-    ///   has zero ability to investigate (the pod is gone). The §6.3 scenario
-    ///   asserts on the response <b>body</b> containing <c>"Degraded"</c> (and the
-    ///   substring <c>"ConversationReferenceStore: Unhealthy"</c>) — it does NOT
-    ///   constrain the HTTP status code — so 200 satisfies the scenario while
-    ///   matching the framework default (<see cref="HealthCheckOptions.ResultStatusCodes"/>
-    ///   defaults Degraded to 200 OK).</description></item>
+    ///   <item><description><see cref="HealthStatus.Degraded"/> → 503 Service
+    ///   Unavailable. <b>This is a deliberate deviation from the ASP.NET Core default
+    ///   (Degraded → 200).</b> Rationale below and inline at the literal.</description></item>
     ///   <item><description><see cref="HealthStatus.Unhealthy"/> → 503 Service
-    ///   Unavailable. This is the only status that flips the readiness probe to
-    ///   "not ready" and removes the pod from the service backend, reserving the
-    ///   disruptive action for the case it is actually warranted.</description></item>
+    ///   Unavailable</description></item>
     /// </list>
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>Why Degraded → 503 instead of the ASP.NET default 200.</b> The §6.3
+    /// acceptance scenario fires when <see cref="ConversationReferenceStoreHealthCheck"/>
+    /// reports <c>Unhealthy</c> while <see cref="BotFrameworkConnectivityHealthCheck"/>
+    /// and <see cref="Security.TeamsAppPolicyHealthCheck"/> stay <c>Healthy</c>; the
+    /// aggregate verdict is therefore <c>Degraded</c>. For a Teams messenger bot, a
+    /// broken reference store means the connector literally cannot resolve a
+    /// recipient address — every outbound proactive message will fail until the
+    /// store is restored. Leaving such a pod in the readiness pool (the default
+    /// 200 behavior) would route fresh traffic into a sink that cannot deliver. The
+    /// §6.3 reliability contract therefore treats Degraded as <i>"do not send new
+    /// work here"</i>, which means readiness must fail-out → 503. Hosts that want
+    /// the default ASP.NET semantics (Degraded keeps serving) should NOT use
+    /// <see cref="MapTeamsHealthChecks(IEndpointRouteBuilder, string, Func{HttpContext, HealthReport, Task}?)"/>
+    /// and should instead register their own <c>MapHealthChecks</c> with
+    /// <see cref="HealthCheckOptions.ResultStatusCodes"/> left at its framework
+    /// default; the Teams-tagged checks are still discoverable via the
+    /// <see cref="TeamsTag"/> filter.
+    /// </para>
+    /// <para>
     /// Exposed as <see cref="IReadOnlyDictionary{TKey, TValue}"/> rather than
     /// <see cref="IDictionary{TKey, TValue}"/> so that callers cannot mutate this
     /// shared singleton via <c>Add</c>/<c>Remove</c>/indexer-set — a silent
@@ -210,11 +221,25 @@ public static class TeamsHealthCheckEndpointRouteBuilderExtensions
     /// of the canonical map. Hosts that need a different status-code mapping should
     /// not mutate this property; instead, supply their own <see cref="HealthCheckOptions"/>
     /// through the standard <c>MapHealthChecks</c> overload.
+    /// </para>
     /// </remarks>
     public static readonly IReadOnlyDictionary<HealthStatus, int> ResponseStatusCodes = new Dictionary<HealthStatus, int>
     {
         [HealthStatus.Healthy] = StatusCodes.Status200OK,
-        [HealthStatus.Degraded] = StatusCodes.Status200OK,
+
+        // DELIBERATE DEVIATION from the ASP.NET Core default (Degraded → 200).
+        // For the §6.3 readiness contract, Degraded means "at least one Teams
+        // dependency (typically ConversationReferenceStore) is Unhealthy while
+        // the others are Healthy". A Teams bot cannot deliver messages without a
+        // functional reference store, so the pod MUST be pulled from the k8s
+        // readiness pool until the dependency recovers — that requires 503, not
+        // 200. The ASP.NET default is appropriate for stateless web APIs where
+        // "degraded" usually means a non-critical sidecar (cache, telemetry sink)
+        // is misbehaving; the Teams stage cannot make that assumption because
+        // every check it registers is on the critical path for message delivery.
+        // See the <remarks> on ResponseStatusCodes for the full rationale and the
+        // escape-hatch for hosts that want the default 200 behavior.
+        [HealthStatus.Degraded] = StatusCodes.Status503ServiceUnavailable,
         [HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable,
     };
 
