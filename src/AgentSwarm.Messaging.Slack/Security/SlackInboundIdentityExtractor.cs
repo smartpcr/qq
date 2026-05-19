@@ -150,6 +150,16 @@ internal static class SlackInboundIdentityExtractor
                 teamId = ReadStringProperty(teamObj, "id");
             }
 
+            // Stage 4.1 iter-2 evaluator item 1: capture the top-level
+            // payload discriminator so SlackAuthorizationFilter can
+            // recognise view_submission modals (which Slack delivers
+            // with no channel context) and let them through the
+            // channel ACL while still enforcing workspace + user-group
+            // ACL. The value is the raw Slack `type` field --
+            // url_verification, event_callback, block_actions,
+            // view_submission, etc.
+            string? payloadType = ReadStringProperty(root, "type");
+
             string? channelId = null;
             string? userId = null;
 
@@ -195,7 +205,10 @@ internal static class SlackInboundIdentityExtractor
                 }
             }
 
-            return new SlackInboundIdentity(teamId, channelId, userId, CommandText: null);
+            return new SlackInboundIdentity(teamId, channelId, userId, CommandText: null)
+            {
+                PayloadType = payloadType,
+            };
         }
         catch (JsonException)
         {
@@ -293,6 +306,23 @@ internal readonly record struct SlackInboundIdentity(
     string? UserId,
     string? CommandText)
 {
+    /// <summary>
+    /// Optional raw Slack payload discriminator (<c>type</c>) -- e.g.,
+    /// <c>url_verification</c>, <c>event_callback</c>,
+    /// <c>block_actions</c>, <c>view_submission</c>. Populated by the
+    /// JSON parser path (Events API callbacks and interaction
+    /// payloads); form-encoded slash commands leave it
+    /// <see langword="null"/>.
+    /// </summary>
+    /// <remarks>
+    /// Stage 4.1 iter-2 evaluator item 1:
+    /// <see cref="SlackAuthorizationFilter"/> reads
+    /// <c>PayloadType == "view_submission"</c> to skip the channel
+    /// ACL on modal submissions, which Slack delivers without a
+    /// <c>channel.id</c> by design (architecture.md §5.3).
+    /// </remarks>
+    public string? PayloadType { get; init; }
+
     /// <summary>An identity record with every field <see langword="null"/>.</summary>
     public static SlackInboundIdentity Empty { get; } = new(null, null, null, null);
 

@@ -329,6 +329,93 @@ public static class SlackInboundTransportServiceCollectionExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Configuration key (under the <c>Slack:Inbound:Queue</c>
+    /// section) that an operator can set to <c>true</c> to explicitly
+    /// opt into the in-process <see cref="ChannelBasedSlackInboundQueue"/>
+    /// in a Production environment. Leaving it absent or
+    /// <c>false</c> (the default) makes
+    /// <see cref="EnsureDurableInboundQueueForProduction"/> throw at
+    /// host startup if no durable implementation has been wired,
+    /// preventing accidental message loss on Worker restarts.
+    /// </summary>
+    public const string AllowInMemoryQueueInProductionConfigKey =
+        "Slack:Inbound:Queue:AllowInMemoryInProduction";
+
+    /// <summary>
+    /// Validates -- at host build time, after
+    /// <see cref="Microsoft.AspNetCore.Builder.WebApplication"/> is
+    /// fully composed -- that the resolved
+    /// <see cref="ISlackInboundQueue"/> satisfies the reliability
+    /// contract for the current
+    /// <see cref="IHostEnvironment.EnvironmentName"/>. In Production
+    /// the in-process
+    /// <see cref="ChannelBasedSlackInboundQueue"/> is REJECTED
+    /// (because process restarts drop every buffered envelope,
+    /// violating FR-005 / FR-007 "no message loss" from
+    /// <c>agent_swarm_messenger_user_stories.md</c>) unless the
+    /// operator has explicitly opted in via
+    /// <see cref="AllowInMemoryQueueInProductionConfigKey"/>=true.
+    /// Non-Production environments (Development, Staging, custom
+    /// names) accept the in-memory queue without complaint so local
+    /// dev and CI keep working.
+    /// </summary>
+    /// <remarks>
+    /// Stage 4.1 iter-2 evaluator item 3. The guard is intentionally
+    /// limited to <see cref="ISlackInboundQueue"/> -- the durable
+    /// dead-letter sink is already enforced separately by
+    /// <see cref="AddFileSystemSlackInboundEnqueueDeadLetterSink"/>
+    /// -- so it fires once per host boot and produces a precise
+    /// error message that tells the operator exactly which
+    /// configuration knob unlocks the in-memory default.
+    /// </remarks>
+    /// <param name="services">
+    /// Built service provider (typically
+    /// <see cref="Microsoft.AspNetCore.Builder.WebApplication.Services"/>).
+    /// </param>
+    /// <param name="environment">Host environment metadata.</param>
+    /// <param name="configuration">Host configuration.</param>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the host is running in Production and the
+    /// resolved <see cref="ISlackInboundQueue"/> is the in-process
+    /// <see cref="ChannelBasedSlackInboundQueue"/> without an
+    /// explicit <see cref="AllowInMemoryQueueInProductionConfigKey"/>
+    /// opt-in.
+    /// </exception>
+    public static void EnsureDurableInboundQueueForProduction(
+        this IServiceProvider services,
+        IHostEnvironment environment,
+        IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(environment);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        if (!environment.IsProduction())
+        {
+            return;
+        }
+
+        bool allowInMemory = configuration.GetValue<bool>(AllowInMemoryQueueInProductionConfigKey);
+        if (allowInMemory)
+        {
+            return;
+        }
+
+        ISlackInboundQueue queue = services.GetRequiredService<ISlackInboundQueue>();
+        if (queue is ChannelBasedSlackInboundQueue)
+        {
+            throw new InvalidOperationException(
+                "Slack inbound queue is the in-process ChannelBasedSlackInboundQueue, which is not durable across "
+                + $"process restarts and therefore cannot satisfy FR-005/FR-007 \"no message loss\" in the {environment.EnvironmentName} environment. "
+                + "Register a durable ISlackInboundQueue implementation (e.g., an Azure Service Bus or RabbitMQ-backed queue) "
+                + "BEFORE calling AddSlackInboundTransport(); or, if you have validated that an in-memory queue is acceptable "
+                + $"for this deployment (single-instance, transient workloads, behind retries), set the configuration key "
+                + $"'{AllowInMemoryQueueInProductionConfigKey}=true' to acknowledge the trade-off explicitly. "
+                + "Stage 4.1 iter-2 evaluator item 3.");
+        }
+    }
 }
 
 /// <summary>

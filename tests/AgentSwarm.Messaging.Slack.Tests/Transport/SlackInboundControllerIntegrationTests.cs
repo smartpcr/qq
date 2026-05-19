@@ -191,6 +191,72 @@ public sealed class SlackInboundControllerIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Scenario_view_submission_payload_authorized_without_channel_id_returns_http_200()
+    {
+        // Stage 4.1 iter-2 evaluator item 1: a Slack view_submission
+        // (modal form submission) payload is not channel-scoped --
+        // Slack delivers it with no channel.id; the modal's origin is
+        // conveyed via view.private_metadata instead. The Stage 3.2
+        // SlackAuthorizationFilter, when run inside the full Worker
+        // MVC pipeline, MUST recognise the view_submission payload
+        // type and skip the channel allow-list rejection so the
+        // authorized modal submission reaches
+        // /api/slack/interactions and is enqueued for HumanDecisionEvent
+        // conversion downstream (Stage 5.3).
+        //
+        // The earlier controller-level test
+        // (SlackInteractionsControllerTests.View_submission_payload_enqueues_envelope_and_returns_200)
+        // bypassed MVC filters; this test exercises the real wiring:
+        // signature middleware -> SlackAuthorizationFilter (global) ->
+        // SlackInteractionsController.Post -> queue. If the filter
+        // were to fall back to its pre-fix behaviour and reject
+        // view_submission payloads on missing channel_id, the queue
+        // would stay empty and the envelope would never reach the
+        // ingestor.
+        using SlackTransportPipelineFactory factory = this.CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        string json = $$"""
+            {
+              "type": "view_submission",
+              "trigger_id": "trig.MODAL",
+              "team": { "id": "{{TestTeamId}}" },
+              "user": { "id": "{{TestUserId}}" },
+              "view": {
+                "id": "V_modal_42",
+                "callback_id": "review_modal",
+                "private_metadata": "{\"correlation_id\":\"corr-42\"}",
+                "state": { "values": {} }
+              }
+            }
+            """;
+        string body = "payload=" + Uri.EscapeDataString(json);
+
+        using HttpRequestMessage request = BuildSignedFormRequest("/api/slack/interactions", body);
+        using HttpResponseMessage response = await client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK,
+            "view_submission payloads from authorized users MUST traverse the full pipeline and reach the controller for HTTP 200 ACK");
+
+        string responseBody = await response.Content.ReadAsStringAsync();
+        responseBody.Should().NotContain("\"response_type\":\"ephemeral\"",
+            "an ephemeral rejection body would mean the SlackAuthorizationFilter rejected the modal submission; the full-pipeline view_submission path must pass the ACL");
+
+        ISlackInboundQueue queue = factory.Services.GetRequiredService<ISlackInboundQueue>();
+        SlackInboundEnvelope envelope = await DequeueWithTimeoutAsync(queue);
+
+        envelope.SourceType.Should().Be(SlackInboundSourceType.Interaction);
+        envelope.TeamId.Should().Be(TestTeamId);
+        envelope.UserId.Should().Be(TestUserId);
+        envelope.ChannelId.Should().BeNull(
+            "view_submission payloads are not channel-scoped per architecture.md §5.3");
+        envelope.TriggerId.Should().Be("trig.MODAL");
+        envelope.IdempotencyKey.Should().Be(
+            $"interact:{TestTeamId}:{TestUserId}:V_modal_42:trig.MODAL",
+            "view_submission payloads anchor the idempotency key on view.id so a Slack retry hits the same dedupe row");
+    }
+
+    [Fact]
     public async Task Replayed_event_callback_produces_stable_idempotency_key()
     {
         // Brief acceptance criterion: "Slack event retries do not

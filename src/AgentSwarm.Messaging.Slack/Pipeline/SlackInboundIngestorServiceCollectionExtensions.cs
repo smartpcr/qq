@@ -87,6 +87,23 @@ public static class SlackInboundIngestorServiceCollectionExtensions
         // through.
         services.TryAddSingleton<ISlackInboundAuthorizer, SlackInboundAuthorizer>();
 
+        // Stage 8.2 AC-5: the authorizer posts a "rejected" ephemeral
+        // back to the originating user via response_url on the async
+        // pipeline path. The command / interaction dispatch extensions
+        // both register HttpClientSlackEphemeralResponder under TryAdd
+        // already, so a host that wires either of them wins; this
+        // duplicate TryAdd defensively covers a host that wires the
+        // ingestor (and therefore the authorizer) WITHOUT wiring
+        // either dispatch extension -- a Socket-Mode-only deployment
+        // can be in exactly that shape, and an unresolvable
+        // ISlackEphemeralResponder would surface as an opaque DI
+        // failure at the first envelope rejection. The named
+        // HttpClient registration mirrors the one in the dispatch
+        // extensions; AddHttpClient is idempotent on (name) so a
+        // duplicate is harmless.
+        services.AddHttpClient(HttpClientSlackEphemeralResponder.HttpClientName);
+        services.TryAddSingleton<ISlackEphemeralResponder, HttpClientSlackEphemeralResponder>();
+
         // Retry policy. The fast-path / outbound stages also resolve
         // ISlackRetryPolicy; using TryAdd lets either side win and
         // ensures both share the same backoff configuration.

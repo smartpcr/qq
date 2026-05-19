@@ -112,9 +112,22 @@ internal readonly record struct SlackInboundEnvelopeAuditFields(
 
     private static SlackInboundEnvelopeAuditFields ExtractCommand(string raw)
     {
-        IDictionary<string, StringValues> fields = QueryHelpers.ParseQuery(raw);
-        string? command = GetFormValue(fields, "command");
-        string? text = GetFormValue(fields, "text");
+        // Iter-8 evaluator item #1 follow-on (production audit gap):
+        // Slack delivers slash commands as form-encoded text on the
+        // HTTP transport AND as a JSON object on the Socket Mode
+        // transport (architecture.md §3.4); the
+        // SlackSocketModePayloadNormalizer stamps the raw JSON
+        // verbatim onto envelope.RawPayload. Previously this helper
+        // form-decoded every body, which silently turned every
+        // Socket Mode slash-command rejection into a rejected_auth
+        // row with CommandText=null -- the audit-completeness bug
+        // story FR-008 "Audit" prohibits. Delegate to the parser's
+        // auto-detecting ParseCommand so this helper is symmetric
+        // with the parser SlackCommandHandler already uses for the
+        // command-execution path.
+        SlackCommandPayload payload = SlackInboundPayloadParser.ParseCommand(raw);
+        string? command = payload.Command;
+        string? text = payload.Text;
 
         string? commandText = (command, text) switch
         {
@@ -132,6 +145,29 @@ internal readonly record struct SlackInboundEnvelopeAuditFields(
 
     private static SlackInboundEnvelopeAuditFields ExtractInteraction(string raw)
     {
+        // Iter-9 evaluator item #1 fix (production audit gap symmetric
+        // with the Stage-8 ExtractCommand fix): Slack delivers
+        // interactive payloads as form-encoded text on the HTTP
+        // transport (`payload=<URL-encoded JSON>`) AND as raw JSON on
+        // the Socket Mode transport (architecture.md §3.4); the
+        // SlackSocketModePayloadNormalizer stamps the raw JSON
+        // verbatim onto envelope.RawPayload (Transport/
+        // SlackSocketModePayloadNormalizer.cs:168). Previously this
+        // helper form-decoded every body, silently turning every
+        // pipeline-side rejected Socket Mode button click / modal
+        // submission into a rejected_auth row with CommandText=null,
+        // ThreadTs=null, and MessageTs=null -- the same audit-
+        // completeness bug story FR-008 "Audit" prohibits. Auto-
+        // detecting the body encoding by inspecting the first non-
+        // whitespace char (the same heuristic
+        // SlackInboundPayloadParser.ParseCommand uses for commands)
+        // makes the helper symmetric across both transports without
+        // needing the caller to know which one delivered the payload.
+        if (LooksLikeJsonObject(raw))
+        {
+            return ExtractInteractionJson(raw);
+        }
+
         IDictionary<string, StringValues> fields = QueryHelpers.ParseQuery(raw);
         if (!fields.TryGetValue("payload", out StringValues payloadValues) || StringValues.IsNullOrEmpty(payloadValues))
         {
@@ -139,6 +175,22 @@ internal readonly record struct SlackInboundEnvelopeAuditFields(
         }
 
         return ExtractInteractionJson(payloadValues.ToString());
+    }
+
+    private static bool LooksLikeJsonObject(string body)
+    {
+        for (int i = 0; i < body.Length; i++)
+        {
+            char c = body[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            {
+                continue;
+            }
+
+            return c == '{';
+        }
+
+        return false;
     }
 
     private static SlackInboundEnvelopeAuditFields ExtractInteractionJson(string json)
@@ -237,13 +289,6 @@ internal readonly record struct SlackInboundEnvelopeAuditFields(
             CommandText: commandText,
             ThreadTs: threadTs,
             MessageTs: messageTs);
-    }
-
-    private static string? GetFormValue(IDictionary<string, StringValues> fields, string key)
-    {
-        return fields.TryGetValue(key, out StringValues values) && !StringValues.IsNullOrEmpty(values)
-            ? values.ToString()
-            : null;
     }
 
     private static string? ReadStringProperty(JsonElement element, string name)

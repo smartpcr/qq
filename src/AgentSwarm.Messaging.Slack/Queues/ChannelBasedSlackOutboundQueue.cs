@@ -1,3 +1,4 @@
+using AgentSwarm.Messaging.Slack.Diagnostics;
 using AgentSwarm.Messaging.Slack.Transport;
 
 namespace AgentSwarm.Messaging.Slack.Queues;
@@ -18,7 +19,7 @@ namespace AgentSwarm.Messaging.Slack.Queues;
 /// resolved through DI as <see cref="ISlackOutboundQueue"/> via
 /// <c>services.AddSingleton&lt;ISlackOutboundQueue, ChannelBasedSlackOutboundQueue&gt;()</c>.
 /// </remarks>
-internal sealed class ChannelBasedSlackOutboundQueue : ISlackOutboundQueue
+internal sealed class ChannelBasedSlackOutboundQueue : ISlackOutboundQueue, ISlackOutboundQueueDepthProbe
 {
     private readonly ChannelBasedSlackQueue<SlackOutboundEnvelope> backing;
 
@@ -61,4 +62,12 @@ internal sealed class ChannelBasedSlackOutboundQueue : ISlackOutboundQueue
     {
         return this.backing.DequeueAsync(ct);
     }
+
+    /// <summary>
+    /// <see cref="ISlackOutboundQueueDepthProbe"/> implementation:
+    /// returns the underlying channel's buffered envelope count so
+    /// the Stage 7.3 outbound-queue-depth health check can sample
+    /// load cheaply (O(1) via <see cref="ChannelBasedSlackQueue{T}.Count"/>).
+    /// </summary>
+    public int GetCurrentDepth() => this.backing.Count;
 }
