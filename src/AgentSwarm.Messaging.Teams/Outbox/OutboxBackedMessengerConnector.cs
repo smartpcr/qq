@@ -36,22 +36,6 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// is fully self-describing.
 /// </para>
 /// <para>
-/// <b>Why <see cref="SendQuestionAsync"/> resolves via the canonical store
-/// (<see cref="IConversationReferenceStore"/>), not the router.</b>
-/// <see cref="AgentQuestion.TargetUserId"/> / <see cref="AgentQuestion.TargetChannelId"/>
-/// are orchestrator-native natural keys (internal user ID, Teams channel ID) — they are
-/// <i>not</i> Bot Framework <c>ConversationId</c>s and routing them through
-/// <see cref="IConversationReferenceRouter.GetByConversationIdAsync"/> would (a) miss
-/// every legitimately registered proactive target whose internal user / channel ID does
-/// not happen to equal a stored conversation ID, and (b) bypass the tenant scope on
-/// <see cref="AgentQuestion.TenantId"/>. The natural-key lookups
-/// (<see cref="IConversationReferenceStore.GetByInternalUserIdAsync"/> and
-/// <see cref="IConversationReferenceStore.GetByChannelIdAsync"/>) are the same contract
-/// the canonical <see cref="TeamsMessengerConnector.SendQuestionAsync"/> uses at
-/// dispatch time, keeping the outbox-backed decorator and the direct connector in lock
-/// step.
-/// </para>
-/// <para>
 /// <b>Stage 6.2 step 4 — outbound deduplication with in-flight coordination.</b> Before
 /// enqueueing an outbox entry the decorator consults the optional
 /// <see cref="OutboundMessageDeduplicator"/> singleton via its <see cref="OutboundMessageDeduplicator.Claim"/>
@@ -66,7 +50,8 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// themselves as the new owner. This guarantees that exactly one outbox row lands per
 /// <c>(CorrelationId, DestinationId)</c> tuple within the window <i>even when</i>
 /// concurrent sends race and the first attempt fails after the loser has already
-/// observed the claim.
+/// observed the claim. Iter-3 evaluator fix #1 closes the prior gap where a loser
+/// could return success-shaped while the winner rolled back, dropping the send.
 /// </para>
 /// <para>
 /// <b>Failure-mode taxonomy.</b> Two distinct error shapes can surface from
@@ -89,7 +74,9 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// <see cref="OutboundDeduplicationException.ConversationId"/>, and
 /// <see cref="OutboundDeduplicationException.Attempts"/> so upstream retry policies can
 /// filter on the exception type (no string parsing required) and surface a per-key
-/// retry signal.
+/// retry signal. Iter-4 evaluator fix: previously both failure modes shared the
+/// <see cref="InvalidOperationException"/> type, forcing message-string inspection to
+/// distinguish them.
 /// </description>
 /// </item>
 /// </list>
@@ -123,7 +110,7 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
     private readonly ILogger<OutboxBackedMessengerConnector> _logger;
     private readonly OutboundMessageDeduplicator? _outboundDeduplicator;
 
-    /// <summary>Construct the decorator (legacy 6-arg overload — no outbound deduplicator wired).</summary>
+    /// <summary>Construct the decorator (legacy 5-arg overload — no outbound deduplicator wired).</summary>
     /// <param name="innerConnector">The wrapped <see cref="TeamsMessengerConnector"/>. Used for <see cref="ReceiveAsync"/> only.</param>
     /// <param name="outbox">Outbox queue for outbound deliveries.</param>
     /// <param name="conversationReferenceRouter">Router used by <see cref="SendMessageAsync"/> to resolve the tenant scope for
@@ -195,10 +182,16 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         // Stage 6.2 step 4 — suppress duplicate (CorrelationId, ConversationId) pairs
         // within the configured window with in-flight coordination so concurrent
         // losers do NOT return success-shaped while the winner is still mid-enqueue.
-        // The Claim API exposes the winner's outcome task so the loser blocks until
-        // the winner commits (suppress as real duplicate) or rolls back (re-claim
-        // and retry as the new owner). A bounded retry loop prevents pathological
-        // churn if every claimed owner crashes immediately.
+        //
+        // Iter-3 evaluator fix #1: previously the loser short-circuited as soon as
+        // TryRegister observed an existing entry, even if the winning thread had not
+        // yet reached EnqueueAsync. If the winner then threw (transient infrastructure
+        // failure) and rolled back the slot via Remove, the loser's caller had already
+        // received a successful-no-op response and would never retry — silently
+        // dropping the send. The Claim API now exposes the winner's outcome task so
+        // the loser blocks until the winner commits (suppress as real duplicate) or
+        // rolls back (re-claim and retry as the new owner). A bounded retry loop
+        // prevents pathological churn if every claimed owner crashes immediately.
         for (var attempt = 1; ; attempt++)
         {
             var claim = _outboundDeduplicator.Claim(message.CorrelationId, message.ConversationId);
@@ -250,13 +243,15 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
 
             // Winner rolled back. Re-claim as the new owner and retry the pipeline
             // ourselves — bounded so a pathological pattern (every claim's first owner
-            // crashes immediately) cannot spin forever. The exhaustion failure is
-            // surfaced as a dedicated OutboundDeduplicationException carrying
-            // CorrelationId / ConversationId / Attempts so upstream retry policies
-            // can filter on the exception TYPE (and inspect structured properties)
-            // instead of string-matching against the InvalidOperationException raised
-            // by EnqueueCoreAsync's missing-reference path — which is a permanent
-            // failure that must NOT be looped on.
+            // crashes immediately) cannot spin forever.
+            //
+            // Iter-4 evaluator fix: the exhaustion failure is surfaced as a dedicated
+            // OutboundDeduplicationException carrying CorrelationId / ConversationId /
+            // Attempts so upstream retry policies can filter on the exception TYPE
+            // (and inspect structured properties) instead of string-matching against
+            // the InvalidOperationException raised by EnqueueCoreAsync's
+            // missing-reference path — which is a permanent failure that must NOT be
+            // looped on.
             if (attempt >= MaxClaimAttempts)
             {
                 _logger.LogWarning(
@@ -478,9 +473,10 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
 /// </description>
 /// </item>
 /// </list>
-/// The dedicated type (with structured properties) lets policies filter via a single
-/// <c>catch</c> clause rather than inspecting the exception message string to decide
-/// whether to loop.
+/// Iter-4 evaluator fix: previously both modes shared the
+/// <see cref="InvalidOperationException"/> type, forcing upstream retry policies to
+/// inspect the exception message string to decide whether to loop. A dedicated type
+/// (with structured properties) lets policies filter via a single <c>catch</c> clause.
 /// </para>
 /// <para>
 /// The structured properties (<see cref="CorrelationId"/>, <see cref="ConversationId"/>,

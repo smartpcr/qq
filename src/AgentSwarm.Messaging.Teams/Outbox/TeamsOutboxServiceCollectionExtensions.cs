@@ -178,24 +178,6 @@ public static class TeamsOutboxServiceCollectionExtensions
         services.TryAddSingleton<OutboxMetrics>();
         services.TryAddSingleton<TokenBucketRateLimiter>();
 
-        // Register the TeamsDirectSendBypassGuard sentinel singleton so the inner
-        // concrete TeamsMessengerConnector / TeamsProactiveNotifier reject every
-        // direct send when the outbox engine is composed. Without the guard,
-        // production code that resolved the concrete type (or the IInnerTeams*
-        // marker's Inner accessor) and called a send method would silently bypass
-        // IMessageOutbox.EnqueueAsync, violating the implementation-plan.md §6.1
-        // requirement that every send flows through the outbox. The connectors' DI
-        // factories in TeamsServiceCollectionExtensions resolve this guard as an
-        // optional dependency and assign it via the DirectSendGuard property
-        // initializer — so legacy hosts / tests that do NOT call
-        // AddTeamsOutboxEngine keep their direct-send semantics unchanged (the
-        // guard simply isn't in the container). TryAddSingleton lets a host or test
-        // pre-register a different singleton instance BEFORE AddTeamsOutboxEngine
-        // runs and have that registration win, for the rare scenarios that
-        // legitimately need to disable the guard at the inner-concrete level (the
-        // guard class is `sealed` so subclassing is not the override path).
-        services.TryAddSingleton<TeamsDirectSendBypassGuard>();
-
         // Stage 6.2 step 4 — outbound deduplication singleton + background eviction
         // service. Registered via TryAdd* so hosts that supplied a custom
         // OutboundDeduplicationOptions or replaced the deduplicator with a no-op for
