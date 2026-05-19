@@ -389,7 +389,8 @@ public sealed class OutboxBackedMessengerConnectorTests
             TimeProvider.System);
 
         var decorator = new OutboxBackedMessengerConnector(
-            inner, outbox, router,
+            inner, outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -412,7 +413,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -434,7 +436,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var outbox = new InMemoryRecordingOutbox();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         var message = SampleMessage("m-leg");
@@ -457,7 +460,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -492,7 +496,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -535,7 +540,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -596,7 +602,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
