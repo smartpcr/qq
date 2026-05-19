@@ -113,6 +113,39 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
     public TeamsConnectorTelemetry? Telemetry { get; init; }
 
     /// <summary>
+    /// Stage 6.1 iter-3 — optional <see cref="AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard"/>
+    /// resolved by the DI factory in <see cref="TeamsServiceCollectionExtensions"/> when
+    /// the host composes
+    /// <see cref="AgentSwarm.Messaging.Teams.Outbox.TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/>.
+    /// When non-<c>null</c>, every direct send method on this connector
+    /// (<see cref="SendMessageAsync"/>, <see cref="SendQuestionAsync"/>) calls
+    /// <see cref="AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard.ThrowIfDisallowed"/>
+    /// at the top — which throws an
+    /// <see cref="InvalidOperationException"/> with a remediation message pointing the
+    /// caller back at the public <see cref="IMessengerConnector"/> contract (which, when
+    /// the outbox engine is wired, resolves to <see cref="Outbox.OutboxBackedMessengerConnector"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why a property and not a constructor parameter.</b> Mirrors the existing
+    /// <see cref="Telemetry"/> property: keeping the canonical 11-arg constructor stable
+    /// preserves test compositions that pre-date Stage 6.1's outbox engine. When the
+    /// outbox engine is NOT composed the property is left <c>null</c> and every send
+    /// method's guard call short-circuits to a no-op — preserving the connector's
+    /// pre-Stage-6.1 direct-send semantics for legacy and test code.
+    /// </para>
+    /// <para>
+    /// <b>Card update/delete is intentionally NOT guarded.</b> Per
+    /// <c>architecture.md</c> §4.7 and <c>implementation-plan.md</c> §6.1 lines 383-384,
+    /// card update/delete operations follow a separate direct path with inline retry
+    /// and are NOT routed through the outbox. The guard therefore applies only to the
+    /// two send methods, not to <c>ITeamsCardManager.UpdateCardAsync</c> /
+    /// <c>ITeamsCardManager.DeleteCardAsync</c>.
+    /// </para>
+    /// </remarks>
+    public AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard? DirectSendGuard { get; init; }
+
+    /// <summary>
     /// Construct the connector with the dependencies required by
     /// <c>implementation-plan.md</c> §2.3 step 1 and §3.1 step 7, plus a
     /// <see cref="IConversationReferenceRouter"/> for <see cref="SendMessageAsync"/>
@@ -229,6 +262,15 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         {
             throw new ArgumentNullException(nameof(message));
         }
+
+        // Stage 6.1 iter-3 evaluator critique #4 — when the outbox engine is composed,
+        // the host's DI graph has registered TeamsDirectSendBypassGuard and the factory
+        // in TeamsServiceCollectionExtensions has wired it onto DirectSendGuard. Any
+        // direct call here would otherwise silently bypass IMessageOutbox.EnqueueAsync.
+        // The guard converts that bypass into a loud, structured exception with a
+        // remediation message pointing the caller at IMessengerConnector (which maps
+        // to OutboxBackedMessengerConnector when the outbox engine is wired).
+        DirectSendGuard?.ThrowIfDisallowed(nameof(TeamsMessengerConnector), nameof(SendMessageAsync));
 
         // Stage 6.3 — open a structured-logging scope so every ILogger entry below
         // (including the warning path on InstallationStateGate rejection) carries the
@@ -371,6 +413,12 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
         {
             throw new ArgumentNullException(nameof(question));
         }
+
+        // Stage 6.1 iter-3 — see DirectSendGuard property remarks and SendMessageAsync
+        // for the rationale. Guard runs BEFORE Validate so a misrouted production
+        // caller gets the outbox-bypass error rather than a validation error that
+        // hides the real misconfiguration.
+        DirectSendGuard?.ThrowIfDisallowed(nameof(TeamsMessengerConnector), nameof(SendQuestionAsync));
 
         var validationErrors = question.Validate();
         if (validationErrors.Count > 0)

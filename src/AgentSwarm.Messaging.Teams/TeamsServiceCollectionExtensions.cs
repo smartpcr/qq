@@ -177,6 +177,12 @@ public static class TeamsServiceCollectionExtensions
             // failure at first connector resolution rather than silently dropping
             // instrumentation.
             Telemetry = sp.GetRequiredService<AgentSwarm.Messaging.Teams.Diagnostics.TeamsConnectorTelemetry>(),
+            // Stage 6.1 iter-3 — outbox-bypass guard is OPTIONAL. It is registered only
+            // when the host composes AgentSwarm.Messaging.Teams.Outbox.TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine;
+            // when absent (legacy hosts / tests), the connector's direct-send methods
+            // run unguarded as before. GetService returns null cleanly when the guard
+            // is not registered.
+            DirectSendGuard = sp.GetService<AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard>(),
         });
 
         services.TryAddKeyedSingleton<IMessengerConnector>(
@@ -439,7 +445,13 @@ public static class TeamsServiceCollectionExtensions
             agentQuestionStore: sp.GetRequiredService<IAgentQuestionStore>(),
             logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsProactiveNotifier>>(),
             timeProvider: sp.GetRequiredService<TimeProvider>(),
-            installationStateGate: sp.GetRequiredService<InstallationStateGate>()));
+            installationStateGate: sp.GetRequiredService<InstallationStateGate>())
+        {
+            // Stage 6.1 iter-3 — outbox-bypass guard is OPTIONAL. See the matching
+            // wiring in AddTeamsMessengerConnector and TeamsProactiveNotifier's
+            // DirectSendGuard property remarks for the rationale.
+            DirectSendGuard = sp.GetService<AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard>(),
+        });
         services.TryAddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<TeamsProactiveNotifier>());
 
         return services;

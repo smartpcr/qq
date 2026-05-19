@@ -15,9 +15,16 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// <para>
 /// Implements the Stage 6.1 brief verbatim: "Refactor TeamsProactiveNotifier and
 /// TeamsMessengerConnector to remove direct ContinueConversationAsync calls; every send
-/// method enqueues an OutboxEntry instead". The wrapped <see cref="TeamsMessengerConnector"/>
-/// remains the canonical delivery implementation but is only invoked from
-/// <see cref="TeamsOutboxDispatcher"/> after the engine dequeues the entry.
+/// method enqueues an OutboxEntry instead". The dispatcher takes no dependency on
+/// <see cref="TeamsMessengerConnector"/> nor on
+/// <see cref="IInnerTeamsMessengerConnector"/> and dispatches each dequeued entry
+/// directly via <see cref="Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter"/>.
+/// The wrapped inner connector is therefore consumed by this decorator for ONE
+/// purpose only — <see cref="ReceiveAsync"/> forwarding, see the constructor XML —
+/// and the dedicated <see cref="TeamsDirectSendBypassGuard"/> singleton blocks
+/// every direct send on the concrete <see cref="TeamsMessengerConnector"/> when the
+/// outbox engine is composed so production code cannot accidentally bypass the
+/// outbox by resolving the inner concrete.
 /// </para>
 /// <para>
 /// <b>Why <see cref="SendMessageAsync"/> resolves the conversation reference here.</b>
@@ -27,6 +34,22 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// and stamps tenant ID + scope on the entry so the dispatcher can route without a
 /// second lookup. The actual reference JSON snapshot is also stamped so the outbox row
 /// is fully self-describing.
+/// </para>
+/// <para>
+/// <b>Why <see cref="SendQuestionAsync"/> resolves via the canonical store
+/// (<see cref="IConversationReferenceStore"/>), not the router.</b>
+/// <see cref="AgentQuestion.TargetUserId"/> / <see cref="AgentQuestion.TargetChannelId"/>
+/// are orchestrator-native natural keys (internal user ID, Teams channel ID) — they are
+/// <i>not</i> Bot Framework <c>ConversationId</c>s and routing them through
+/// <see cref="IConversationReferenceRouter.GetByConversationIdAsync"/> would (a) miss
+/// every legitimately registered proactive target whose internal user / channel ID does
+/// not happen to equal a stored conversation ID, and (b) bypass the tenant scope on
+/// <see cref="AgentQuestion.TenantId"/>. The natural-key lookups
+/// (<see cref="IConversationReferenceStore.GetByInternalUserIdAsync"/> and
+/// <see cref="IConversationReferenceStore.GetByChannelIdAsync"/>) are the same contract
+/// the canonical <see cref="TeamsMessengerConnector.SendQuestionAsync"/> uses at
+/// dispatch time, keeping the outbox-backed decorator and the direct connector in lock
+/// step.
 /// </para>
 /// <para>
 /// <b>Stage 6.2 step 4 — outbound deduplication with in-flight coordination.</b> Before
@@ -43,8 +66,7 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// themselves as the new owner. This guarantees that exactly one outbox row lands per
 /// <c>(CorrelationId, DestinationId)</c> tuple within the window <i>even when</i>
 /// concurrent sends race and the first attempt fails after the loser has already
-/// observed the claim. Iter-3 evaluator fix #1 closes the prior gap where a loser
-/// could return success-shaped while the winner rolled back, dropping the send.
+/// observed the claim.
 /// </para>
 /// <para>
 /// <b>Failure-mode taxonomy.</b> Two distinct error shapes can surface from
@@ -67,9 +89,7 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// <see cref="OutboundDeduplicationException.ConversationId"/>, and
 /// <see cref="OutboundDeduplicationException.Attempts"/> so upstream retry policies can
 /// filter on the exception type (no string parsing required) and surface a per-key
-/// retry signal. Iter-4 evaluator fix: previously both failure modes shared the
-/// <see cref="InvalidOperationException"/> type, forcing message-string inspection to
-/// distinguish them.
+/// retry signal.
 /// </description>
 /// </item>
 /// </list>
@@ -97,23 +117,34 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
     private readonly IMessengerConnector _innerConnector;
     private readonly IMessageOutbox _outbox;
     private readonly IConversationReferenceRouter _conversationReferenceRouter;
+    private readonly IConversationReferenceStore _conversationReferenceStore;
+    private readonly IAgentQuestionStore _agentQuestionStore;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<OutboxBackedMessengerConnector> _logger;
     private readonly OutboundMessageDeduplicator? _outboundDeduplicator;
 
-    /// <summary>Construct the decorator (legacy 5-arg overload — no outbound deduplicator wired).</summary>
+    /// <summary>Construct the decorator (legacy 6-arg overload — no outbound deduplicator wired).</summary>
     /// <param name="innerConnector">The wrapped <see cref="TeamsMessengerConnector"/>. Used for <see cref="ReceiveAsync"/> only.</param>
     /// <param name="outbox">Outbox queue for outbound deliveries.</param>
-    /// <param name="conversationReferenceRouter">Router used to resolve the tenant scope for outbound messages.</param>
+    /// <param name="conversationReferenceRouter">Router used by <see cref="SendMessageAsync"/> to resolve the tenant scope for
+    /// outbound <see cref="MessengerMessage"/> (whose only routing field is the Bot Framework <c>ConversationId</c>).</param>
+    /// <param name="conversationReferenceStore">Canonical store used by <see cref="SendQuestionAsync"/> to resolve the proactive
+    /// reference via the question's natural keys (<see cref="AgentQuestion.TenantId"/> +
+    /// <see cref="AgentQuestion.TargetUserId"/> or <see cref="AgentQuestion.TargetChannelId"/>). Required so the outbox-backed
+    /// decorator's lookup contract matches the canonical <see cref="TeamsMessengerConnector.SendQuestionAsync"/> path.</param>
+    /// <param name="agentQuestionStore">Question store used for the canonical pre-enqueue
+    /// <see cref="IAgentQuestionStore.SaveAsync"/> step on <see cref="SendQuestionAsync"/> (see remarks).</param>
     /// <param name="logger">Logger.</param>
     /// <param name="timeProvider">Optional clock (defaults to <see cref="TimeProvider.System"/>).</param>
     public OutboxBackedMessengerConnector(
         IMessengerConnector innerConnector,
         IMessageOutbox outbox,
         IConversationReferenceRouter conversationReferenceRouter,
+        IConversationReferenceStore conversationReferenceStore,
+        IAgentQuestionStore agentQuestionStore,
         ILogger<OutboxBackedMessengerConnector> logger,
         TimeProvider? timeProvider = null)
-        : this(innerConnector, outbox, conversationReferenceRouter, logger, timeProvider, outboundDeduplicator: null)
+        : this(innerConnector, outbox, conversationReferenceRouter, conversationReferenceStore, agentQuestionStore, logger, timeProvider, outboundDeduplicator: null)
     {
     }
 
@@ -129,6 +160,8 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         IMessengerConnector innerConnector,
         IMessageOutbox outbox,
         IConversationReferenceRouter conversationReferenceRouter,
+        IConversationReferenceStore conversationReferenceStore,
+        IAgentQuestionStore agentQuestionStore,
         ILogger<OutboxBackedMessengerConnector> logger,
         TimeProvider? timeProvider,
         OutboundMessageDeduplicator? outboundDeduplicator)
@@ -136,6 +169,8 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         _innerConnector = innerConnector ?? throw new ArgumentNullException(nameof(innerConnector));
         _outbox = outbox ?? throw new ArgumentNullException(nameof(outbox));
         _conversationReferenceRouter = conversationReferenceRouter ?? throw new ArgumentNullException(nameof(conversationReferenceRouter));
+        _conversationReferenceStore = conversationReferenceStore ?? throw new ArgumentNullException(nameof(conversationReferenceStore));
+        _agentQuestionStore = agentQuestionStore ?? throw new ArgumentNullException(nameof(agentQuestionStore));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _timeProvider = timeProvider ?? TimeProvider.System;
         _outboundDeduplicator = outboundDeduplicator;
@@ -160,16 +195,10 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         // Stage 6.2 step 4 — suppress duplicate (CorrelationId, ConversationId) pairs
         // within the configured window with in-flight coordination so concurrent
         // losers do NOT return success-shaped while the winner is still mid-enqueue.
-        //
-        // Iter-3 evaluator fix #1: previously the loser short-circuited as soon as
-        // TryRegister observed an existing entry, even if the winning thread had not
-        // yet reached EnqueueAsync. If the winner then threw (transient infrastructure
-        // failure) and rolled back the slot via Remove, the loser's caller had already
-        // received a successful-no-op response and would never retry — silently
-        // dropping the send. The Claim API now exposes the winner's outcome task so
-        // the loser blocks until the winner commits (suppress as real duplicate) or
-        // rolls back (re-claim and retry as the new owner). A bounded retry loop
-        // prevents pathological churn if every claimed owner crashes immediately.
+        // The Claim API exposes the winner's outcome task so the loser blocks until
+        // the winner commits (suppress as real duplicate) or rolls back (re-claim
+        // and retry as the new owner). A bounded retry loop prevents pathological
+        // churn if every claimed owner crashes immediately.
         for (var attempt = 1; ; attempt++)
         {
             var claim = _outboundDeduplicator.Claim(message.CorrelationId, message.ConversationId);
@@ -221,15 +250,13 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
 
             // Winner rolled back. Re-claim as the new owner and retry the pipeline
             // ourselves — bounded so a pathological pattern (every claim's first owner
-            // crashes immediately) cannot spin forever.
-            //
-            // Iter-4 evaluator fix: the exhaustion failure is surfaced as a dedicated
-            // OutboundDeduplicationException carrying CorrelationId / ConversationId /
-            // Attempts so upstream retry policies can filter on the exception TYPE
-            // (and inspect structured properties) instead of string-matching against
-            // the InvalidOperationException raised by EnqueueCoreAsync's
-            // missing-reference path — which is a permanent failure that must NOT be
-            // looped on.
+            // crashes immediately) cannot spin forever. The exhaustion failure is
+            // surfaced as a dedicated OutboundDeduplicationException carrying
+            // CorrelationId / ConversationId / Attempts so upstream retry policies
+            // can filter on the exception TYPE (and inspect structured properties)
+            // instead of string-matching against the InvalidOperationException raised
+            // by EnqueueCoreAsync's missing-reference path — which is a permanent
+            // failure that must NOT be looped on.
             if (attempt >= MaxClaimAttempts)
             {
                 _logger.LogWarning(
@@ -298,41 +325,54 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
     {
         ArgumentNullException.ThrowIfNull(question);
 
-        var validationErrors = question.Validate();
-        if (validationErrors.Count > 0)
-        {
-            throw new InvalidOperationException(
-                $"AgentQuestion '{question.QuestionId}' is invalid: {string.Join("; ", validationErrors)}");
-        }
+        // Validate the payload shape through the same shared helper the proactive
+        // notifier uses, so identical misuse produces identical observable failures
+        // (type, message) across every send surface.
+        TeamsQuestionSendGuards.ValidateQuestion(question);
 
-        // Resolve via the question's own routing fields — exactly one of TargetUserId /
-        // TargetChannelId is set (enforced by Validate()).
+        // Resolve via the question's own natural-key routing fields — exactly one of
+        // TargetUserId / TargetChannelId is set (enforced by Validate()). These are
+        // orchestrator-native identifiers (internal user ID, Teams channel ID) — NOT
+        // Bot Framework ConversationIds — so the lookup MUST go through the canonical
+        // IConversationReferenceStore.GetByInternalUserIdAsync / GetByChannelIdAsync
+        // contract, exactly as the direct TeamsMessengerConnector.SendQuestionAsync does
+        // at dispatch time. Routing the orchestrator-native ID through the router's
+        // GetByConversationIdAsync would (a) silently miss every legitimate proactive
+        // target whose internal user / channel ID does not equal a stored Bot Framework
+        // conversation ID, and (b) drop the TenantId scope (router is tenant-agnostic).
         TeamsConversationReference stored;
         string destinationType;
         string destinationId;
         string destination;
         if (!string.IsNullOrWhiteSpace(question.TargetUserId))
         {
-            stored = await _conversationReferenceRouter
-                .GetByConversationIdAsync(question.TargetUserId!, ct)
+            stored = await _conversationReferenceStore
+                .GetByInternalUserIdAsync(question.TenantId, question.TargetUserId!, ct)
                 .ConfigureAwait(false)
                 ?? throw new InvalidOperationException(
-                    $"AgentQuestion '{question.QuestionId}' targets user '{question.TargetUserId}' but no TeamsConversationReference is registered for that ID.");
+                    $"AgentQuestion '{question.QuestionId}' targets tenant '{question.TenantId}' user '{question.TargetUserId}' but no active TeamsConversationReference is registered for that natural key. The Teams app must be installed for the target user before proactive delivery can succeed.");
             destinationType = OutboxDestinationTypes.Personal;
             destinationId = question.TargetUserId!;
             destination = $"teams://{Uri.EscapeDataString(question.TenantId)}/user/{Uri.EscapeDataString(destinationId)}";
         }
         else
         {
-            stored = await _conversationReferenceRouter
-                .GetByConversationIdAsync(question.TargetChannelId!, ct)
+            stored = await _conversationReferenceStore
+                .GetByChannelIdAsync(question.TenantId, question.TargetChannelId!, ct)
                 .ConfigureAwait(false)
                 ?? throw new InvalidOperationException(
-                    $"AgentQuestion '{question.QuestionId}' targets channel '{question.TargetChannelId}' but no TeamsConversationReference is registered for that ID.");
+                    $"AgentQuestion '{question.QuestionId}' targets tenant '{question.TenantId}' channel '{question.TargetChannelId}' but no active TeamsConversationReference is registered for that natural key. The Teams app must be installed in the target channel before proactive delivery can succeed.");
             destinationType = OutboxDestinationTypes.Channel;
             destinationId = question.TargetChannelId!;
             destination = $"teams://{Uri.EscapeDataString(question.TenantId)}/channel/{Uri.EscapeDataString(destinationId)}";
         }
+
+        // Stage 6.1 canonical pre-enqueue AgentQuestion persistence per
+        // implementation-plan.md §6.1 — see class remarks. SaveAsync MUST land before
+        // EnqueueAsync so CardActionHandler.GetByIdAsync(questionId) can immediately
+        // resolve the question row when the user taps approve/reject after the
+        // OutboxRetryEngine delivers the card, including the millisecond-fast case.
+        await PreEnqueueSaveQuestionAsync(question, ct).ConfigureAwait(false);
 
         var entry = new OutboxEntry
         {
@@ -357,6 +397,49 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
             question.CorrelationId,
             destinationType,
             destinationId);
+    }
+
+    /// <summary>
+    /// Canonical pre-enqueue <see cref="IAgentQuestionStore.SaveAsync"/> step per
+    /// <c>implementation-plan.md</c> §6.1. Persists a sanitised copy of the question
+    /// (<c>ConversationId = null</c>, <c>Status = "Open"</c>) so
+    /// <c>CardActionHandler.GetByIdAsync(questionId)</c> can immediately resolve the
+    /// row when the user taps approve/reject after the outbox engine delivers the
+    /// card. Implements a check-then-save guard mirroring
+    /// <c>TeamsProactiveNotifier</c>'s retry-safe pattern: if a row already exists
+    /// with <c>Status = "Open"</c> the duplicate save is skipped but the incoming
+    /// payload MUST match the stored row
+    /// (<see cref="TeamsQuestionSendGuards.EnsureRetryMatchesStoredQuestion"/>) so a
+    /// mutated retry never ships a card whose payload diverges from the persisted
+    /// row. If the existing row holds a terminal status the call throws
+    /// <see cref="InvalidOperationException"/> rather than enqueue a stale card.
+    /// </summary>
+    private async Task PreEnqueueSaveQuestionAsync(AgentQuestion question, CancellationToken ct)
+    {
+        var sanitised = question with { ConversationId = null, Status = AgentQuestionStatuses.Open };
+        var existing = await _agentQuestionStore.GetByIdAsync(question.QuestionId, ct).ConfigureAwait(false);
+        if (existing is null)
+        {
+            await _agentQuestionStore.SaveAsync(sanitised, ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (!string.Equals(existing.Status, AgentQuestionStatuses.Open, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"AgentQuestion '{question.QuestionId}' already exists with terminal status '{existing.Status}'; refusing to enqueue a stale Adaptive Card. The orchestrator should not retry resolved or expired questions.");
+        }
+
+        // Mirror TeamsProactiveNotifier.SendQuestionCoreAsync's retry-drift check
+        // through the shared helper so a retry whose routing or payload mutated
+        // between attempts is rejected loudly instead of silently shipping a card
+        // that diverges from the persisted row.
+        TeamsQuestionSendGuards.EnsureRetryMatchesStoredQuestion(sanitised, existing);
+
+        _logger.LogInformation(
+            "AgentQuestion {QuestionId} (correlation {CorrelationId}) row already present in IAgentQuestionStore with Status=Open; skipping duplicate pre-enqueue SaveAsync.",
+            question.QuestionId,
+            question.CorrelationId);
     }
 
     /// <inheritdoc />
@@ -395,10 +478,9 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
 /// </description>
 /// </item>
 /// </list>
-/// Iter-4 evaluator fix: previously both modes shared the
-/// <see cref="InvalidOperationException"/> type, forcing upstream retry policies to
-/// inspect the exception message string to decide whether to loop. A dedicated type
-/// (with structured properties) lets policies filter via a single <c>catch</c> clause.
+/// The dedicated type (with structured properties) lets policies filter via a single
+/// <c>catch</c> clause rather than inspecting the exception message string to decide
+/// whether to loop.
 /// </para>
 /// <para>
 /// The structured properties (<see cref="CorrelationId"/>, <see cref="ConversationId"/>,
