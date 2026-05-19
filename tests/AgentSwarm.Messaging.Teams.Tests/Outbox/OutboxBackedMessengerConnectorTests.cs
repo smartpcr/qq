@@ -267,6 +267,68 @@ public sealed class OutboxBackedMessengerConnectorTests
     }
 
     [Fact]
+    public async Task SendQuestionAsync_QuestionAlreadyExistsOpenWithMutatedPayload_ThrowsAndDoesNotEnqueue()
+    {
+        // Iter-4 evaluator critique — EnsureRetryMatchesStoredQuestion parity. The
+        // orchestrator mutated the Title between attempts; the stored Open row exists.
+        // The decorator MUST refuse rather than enqueue a card whose payload diverges
+        // from the row CardActionHandler will load on reply.
+        var router = new RecordingConversationReferenceStore();
+        router.UserReferences[("tenant-1", "user-1")] = NewReference(tenantId: "tenant-1");
+
+        var questionStore = new RecordingAgentQuestionStore();
+        questionStore.Seed(SampleQuestion("q-drift", userId: "user-1")); // Title = "Title"
+
+        var outbox = new InMemoryRecordingOutbox();
+        var decorator = new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(), outbox, router, router,
+            questionStore,
+            NullLogger<OutboxBackedMessengerConnector>.Instance);
+
+        var mutated = SampleQuestion("q-drift", userId: "user-1") with { Title = "Title MUTATED" };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            decorator.SendQuestionAsync(mutated, CancellationToken.None));
+
+        Assert.Contains("q-drift", ex.Message);
+        Assert.Contains("Title", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_QuestionAlreadyExistsOpenWithMutatedRouting_ThrowsAndDoesNotEnqueue()
+    {
+        // Routing-drift sibling — the orchestrator re-targeted the question between
+        // attempts (TargetUserId now points to a different user). This is a separate
+        // failure mode from terminal-status and a separate guard from
+        // EnsureScopeUserTargeted (which compared incoming routing to caller-supplied
+        // userId, not to the stored row).
+        var router = new RecordingConversationReferenceStore();
+        router.UserReferences[("tenant-1", "user-1")] = NewReference(tenantId: "tenant-1");
+        router.UserReferences[("tenant-1", "user-2")] = NewReference(tenantId: "tenant-1");
+
+        var questionStore = new RecordingAgentQuestionStore();
+        questionStore.Seed(SampleQuestion("q-reroute", userId: "user-1"));
+
+        var outbox = new InMemoryRecordingOutbox();
+        var decorator = new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(), outbox, router, router,
+            questionStore,
+            NullLogger<OutboxBackedMessengerConnector>.Instance);
+
+        var rerouted = SampleQuestion("q-reroute", userId: "user-2");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            decorator.SendQuestionAsync(rerouted, CancellationToken.None));
+
+        Assert.Contains("q-reroute", ex.Message);
+        Assert.Contains("TargetUserId", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
     public void Constructor_RejectsNullAgentQuestionStore()
     {
         Assert.Throws<ArgumentNullException>(() => new OutboxBackedMessengerConnector(

@@ -154,6 +154,18 @@ public sealed class OutboxBackedProactiveNotifier : IProactiveNotifier
         ValidateRequired(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(question);
 
+        // Iter-4 evaluator critique #1 — parity with
+        // TeamsProactiveNotifier.SendProactiveQuestionAsync. Validate the payload
+        // shape, the tenant-isolation invariant, and the user-scope routing BEFORE
+        // touching the outbox. Without these guards a caller could pre-save and
+        // enqueue an AgentQuestion whose TenantId / TargetUserId / TargetChannelId
+        // disagree with the routing handed to the decorator, producing an outbox row
+        // delivered under one identity while the question row was persisted under
+        // another.
+        OutboxQuestionGuards.ValidateQuestion(question);
+        OutboxQuestionGuards.EnsureTenantMatchesQuestion(tenantId, question);
+        OutboxQuestionGuards.EnsureScopeUserTargeted(userId, question);
+
         using var logScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
             _logger,
             correlationId: question.CorrelationId,
@@ -185,6 +197,12 @@ public sealed class OutboxBackedProactiveNotifier : IProactiveNotifier
         ValidateRequired(tenantId, nameof(tenantId));
         ValidateRequired(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Iter-4 evaluator critique #1 — channel-scope sibling of the validation
+        // wired into SendProactiveQuestionAsync. See that method's comment.
+        OutboxQuestionGuards.ValidateQuestion(question);
+        OutboxQuestionGuards.EnsureTenantMatchesQuestion(tenantId, question);
+        OutboxQuestionGuards.EnsureScopeChannelTargeted(channelId, question);
 
         using var logScope = AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogScope.BeginScope(
             _logger,
@@ -315,12 +333,17 @@ public sealed class OutboxBackedProactiveNotifier : IProactiveNotifier
     /// Canonical pre-enqueue <see cref="IAgentQuestionStore.SaveAsync"/> step per
     /// <c>implementation-plan.md</c> §6.1. Persists a sanitised copy of the question
     /// (<c>ConversationId = null</c>) so <c>CardActionHandler.GetByIdAsync(questionId)</c>
-    /// can immediately resolve the row when the user taps approve/reject, even when the
-    /// outbox engine delivers the card within milliseconds. Implements a check-then-save
-    /// guard mirroring <c>TeamsProactiveNotifier</c>'s retry-safe pattern: if a row
-    /// already exists with <c>Status = "Open"</c> the duplicate save is skipped; if the
-    /// existing row holds a terminal status the call throws
-    /// <see cref="InvalidOperationException"/> rather than enqueue a stale card.
+    /// can immediately resolve the row when the user taps approve/reject after the
+    /// outbox engine delivers the card, even when the outbox engine delivers the card
+    /// within milliseconds. Implements a check-then-save guard mirroring
+    /// <c>TeamsProactiveNotifier</c>'s retry-safe pattern: if a row already exists
+    /// with <c>Status = "Open"</c> the duplicate save is skipped but the incoming
+    /// payload MUST match the stored row (<see cref="OutboxQuestionGuards.EnsureRetryMatchesStoredQuestion"/>),
+    /// otherwise the orchestrator has mutated routing/payload between retries and
+    /// the card the dispatcher delivers would drift from the row CardActionHandler
+    /// loads on reply — iter-4 evaluator critique. If the existing row holds a
+    /// terminal status the call throws <see cref="InvalidOperationException"/> rather
+    /// than enqueue a stale card.
     /// </summary>
     private async Task PreEnqueueSaveQuestionAsync(AgentQuestion question, CancellationToken ct)
     {
@@ -337,6 +360,12 @@ public sealed class OutboxBackedProactiveNotifier : IProactiveNotifier
             throw new InvalidOperationException(
                 $"AgentQuestion '{question.QuestionId}' already exists with terminal status '{existing.Status}'; refusing to enqueue a stale Adaptive Card. The orchestrator should not retry resolved or expired questions.");
         }
+
+        // Iter-4 evaluator critique — match TeamsProactiveNotifier.SendQuestionCoreAsync's
+        // EnsureRetryMatchesStoredQuestion contract so a retry whose routing or payload
+        // mutated between attempts is rejected loudly instead of silently shipping a
+        // card that diverges from the persisted row.
+        OutboxQuestionGuards.EnsureRetryMatchesStoredQuestion(sanitised, existing);
 
         _logger.LogInformation(
             "Proactive AgentQuestion {QuestionId} (correlation {CorrelationId}) row already present in IAgentQuestionStore with Status=Open; skipping duplicate pre-enqueue SaveAsync.",

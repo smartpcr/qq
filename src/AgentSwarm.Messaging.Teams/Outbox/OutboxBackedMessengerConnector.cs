@@ -425,9 +425,11 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
     /// row when the user taps approve/reject after the outbox engine delivers the
     /// card. Implements a check-then-save guard mirroring
     /// <c>TeamsProactiveNotifier</c>'s retry-safe pattern: if a row already exists
-    /// with <c>Status = "Open"</c> the duplicate save is skipped; if it exists with a
-    /// terminal status the call throws <see cref="InvalidOperationException"/> rather
-    /// than enqueue a stale card.
+    /// with <c>Status = "Open"</c> the duplicate save is skipped but the incoming
+    /// payload MUST match the stored row
+    /// (<see cref="OutboxQuestionGuards.EnsureRetryMatchesStoredQuestion"/>) — iter-4
+    /// evaluator critique. If the existing row holds a terminal status the call throws
+    /// <see cref="InvalidOperationException"/> rather than enqueue a stale card.
     /// </summary>
     private async Task PreEnqueueSaveQuestionAsync(AgentQuestion question, CancellationToken ct)
     {
@@ -444,6 +446,12 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
             throw new InvalidOperationException(
                 $"AgentQuestion '{question.QuestionId}' already exists with terminal status '{existing.Status}'; refusing to enqueue a stale Adaptive Card. The orchestrator should not retry resolved or expired questions.");
         }
+
+        // Iter-4 evaluator critique — match TeamsProactiveNotifier.SendQuestionCoreAsync's
+        // EnsureRetryMatchesStoredQuestion contract so a retry whose routing or payload
+        // mutated between attempts is rejected loudly instead of silently shipping a
+        // card that diverges from the persisted row.
+        OutboxQuestionGuards.EnsureRetryMatchesStoredQuestion(sanitised, existing);
 
         _logger.LogInformation(
             "AgentQuestion {QuestionId} (correlation {CorrelationId}) row already present in IAgentQuestionStore with Status=Open; skipping duplicate pre-enqueue SaveAsync.",

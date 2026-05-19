@@ -292,6 +292,267 @@ public sealed class OutboxBackedProactiveNotifierTests
         Assert.Equal(2, outbox.Enqueued.Count);
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Iter-4 evaluator critique #1 — validation/security parity with
+    // TeamsProactiveNotifier.SendProactiveQuestionAsync / SendQuestionToChannelAsync.
+    // Before this iteration the outbox-backed decorator only validated tenantId /
+    // userId / channelId nullness, allowing a caller to enqueue (and pre-save) an
+    // AgentQuestion whose TenantId / TargetUserId / TargetChannelId disagreed with
+    // the routing handed to the decorator — producing an outbox row delivered
+    // under one identity while IAgentQuestionStore persisted the question under
+    // another. The Ensure* / ValidateQuestion guards close that regression.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task SendProactiveQuestionAsync_TenantMismatch_ThrowsAndDoesNotPersistOrEnqueue()
+    {
+        var store = new RecordingConversationReferenceStore();
+        store.UserReferences[("tenant-a", "user-1")] = NewReference("tenant-a", internalUserId: "user-1");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        var question = SampleQuestion("q-1", userId: "user-1") with { TenantId = "tenant-b" };
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            notifier.SendProactiveQuestionAsync("tenant-a", "user-1", question, CancellationToken.None));
+
+        Assert.Equal("tenantId", ex.ParamName);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendProactiveQuestionAsync_UserMismatch_ThrowsAndDoesNotPersistOrEnqueue()
+    {
+        var store = new RecordingConversationReferenceStore();
+        store.UserReferences[("tenant-1", "user-A")] = NewReference("tenant-1", internalUserId: "user-A");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        // Question targets user-B but the caller asks to send to user-A.
+        var question = SampleQuestion("q-1", userId: "user-B");
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            notifier.SendProactiveQuestionAsync("tenant-1", "user-A", question, CancellationToken.None));
+
+        Assert.Equal("userId", ex.ParamName);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendProactiveQuestionAsync_ChannelScopedQuestion_ThrowsScopeViolation()
+    {
+        var store = new RecordingConversationReferenceStore();
+        store.UserReferences[("tenant-1", "user-1")] = NewReference("tenant-1", internalUserId: "user-1");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        // Channel-scoped question routed through the user-scope entry point.
+        var question = SampleQuestion("q-1", channelId: "channel-1");
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            notifier.SendProactiveQuestionAsync("tenant-1", "user-1", question, CancellationToken.None));
+
+        Assert.Equal("question", ex.ParamName);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendProactiveQuestionAsync_InvalidQuestion_ThrowsAndDoesNotPersistOrEnqueue()
+    {
+        var store = new RecordingConversationReferenceStore();
+        store.UserReferences[("tenant-1", "user-1")] = NewReference("tenant-1", internalUserId: "user-1");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        // Both target fields populated — violates the TargetUserId XOR TargetChannelId
+        // invariant enforced by AgentQuestion.Validate(). The Validate() guard runs first
+        // (matches TeamsProactiveNotifier.SendQuestionCoreAsync ordering), so the surfaced
+        // error is InvalidOperationException with the validation messages.
+        var invalid = SampleQuestion("q-bad", userId: "user-1") with { TargetChannelId = "channel-1" };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            notifier.SendProactiveQuestionAsync("tenant-1", "user-1", invalid, CancellationToken.None));
+
+        Assert.Contains("q-bad", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendProactiveQuestionAsync_MissingRequiredField_FailsValidationFirst()
+    {
+        // Pin Validate() ordering — when the question is otherwise correctly user-scoped
+        // and tenant-matched but is missing a required field (CorrelationId), Validate()
+        // must reject it BEFORE PreEnqueueSaveQuestionAsync runs.
+        var store = new RecordingConversationReferenceStore();
+        store.UserReferences[("tenant-1", "user-1")] = NewReference("tenant-1", internalUserId: "user-1");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        var invalid = SampleQuestion("q-bad", userId: "user-1") with { CorrelationId = "" };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            notifier.SendProactiveQuestionAsync("tenant-1", "user-1", invalid, CancellationToken.None));
+
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendQuestionToChannelAsync_TenantMismatch_ThrowsAndDoesNotPersistOrEnqueue()
+    {
+        var store = new RecordingConversationReferenceStore();
+        store.ChannelReferences[("tenant-a", "channel-1")] = NewReference("tenant-a", channelId: "channel-1");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        var question = SampleQuestion("q-1", channelId: "channel-1") with { TenantId = "tenant-b" };
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            notifier.SendQuestionToChannelAsync("tenant-a", "channel-1", question, CancellationToken.None));
+
+        Assert.Equal("tenantId", ex.ParamName);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendQuestionToChannelAsync_ChannelMismatch_ThrowsAndDoesNotPersistOrEnqueue()
+    {
+        var store = new RecordingConversationReferenceStore();
+        store.ChannelReferences[("tenant-1", "channel-A")] = NewReference("tenant-1", channelId: "channel-A");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        // Question targets channel-B but caller sends to channel-A.
+        var question = SampleQuestion("q-1", channelId: "channel-B");
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            notifier.SendQuestionToChannelAsync("tenant-1", "channel-A", question, CancellationToken.None));
+
+        Assert.Equal("channelId", ex.ParamName);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendQuestionToChannelAsync_UserScopedQuestion_ThrowsScopeViolation()
+    {
+        var store = new RecordingConversationReferenceStore();
+        store.ChannelReferences[("tenant-1", "channel-1")] = NewReference("tenant-1", channelId: "channel-1");
+
+        var outbox = new InMemoryRecordingOutbox();
+        var questionStore = new RecordingAgentQuestionStore();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        // User-scoped question routed through the channel-scope entry point.
+        var question = SampleQuestion("q-1", userId: "user-1");
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() =>
+            notifier.SendQuestionToChannelAsync("tenant-1", "channel-1", question, CancellationToken.None));
+
+        Assert.Equal("question", ex.ParamName);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendProactiveQuestionAsync_StoredOpenWithMutatedPayload_ThrowsAndDoesNotEnqueue()
+    {
+        // Iter-4 evaluator critique — EnsureRetryMatchesStoredQuestion parity. The
+        // orchestrator mutated the Body between attempts; the stored Open row already
+        // exists. The decorator MUST refuse rather than enqueue a card whose payload
+        // diverges from the row CardActionHandler will load on approve/reject.
+        var store = new RecordingConversationReferenceStore();
+        store.UserReferences[("tenant-1", "user-1")] = NewReference("tenant-1", internalUserId: "user-1");
+
+        var questionStore = new RecordingAgentQuestionStore();
+        questionStore.Seed(SampleQuestion("q-drift", userId: "user-1")); // original Body = "body"
+
+        var outbox = new InMemoryRecordingOutbox();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        var mutated = SampleQuestion("q-drift", userId: "user-1") with { Body = "body MUTATED" };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            notifier.SendProactiveQuestionAsync("tenant-1", "user-1", mutated, CancellationToken.None));
+
+        Assert.Contains("q-drift", ex.Message);
+        Assert.Contains("Body", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+        // No new SaveAsync — the existing seeded row was the only write.
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
+    [Fact]
+    public async Task SendQuestionToChannelAsync_StoredOpenWithMutatedAllowedActions_ThrowsAndDoesNotEnqueue()
+    {
+        // Channel-scoped sibling — payload mutation on AllowedActions (the
+        // orchestrator added a new approve/reject button between retries).
+        var store = new RecordingConversationReferenceStore();
+        store.ChannelReferences[("tenant-1", "channel-1")] = NewReference("tenant-1", channelId: "channel-1");
+
+        var questionStore = new RecordingAgentQuestionStore();
+        questionStore.Seed(SampleQuestion("q-drift-ch", channelId: "channel-1"));
+
+        var outbox = new InMemoryRecordingOutbox();
+        var notifier = new OutboxBackedProactiveNotifier(
+            outbox, store, questionStore,
+            NullLogger<OutboxBackedProactiveNotifier>.Instance);
+
+        var mutated = SampleQuestion("q-drift-ch", channelId: "channel-1") with
+        {
+            AllowedActions = new[]
+            {
+                new HumanAction("yes", "Yes", "yes", false),
+                new HumanAction("no", "No", "no", false), // newly added button
+            },
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            notifier.SendQuestionToChannelAsync("tenant-1", "channel-1", mutated, CancellationToken.None));
+
+        Assert.Contains("q-drift-ch", ex.Message);
+        Assert.Contains("AllowedActions", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+        Assert.Empty(questionStore.SavedQuestions);
+    }
+
     private static TeamsConversationReference NewReference(string tenantId, string? internalUserId = null, string? channelId = null) => new()
     {
         Id = $"ref-{tenantId}-{internalUserId ?? channelId ?? "x"}",
