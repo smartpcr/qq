@@ -47,33 +47,26 @@ public static class SlackInboundIngestorServiceCollectionExtensions
     /// running.
     /// </para>
     /// <para>
-    /// <b>Iter 5 evaluator item #2 (STRUCTURAL fix).</b> Earlier iters
-    /// registered <see cref="NoOpSlackCommandHandler"/>,
+    /// <b>Handler registrations are intentionally OUT-OF-BAND.</b>
+    /// Earlier iters registered <see cref="NoOpSlackCommandHandler"/>,
     /// <see cref="NoOpSlackAppMentionHandler"/>, and
-    /// <see cref="NoOpSlackInteractionHandler"/> as the production
-    /// defaults via <c>TryAddSingleton</c>; a host that called
-    /// <c>AddSlackInboundIngestor</c> and forgot to register real
-    /// Stage 5 handlers would silently ack-and-drop every Slack
-    /// request because the no-op completes the envelope and the
-    /// idempotency guard marks it <c>completed</c>. To eliminate
-    /// that silent-loss class of bug, this extension no longer
-    /// registers the no-op handlers. A host that does not register
-    /// <see cref="ISlackCommandHandler"/> /
+    /// <see cref="NoOpSlackInteractionHandler"/> as production
+    /// defaults; a host that forgot to register real Stage 5 handlers
+    /// would silently ack-and-drop every Slack request because the
+    /// no-op completes the envelope and the idempotency guard marks
+    /// it <c>completed</c>. To eliminate that silent-loss class of
+    /// bug, this extension does NOT register the no-op handlers. A
+    /// host without <see cref="ISlackCommandHandler"/> /
     /// <see cref="ISlackAppMentionHandler"/> /
-    /// <see cref="ISlackInteractionHandler"/> will get a clear
-    /// <see cref="InvalidOperationException"/> the FIRST time the
-    /// <see cref="SlackInboundIngestor"/> BackgroundService lazily
-    /// resolves <see cref="SlackInboundProcessingPipeline"/> for an
-    /// inbound envelope (the pipeline ctor injects the handlers
-    /// from DI, so the missing-handler failure surfaces at that
-    /// lazy resolution rather than at host start). The ingestor's
-    /// catch block forwards that envelope to the durable last-resort
+    /// <see cref="ISlackInteractionHandler"/> registrations gets an
+    /// <see cref="InvalidOperationException"/> from the pipeline ctor
+    /// the first time <see cref="SlackInboundIngestor"/> lazily
+    /// resolves it for a dequeued envelope; the ingestor forwards
+    /// that envelope to the durable last-resort
     /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> so the host
-    /// itself still starts cleanly and the unrecoverable envelope
-    /// is preserved instead of silently lost. Development hosts that
-    /// genuinely want the no-op stand-ins (e.g. the Worker before
-    /// Stage 5.1/5.2/5.3 ships) opt in explicitly by additionally
-    /// calling <see cref="AddSlackInboundDevelopmentHandlerStubs"/>.
+    /// still starts cleanly and the envelope is preserved. Dev
+    /// hosts that want the no-op stand-ins opt in via
+    /// <see cref="AddSlackInboundDevelopmentHandlerStubs"/>.
     /// </para>
     /// </remarks>
     public static IServiceCollection AddSlackInboundIngestor<TContext>(this IServiceCollection services)
@@ -105,10 +98,9 @@ public static class SlackInboundIngestorServiceCollectionExtensions
         services.TryAddSingleton<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>();
 
         // NOTE: ISlackCommandHandler / ISlackAppMentionHandler /
-        // ISlackInteractionHandler are INTENTIONALLY NOT registered
-        // here -- see the class-level remarks for the iter-5
-        // evaluator-driven rationale. Hosts MUST register real
-        // handlers (Stage 5.1/5.2/5.3) or call
+        // ISlackInteractionHandler are intentionally NOT registered
+        // here (see remarks). Hosts MUST register real handlers
+        // (Stage 5.1/5.2/5.3) or call
         // AddSlackInboundDevelopmentHandlerStubs to opt into the
         // no-op stand-ins.
 

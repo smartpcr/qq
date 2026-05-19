@@ -22,6 +22,7 @@ using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
 using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -246,49 +247,44 @@ public sealed class SlackInboundIngestorTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_forwards_envelope_to_fallback_sink_when_pipeline_cannot_be_lazily_resolved_from_DI()
+    public async Task ExecuteAsync_forwards_envelope_to_fallback_sink_when_pipeline_ctor_cannot_resolve_missing_handlers()
     {
-        // Iter-3 evaluator item #1 (PRIMARY): direct coverage for the
-        // lazy-resolution catch block that iter-2 added inside
-        // SlackInboundIngestor.ExecuteAsync.
-        //
-        // The shipped Worker registers SlackInboundIngestor as a
-        // BackgroundService even when no real Stage 5 handlers are
-        // wired AND the AddSlackInboundDevelopmentHandlerStubs gate
-        // is OFF (Production default). The ingestor must therefore
-        // tolerate a DI graph where SlackInboundProcessingPipeline
-        // cannot be resolved at all (the pipeline ctor requires
-        // ISlackCommandHandler / ISlackAppMentionHandler /
-        // ISlackInteractionHandler, none of which are registered).
-        //
-        // Existing coverage in WorkerHandlerStubGatingTests asserts
-        // direct factory.Services.GetRequiredService<SlackInboundProcessingPipeline>()
-        // throws -- but that does NOT exercise the ingestor's catch
-        // block. This test wires the actual SlackInboundIngestor with
-        // an IServiceProvider that has NO pipeline registration,
-        // enqueues a real envelope, and asserts:
-        //   1) the ingestor does not crash (the BackgroundService
-        //      loop keeps running so a later operator-driven
-        //      handler registration could recover the host);
-        //   2) the original envelope is forwarded to the durable
-        //      last-resort ISlackInboundEnqueueDeadLetterSink so the
-        //      FR-005 / FR-007 zero-message-loss guarantee still
-        //      holds even when the handler set is missing;
-        //   3) the captured exception is the DI resolve failure
-        //      (InvalidOperationException) so operators triaging the
-        //      sink can see the root cause without having to dig
-        //      through the host logs.
+        // Mirrors the production failure mode: SlackInboundProcessingPipeline
+        // IS registered (matching AddSlackInboundIngestor), but the three
+        // handler interfaces (ISlackCommandHandler / ISlackAppMentionHandler /
+        // ISlackInteractionHandler) are NOT -- exactly the DI graph a
+        // Production Worker has when EnableDevelopmentHandlerStubs is OFF
+        // and Stage 5 handlers have not yet shipped. The pipeline ctor
+        // therefore throws InvalidOperationException at first lazy resolve;
+        // the ingestor's catch MUST forward the envelope to the
+        // last-resort sink so it is preserved.
         FakeQueue queue = new();
         RecordingDeadLetterFallbackSink sink = new();
-        SlackInboundEnvelope envelope = BuildCommandEnvelope("cmd:T1:U1:/agent:trig-no-pipeline");
+        SlackInboundEnvelope envelope = BuildCommandEnvelope("cmd:T1:U1:/agent:trig-missing-handlers");
 
-        // Build a service provider that DELIBERATELY does NOT
-        // register SlackInboundProcessingPipeline (mirroring a
-        // Production Worker that has opted out of the development
-        // handler stubs and not yet shipped Stage 5 handlers). The
-        // fallback sink is registered because the ingestor MUST
-        // still be able to preserve the envelope.
         ServiceCollection services = new();
+        services.AddSingleton(TimeProvider.System);
+        services.AddSingleton<ILogger<SlackInboundProcessingPipeline>>(
+            NullLogger<SlackInboundProcessingPipeline>.Instance);
+        services.AddSingleton<ILogger<SlackInboundAuditRecorder>>(
+            NullLogger<SlackInboundAuditRecorder>.Instance);
+
+        // Pipeline dependencies that ARE present in production
+        // composition (mirrors AddSlackInboundIngestor minus handlers).
+        services.AddSingleton<ISlackInboundAuthorizer>(new FakeAuthorizer(true));
+        services.AddSingleton<ISlackIdempotencyGuard, InMemorySlackIdempotencyGuard>();
+        services.AddSingleton<ISlackRetryPolicy>(new ZeroDelayRetryPolicy(maxAttempts: 1));
+        services.AddSingleton<ISlackDeadLetterQueue, RecordingDeadLetterQueue>();
+        services.AddSingleton<ISlackAuditEntryWriter, InMemorySlackAuditEntryWriter>();
+        services.AddSingleton<SlackInboundAuditRecorder>();
+
+        // The pipeline itself IS registered -- the production
+        // AddSlackInboundIngestor extension registers it -- so the
+        // missing-handler failure surfaces from the pipeline ctor
+        // (DI activator) rather than from a missing pipeline service.
+        services.AddSingleton<SlackInboundProcessingPipeline>();
+
+        // Last-resort sink is wired so the no-loss guarantee can hold.
         services.AddSingleton<ISlackInboundEnqueueDeadLetterSink>(sink);
 
         SlackInboundIngestor ingestor = new(
@@ -308,13 +304,15 @@ public sealed class SlackInboundIngestorTests
         await run;
 
         sink.Records.Should().HaveCount(1,
-            "the ingestor's lazy-resolution catch block MUST forward the envelope to the durable last-resort sink when SlackInboundProcessingPipeline cannot be resolved from DI; otherwise the envelope is permanently lost");
+            "the production DI graph (pipeline registered but handlers missing) MUST surface the pipeline ctor failure to the last-resort sink");
         sink.Records[0].Envelope.IdempotencyKey.Should().Be(envelope.IdempotencyKey,
-            "the forwarded envelope MUST be the ORIGINAL envelope (not a copy with stripped fields) so an operator can replay it after Stage 5 handlers ship");
+            "the forwarded envelope MUST be the ORIGINAL envelope so an operator can replay it once Stage 5 handlers ship");
         sink.Records[0].Envelope.SourceType.Should().Be(envelope.SourceType);
         sink.Records[0].Envelope.RawPayload.Should().Be(envelope.RawPayload);
         sink.Records[0].LastException.Should().BeOfType<InvalidOperationException>(
-            "GetRequiredService<SlackInboundProcessingPipeline>() throws InvalidOperationException when the service is not registered, and that root-cause exception MUST be the one captured in the sink");
+            "DI activator throws InvalidOperationException when a constructor parameter cannot be resolved -- that root cause MUST reach the sink");
+        sink.Records[0].LastException.Message.Should().Contain(nameof(ISlackCommandHandler),
+            "the captured exception SHOULD identify which handler interface was missing so operators can triage from the sink record alone");
         sink.Records[0].AttemptCount.Should().Be(0,
             "the envelope never made it past DI resolution so no handler attempts were made");
     }
@@ -322,34 +320,31 @@ public sealed class SlackInboundIngestorTests
     [Fact]
     public async Task ExecuteAsync_survives_when_pipeline_cannot_be_resolved_AND_fallback_sink_is_also_missing()
     {
-        // Iter-3 belt-and-braces companion to the lazy-resolve test:
-        // even if the host has misconfigured BOTH the pipeline AND
-        // the last-resort sink (the worst case for a production
-        // composition root that has skipped the entire ingestion
-        // wiring), the BackgroundService MUST NOT crash the host. It
-        // logs critical, leaves the envelope unrecoverable (the
-        // contract is "best effort to preserve"), and returns to the
-        // dequeue loop so a subsequent operator fix that adds the
-        // missing services recovers normal processing.
-        FakeQueue queue = new();
+        // Belt-and-braces: even with NEITHER the pipeline NOR the
+        // last-resort sink registered, the BackgroundService MUST NOT
+        // crash. Observable proof: instrument the queue so we can wait
+        // until BOTH envelopes have been dequeued -- which proves the
+        // loop survived the first resolve failure to reach the second
+        // envelope. (Without the instrumentation, a Task.Delay-based
+        // wait gives no positive proof that any envelope traversed
+        // the catch path.)
+        InstrumentedFakeQueue queue = new();
         ServiceCollection services = new();
         SlackInboundIngestor ingestor = new(
             queue,
             services.BuildServiceProvider(),
             NullLogger<SlackInboundIngestor>.Instance);
 
-        await queue.EnqueueAsync(BuildCommandEnvelope("cmd:T1:U1:/agent:trig-no-pipe-no-sink-1"));
-        await queue.EnqueueAsync(BuildCommandEnvelope("cmd:T1:U1:/agent:trig-no-pipe-no-sink-2"));
+        await queue.EnqueueAsync(BuildCommandEnvelope("cmd:T1:U1:/agent:no-pipe-no-sink-1"));
+        await queue.EnqueueAsync(BuildCommandEnvelope("cmd:T1:U1:/agent:no-pipe-no-sink-2"));
 
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
         Task run = ingestor.StartAsync(cts.Token);
 
-        // Give the loop enough time to drain both envelopes through
-        // the catch path. There is no observable side-effect to wait
-        // on (the whole point is that the envelope is unrecoverable
-        // when even the sink is missing), so we just give the loop a
-        // generous window and then prove it is still running.
-        await Task.Delay(TimeSpan.FromMilliseconds(300));
+        // Wait for OBSERVABLE proof that the loop dequeued both
+        // envelopes -- which can only happen if the first resolve
+        // failure was absorbed without crashing the loop.
+        await WaitUntilAsync(() => queue.DequeueCount >= 2, TimeSpan.FromSeconds(5));
 
         Func<Task> stop = async () =>
         {
@@ -360,6 +355,8 @@ public sealed class SlackInboundIngestorTests
 
         await stop.Should().NotThrowAsync(
             "the BackgroundService MUST NOT propagate the resolve failure as an unhandled exception even when the fallback sink itself is missing");
+        queue.DequeueCount.Should().BeGreaterThanOrEqualTo(2,
+            "both envelopes MUST have been dequeued, proving the loop survived the resolve failure on the first envelope");
     }
 
     [Fact]
@@ -537,6 +534,34 @@ public sealed class SlackInboundIngestorTests
 
         public ValueTask<SlackInboundEnvelope> DequeueAsync(CancellationToken ct)
             => this.channel.Reader.ReadAsync(ct);
+    }
+
+    /// <summary>
+    /// FakeQueue variant that counts successful dequeues. Used by the
+    /// no-pipeline-no-sink survival test to assert observably that the
+    /// loop reached the SECOND envelope -- which proves the first
+    /// resolve failure was absorbed without crashing the loop.
+    /// </summary>
+    private sealed class InstrumentedFakeQueue : ISlackInboundQueue
+    {
+        private readonly System.Threading.Channels.Channel<SlackInboundEnvelope> channel =
+            System.Threading.Channels.Channel.CreateUnbounded<SlackInboundEnvelope>();
+        private int dequeueCount;
+
+        public int DequeueCount => Volatile.Read(ref this.dequeueCount);
+
+        public ValueTask EnqueueAsync(SlackInboundEnvelope envelope)
+        {
+            this.channel.Writer.TryWrite(envelope);
+            return ValueTask.CompletedTask;
+        }
+
+        public async ValueTask<SlackInboundEnvelope> DequeueAsync(CancellationToken ct)
+        {
+            SlackInboundEnvelope envelope = await this.channel.Reader.ReadAsync(ct).ConfigureAwait(false);
+            Interlocked.Increment(ref this.dequeueCount);
+            return envelope;
+        }
     }
 
     private sealed class FakeAuthorizer : ISlackInboundAuthorizer
