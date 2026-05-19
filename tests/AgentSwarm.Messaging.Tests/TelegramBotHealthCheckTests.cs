@@ -110,8 +110,8 @@ public sealed class TelegramBotHealthCheckTests
                 "the internal timeout path explicitly records that the caller did NOT cancel — distinguishes this from the caller-cancellation branch");
         sw.Elapsed.Should().BeGreaterThanOrEqualTo(TimeSpan.FromMilliseconds(150),
             "the internal CTS must have actually fired (~200ms budget) — a sub-150ms elapsed time would mean the test isn't really exercising the timeout");
-        sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(3),
-            "the internal timeout MUST short-circuit well before the hanging handler completes (it never does)");
+        sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(10),
+            "the internal timeout MUST short-circuit before the hanging handler completes (it never does); a finite elapsed time proves the CTS fired rather than the handler returning. Upper bound widened from 3s to 10s in iter-9 because xUnit's default parallel-class execution + the SQLite shared-cache integration tests + the OutboundQueueProcessor delay-based suite starved the CTS timer queue on CI under contention (observed elapsed ~5s in the iter-8 gate run despite a 200ms budget). The semantic invariant — \"the timeout fires before the handler\" — is unchanged; only the wall-clock guess was loosened to absorb scheduler jitter without losing the never-completing-handler proof");
 
         // Release the hanging task to let xUnit dispose the handler.
         hangForever.TrySetCanceled();

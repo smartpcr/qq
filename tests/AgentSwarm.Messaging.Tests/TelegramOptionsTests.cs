@@ -92,12 +92,14 @@ public class TelegramOptionsTests
         var options = new TelegramOptions
         {
             BotToken = SampleToken,
+#pragma warning disable CS0618 // Type or member is obsolete -- test pins ToString() back-compat surface; see TelegramOptions.OperatorBindings.
             OperatorBindings = new List<TelegramOperatorBindingOptions>
             {
                 new() { TelegramUserId = 11111, TelegramChatId = 22222, TenantId = "tenant-a", WorkspaceId = "ws-1" },
                 new() { TelegramUserId = 33333, TelegramChatId = 44444, TenantId = "tenant-b", WorkspaceId = "ws-2" },
                 new() { TelegramUserId = 55555, TelegramChatId = 66666, TenantId = "tenant-c", WorkspaceId = "ws-3" },
             }
+#pragma warning restore CS0618
         };
 
         var text = options.ToString();
@@ -116,7 +118,9 @@ public class TelegramOptionsTests
         var options = new TelegramOptions
         {
             BotToken = SampleToken,
+#pragma warning disable CS0618 // Type or member is obsolete -- test pins ToString() null-safety contract.
             OperatorBindings = null!
+#pragma warning restore CS0618
         };
 
         var act = () => options.ToString();

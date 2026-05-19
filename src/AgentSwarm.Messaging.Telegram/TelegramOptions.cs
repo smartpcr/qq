@@ -250,7 +250,9 @@ public sealed class TelegramOptions
     public override string ToString()
     {
         var allowedCount = AllowedUserIds is null ? 0 : AllowedUserIds.Count;
+#pragma warning disable CS0618 // Type or member is obsolete -- ToString() retains the field's count for backwards-compatible log output; see OperatorBindings remarks above.
         var bindingCount = OperatorBindings is null ? 0 : OperatorBindings.Count;
+#pragma warning restore CS0618
         var rl = RateLimits ?? new RateLimitOptions();
         return "TelegramOptions { "
              + $"BotToken = {(string.IsNullOrEmpty(BotToken) ? NotSetMarker : RedactedMarker)}, "
