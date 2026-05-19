@@ -63,6 +63,16 @@ public class Program
     public const string SlackAuditConnectionStringKey = "SlackAudit";
 
     /// <summary>
+    /// Default connection string used when
+    /// <c>ConnectionStrings:<see cref="SlackAuditConnectionStringKey"/></c>
+    /// is not configured. Points at a relative SQLite file so a
+    /// freshly-cloned host still boots; production deployments
+    /// override this via configuration.
+    /// </summary>
+    private const string DefaultSlackAuditConnectionString =
+        "Data Source=slack-audit.db";
+
+    /// <summary>
     /// Configuration key (boolean) that gates the opt-in for the
     /// no-op Slack handler stand-ins
     /// (<see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>).
@@ -154,28 +164,23 @@ public class Program
         // buffer SlackConnector.ReceiveAsync drains. The host MUST
         // register SlackPersistenceDbContext (above) before this call.
         //
-        // Iter-3 evaluator item 2 fix: the facade NO LONGER installs
-        // a development-default NoOpAgentTaskService stub (the prior
-        // behaviour silently ack'd /agent ask with a synthetic task
-        // when the host forgot a real orchestrator). The Worker is
-        // still in pre-orchestrator-client mode, so we explicitly opt
-        // in to the dev stub here -- the call is observable in the
-        // composition root and a future commit that wires the real
-        // orchestrator simply deletes this single line. Production
-        // hosts that ship the real orchestrator client BEFORE the
-        // dev opt-in get TryAdd semantics (their real registration
-        // wins).
+        // The Slack facade does NOT install a default NoOpAgentTaskService
+        // stub (silent /agent ask acknowledgement is a footgun). The
+        // Worker is still in pre-orchestrator-client mode, so explicitly
+        // opt in to the dev stub here; the call is observable in the
+        // composition root, and a future commit that wires the real
+        // orchestrator simply deletes this single line. Production hosts
+        // that register a real orchestrator client BEFORE this call get
+        // TryAdd semantics (their real registration wins).
         builder.Services.AddSlackCommandDispatcherDevelopmentDefaults();
 
-        // Iter-4 evaluator item 2 fix: AddSlackMessenger now composes
-        // BOTH AddSlackInboundTransport (Events API) AND
-        // AddSlackSocketModeTransport (Socket Mode) internally. The
-        // Worker previously had to call AddSlackSocketModeTransport
-        // explicitly; that responsibility moved into the facade so
-        // every host that calls AddSlackMessenger automatically wires
-        // ISlackInboundTransportFactory, ISlackSocketModeConnectionFactory,
-        // SlackSocketModeOptions (bound to Slack:SocketMode), and
-        // SlackInboundTransportHostedService -- no per-host duplication.
+        // AddSlackMessenger composes BOTH AddSlackInboundTransport
+        // (Events API) AND AddSlackSocketModeTransport (Socket Mode)
+        // internally, so every host that calls AddSlackMessenger
+        // automatically wires ISlackInboundTransportFactory,
+        // ISlackSocketModeConnectionFactory, SlackSocketModeOptions
+        // (bound to Slack:SocketMode), and SlackInboundTransportHostedService
+        // -- no per-host duplication.
         builder.Services.AddSlackMessenger(builder.Configuration);
 
         // Stage 3.2 / 4.1: mount the SlackAuthorizationFilter as a global
@@ -213,20 +218,20 @@ public class Program
         // appsettings.json / environment variables without rebuilding.
         builder.Services.AddSlackSocketModeTransport(builder.Configuration);
 
-        // Stage 4.1 (evaluator iter-3 item 2): swap the default
-        // in-process-only ISlackFastPathIdempotencyStore for the
-        // durable two-level composite (in-process L1 + EF L2 backed by
-        // the slack_inbound_request_record table). Without this call
-        // the modal fast-path falls back to in-memory dedup that does
-        // not survive a process restart, allowing a Slack retry that
+        // Stage 4.1: swap the default in-process-only
+        // ISlackFastPathIdempotencyStore for the durable two-level
+        // composite (in-process L1 + EF L2 backed by the
+        // slack_inbound_request_record table). Without this call the
+        // modal fast-path falls back to in-memory dedup that does not
+        // survive a process restart, allowing a Slack retry that
         // crosses a deployment to open a second modal for the same
         // trigger_id.
         builder.Services
             .AddSlackFastPathDurableIdempotency<SlackPersistenceDbContext>();
 
-        // Stage 4.3 iter 6 evaluator item #2: opt the Worker into the
-        // disk-backed dead-letter queue BEFORE the ingestor wires its
-        // own TryAdd<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>
+        // Stage 4.3: opt the Worker into the disk-backed dead-letter
+        // queue BEFORE the ingestor wires its own
+        // TryAdd<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>
         // default. The in-memory default loses every exhausted-retry
         // envelope on a process restart, which contradicts the story's
         // FR-005 / FR-007 zero-loss requirement and the operator
@@ -279,18 +284,17 @@ public class Program
             builder.Services.AddSlackInboundDevelopmentHandlerStubs();
         }
 
-        // Stage 4.1 (evaluator iter-4 item 1): opt the Worker into the
-        // durable file-system dead-letter sink for post-ACK enqueue
-        // failures. The default registration inside
-        // AddSlackInboundTransport is InMemorySlackInboundEnqueueDeadLetterSink,
-        // which loses captured envelopes on process restart -- the
-        // operator-uploaded story attachment's FR-005 / FR-007
-        // "no message loss" requirements (and the iter-4 evaluator)
-        // require durable persistence so a worker restart cannot
-        // erase the recovery log. Hosts configure the destination via
-        // Slack:Inbound:DeadLetterDirectory; the default value points
-        // at a relative "data/slack-inbound-dead-letter" path so a
-        // missing config does NOT silently fall back to in-memory.
+        // Stage 4.1: opt the Worker into the durable file-system
+        // dead-letter sink for post-ACK enqueue failures. The default
+        // registration inside AddSlackInboundTransport is
+        // InMemorySlackInboundEnqueueDeadLetterSink, which loses
+        // captured envelopes on process restart -- FR-005 / FR-007
+        // "no message loss" requires durable persistence so a worker
+        // restart cannot erase the recovery log. Hosts configure the
+        // destination via Slack:Inbound:DeadLetterDirectory; the
+        // default value points at a relative "data/slack-inbound-dead-letter"
+        // path so a missing config does NOT silently fall back to
+        // in-memory.
         string deadLetterDir = builder.Configuration["Slack:Inbound:DeadLetterDirectory"]
             ?? "data/slack-inbound-dead-letter";
         if (!string.IsNullOrWhiteSpace(deadLetterDir))
@@ -300,8 +304,8 @@ public class Program
 
         WebApplication app = builder.Build();
 
-        // Stage 4.1 iter-2 evaluator item 3: fail-fast at host startup
-        // when the resolved ISlackInboundQueue is the in-process
+        // Stage 4.1: fail-fast at host startup when the resolved
+        // ISlackInboundQueue is the in-process
         // ChannelBasedSlackInboundQueue and the deployment claims to
         // be Production. Operators who have validated that an
         // in-memory queue is acceptable for their deployment can
@@ -323,11 +327,10 @@ public class Program
             ctx.Database.EnsureCreated();
         }
 
-        // Stage 3.1 (evaluator iter-3 item 3): eagerly resolve the
-        // composite ISecretProvider so a misconfigured
-        // SecretProvider:ProviderType (e.g. KeyVault without a registered
-        // backend) fails at host start, not at the first inbound Slack
-        // request.
+        // Stage 3.1: eagerly resolve the composite ISecretProvider so a
+        // misconfigured SecretProvider:ProviderType (e.g. KeyVault
+        // without a registered backend) fails at host start, not at
+        // the first inbound Slack request.
         _ = app.Services.GetRequiredService<ISecretProvider>();
 
         // Stage 3.1: signature verification middleware. Placed before
