@@ -131,7 +131,7 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         IAgentQuestionStore agentQuestionStore,
         ILogger<OutboxBackedMessengerConnector> logger,
         TimeProvider? timeProvider = null)
-        : this(innerConnector, outbox, conversationReferenceRouter, logger, timeProvider, outboundDeduplicator: null)
+        : this(innerConnector, outbox, conversationReferenceRouter, conversationReferenceStore, agentQuestionStore, logger, timeProvider, outboundDeduplicator: null)
     {
     }
 
@@ -147,6 +147,8 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         IMessengerConnector innerConnector,
         IMessageOutbox outbox,
         IConversationReferenceRouter conversationReferenceRouter,
+        IConversationReferenceStore conversationReferenceStore,
+        IAgentQuestionStore agentQuestionStore,
         ILogger<OutboxBackedMessengerConnector> logger,
         TimeProvider? timeProvider,
         OutboundMessageDeduplicator? outboundDeduplicator)
