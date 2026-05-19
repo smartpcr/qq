@@ -247,6 +247,14 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         services.AddSingleton<IConversationReferenceStore>(store);
         services.AddSingleton<IConversationReferenceRouter>(store);
 
+        // Stage 6.1 — IAgentQuestionStore is a hard dependency of both
+        // OutboxBackedProactiveNotifier and OutboxBackedMessengerConnector because
+        // both must call IAgentQuestionStore.SaveAsync BEFORE IMessageOutbox.EnqueueAsync
+        // for question-sending paths per the canonical pre-enqueue contract in
+        // implementation-plan.md §6.1. Without this registration the DI graph fails to
+        // resolve the outbox-backed wrappers.
+        services.AddSingleton<IAgentQuestionStore>(new RecordingAgentQuestionStore());
+
         services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
 
         return services;
@@ -351,6 +359,7 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         var store = new RecordingConversationReferenceStore();
         services.AddSingleton<IConversationReferenceStore>(store);
         services.AddSingleton<IConversationReferenceRouter>(store);
+        services.AddSingleton<IAgentQuestionStore>(new RecordingAgentQuestionStore());
         services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
 
         services.AddTeamsOutboxEngine();
@@ -419,6 +428,7 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         var store = new RecordingConversationReferenceStore();
         services.AddSingleton<IConversationReferenceStore>(store);
         services.AddSingleton<IConversationReferenceRouter>(store);
+        services.AddSingleton<IAgentQuestionStore>(new RecordingAgentQuestionStore());
         services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
 
         services.AddTeamsOutboxEngine();
@@ -496,6 +506,7 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         // is the wiring shape critique #3 calls out: a host that wired the concrete
         // type by hand but never opted into the keyed contract.
         services.AddSingleton<TeamsMessengerConnector>(concreteConnector);
+        services.AddSingleton<IAgentQuestionStore>(new RecordingAgentQuestionStore());
         services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
 
         // Pre-condition: no keyed "teams" descriptor.
@@ -541,6 +552,7 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         var store = new RecordingConversationReferenceStore();
         services.AddSingleton<IConversationReferenceStore>(store);
         services.AddSingleton<IConversationReferenceRouter>(store);
+        services.AddSingleton<IAgentQuestionStore>(new RecordingAgentQuestionStore());
         services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
 
         // Canonical-shape registration: keyed "teams" registration is the source of
@@ -591,6 +603,7 @@ public sealed class TeamsOutboxServiceCollectionExtensionsTests
         var store = new RecordingConversationReferenceStore();
         services.AddSingleton<IConversationReferenceStore>(store);
         services.AddSingleton<IConversationReferenceRouter>(store);
+        services.AddSingleton<IAgentQuestionStore>(new RecordingAgentQuestionStore());
         services.AddSingleton<IMessageOutbox>(new InMemoryRecordingOutbox());
 
         services.AddKeyedSingleton<IMessengerConnector>(

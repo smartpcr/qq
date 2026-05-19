@@ -30,11 +30,50 @@ public static class TeamsOutboxServiceCollectionExtensions
     /// <b>Composition order requirement.</b> The host MUST register the inner notifier
     /// and connector (via <c>AddTeamsProactiveNotifier</c> +
     /// <c>AddTeamsMessengerConnector</c> + <c>AddSqlMessageOutbox</c>) BEFORE calling
-    /// this helper — the decorator wiring captures the prior registration and
-    /// re-introduces it under a marker interface
+    /// this helper — the decorator wiring captures the prior registrations and
+    /// re-introduces them under marker interfaces
     /// (<see cref="IInnerTeamsProactiveNotifier"/> /
-    /// <see cref="IInnerTeamsMessengerConnector"/>) so the decorator can forward to it
-    /// while the public interface points to the outbox-backed wrapper.
+    /// <see cref="IInnerTeamsMessengerConnector"/>). Iter-3 evaluator critique #3 fix —
+    /// the previous narrative claimed the markers "let the decorator forward to the
+    /// inner registrations", which was misleading: only the
+    /// <see cref="IInnerTeamsMessengerConnector"/> marker is consumed at runtime, and
+    /// only for the single <see cref="IMessengerConnector.ReceiveAsync"/> forwarding
+    /// call (inbound events do not flow through the outbox by design).
+    /// <see cref="OutboxBackedProactiveNotifier"/> takes NO inner dependency at all —
+    /// every send method enqueues directly to <see cref="IMessageOutbox"/>, and the
+    /// <see cref="IInnerTeamsProactiveNotifier"/> registration is reserved for
+    /// test/diagnostic resolution of the pre-decoration notifier (e.g. to pin
+    /// underlying send semantics in unit tests that do not start the outbox engine).
+    /// <see cref="TeamsOutboxDispatcher"/> consumes neither marker — it owns
+    /// <see cref="Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter"/>
+    /// directly and dispatches each dequeued entry via
+    /// <c>CloudAdapter.ContinueConversationAsync</c>.
+    /// </para>
+    /// <para>
+    /// <b>Direct-send bypass boundary (iter-3 evaluator critique #4 fix).</b>
+    /// Even though this helper re-exposes the inner concretes under markers, the
+    /// concrete <see cref="TeamsMessengerConnector"/> and
+    /// <see cref="TeamsProactiveNotifier"/> classes still own direct
+    /// <c>CloudAdapter.ContinueConversationAsync</c> calls in their send methods
+    /// (see <c>implementation-plan.md</c> §6.1 lines 383-384). Without a guard those
+    /// direct paths would silently bypass <see cref="IMessageOutbox.EnqueueAsync"/>
+    /// for any production caller that resolved the concrete type or the marker's
+    /// <see cref="IInnerTeamsMessengerConnector.Inner"/> /
+    /// <see cref="IInnerTeamsProactiveNotifier.Inner"/> accessor and called send on
+    /// it. To close that bypass, this helper registers
+    /// <see cref="TeamsDirectSendBypassGuard"/> as a sentinel singleton; the
+    /// connector / notifier factories in
+    /// <see cref="TeamsServiceCollectionExtensions"/> wire the guard onto the
+    /// concretes via <see cref="TeamsMessengerConnector.DirectSendGuard"/> /
+    /// <see cref="TeamsProactiveNotifier.DirectSendGuard"/> property initializers,
+    /// and every concrete send method calls
+    /// <see cref="TeamsDirectSendBypassGuard.ThrowIfDisallowed"/> at the top — which
+    /// converts the silent bypass into a loud <see cref="InvalidOperationException"/>
+    /// with a remediation message pointing the caller back at the public
+    /// <see cref="IMessengerConnector"/> / <see cref="IProactiveNotifier"/>
+    /// contracts. Tests and legacy compositions that do not call
+    /// <c>AddTeamsOutboxEngine</c> never see the guard registered, so their existing
+    /// direct-send semantics are preserved unchanged.
     /// </para>
     /// <para>
     /// <b>Connector source discovery (iter-2 fix).</b>
@@ -142,6 +181,22 @@ public static class TeamsOutboxServiceCollectionExtensions
         services.TryAddSingleton<OutboxMetrics>();
         services.TryAddSingleton<TokenBucketRateLimiter>();
 
+        // Iter-3 evaluator critique #4 fix — register the TeamsDirectSendBypassGuard
+        // sentinel singleton so the inner concrete TeamsMessengerConnector /
+        // TeamsProactiveNotifier reject every direct send when the outbox engine is
+        // composed. Without the guard, production code that resolved the concrete
+        // type (or the IInnerTeams* marker's Inner accessor) and called a send method
+        // would silently bypass IMessageOutbox.EnqueueAsync, violating the
+        // implementation-plan.md §6.1 lines 383-384 requirement that every send flows
+        // through the outbox. The connectors' DI factories in
+        // TeamsServiceCollectionExtensions resolve this guard as an optional dependency
+        // and assign it via the DirectSendGuard property initializer — so legacy
+        // hosts / tests that do NOT call AddTeamsOutboxEngine keep their direct-send
+        // semantics unchanged (the guard simply isn't in the container). TryAdd lets
+        // a host (or test) replace the guard with a custom no-op subclass for
+        // scenarios that legitimately need to bypass the guard at the inner level.
+        services.TryAddSingleton<TeamsDirectSendBypassGuard>();
+
         // Stage 6.2 step 4 — outbound deduplication singleton + background eviction
         // service. Registered via TryAdd* so hosts that supplied a custom
         // OutboundDeduplicationOptions or replaced the deduplicator with a no-op for
@@ -217,6 +272,7 @@ public static class TeamsOutboxServiceCollectionExtensions
         services.AddSingleton<IProactiveNotifier>(sp => new OutboxBackedProactiveNotifier(
             sp.GetRequiredService<IMessageOutbox>(),
             sp.GetRequiredService<IConversationReferenceStore>(),
+            sp.GetRequiredService<IAgentQuestionStore>(),
             sp.GetRequiredService<ILogger<OutboxBackedProactiveNotifier>>(),
             sp.GetService<TimeProvider>()));
     }
@@ -309,6 +365,8 @@ public static class TeamsOutboxServiceCollectionExtensions
             sp.GetRequiredService<IInnerTeamsMessengerConnector>().Inner,
             sp.GetRequiredService<IMessageOutbox>(),
             sp.GetRequiredService<IConversationReferenceRouter>(),
+            sp.GetRequiredService<IConversationReferenceStore>(),
+            sp.GetRequiredService<IAgentQuestionStore>(),
             sp.GetRequiredService<ILogger<OutboxBackedMessengerConnector>>(),
             sp.GetService<TimeProvider>(),
             sp.GetService<OutboundMessageDeduplicator>()));
@@ -489,13 +547,32 @@ public static class TeamsOutboxServiceCollectionExtensions
 
 /// <summary>
 /// Internal marker used by <see cref="TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/>
-/// to expose the pre-decoration <see cref="IProactiveNotifier"/> registration to the
-/// outbox dispatcher without re-introducing a circular DI graph. Concrete tests can wire
-/// a custom adapter under this marker for isolation.
+/// to expose the pre-decoration <see cref="IProactiveNotifier"/> registration to
+/// test/diagnostic code without re-introducing a circular DI graph.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>NOT consumed at runtime by production code.</b>
+/// <see cref="OutboxBackedProactiveNotifier"/> takes no inner-notifier dependency, and
+/// <see cref="TeamsOutboxDispatcher"/> owns
+/// <see cref="Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter"/> directly. This
+/// marker is preserved so unit tests can pin the underlying
+/// <see cref="TeamsProactiveNotifier"/> send semantics by resolving the pre-decoration
+/// instance, and so audit/diagnostic tooling can reflect on the original registration.
+/// Production hosts MUST resolve <see cref="IProactiveNotifier"/> directly — that points
+/// to <see cref="OutboxBackedProactiveNotifier"/> which enqueues to
+/// <see cref="IMessageOutbox"/>. Calling
+/// <see cref="TeamsProactiveNotifier"/> send methods through this marker's
+/// <see cref="Inner"/> accessor in production would normally constitute a direct-send
+/// bypass; the <see cref="TeamsDirectSendBypassGuard"/> registered by
+/// <see cref="TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/> blocks
+/// every such call with a structured
+/// <see cref="System.InvalidOperationException"/>.
+/// </para>
+/// </remarks>
 public interface IInnerTeamsProactiveNotifier
 {
-    /// <summary>The wrapped notifier.</summary>
+    /// <summary>The wrapped notifier (test/diagnostic access only — see remarks).</summary>
     IProactiveNotifier Inner { get; }
 }
 
@@ -514,9 +591,27 @@ internal sealed class InnerProactiveNotifierAdapter : IInnerTeamsProactiveNotifi
 /// Internal marker used by <see cref="TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/>
 /// to expose the pre-decoration <see cref="IMessengerConnector"/> registration.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>Consumed for ReceiveAsync forwarding ONLY.</b>
+/// <see cref="OutboxBackedMessengerConnector"/> resolves this marker so its
+/// <see cref="IMessengerConnector.ReceiveAsync"/> implementation can delegate to the
+/// inner concrete connector — inbound events do not flow through the outbox by design.
+/// <see cref="TeamsOutboxDispatcher"/> does NOT resolve this marker; it owns
+/// <see cref="Microsoft.Bot.Builder.Integration.AspNet.Core.CloudAdapter"/> directly and
+/// dispatches each dequeued <see cref="OutboxEntry"/> via
+/// <c>CloudAdapter.ContinueConversationAsync</c>. Calling the inner connector's send
+/// methods through this marker's <see cref="Inner"/> accessor in production would
+/// constitute a direct-send bypass; the <see cref="TeamsDirectSendBypassGuard"/>
+/// registered by
+/// <see cref="TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/> blocks
+/// every such call with a structured
+/// <see cref="System.InvalidOperationException"/>.
+/// </para>
+/// </remarks>
 public interface IInnerTeamsMessengerConnector
 {
-    /// <summary>The wrapped connector.</summary>
+    /// <summary>The wrapped connector (used for <see cref="IMessengerConnector.ReceiveAsync"/> forwarding — see remarks).</summary>
     IMessengerConnector Inner { get; }
 }
 

@@ -20,7 +20,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         router.ConversationIdReferences["conv-1"] = NewReference(tenantId: "tenant-1");
         var outbox = new InMemoryRecordingOutbox();
 
-        var decorator = new OutboxBackedMessengerConnector(inner, outbox, router,
+        var decorator = new OutboxBackedMessengerConnector(inner, outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         await decorator.SendMessageAsync(SampleMessage("m-1"), CancellationToken.None);
@@ -30,6 +31,10 @@ public sealed class OutboxBackedMessengerConnectorTests
         Assert.Equal(OutboxPayloadTypes.MessengerMessage, entry.PayloadType);
         Assert.Equal("conv-1", entry.DestinationId);
         Assert.Equal("teams://tenant-1/conversation/conv-1", entry.Destination);
+        // SendMessageAsync routes via the router (bare ConversationId) — verify the
+        // contract used so a future refactor that swaps it to the natural-key store path
+        // would fail loudly.
+        Assert.Contains("GetByConversationIdAsync:conv-1", router.LookupCalls);
     }
 
     [Fact]
@@ -39,6 +44,8 @@ public sealed class OutboxBackedMessengerConnectorTests
             new RecordingMessengerConnector(),
             new InMemoryRecordingOutbox(),
             new RecordingConversationReferenceStore(),
+            new RecordingConversationReferenceStore(),
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -46,14 +53,23 @@ public sealed class OutboxBackedMessengerConnectorTests
     }
 
     [Fact]
-    public async Task SendQuestionAsync_EnqueuesUserScopedQuestion()
+    public async Task SendQuestionAsync_EnqueuesUserScopedQuestion_LooksUpByInternalUserIdNotConversationId()
     {
+        // Iter-2 evaluator critique #1/#2: the outbox-backed connector MUST resolve
+        // user-scoped AgentQuestion targets via
+        // IConversationReferenceStore.GetByInternalUserIdAsync(TenantId, TargetUserId),
+        // exactly like the canonical TeamsMessengerConnector.SendQuestionAsync — NOT via
+        // IConversationReferenceRouter.GetByConversationIdAsync(TargetUserId). The latter
+        // would reject every legitimately registered proactive target whose internal
+        // user ID does not happen to equal a stored Bot Framework conversation ID, and
+        // would also bypass the question's TenantId scope.
         var inner = new RecordingMessengerConnector();
         var router = new RecordingConversationReferenceStore();
-        router.ConversationIdReferences["user-1"] = NewReference(tenantId: "tenant-1");
+        router.UserReferences[("tenant-1", "user-1")] = NewReference(tenantId: "tenant-1");
         var outbox = new InMemoryRecordingOutbox();
 
-        var decorator = new OutboxBackedMessengerConnector(inner, outbox, router,
+        var decorator = new OutboxBackedMessengerConnector(inner, outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         await decorator.SendQuestionAsync(SampleQuestion("q-1", userId: "user-1"), CancellationToken.None);
@@ -67,17 +83,26 @@ public sealed class OutboxBackedMessengerConnectorTests
             entry.PayloadJson, TeamsOutboxPayloadEnvelope.JsonOptions)!;
         Assert.NotNull(envelope.Question);
         Assert.Equal("q-1", envelope.Question!.QuestionId);
+
+        // Contract assertion — the natural-key lookup was used, and the wrong
+        // ConversationId-based lookup was NOT.
+        Assert.Contains("GetByInternalUserIdAsync:tenant-1:user-1", router.LookupCalls);
+        Assert.DoesNotContain("GetByConversationIdAsync:user-1", router.LookupCalls);
     }
 
     [Fact]
-    public async Task SendQuestionAsync_EnqueuesChannelScopedQuestion()
+    public async Task SendQuestionAsync_EnqueuesChannelScopedQuestion_LooksUpByChannelIdNotConversationId()
     {
+        // Companion to the user-scoped variant above — channel-scoped questions MUST
+        // resolve via IConversationReferenceStore.GetByChannelIdAsync(TenantId, TargetChannelId)
+        // for the same reasons (iter-2 evaluator critique #1/#2).
         var router = new RecordingConversationReferenceStore();
-        router.ConversationIdReferences["channel-1"] = NewReference(tenantId: "tenant-1");
+        router.ChannelReferences[("tenant-1", "channel-1")] = NewReference(tenantId: "tenant-1");
         var outbox = new InMemoryRecordingOutbox();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         await decorator.SendQuestionAsync(SampleQuestion("q-1", channelId: "channel-1"), CancellationToken.None);
@@ -85,6 +110,62 @@ public sealed class OutboxBackedMessengerConnectorTests
         var entry = Assert.Single(outbox.Enqueued);
         Assert.Equal(OutboxDestinationTypes.Channel, entry.DestinationType);
         Assert.Equal("channel-1", entry.DestinationId);
+
+        Assert.Contains("GetByChannelIdAsync:tenant-1:channel-1", router.LookupCalls);
+        Assert.DoesNotContain("GetByConversationIdAsync:channel-1", router.LookupCalls);
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_UserMissingFromStore_ThrowsAndDoesNotEnqueue()
+    {
+        // Iter-2 evaluator critique #1 regression guard — wrong-key seeding (router-style
+        // ConversationIdReferences) MUST NOT satisfy the connector's natural-key lookup.
+        // If the connector ever regresses back to GetByConversationIdAsync(TargetUserId)
+        // this test will start passing the wrong way and the assertion will catch the
+        // regression at review time.
+        var router = new RecordingConversationReferenceStore();
+        router.ConversationIdReferences["user-1"] = NewReference(tenantId: "tenant-1"); // wrong shape on purpose
+        var outbox = new InMemoryRecordingOutbox();
+
+        var decorator = new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
+            NullLogger<OutboxBackedMessengerConnector>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            decorator.SendQuestionAsync(
+                SampleQuestion("q-noref", userId: "user-1"),
+                CancellationToken.None));
+
+        Assert.Contains("tenant 'tenant-1'", ex.Message);
+        Assert.Contains("user 'user-1'", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+
+        Assert.Contains("GetByInternalUserIdAsync:tenant-1:user-1", router.LookupCalls);
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_ChannelMissingFromStore_ThrowsAndDoesNotEnqueue()
+    {
+        var router = new RecordingConversationReferenceStore();
+        router.ConversationIdReferences["channel-1"] = NewReference(tenantId: "tenant-1"); // wrong shape on purpose
+        var outbox = new InMemoryRecordingOutbox();
+
+        var decorator = new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
+            NullLogger<OutboxBackedMessengerConnector>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            decorator.SendQuestionAsync(
+                SampleQuestion("q-noref", channelId: "channel-1"),
+                CancellationToken.None));
+
+        Assert.Contains("tenant 'tenant-1'", ex.Message);
+        Assert.Contains("channel 'channel-1'", ex.Message);
+        Assert.Empty(outbox.Enqueued);
+
+        Assert.Contains("GetByChannelIdAsync:tenant-1:channel-1", router.LookupCalls);
     }
 
     [Fact]
@@ -94,6 +175,8 @@ public sealed class OutboxBackedMessengerConnectorTests
             new RecordingMessengerConnector(),
             new InMemoryRecordingOutbox(),
             new RecordingConversationReferenceStore(),
+            new RecordingConversationReferenceStore(),
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         // Both target fields null — fails Validate().
@@ -104,6 +187,114 @@ public sealed class OutboxBackedMessengerConnectorTests
     }
 
     [Fact]
+    public async Task SendQuestionAsync_PersistsAgentQuestionBeforeEnqueue()
+    {
+        // Stage 6.1 canonical pre-enqueue contract per implementation-plan.md §6.1.
+        var router = new RecordingConversationReferenceStore();
+        router.UserReferences[("tenant-1", "user-1")] = NewReference(tenantId: "tenant-1");
+
+        var questionStore = new RecordingAgentQuestionStore();
+        var outbox = new OrderingTrackingOutbox(questionStore.OperationLog);
+
+        var decorator = new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(), outbox, router, router,
+            questionStore,
+            NullLogger<OutboxBackedMessengerConnector>.Instance);
+
+        var question = SampleQuestion("q-pre", userId: "user-1") with { ConversationId = "should-be-overwritten" };
+        await decorator.SendQuestionAsync(question, CancellationToken.None);
+
+        Assert.Equal(2, questionStore.OperationLog.Count);
+        Assert.Equal("SaveAsync:q-pre", questionStore.OperationLog[0]);
+        Assert.StartsWith("EnqueueAsync:", questionStore.OperationLog[1]);
+
+        var saved = Assert.Single(questionStore.SavedQuestions);
+        Assert.Equal("q-pre", saved.QuestionId);
+        Assert.Null(saved.ConversationId);
+        Assert.Equal(AgentQuestionStatuses.Open, saved.Status);
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_QuestionAlreadyExistsOpen_SkipsDuplicateSaveAndStillEnqueues()
+    {
+        var router = new RecordingConversationReferenceStore();
+        router.UserReferences[("tenant-1", "user-1")] = NewReference(tenantId: "tenant-1");
+
+        var questionStore = new RecordingAgentQuestionStore();
+        questionStore.Seed(SampleQuestion("q-dup", userId: "user-1") with
+        {
+            Status = AgentQuestionStatuses.Open,
+        });
+
+        var outbox = new InMemoryRecordingOutbox();
+        var decorator = new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(), outbox, router, router,
+            questionStore,
+            NullLogger<OutboxBackedMessengerConnector>.Instance);
+
+        await decorator.SendQuestionAsync(
+            SampleQuestion("q-dup", userId: "user-1"),
+            CancellationToken.None);
+
+        Assert.Empty(questionStore.SavedQuestions);
+        Assert.Single(outbox.Enqueued);
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_QuestionAlreadyExistsResolved_ThrowsAndDoesNotEnqueue()
+    {
+        var router = new RecordingConversationReferenceStore();
+        router.UserReferences[("tenant-1", "user-1")] = NewReference(tenantId: "tenant-1");
+
+        var questionStore = new RecordingAgentQuestionStore();
+        questionStore.Seed(SampleQuestion("q-resolved", userId: "user-1") with
+        {
+            Status = AgentQuestionStatuses.Resolved,
+        });
+
+        var outbox = new InMemoryRecordingOutbox();
+        var decorator = new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(), outbox, router, router,
+            questionStore,
+            NullLogger<OutboxBackedMessengerConnector>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            decorator.SendQuestionAsync(
+                SampleQuestion("q-resolved", userId: "user-1"),
+                CancellationToken.None));
+
+        Assert.Empty(outbox.Enqueued);
+    }
+
+    [Fact]
+    public void Constructor_RejectsNullAgentQuestionStore()
+    {
+        Assert.Throws<ArgumentNullException>(() => new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(),
+            new InMemoryRecordingOutbox(),
+            new RecordingConversationReferenceStore(),
+            new RecordingConversationReferenceStore(),
+            agentQuestionStore: null!,
+            NullLogger<OutboxBackedMessengerConnector>.Instance));
+    }
+
+    [Fact]
+    public void Constructor_RejectsNullConversationReferenceStore()
+    {
+        // Iter-2 evaluator critique #1 fix — the new natural-key store dependency must
+        // be explicitly null-checked (parallel to the existing router and question-store
+        // guards) so a misconfigured host gets a clear ArgumentNullException at
+        // construction rather than a NullReferenceException at first question send.
+        Assert.Throws<ArgumentNullException>(() => new OutboxBackedMessengerConnector(
+            new RecordingMessengerConnector(),
+            new InMemoryRecordingOutbox(),
+            new RecordingConversationReferenceStore(),
+            conversationReferenceStore: null!,
+            new RecordingAgentQuestionStore(),
+            NullLogger<OutboxBackedMessengerConnector>.Instance));
+    }
+
+    [Fact]
     public async Task ReceiveAsync_DelegatesToInner()
     {
         var inner = new ReceiveStubConnector();
@@ -111,6 +302,8 @@ public sealed class OutboxBackedMessengerConnectorTests
             inner,
             new InMemoryRecordingOutbox(),
             new RecordingConversationReferenceStore(),
+            new RecordingConversationReferenceStore(),
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         var received = await decorator.ReceiveAsync(CancellationToken.None);
@@ -134,7 +327,8 @@ public sealed class OutboxBackedMessengerConnectorTests
             TimeProvider.System);
 
         var decorator = new OutboxBackedMessengerConnector(
-            inner, outbox, router,
+            inner, outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -157,7 +351,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -172,14 +367,15 @@ public sealed class OutboxBackedMessengerConnectorTests
     [Fact]
     public async Task SendMessageAsync_NoDeduplicatorWired_PreservesLegacyBehaviour()
     {
-        // Legacy 5-arg constructor — must keep enqueueing every send so pre-Stage-6.2
+        // Legacy short-form constructor — must keep enqueueing every send so pre-Stage-6.2
         // hosts that opted out of the deduplicator continue to work identically.
         var router = new RecordingConversationReferenceStore();
         router.ConversationIdReferences["conv-1"] = NewReference(tenantId: "tenant-1");
         var outbox = new InMemoryRecordingOutbox();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance);
 
         var message = SampleMessage("m-leg");
@@ -202,7 +398,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -237,7 +434,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -280,7 +478,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);
@@ -341,7 +540,8 @@ public sealed class OutboxBackedMessengerConnectorTests
         var dedup = new OutboundMessageDeduplicator();
 
         var decorator = new OutboxBackedMessengerConnector(
-            new RecordingMessengerConnector(), outbox, router,
+            new RecordingMessengerConnector(), outbox, router, router,
+            new RecordingAgentQuestionStore(),
             NullLogger<OutboxBackedMessengerConnector>.Instance,
             timeProvider: null,
             outboundDeduplicator: dedup);

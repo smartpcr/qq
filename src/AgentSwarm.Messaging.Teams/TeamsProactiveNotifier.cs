@@ -74,6 +74,30 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
     private readonly InstallationStateGate? _installationStateGate;
 
     /// <summary>
+    /// Stage 6.1 iter-3 — optional <see cref="AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard"/>
+    /// resolved by the DI factory in <see cref="TeamsServiceCollectionExtensions"/> when
+    /// the host composes
+    /// <see cref="AgentSwarm.Messaging.Teams.Outbox.TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine"/>.
+    /// When non-<c>null</c>, every direct send method on this notifier
+    /// (<see cref="SendProactiveAsync"/>, <see cref="SendProactiveQuestionAsync"/>,
+    /// <see cref="SendToChannelAsync"/>, <see cref="SendQuestionToChannelAsync"/>) calls
+    /// <see cref="AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard.ThrowIfDisallowed"/>
+    /// at the top — which throws an
+    /// <see cref="InvalidOperationException"/> with a remediation message pointing the
+    /// caller back at the public <see cref="IProactiveNotifier"/> contract (which, when
+    /// the outbox engine is wired, resolves to <see cref="Outbox.OutboxBackedProactiveNotifier"/>).
+    /// </summary>
+    /// <remarks>
+    /// <b>Why a property and not a constructor parameter.</b> Mirrors the
+    /// <see cref="TeamsMessengerConnector.Telemetry"/> pattern: keeping the canonical
+    /// 9-arg constructor stable preserves the legacy test compositions and the
+    /// installation-state gate wiring path. When the outbox engine is NOT composed the
+    /// property is left <c>null</c> and every send method's guard call short-circuits to
+    /// a no-op — preserving pre-Stage-6.1 direct-send semantics.
+    /// </remarks>
+    public AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard? DirectSendGuard { get; init; }
+
+    /// <summary>
     /// Production constructor — defaults the clock to <see cref="TimeProvider.System"/>.
     /// Every constructor parameter is null-guarded so DI mis-registration fails loudly at
     /// composition root rather than producing a <see cref="NullReferenceException"/>
@@ -153,6 +177,10 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(message);
 
+        // Stage 6.1 iter-3 — outbox-bypass guard. See DirectSendGuard property
+        // remarks for the rationale.
+        DirectSendGuard?.ThrowIfDisallowed(nameof(TeamsProactiveNotifier), nameof(SendProactiveAsync));
+
         // Stage 6.3 iter-2 — push the canonical CorrelationId/TenantId/UserId enrichment
         // onto every log entry emitted by this proactive send (both via ILogger.BeginScope
         // and via the AsyncLocal-backed Serilog enricher feed).
@@ -227,6 +255,10 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(userId, nameof(userId));
         ArgumentNullException.ThrowIfNull(question);
 
+        // Stage 6.1 iter-3 — outbox-bypass guard. See DirectSendGuard property
+        // remarks for the rationale.
+        DirectSendGuard?.ThrowIfDisallowed(nameof(TeamsProactiveNotifier), nameof(SendProactiveQuestionAsync));
+
         // Stage 6.3 iter-2 — enrichment scope is opened BEFORE argument-cross-check so
         // even validation-failure logs carry the canonical keys. Method is async (not
         // sync-returning-Task) so the scope persists across the entire SendQuestionCore
@@ -264,6 +296,10 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(message);
+
+        // Stage 6.1 iter-3 — outbox-bypass guard. See DirectSendGuard property
+        // remarks for the rationale.
+        DirectSendGuard?.ThrowIfDisallowed(nameof(TeamsProactiveNotifier), nameof(SendToChannelAsync));
 
         // Stage 6.3 iter-2 — channel sends carry the same enrichment minus UserId; the
         // tenant + channel + correlation triple is what dashboards key on for
@@ -332,6 +368,10 @@ public sealed class TeamsProactiveNotifier : IProactiveNotifier
         ValidateRequiredArgument(tenantId, nameof(tenantId));
         ValidateRequiredArgument(channelId, nameof(channelId));
         ArgumentNullException.ThrowIfNull(question);
+
+        // Stage 6.1 iter-3 — outbox-bypass guard. See DirectSendGuard property
+        // remarks for the rationale.
+        DirectSendGuard?.ThrowIfDisallowed(nameof(TeamsProactiveNotifier), nameof(SendQuestionToChannelAsync));
 
         // Stage 6.3 iter-2 — channel-scoped question enrichment scope.
         using var logScope = TeamsLogScope.BeginScope(
