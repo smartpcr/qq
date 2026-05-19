@@ -302,6 +302,25 @@ public sealed class SqlConversationReferenceStore : IConversationReferenceStore,
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Stage 6.3 — overrides the interface's <c>-1</c> sentinel default with a real
+    /// <c>SELECT COUNT(*)</c> against the active-references filtered index. Used by
+    /// <c>ConversationReferenceStoreHealthCheck</c> to surface a meaningful population
+    /// number on the <c>/health</c> endpoint per the §6.3 brief ("verify database
+    /// connectivity AND reference count"). The count crosses ALL tenants by design —
+    /// the health check is a global-store probe, not a tenant-scoped probe.
+    /// </remarks>
+    public async Task<long> CountActiveAsync(CancellationToken ct)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
+        return await context.ConversationReferences
+            .AsNoTracking()
+            .Where(e => e.IsActive)
+            .LongCountAsync(ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
     public async Task<bool> IsActiveAsync(string tenantId, string aadObjectId, CancellationToken ct)
     {
         ValidateKey(tenantId, aadObjectId, nameof(aadObjectId));

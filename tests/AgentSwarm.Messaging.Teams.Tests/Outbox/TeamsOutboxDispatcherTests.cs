@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using AgentSwarm.Messaging.Teams.Outbox;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
@@ -404,6 +405,82 @@ public sealed class TeamsOutboxDispatcherTests
     }
 
     // -----------------------------------------------------------------------------------
+    // Stage 6.3 iter-4 — log-scope enrichment must NOT label channel IDs as UserId.
+    // -----------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task DispatchAsync_ChannelDestination_OmitsUserIdEnrichment()
+    {
+        // Iter-4 evaluator feedback item 2 — when DestinationType is Channel, the
+        // destinationId parsed out of "teams://{tenant}/{channelId}/{id}" is a
+        // CHANNEL ID, not a user ID. The dispatcher must not stamp it into the
+        // TeamsLogScope UserId enrichment slot (doing so corrupts user-oriented
+        // dashboards and RBAC queries with channel identifiers that look like user
+        // identifiers). The CorrelationId and TenantId enrichments still apply.
+        var logger = new RecordingScopeLogger<TeamsOutboxDispatcher>();
+        var dispatcher = NewDispatcher(
+            adapter: new ThrowingCloudAdapter(),
+            outbox: new RecordingOutbox(),
+            cardStore: new RecordingCardStateStore(),
+            qStore: new RecordingAgentQuestionStore(),
+            renderer: new StubCardRenderer(),
+            logger: logger);
+
+        var entry = MinimalEntry("e-channel") with
+        {
+            DestinationType = OutboxDestinationTypes.Channel,
+            Destination = "teams://tenant-1/channel/19:abc@thread.tacv2",
+            DestinationId = "19:abc@thread.tacv2",
+            ConversationReferenceJson = string.Empty,
+        };
+
+        _ = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+
+        var dispatchScope = Assert.Single(
+            logger.Scopes,
+            s => s.ContainsKey(TeamsLogScope.CorrelationIdKey)
+                 && (string?)s[TeamsLogScope.CorrelationIdKey] == "corr-e-channel");
+        Assert.Equal("tenant-1", dispatchScope[TeamsLogScope.TenantIdKey]);
+        Assert.False(
+            dispatchScope.ContainsKey(TeamsLogScope.UserIdKey),
+            "Channel-scoped outbox entries must not emit the UserId enrichment key. " +
+            $"Found UserId='{(dispatchScope.TryGetValue(TeamsLogScope.UserIdKey, out var v) ? v : null)}'.");
+    }
+
+    [Fact]
+    public async Task DispatchAsync_PersonalDestination_EmitsUserIdEnrichment()
+    {
+        // Companion to the channel test — personal (1:1) deliveries SHOULD continue
+        // to surface the destination user identity in the UserId enrichment slot,
+        // since that IS the actor / target user for the send.
+        var logger = new RecordingScopeLogger<TeamsOutboxDispatcher>();
+        var dispatcher = NewDispatcher(
+            adapter: new ThrowingCloudAdapter(),
+            outbox: new RecordingOutbox(),
+            cardStore: new RecordingCardStateStore(),
+            qStore: new RecordingAgentQuestionStore(),
+            renderer: new StubCardRenderer(),
+            logger: logger);
+
+        var entry = MinimalEntry("e-personal") with
+        {
+            DestinationType = OutboxDestinationTypes.Personal,
+            Destination = "teams://tenant-1/user/user-42",
+            DestinationId = "user-42",
+            ConversationReferenceJson = string.Empty,
+        };
+
+        _ = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+
+        var dispatchScope = Assert.Single(
+            logger.Scopes,
+            s => s.ContainsKey(TeamsLogScope.CorrelationIdKey)
+                 && (string?)s[TeamsLogScope.CorrelationIdKey] == "corr-e-personal");
+        Assert.Equal("tenant-1", dispatchScope[TeamsLogScope.TenantIdKey]);
+        Assert.Equal("user-42", dispatchScope[TeamsLogScope.UserIdKey]);
+    }
+
+    // -----------------------------------------------------------------------------------
     // Helpers.
     // -----------------------------------------------------------------------------------
 
@@ -428,6 +505,18 @@ public sealed class TeamsOutboxDispatcherTests
         IAgentQuestionStore qStore,
         IAdaptiveCardRenderer renderer)
     {
+        return NewDispatcher(adapter, outbox, cardStore, qStore, renderer,
+            logger: NullLogger<TeamsOutboxDispatcher>.Instance);
+    }
+
+    private static TeamsOutboxDispatcher NewDispatcher(
+        CloudAdapter adapter,
+        IMessageOutbox outbox,
+        ICardStateStore cardStore,
+        IAgentQuestionStore qStore,
+        IAdaptiveCardRenderer renderer,
+        Microsoft.Extensions.Logging.ILogger<TeamsOutboxDispatcher> logger)
+    {
         return new TeamsOutboxDispatcher(
             adapter: adapter,
             options: new TeamsMessagingOptions { MicrosoftAppId = "test-app" },
@@ -435,7 +524,7 @@ public sealed class TeamsOutboxDispatcherTests
             cardStateStore: cardStore,
             agentQuestionStore: qStore,
             cardRenderer: renderer,
-            logger: NullLogger<TeamsOutboxDispatcher>.Instance);
+            logger: logger);
     }
 
     private static OutboxEntry MinimalEntry(string id) => new()
@@ -716,5 +805,56 @@ public sealed class TeamsOutboxDispatcherTests
 
         public Task UpdateStatusAsync(string questionId, string newStatus, CancellationToken ct)
             => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Iter-4 — captures every <see cref="ILogger.BeginScope{TState}"/> dictionary
+    /// the SUT pushes so tests can assert which enrichment keys are present /
+    /// absent. The dispatcher always passes a <see cref="Dictionary{TKey, TValue}"/>
+    /// via <see cref="Diagnostics.TeamsLogScope.BeginScope"/>; non-dictionary scopes
+    /// are recorded as their <c>ToString()</c> representation in
+    /// <see cref="ScopeStrings"/> so a mistakenly-passed primitive scope is still
+    /// observable.
+    /// </summary>
+    private sealed class RecordingScopeLogger<TCategory> : Microsoft.Extensions.Logging.ILogger<TCategory>
+    {
+        public List<IReadOnlyDictionary<string, object?>> Scopes { get; } = new();
+        public List<string> ScopeStrings { get; } = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull
+        {
+            if (state is IEnumerable<KeyValuePair<string, object?>> kvps)
+            {
+                var snapshot = new Dictionary<string, object?>(StringComparer.Ordinal);
+                foreach (var kvp in kvps)
+                {
+                    snapshot[kvp.Key] = kvp.Value;
+                }
+
+                Scopes.Add(snapshot);
+            }
+
+            ScopeStrings.Add(state.ToString() ?? string.Empty);
+            return Noop.Instance;
+        }
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+        }
+
+        private sealed class Noop : IDisposable
+        {
+            public static readonly Noop Instance = new();
+            public void Dispose()
+            {
+            }
+        }
     }
 }

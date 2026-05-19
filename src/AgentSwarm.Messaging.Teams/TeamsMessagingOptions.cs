@@ -44,6 +44,29 @@ public sealed class TeamsMessagingOptions : ConnectorOptions
     /// <summary>Bot Framework AAD application secret. Required.</summary>
     public string MicrosoftAppPassword { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Authentication strategy the deployment uses to acquire Bot Framework tokens.
+    /// Defaults to <see cref="TeamsAuthenticationMode.SharedSecret"/>, which is the
+    /// canonical configuration documented by Microsoft's Bot Framework samples and
+    /// matches the "Required" contract on <see cref="MicrosoftAppId"/> /
+    /// <see cref="MicrosoftAppPassword"/>. Hosts using certificate, managed-identity,
+    /// or federated credentials MUST set this property to the matching enum value so
+    /// the §6.3 connectivity health check does not flag missing
+    /// <see cref="MicrosoftAppPassword"/> as a Degraded condition.
+    /// </summary>
+    /// <remarks>
+    /// Iter-3 evaluator feedback item 1 — the default
+    /// <see cref="Diagnostics.MicrosoftAppCredentialsTokenProbe"/> reads this property
+    /// to decide whether an empty <see cref="MicrosoftAppPassword"/> is a
+    /// configuration defect (mode = <see cref="TeamsAuthenticationMode.SharedSecret"/>
+    /// → reports Failed, health flips to Degraded) or a legitimate skip (mode =
+    /// <see cref="TeamsAuthenticationMode.Certificate"/> /
+    /// <see cref="TeamsAuthenticationMode.ManagedIdentity"/> /
+    /// <see cref="TeamsAuthenticationMode.WorkloadFederated"/> → reports Skipped,
+    /// health remains Healthy).
+    /// </remarks>
+    public TeamsAuthenticationMode AuthenticationMode { get; set; } = TeamsAuthenticationMode.SharedSecret;
+
     /// <summary>The bot's home tenant (single-tenant configuration). Optional for multi-tenant deployments.</summary>
     public string MicrosoftAppTenantId { get; set; } = string.Empty;
 

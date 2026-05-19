@@ -1,9 +1,11 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Persistence;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Integration.AspNet.Core;
 using Microsoft.Bot.Schema;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -237,6 +239,66 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Single(harness.Adapter.ContinueCalls);
         Assert.Equal((TenantId, "19:team-channel"), Assert.Single(harness.ConversationReferenceStore.ChannelLookups));
         Assert.Empty(harness.ConversationReferenceStore.InternalUserLookups);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Iter-5 evaluator feedback item 1 — channel-targeted SendQuestionAsync must NOT
+    // stamp the channel ID into the canonical TeamsLogScope UserId enrichment slot.
+    // -----------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task SendQuestionAsync_ChannelTarget_LogScopeOmitsUserIdEnrichment()
+    {
+        // Iter-5 — Regression for the channel-as-UserId mislabel at
+        // TeamsMessengerConnector.SendQuestionAsync (formerly line ~390 in iter-4 layout).
+        // When the orchestrator routes a question to a channel (TargetChannelId set,
+        // TargetUserId null), the connector's logging scope MUST contain
+        // (CorrelationId, TenantId) only; UserId must be absent so dashboards and
+        // user-oriented RBAC queries are not polluted with channel IDs that look
+        // like user IDs.
+        var logger = new ConnectorScopeRecordingLogger();
+        var harness = ConnectorHarness.Build(logger: logger);
+        var stored = NewChannelReference("ref-channel-scope", channelId: "19:team-channel-scope");
+        harness.ConversationReferenceStore.PreloadByChannelId[(TenantId, "19:team-channel-scope")] = stored;
+
+        var question = NewQuestion(
+            "Q-channel-scope",
+            targetUserId: null,
+            targetChannelId: "19:team-channel-scope");
+
+        await harness.Connector.SendQuestionAsync(question, CancellationToken.None);
+
+        var dispatchScope = Assert.Single(
+            logger.ScopeDictionaries,
+            d => d.TryGetValue(TeamsLogScope.CorrelationIdKey, out var c)
+                 && (string?)c == question.CorrelationId);
+        Assert.Equal(TenantId, dispatchScope[TeamsLogScope.TenantIdKey]);
+        Assert.False(
+            dispatchScope.ContainsKey(TeamsLogScope.UserIdKey),
+            "Channel-targeted SendQuestionAsync must not emit the UserId enrichment key. " +
+            $"Found UserId='{(dispatchScope.TryGetValue(TeamsLogScope.UserIdKey, out var v) ? v : null)}'.");
+    }
+
+    [Fact]
+    public async Task SendQuestionAsync_UserTarget_LogScopeEmitsUserIdEnrichment()
+    {
+        // Companion to the channel test — personal (TargetUserId-populated) questions
+        // SHOULD continue to surface the target user identity in the UserId slot.
+        var logger = new ConnectorScopeRecordingLogger();
+        var harness = ConnectorHarness.Build(logger: logger);
+        var stored = NewPersonalReference("ref-alice-scope", aadObjectId: "aad-alice", internalUserId: "internal-alice");
+        harness.ConversationReferenceStore.PreloadByInternalUserId[(TenantId, "internal-alice")] = stored;
+
+        var question = NewQuestion("Q-user-scope", targetUserId: "internal-alice");
+
+        await harness.Connector.SendQuestionAsync(question, CancellationToken.None);
+
+        var dispatchScope = Assert.Single(
+            logger.ScopeDictionaries,
+            d => d.TryGetValue(TeamsLogScope.CorrelationIdKey, out var c)
+                 && (string?)c == question.CorrelationId);
+        Assert.Equal(TenantId, dispatchScope[TeamsLogScope.TenantIdKey]);
+        Assert.Equal("internal-alice", dispatchScope[TeamsLogScope.UserIdKey]);
     }
 
     [Fact]
@@ -477,7 +539,10 @@ public sealed class TeamsMessengerConnectorTests
         RecordingCardStateStore CardStateStore,
         TeamsMessagingOptions Options)
     {
-        public static ConnectorHarness Build(IInboundEventReader? reader = null, RecordingCloudAdapter? adapter = null)
+        public static ConnectorHarness Build(
+            IInboundEventReader? reader = null,
+            RecordingCloudAdapter? adapter = null,
+            ILogger<TeamsMessengerConnector>? logger = null)
         {
             adapter ??= new RecordingCloudAdapter();
             var options = new TeamsMessagingOptions { MicrosoftAppId = MicrosoftAppId };
@@ -496,8 +561,60 @@ public sealed class TeamsMessengerConnectorTests
                 cardStore,
                 renderer,
                 reader,
-                NullLogger<TeamsMessengerConnector>.Instance);
+                logger ?? NullLogger<TeamsMessengerConnector>.Instance);
             return new ConnectorHarness(connector, adapter, convStore, router, qStore, cardStore, options);
+        }
+    }
+
+    /// <summary>
+    /// Iter-5 — minimal <see cref="ILogger{T}"/> that snapshots every
+    /// <see cref="ILogger.BeginScope{TState}"/> dictionary into
+    /// <see cref="ScopeDictionaries"/>. Used by the channel-vs-personal
+    /// <see cref="TeamsLogScope"/> regression tests to assert which enrichment
+    /// keys are present / absent on the connector's logging scope. Snapshots are
+    /// captured via the <see cref="IEnumerable{T}"/> of
+    /// <see cref="KeyValuePair{TKey, TValue}"/> interface contract — the same
+    /// projection Serilog's <c>Microsoft.Extensions.Logging</c> bridge uses to
+    /// hoist scope state onto every emitted <c>LogEvent</c>.
+    /// </summary>
+    private sealed class ConnectorScopeRecordingLogger : ILogger<TeamsMessengerConnector>
+    {
+        public List<IReadOnlyDictionary<string, object?>> ScopeDictionaries { get; } = new();
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+        {
+            if (state is IEnumerable<KeyValuePair<string, object?>> kvps)
+            {
+                var snapshot = new Dictionary<string, object?>(StringComparer.Ordinal);
+                foreach (var kvp in kvps)
+                {
+                    snapshot[kvp.Key] = kvp.Value;
+                }
+
+                ScopeDictionaries.Add(snapshot);
+            }
+
+            return Noop.Instance;
+        }
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+        }
+
+        private sealed class Noop : IDisposable
+        {
+            public static readonly Noop Instance = new();
+            public void Dispose()
+            {
+            }
         }
     }
 

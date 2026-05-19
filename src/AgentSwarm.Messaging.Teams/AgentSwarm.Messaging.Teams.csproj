@@ -20,6 +20,14 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+    <!--
+      Stage 6.3 step 5 ships a Serilog ILogEventEnricher (TeamsLogEnricher) alongside
+      the portable ILogger.BeginScope pipeline. The Serilog dependency is intentionally
+      narrowed to the core abstractions package — hosts that already pull Serilog in
+      get the enricher for free; hosts that prefer pure Microsoft.Extensions.Logging
+      keep using TeamsLogScope.BeginScope and pay only for the AsyncLocal push.
+    -->
+    <PackageReference Include="Serilog" Version="4.3.1" />
   </ItemGroup>
 
   <!--

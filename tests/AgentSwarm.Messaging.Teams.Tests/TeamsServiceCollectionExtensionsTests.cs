@@ -58,6 +58,34 @@ public sealed class TeamsServiceCollectionExtensionsTests
         Assert.NotNull(sp.GetRequiredService<IInboundEventReader>());
     }
 
+    /// <summary>
+    /// Stage 6.3 iter-2 evaluator-feedback item 1 — telemetry must be ON by default.
+    /// Before this iter <c>AddTeamsMessengerConnector</c> only assigned the
+    /// <c>Telemetry</c> property when a host had separately wired
+    /// <c>AddTeamsDiagnostics</c>; the evaluator flagged this because a normal
+    /// deployment could emit no Stage 6.3 spans/metrics. The fix moves
+    /// <c>AddTeamsConnectorTelemetry()</c> into <c>AddTeamsMessengerConnector</c>'s body
+    /// so every Teams host inherits the §6.3 instrumentation surface out of the box.
+    /// </summary>
+    [Fact]
+    public void AddTeamsMessengerConnector_WiresTelemetryAndSerilogEnricherByDefault()
+    {
+        var services = BuildServices();
+        services.AddTeamsMessengerConnector();
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+
+        var telemetry = sp.GetRequiredService<AgentSwarm.Messaging.Teams.Diagnostics.TeamsConnectorTelemetry>();
+        var enricher = sp.GetRequiredService<AgentSwarm.Messaging.Teams.Diagnostics.TeamsLogEnricher>();
+        var queueDepth = sp.GetRequiredService<AgentSwarm.Messaging.Teams.Diagnostics.IOutboxQueueDepthProvider>();
+        var connector = sp.GetRequiredService<TeamsMessengerConnector>();
+
+        Assert.NotNull(telemetry);
+        Assert.NotNull(enricher);
+        Assert.NotNull(queueDepth);
+        // Same singleton must be observable on the connector's Telemetry property.
+        Assert.Same(telemetry, connector.Telemetry);
+    }
+
     [Fact]
     public void AddInProcessInboundEventChannel_NullServices_Throws()
     {

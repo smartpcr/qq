@@ -2,6 +2,7 @@ using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
 using AgentSwarm.Messaging.Teams.Cards;
 using AgentSwarm.Messaging.Teams.Commands;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using AgentSwarm.Messaging.Teams.Extensions;
 using AgentSwarm.Messaging.Teams.Lifecycle;
 using AgentSwarm.Messaging.Teams.Outbox;
@@ -125,6 +126,19 @@ public static class TeamsServiceCollectionExtensions
         // already wired the security graph explicitly.
         services.AddTeamsSecurity();
 
+        // Stage 6.3 iter-2 — telemetry is now WIRED BY DEFAULT (no separate
+        // AddTeamsDiagnostics() call required). The Stage 6.3 evaluator (iter-1 item 1)
+        // observed that opt-in telemetry meant "a normal AddTeamsMessengerConnector()
+        // deployment can still emit no Stage 6.3 spans or metrics". Making this the
+        // default closes that gap: every Teams host now publishes the canonical
+        // TeamsConnector.SendMessage / SendQuestion / Receive spans + the
+        // teams.messages.sent / teams.messages.received counters + the
+        // teams.card.delivery.duration_ms histogram + the teams.outbox.queue_depth gauge
+        // out of the box. The call is idempotent (TryAdd*), so hosts that already wired
+        // diagnostics explicitly remain unaffected.
+        services.AddTeamsConnectorTelemetry();
+        services.AddTeamsSerilogEnricher();
+
         // Stage 5.1 iter-4 evaluator feedback item 2 — TimeProvider MUST be in the DI graph
         // so the constructor-with-TimeProvider+InstallationStateGate overload of
         // TeamsMessengerConnector / TeamsProactiveNotifier is the one DI resolves.
@@ -154,7 +168,22 @@ public static class TeamsServiceCollectionExtensions
             inboundEventReader: sp.GetRequiredService<IInboundEventReader>(),
             logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsMessengerConnector>>(),
             timeProvider: sp.GetRequiredService<TimeProvider>(),
-            installationStateGate: sp.GetRequiredService<InstallationStateGate>()));
+            installationStateGate: sp.GetRequiredService<InstallationStateGate>())
+        {
+            // Stage 6.3 iter-2 — Telemetry is REQUIRED by default (no longer opt-in).
+            // AddTeamsConnectorTelemetry() at the top of this method ensures the singleton
+            // is always registered when AddTeamsMessengerConnector wires the connector;
+            // GetRequiredService surfaces any explicit ServiceDescriptor removal as a loud
+            // failure at first connector resolution rather than silently dropping
+            // instrumentation.
+            Telemetry = sp.GetRequiredService<AgentSwarm.Messaging.Teams.Diagnostics.TeamsConnectorTelemetry>(),
+            // Stage 6.1 iter-3 — outbox-bypass guard is OPTIONAL. It is registered only
+            // when the host composes AgentSwarm.Messaging.Teams.Outbox.TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine;
+            // when absent (legacy hosts / tests), the connector's direct-send methods
+            // run unguarded as before. GetService returns null cleanly when the guard
+            // is not registered.
+            DirectSendGuard = sp.GetService<AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard>(),
+        });
 
         services.TryAddKeyedSingleton<IMessengerConnector>(
             MessengerKey,
@@ -416,7 +445,13 @@ public static class TeamsServiceCollectionExtensions
             agentQuestionStore: sp.GetRequiredService<IAgentQuestionStore>(),
             logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<TeamsProactiveNotifier>>(),
             timeProvider: sp.GetRequiredService<TimeProvider>(),
-            installationStateGate: sp.GetRequiredService<InstallationStateGate>()));
+            installationStateGate: sp.GetRequiredService<InstallationStateGate>())
+        {
+            // Stage 6.1 iter-3 — outbox-bypass guard is OPTIONAL. See the matching
+            // wiring in AddTeamsMessengerConnector and TeamsProactiveNotifier's
+            // DirectSendGuard property remarks for the rationale.
+            DirectSendGuard = sp.GetService<AgentSwarm.Messaging.Teams.Outbox.TeamsDirectSendBypassGuard>(),
+        });
         services.TryAddSingleton<IProactiveNotifier>(sp => sp.GetRequiredService<TeamsProactiveNotifier>());
 
         return services;

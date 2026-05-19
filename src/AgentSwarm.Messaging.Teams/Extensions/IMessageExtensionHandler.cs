@@ -12,11 +12,22 @@ namespace AgentSwarm.Messaging.Teams.Extensions;
 /// "Forward to Agent").
 /// </summary>
 /// <remarks>
+/// <para>
 /// Defined in the <c>AgentSwarm.Messaging.Teams</c> assembly (not Abstractions) because the
 /// contract takes <see cref="ITurnContext{IInvokeActivity}"/> and returns
 /// <see cref="MessagingExtensionActionResponse"/> — both Bot Framework Teams types. The
 /// Abstractions assembly stays platform-agnostic, mirroring the
 /// <see cref="ICardActionHandler"/> placement decision.
+/// </para>
+/// <para>
+/// Concrete implementations extract the canonical message-payload triple required by the
+/// Stage 3.4 work-item spec (body text, sender display name, source timestamp) and SHOULD
+/// also capture the channel-post forensic context (subject / locale / link-to-message /
+/// sender AAD ID) when present so the audit trail can identify the originating thread
+/// even after the platform IDs rotate. See
+/// <see cref="MessageExtensionHandler.ExtractMessagePayload"/> for the canonical
+/// implementation.
+/// </para>
 /// </remarks>
 public interface IMessageExtensionHandler
 {
