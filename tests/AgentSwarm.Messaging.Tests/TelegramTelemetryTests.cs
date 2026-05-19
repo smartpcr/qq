@@ -240,12 +240,42 @@ public sealed class TelegramTelemetryTests
     [Fact]
     public void Counters_AreObservable_OnTheCanonicalMeter()
     {
-        using var collector = new CounterCollector(TelegramTelemetry.MeterName);
+        // Iter-9 — counter measurements on a SHARED Meter are inherently
+        // racy under xUnit's per-class parallelism. The Stage 2.3
+        // TelegramMessageSender tests (concurrently running in their
+        // own class) also call TelegramTelemetry.MessagesSentCounter.Add
+        // inside SendWithRetry; without a unique-tag filter, this test's
+        // collector observed their increments too and the
+        // `.Be(2)` assertion would non-deterministically fail (e.g. the
+        // observed iter-9 flake: telegram.messages.sent total observed
+        // as 4+ instead of 2). The fix mirrors the SpanCollector iter-3
+        // pattern: tag every counter add with a test-unique value and
+        // have the collector filter by that exact tag, so a concurrent
+        // sender's `source_type=text` add never lands in this test's
+        // tally. Pure test-infrastructure change; the production
+        // counters and their tag shapes are unchanged.
+        const string testTag = "telemetry-test-counters-1";
+        using var collector = new CounterCollector(
+            TelegramTelemetry.MeterName,
+            tagFilter: (key, value) =>
+                key == "test_marker" && (value as string) == testTag);
 
-        TelegramTelemetry.MessagesReceivedCounter.Add(1, new KeyValuePair<string, object?>("event_type", "command"));
-        TelegramTelemetry.MessagesSentCounter.Add(2, new KeyValuePair<string, object?>("source_type", "text"));
-        TelegramTelemetry.CommandsProcessedCounter.Add(3, new KeyValuePair<string, object?>("command", "status"));
-        TelegramTelemetry.ErrorsCounter.Add(4, new KeyValuePair<string, object?>("error_kind", "send_transient"));
+        TelegramTelemetry.MessagesReceivedCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("event_type", "command"),
+            new KeyValuePair<string, object?>("test_marker", testTag));
+        TelegramTelemetry.MessagesSentCounter.Add(
+            2,
+            new KeyValuePair<string, object?>("source_type", "text"),
+            new KeyValuePair<string, object?>("test_marker", testTag));
+        TelegramTelemetry.CommandsProcessedCounter.Add(
+            3,
+            new KeyValuePair<string, object?>("command", "status"),
+            new KeyValuePair<string, object?>("test_marker", testTag));
+        TelegramTelemetry.ErrorsCounter.Add(
+            4,
+            new KeyValuePair<string, object?>("error_kind", "send_transient"),
+            new KeyValuePair<string, object?>("test_marker", testTag));
 
         collector.Total("telegram.messages.received").Should().Be(1);
         collector.Total("telegram.messages.sent").Should().Be(2);
@@ -334,14 +364,27 @@ public sealed class TelegramTelemetryTests
     /// xUnit-friendly <see cref="MeterListener"/> that captures every
     /// long counter measurement on a named meter and exposes the
     /// per-instrument totals.
+    ///
+    /// Iter-9 — the optional <paramref name="tagFilter"/> predicate is
+    /// the counter analog of the iter-3 <see cref="SpanCollector"/>
+    /// per-test filter. Counter instruments are PROCESS-WIDE: tests
+    /// in sibling classes that hit
+    /// <see cref="TelegramTelemetry.MessagesSentCounter"/> et al.
+    /// during the lifetime of this listener would otherwise inflate
+    /// the per-instrument totals. The filter is invoked once per tag
+    /// on each measurement; if any tag matches, the measurement is
+    /// counted. Without a filter all measurements are counted (the
+    /// pre-iter-9 behaviour).
     /// </summary>
     private sealed class CounterCollector : IDisposable
     {
         private readonly MeterListener _listener;
         private readonly ConcurrentDictionary<string, long> _totals = new(StringComparer.Ordinal);
+        private readonly Func<string, object?, bool>? _tagFilter;
 
-        public CounterCollector(string meterName)
+        public CounterCollector(string meterName, Func<string, object?, bool>? tagFilter = null)
         {
+            _tagFilter = tagFilter;
             _listener = new MeterListener();
             _listener.InstrumentPublished = (instrument, l) =>
             {
@@ -353,6 +396,23 @@ public sealed class TelegramTelemetryTests
             };
             _listener.SetMeasurementEventCallback<long>((instrument, measurement, tags, _) =>
             {
+                if (_tagFilter is not null)
+                {
+                    var matched = false;
+                    for (var i = 0; i < tags.Length; i++)
+                    {
+                        var t = tags[i];
+                        if (_tagFilter(t.Key, t.Value))
+                        {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched)
+                    {
+                        return;
+                    }
+                }
                 _totals.AddOrUpdate(instrument.Name, measurement, (_, acc) => acc + measurement);
             });
             _listener.Start();
