@@ -322,11 +322,11 @@ public sealed class SlackHealthEndpointsIntegrationTests : IDisposable
 
             // Stage 5.1 iter-4 evaluator item 3 (downstream test
             // impact): Program.BuildApp gates the no-op IAgentTaskService
-            // stub on EnableNoOpAgentTaskService (default = false;
-            // iter-4 structural fix removed the IsDevelopment
-            // fallback so production hosts cannot silently inherit
-            // the stub). Opt in explicitly so AddSlackMessenger's
-            // validation guard observes a registered IAgentTaskService.
+            // stub on EnableNoOpAgentTaskService (default = false in
+            // every environment after the iter-4 structural fix; the
+            // prior IsDevelopment fallback is gone). Opt in explicitly
+            // so AddSlackMessenger's validation guard observes a
+            // registered IAgentTaskService.
             builder.UseSetting(Program.EnableNoOpAgentTaskServiceKey, "true");
 
             builder.ConfigureAppConfiguration((_, cfg) =>
