@@ -151,6 +151,89 @@ public sealed class WorkerHandlerStubGatingTests
             "Stage 5.1 iter-3 evaluator items 1 + 2: the pipeline ctor MUST resolve cleanly in Production because the Worker wires the real Stage 5 handlers in BuildApp");
     }
 
+    [Fact]
+    public void Worker_with_no_NoOpAgentTaskService_optin_and_no_real_orchestrator_fails_fast_at_BuildApp()
+    {
+        // Stage 5.2 iter-2 evaluator item 4: pin the
+        // currently-documented Worker default behaviour --
+        // a host that boots Program.BuildApp with NEITHER
+        // Slack:Inbound:EnableNoOpAgentTaskService=true NOR a
+        // pre-registered real IAgentTaskService MUST fail loudly
+        // inside AddSlackMessenger via
+        // ValidateAgentTaskServiceRegistration. The evaluator
+        // flagged that this fail-fast contract was only opted in
+        // by tests; this test pins it as the EXPECTED default so
+        // any future change that silently re-introduces a NoOp
+        // fallback surfaces here.
+        FactoryWithExplicitNoOpToggle factory = new(noOpToggle: false);
+
+        Action act = () => _ = factory.Services;
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*no IAgentTaskService*",
+                "Stage 5.2 iter-2 evaluator item 4: the documented default Worker path MUST throw ValidateAgentTaskServiceRegistration when no orchestrator is registered AND EnableNoOpAgentTaskService is not toggled on -- silently degrading to a NoOp stub is the production-data-loss regression that the iter-3 / iter-4 evaluator items fixed");
+
+        factory.Dispose();
+    }
+
+    /// <summary>
+    /// Variant of <see cref="GatedWorkerFactory"/> that lets a
+    /// test explicitly turn the
+    /// <see cref="Program.EnableNoOpAgentTaskServiceKey"/> opt-in
+    /// off, so the negative-side default (BuildApp throws via
+    /// ValidateAgentTaskServiceRegistration) is observable. The
+    /// fixture intentionally does NOT pre-register a real
+    /// orchestrator.
+    /// </summary>
+    private sealed class FactoryWithExplicitNoOpToggle : WebApplicationFactory<Program>
+    {
+        private readonly bool noOpToggle;
+        private readonly string sqlitePath = Path.Combine(Path.GetTempPath(),
+            $"slack-no-noop-{Guid.NewGuid():N}.db");
+
+        public FactoryWithExplicitNoOpToggle(bool noOpToggle)
+        {
+            this.noOpToggle = noOpToggle;
+        }
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Production");
+            builder.UseSetting(Program.EnableNoOpAgentTaskServiceKey, this.noOpToggle ? "true" : "false");
+            builder.UseSetting("Slack:Inbound:Queue:AllowInMemoryInProduction", "true");
+            builder.UseSetting("SecretProvider:ProviderType", "InMemory");
+            builder.UseSetting(
+                "ConnectionStrings:" + Program.SlackAuditConnectionStringKey,
+                $"Data Source={this.sqlitePath}");
+
+            // Minimal workspace so options binding does not error out
+            // before AddSlackMessenger's guard runs.
+            builder.UseSetting("Slack:Workspaces:0:TeamId", "T-no-noop");
+            builder.UseSetting("Slack:Workspaces:0:WorkspaceName", "No NoOp");
+            builder.UseSetting("Slack:Workspaces:0:SigningSecretRef", "test://signing/T-no-noop");
+            builder.UseSetting("Slack:Workspaces:0:BotTokenSecretRef", "test://bot/T-no-noop");
+            builder.UseSetting("Slack:Workspaces:0:DefaultChannelId", "C-no-noop");
+            builder.UseSetting("Slack:Workspaces:0:AllowedChannelIds:0", "C-no-noop");
+            builder.UseSetting("Slack:Workspaces:0:Enabled", "true");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing && File.Exists(this.sqlitePath))
+            {
+                try
+                {
+                    File.Delete(this.sqlitePath);
+                }
+                catch
+                {
+                    // best-effort cleanup
+                }
+            }
+        }
+    }
+
     /// <summary>
     /// Hosts the Worker via <see cref="WebApplicationFactory{TEntryPoint}"/>
     /// with a controllable environment + opt-in flag. Persistence is

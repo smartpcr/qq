@@ -411,25 +411,24 @@ internal sealed class SlackIntegrationTestFixture : WebApplicationFactory<Progra
                     .ConfigurePrimaryHttpMessageHandler(() => this.mockSlackWebApi.CreateRewritingHandler());
             }
 
-            // Stage 5.1 iter-2 evaluator item 2 fix: the
-            // AddSlackMessenger facade no longer wires the real
-            // Stage 5.1 / 5.3 handler dispatchers (which used to
-            // silently replace the Stage 4.3 NoOp stand-ins and
-            // therefore broke the Worker's
-            // EnableDevelopmentHandlerStubsKey gate). The integration
-            // fixture is the canonical "production with a real
-            // orchestrator" composition root and explicitly opts
-            // into the real SlackCommandHandler / SlackInteractionHandler
-            // here so the /agent ask -> question -> approve flow
-            // these tests exercise actually runs the production code
-            // path. Both extensions use RemoveAll<>+AddSingleton<>
-            // so they replace the recording fakes only after the
-            // recording IAgentTaskService is in place (already wired
-            // above), which is the same ordering the Worker's
-            // future-state composition root will use once the real
-            // orchestrator client lands.
-            services.AddSlackCommandDispatcher();
-            services.AddSlackInteractionDispatcher();
+            // Stage 5.2 iter-2 evaluator item 1 fix: the
+            // AddSlackMessenger facade restored its documented
+            // contract and now binds ISlackCommandHandler /
+            // ISlackAppMentionHandler / ISlackInteractionHandler
+            // internally (via AddSlackCommandDispatcher and
+            // AddSlackInteractionDispatcher inside the facade). The
+            // fixture's earlier explicit calls to those extensions
+            // were redundant after iter-2 -- they re-applied the
+            // same RemoveAll+AddSingleton over the bindings the
+            // facade had already pinned. Both extensions are
+            // idempotent (a repeat call simply RemoveAll-s the
+            // singleton, AddSingleton-s the same handler type
+            // again), so leaving the calls here would still work,
+            // but removing them aligns the fixture with the
+            // Worker's iter-2 composition root and proves the
+            // facade-only contract end-to-end without the fixture
+            // silently masking a regression by re-binding the
+            // handlers itself.
 
             // Iter-7 evaluator item #1 (STRUCTURAL): the prior
             // bypassMvcAuthorizationFilter PostConfigure<MvcOptions>
