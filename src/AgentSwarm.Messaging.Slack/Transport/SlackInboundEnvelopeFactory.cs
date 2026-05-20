@@ -198,17 +198,20 @@ internal sealed class SlackInboundEnvelopeFactory
             UserId: payload.UserId ?? string.Empty,
             RawPayload: body,
             TriggerId: NullIfEmpty(payload.TriggerId),
-            ReceivedAt: receivedAt);
-
-        // Block-kit and view_submission payloads also carry a top-level
-        // response_url, but Stage 4.1's SlackInteractionPayload struct
-        // does not surface that field yet. The Stage 8.2 AC-5 brief
-        // wording is slash-command-scoped ("send a slash command from a
-        // channel not in AllowedChannelIds"), so extending the
-        // interaction payload + envelope is intentionally deferred
-        // until an acceptance criterion demands it. The envelope's
-        // ResponseUrl init property remains available for that future
-        // extension without any further envelope-shape change.
+            ReceivedAt: receivedAt)
+        {
+            // Iter-2 evaluator item #5: interactive payloads (block_actions
+            // and view_submission) ship a top-level response_url that's
+            // valid for ~30 minutes and accepts up to five delayed
+            // ephemerals. Capturing it here on the envelope means the
+            // Stage 4.3 SlackInboundAuthorizer can post an async
+            // ephemeral on rejection AND the Stage 5.3 interaction
+            // handler's async views.open fallback can surface
+            // "please click again" feedback after the HTTP ACK has
+            // flushed. Mirrors BuildCommandEnvelope's response_url
+            // capture (Stage 8.2 AC-5).
+            ResponseUrl = NullIfEmpty(payload.ResponseUrl),
+        };
     }
 
     private static string DeriveEventKey(SlackEventPayload payload, string body)

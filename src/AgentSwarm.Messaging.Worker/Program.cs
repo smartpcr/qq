@@ -295,49 +295,30 @@ public class Program
             builder.Services.AddFileSystemSlackDeadLetterQueue(dlqDir);
         }
 
-        // Stage 5.1 / 5.2 / 5.3: wire the REAL production handlers.
-        // AddSlackCommandDispatcher() RemoveAll+AddSingleton's
-        // ISlackCommandHandler -> SlackCommandHandler and
-        // ISlackAppMentionHandler -> SlackAppMentionHandler.
-        // AddSlackInteractionDispatcher() does the same for
-        // ISlackInteractionHandler -> SlackInteractionHandler and
-        // ISlackInteractionFastPathHandler -> DefaultSlackInteractionFastPathHandler.
-        // Both extensions also TryAdd every collaborator they need
-        // (HTTP-backed ephemeral responder, message renderer, threaded
-        // reply poster, modal-audit recorder, chat.update / views.open
-        // clients, rate limiter, null thread-mapping lookup default).
-        // The earlier AddSlackMessenger call already TryAdded the same
-        // collaborators so these calls de-duplicate cleanly; the only
-        // new effect is binding the four handler contracts.
-        //
-        // Stage 5.1 iter-3 evaluator items 1 + 2: the previous gate
-        // (AddSlackInboundDevelopmentHandlerStubs() under an env-based
-        // condition) registered NoOp stubs that silently ack-and-dropped
-        // every Slack command in dev AND left production resolving no
-        // handler at all -- the first /agent ask either dead-letters
-        // on missing handler resolution (production) or completes
-        // without producing an agent task (development). Wiring the
-        // real handlers here unconditionally means /agent ask actually
-        // dispatches through SlackCommandHandler in both modes;
-        // IAgentTaskService falls back to NoOpAgentTaskService when
-        // the EnableNoOpAgentTaskServiceKey gate above admits it
-        // (default = Development only), otherwise production hosts
-        // fail loud at pipeline resolution until a real orchestrator
-        // client is wired.
-        builder.Services.AddSlackCommandDispatcher();
-        builder.Services.AddSlackInteractionDispatcher();
+        // Stage 5.1 / 5.2 / 5.3: the REAL production handlers
+        // (ISlackCommandHandler -> SlackCommandHandler,
+        // ISlackAppMentionHandler -> SlackAppMentionHandler,
+        // ISlackInteractionHandler -> SlackInteractionHandler,
+        // ISlackInteractionFastPathHandler -> DefaultSlackInteractionFastPathHandler)
+        // are now bound inside AddSlackMessenger above (Stage 5.3
+        // iter-2 evaluator item -- the facade now honours its
+        // documented "registers all internal handlers" contract).
+        // The previous explicit AddSlackCommandDispatcher() /
+        // AddSlackInteractionDispatcher() lines that lived here in
+        // iter-1 are no longer required; their RemoveAll+AddSingleton
+        // would re-bind the same singleton types and is harmless, but
+        // dropping them keeps the composition root single-source-of-
+        // truth for handler wiring (the facade).
 
         // Legacy Stage 4.3 dev-stub gate: now obsolete because Stage
-        // 5.1 / 5.2 / 5.3 real handlers exist and the
-        // AddSlackCommandDispatcher / AddSlackInteractionDispatcher
-        // calls above RemoveAll+AddSingleton them ahead of any
-        // TryAdd. The gate's call is kept under an explicit opt-in
-        // (default OFF in every environment) so operators driving a
-        // smoke test that intentionally exercises the no-op stubs
-        // can still toggle them on, but no environment-defaulted
-        // wiring fires here anymore. The constant + helper survive
-        // for back-compat with hosts that read the configuration
-        // key directly.
+        // 5.1 / 5.2 / 5.3 real handlers are bound by AddSlackMessenger
+        // above (RemoveAll+AddSingleton). The gate's TryAdd
+        // registrations observe the real handlers already bound and
+        // no-op, so toggling the flag has no observable effect on
+        // handler resolution -- the call survives under an explicit
+        // opt-in (default OFF in every environment) for back-compat
+        // with operator tooling that already reads the configuration
+        // key.
         if (ShouldEnableDevelopmentHandlerStubs(builder))
         {
             builder.Services.AddSlackInboundDevelopmentHandlerStubs();

@@ -448,7 +448,25 @@ internal sealed class DefaultSlackInteractionFastPathHandler : ISlackInteraction
             return mapping.CorrelationId;
         }
 
-        return fallback;
+        // Iter-3 evaluator item #1 (STRUCTURAL): mirror the async
+        // SlackInteractionHandler's slack-thread-anchored fallback so
+        // the fast-path's comment modal pins a stable thread-anchored
+        // correlation id into private_metadata instead of the per-click
+        // envelope.IdempotencyKey. Without this the SlackInteractionsController
+        // short-circuits the async enqueue after a successful
+        // RequiresComment fast-path, and the eventual view_submission
+        // arrives carrying the per-click envelope.IdempotencyKey
+        // verbatim -- SlackInteractionHandler.HandleViewSubmissionAsync
+        // trusts the pinned private_metadata.CorrelationId BEFORE
+        // attempting its own thread-mapping lookup
+        // (SlackInteractionHandler.cs:399-407), so the slack-thread
+        // fallback the async path added would never run on the
+        // RequiresComment flow whose mapping row is missing. Every
+        // click on the same (team, channel, thread_ts) triple now
+        // shares the slack-thread anchor regardless of whether the
+        // mapping table has caught up, which is what AC-6 ("every
+        // agent/human exchange queryable by correlation id") requires.
+        return SlackInteractionHandler.BuildThreadAnchorCorrelationId(envelope.TeamId, channelId, threadTs);
     }
 
     private static IActionResult BuildEphemeralError(string text)

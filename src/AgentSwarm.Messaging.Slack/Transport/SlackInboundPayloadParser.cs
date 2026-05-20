@@ -463,6 +463,7 @@ internal static class SlackInboundPayloadParser
 
             string? type = ReadStringProperty(root, "type");
             string? triggerId = ReadStringProperty(root, "trigger_id");
+            string? responseUrl = ReadStringProperty(root, "response_url");
 
             string? teamId = null;
             if (root.TryGetProperty("team", out JsonElement teamObj) && teamObj.ValueKind == JsonValueKind.Object)
@@ -507,7 +508,8 @@ internal static class SlackInboundPayloadParser
                 ChannelId: channelId,
                 UserId: userId,
                 TriggerId: triggerId,
-                ActionOrViewId: actionOrViewId);
+                ActionOrViewId: actionOrViewId,
+                ResponseUrl: responseUrl);
         }
         catch (JsonException)
         {
@@ -626,16 +628,31 @@ internal readonly record struct SlackCommandPayload(
 /// Canonical field set extracted from a Block Kit / view-submission
 /// interactive payload.
 /// </summary>
+/// <remarks>
+/// The <see cref="ResponseUrl"/> field is required by Stage 8.2 AC-5's
+/// async ephemeral rejection contract for interactions: Slack publishes
+/// a per-invocation <c>response_url</c> on every block_actions /
+/// view_submission payload that is valid for ~30 minutes and accepts up
+/// to five delayed replies. The pipeline-side authorizer
+/// (<c>SlackInboundAuthorizer</c>) and the Stage 5.3 interaction
+/// handler's async views.open fallback both rely on this URL to post
+/// "please click again" / "channel not allowed" ephemerals AFTER the
+/// HTTP transport has already ACK'd Slack. Capturing it in the
+/// canonical payload struct (and forwarding it onto the envelope via
+/// <see cref="SlackInboundEnvelope.ResponseUrl"/>) is what unblocks
+/// every late-reply path -- iter-1 evaluator item #5.
+/// </remarks>
 internal readonly record struct SlackInteractionPayload(
     string? Type,
     string? TeamId,
     string? ChannelId,
     string? UserId,
     string? TriggerId,
-    string? ActionOrViewId)
+    string? ActionOrViewId,
+    string? ResponseUrl = null)
 {
     public static SlackInteractionPayload Empty { get; } =
-        new(null, null, null, null, null, null);
+        new(null, null, null, null, null, null, null);
 }
 
 /// <summary>

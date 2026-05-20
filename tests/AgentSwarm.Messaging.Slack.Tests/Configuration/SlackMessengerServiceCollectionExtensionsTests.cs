@@ -138,11 +138,33 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         provider.GetRequiredService<ISlackIdempotencyGuard>().Should().NotBeNull();
         provider.GetRequiredService<ISlackThreadMappingLookup>().Should().NotBeNull();
         provider.GetRequiredService<ISlackThreadManager>().Should().NotBeNull();
-        provider.GetRequiredService<ISlackInteractionFastPathHandler>().Should().NotBeNull();
         provider.GetRequiredService<ISlackInboundEventBuffer>().Should().NotBeNull();
         provider.GetRequiredService<IAgentTaskService>()
             .Should().BeOfType<BufferingAgentTaskServiceDecorator>(
                 "Stage 8.1 wraps the orchestrator with the buffering decorator so HumanDecisionEvents land in the inbound buffer SlackConnector.ReceiveAsync drains");
+
+        // Stage 5.3 iter-2 evaluator item: the facade's documented
+        // contract pins the REAL async handlers + interaction
+        // fast-path, not the dev-stub NoOp implementations that
+        // AddSlackInboundTransport's TryAdd installs as the baseline
+        // default. A standalone host calling only AddSlackMessenger
+        // (no AddSlackInboundDevelopmentHandlerStubs, no explicit
+        // AddSlackCommandDispatcher/AddSlackInteractionDispatcher
+        // post-facade) MUST resolve the production handler types so
+        // /agent ask + button-click + view_submission payloads
+        // dispatch through the real Stage 5.x code path.
+        provider.GetRequiredService<ISlackCommandHandler>()
+            .Should().BeOfType<SlackCommandHandler>(
+                "Stage 5.1: the facade MUST bind the real SlackCommandHandler so a standalone host's /agent ask dispatches through the production code path");
+        provider.GetRequiredService<ISlackAppMentionHandler>()
+            .Should().BeOfType<SlackAppMentionHandler>(
+                "Stage 5.2: the facade MUST bind the real SlackAppMentionHandler so a standalone host's @app mentions dispatch through the production code path");
+        provider.GetRequiredService<ISlackInteractionHandler>()
+            .Should().BeOfType<SlackInteractionHandler>(
+                "Stage 5.3: the facade MUST bind the real SlackInteractionHandler so a standalone host's button clicks / view_submissions publish HumanDecisionEvents");
+        provider.GetRequiredService<ISlackInteractionFastPathHandler>()
+            .Should().BeOfType<DefaultSlackInteractionFastPathHandler>(
+                "Stage 5.3: the facade MUST replace the NoOp interaction fast-path baseline with DefaultSlackInteractionFastPathHandler so RequiresComment buttons synchronously open views.open while trigger_id is still valid");
 
         // Security.
         provider.GetRequiredService<SlackSignatureValidator>().Should().NotBeNull();
@@ -372,15 +394,19 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         services.AddMessagingCore(configuration);
         services.AddMessagingPersistence(configuration);
         services.AddSecretProvider(configuration);
-        // Iter-3 item 2: explicit dev-defaults opt-in (the facade no
-        // longer auto-installs the NoOp orchestrator stub).
+        // Iter-3 item 2: explicit dev-defaults opt-in so an
+        // IAgentTaskService is present for the orchestrator-facing
+        // SlackCommandHandler that the facade now binds via
+        // AddSlackCommandDispatcher / AddSlackInteractionDispatcher
+        // (SlackMessengerServiceCollectionExtensions.cs:302-303).
+        // No handler-stub opt-in is needed because the facade binds
+        // the real ISlackCommandHandler / ISlackAppMentionHandler /
+        // ISlackInteractionHandler / DefaultSlackInteractionFastPathHandler
+        // implementations -- AddSlackInboundDevelopmentHandlerStubs's
+        // TryAdd would no-op against those bindings anyway and only
+        // muddied the test's contract by suggesting the facade did
+        // not register them.
         services.AddSlackCommandDispatcherDevelopmentDefaults();
-        // Stage 5.1 iter-2 evaluator item 2: facade no longer
-        // registers handler dispatchers; tests opt into the NoOp
-        // stand-ins explicitly so SlackInboundProcessingPipeline
-        // (which takes the three handler contracts by ctor) resolves
-        // under ValidateOnBuild.
-        services.AddSlackInboundDevelopmentHandlerStubs();
         services.AddSlackMessenger(configuration);
 
         Action act = () => services.BuildServiceProvider(new ServiceProviderOptions
@@ -537,6 +563,93 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         IAgentTaskService resolved = provider.GetRequiredService<IAgentTaskService>();
         resolved.Should().BeOfType<BufferingAgentTaskServiceDecorator>(
             "the facade still wraps the real orchestrator with the buffering decorator");
+
+        // Stage 5.3 iter-2 evaluator item: a standalone host that
+        // calls only AddSlackMessenger (no
+        // AddSlackInboundDevelopmentHandlerStubs, no post-facade
+        // explicit AddSlackCommandDispatcher / AddSlackInteractionDispatcher)
+        // MUST end up with the production async handlers and
+        // interaction fast-path bound -- otherwise the documented
+        // "registers all internal handlers" contract is fiction and
+        // a library consumer following the facade API silently has
+        // no inbound dispatch path. Pinning the implementation types
+        // here surfaces a future regression that splits handler
+        // wiring back out of the facade.
+        provider.GetRequiredService<ISlackCommandHandler>()
+            .Should().BeOfType<SlackCommandHandler>(
+                "Stage 5.1: a facade-only host MUST get the real SlackCommandHandler");
+        provider.GetRequiredService<ISlackAppMentionHandler>()
+            .Should().BeOfType<SlackAppMentionHandler>(
+                "Stage 5.2: a facade-only host MUST get the real SlackAppMentionHandler");
+        provider.GetRequiredService<ISlackInteractionHandler>()
+            .Should().BeOfType<SlackInteractionHandler>(
+                "Stage 5.3: a facade-only host MUST get the real SlackInteractionHandler so button clicks / view_submissions publish HumanDecisionEvents");
+        provider.GetRequiredService<ISlackInteractionFastPathHandler>()
+            .Should().BeOfType<DefaultSlackInteractionFastPathHandler>(
+                "Stage 5.3: a facade-only host MUST get DefaultSlackInteractionFastPathHandler so RequiresComment buttons open views.open synchronously while trigger_id is still valid -- a NoOp baseline here means RequiresComment is silently dropped");
+    }
+
+    [Fact]
+    public void AddSlackMessenger_binds_real_handlers_for_standalone_facade_host()
+    {
+        // Stage 5.3 iter-2 evaluator item (regression test for the
+        // facade-only handler contract): exercises the standalone
+        // library-consumer path -- a host that wires the minimal
+        // prerequisites + a real IAgentTaskService + AddSlackMessenger
+        // and nothing else. The previous iter-1 facade contract left
+        // every async handler unbound and kept the NoOp interaction
+        // fast-path in this path; iter-2 restores full handler
+        // registration so /agent ask, @app mentions, button clicks
+        // and view_submissions all dispatch through Stage 5.x
+        // production code without the host needing to know about the
+        // per-stage AddSlack*Dispatcher extensions.
+        IConfiguration configuration = BuildFacadeConfiguration();
+        ServiceCollection services = new();
+        services.AddLogging();
+        services.AddDbContext<SlackPersistenceDbContext>(opts =>
+            opts.UseSqlite("Data Source=:memory:"));
+        services.AddMessagingCore(configuration);
+        services.AddMessagingPersistence(configuration);
+        services.AddSecretProvider(configuration);
+
+        // The ONLY orchestrator the host registers -- no dev
+        // defaults, no explicit handler-stub opt-in, no post-facade
+        // dispatcher wiring. The library consumer's mental model is
+        // "AddSlackMessenger does it all".
+        services.AddSingleton<IAgentTaskService, RealOrchestratorStub>();
+
+        services.AddSlackMessenger(configuration);
+
+        using ServiceProvider provider = services.BuildServiceProvider(
+            new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true });
+
+        // Async handler dispatchers -- the three contracts the Stage
+        // 4.3 SlackInboundProcessingPipeline ctor requires.
+        provider.GetRequiredService<ISlackCommandHandler>()
+            .Should().BeOfType<SlackCommandHandler>();
+        provider.GetRequiredService<ISlackAppMentionHandler>()
+            .Should().BeOfType<SlackAppMentionHandler>();
+        provider.GetRequiredService<ISlackInteractionHandler>()
+            .Should().BeOfType<SlackInteractionHandler>();
+
+        // Synchronous interaction fast-path -- DefaultSlackInteractionFastPathHandler
+        // opens RequiresComment follow-up modals inline (before the
+        // controller's ACK flushes) so views.open lands while
+        // trigger_id is still valid. The previous facade left the
+        // NoOp default from AddSlackInboundTransport here; a
+        // standalone host would therefore have silently dropped
+        // every RequiresComment button click.
+        provider.GetRequiredService<ISlackInteractionFastPathHandler>()
+            .Should().BeOfType<DefaultSlackInteractionFastPathHandler>(
+                "Stage 5.3 RequiresComment buttons rely on the production fast-path opening views.open inline; a NoOp baseline here means the comment modal never opens and the interaction is dropped after ACK");
+
+        // The whole point of the contract: SlackInboundProcessingPipeline
+        // -- the BackgroundService entry point that drains the
+        // inbound queue -- resolves cleanly with the production
+        // handlers wired by the facade.
+        provider.GetRequiredService<SlackInboundProcessingPipeline>()
+            .Should().NotBeNull(
+                "Stage 4.3 inbound processing pipeline depends on all three handler contracts; a facade-only composition MUST resolve it without the host knowing per-stage extension names");
     }
 
     private static ServiceProvider BuildFacadeContainer()
@@ -566,16 +679,15 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         // dev-defaults shim BEFORE invoking AddSlackMessenger.
         services.AddSlackCommandDispatcherDevelopmentDefaults();
 
-        // Stage 5.1 iter-2 evaluator item 2 fix: the facade no
-        // longer registers ISlackCommandHandler / ISlackInteractionHandler
-        // / ISlackAppMentionHandler unconditionally (which used to
-        // silently replace the Stage 4.3 NoOp stand-ins). Acceptance
-        // tests that drive the full DI container (ValidateOnBuild
-        // walks every singleton ctor, including
-        // SlackInboundProcessingPipeline whose ctor requires all
-        // three handler contracts) opt in to the NoOp stubs
-        // explicitly so the pipeline ctor resolves.
-        services.AddSlackInboundDevelopmentHandlerStubs();
+        // Stage 5.3 iter-2 evaluator item (FIXTURE FIX): the facade
+        // now binds the production async handlers + interaction
+        // fast-path itself, so the prior workaround that called
+        // AddSlackInboundDevelopmentHandlerStubs() to keep the
+        // pipeline ctor resolvable is no longer needed -- and would
+        // actively misrepresent the facade's surface (the dev stubs
+        // would be RemoveAll'd by the facade anyway). Drop the
+        // workaround so AddSlackMessenger_registers_every_internal_pipeline_collaborator
+        // exercises the same DI shape a real production host gets.
 
         // The facade under test.
         services.AddSlackMessenger(configuration);

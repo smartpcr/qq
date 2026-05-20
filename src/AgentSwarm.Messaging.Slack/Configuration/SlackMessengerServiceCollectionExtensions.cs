@@ -25,8 +25,8 @@ using Microsoft.Extensions.Logging;
 /// Single Stage 8.1 connector-facade entry point: composes every
 /// internal Slack registration (options, persistence, signature
 /// validation, authorization, inbound transport + ingestor, command /
-/// app-mention / interaction dispatchers, thread lifecycle, outbound
-/// dispatcher + <see cref="SlackConnector"/>,
+/// app-mention / interaction handlers + fast-path, thread lifecycle,
+/// outbound dispatcher + <see cref="SlackConnector"/>,
 /// <see cref="Transport.SlackDirectApiClient"/>, health checks,
 /// startup diagnostics, telemetry, and the inbound
 /// <see cref="ISlackInboundEventBuffer"/> that
@@ -53,12 +53,33 @@ using Microsoft.Extensions.Logging;
 /// composition roots already called.
 /// </para>
 /// <para>
+/// <b>Stage 5.3 iter-2 -- handler dispatchers are part of the facade.</b>
+/// <see cref="AddSlackMessenger{TContext}(IServiceCollection, IConfiguration)"/>
+/// invokes
+/// <see cref="SlackCommandDispatchServiceCollectionExtensions.AddSlackCommandDispatcher"/>
+/// and
+/// <see cref="SlackInteractionDispatchServiceCollectionExtensions.AddSlackInteractionDispatcher"/>
+/// so a standalone host that calls only the facade (plus the
+/// host-owned <see cref="DbContext"/> registration and an
+/// <see cref="IAgentTaskService"/>) gets a working inbound dispatch
+/// path -- <see cref="Pipeline.SlackCommandHandler"/>,
+/// <see cref="Pipeline.SlackAppMentionHandler"/>,
+/// <see cref="Pipeline.SlackInteractionHandler"/>, and the real
+/// <see cref="Transport.DefaultSlackInteractionFastPathHandler"/> all
+/// resolve from the same single call. Hosts that pre-registered an
+/// alternative implementation see the facade replace it
+/// (<see cref="ServiceCollectionDescriptorExtensions.RemoveAll{T}(IServiceCollection)"/>
+/// + <see cref="ServiceCollectionServiceExtensions.AddSingleton{TService, TImplementation}(IServiceCollection)"/>),
+/// matching the documented behaviour of the standalone extensions
+/// before they became part of the facade.
+/// </para>
+/// <para>
 /// <b>Order matters for the inbound-event tap.</b> The facade decorates
 /// whatever <see cref="IAgentTaskService"/> the host registered with
 /// the <see cref="BufferingAgentTaskServiceDecorator"/> so
 /// <see cref="SlackConnector.ReceiveAsync"/> drains the same
 /// <see cref="HumanDecisionEvent"/>s the orchestrator observes. The
-/// facade NO LONGER installs a development-default
+/// facade does NOT install a development-default
 /// <see cref="NoOpAgentTaskService"/> (Stage 8.1 evaluator iter-3
 /// item 2): hosts that previously relied on that silent fallback MUST
 /// now explicitly opt in via
@@ -247,50 +268,39 @@ public static class SlackMessengerServiceCollectionExtensions
         // does that).
         services.AddSlackInboundIngestor<TContext>();
 
-        // 6. Stage 5.1 iter-2 evaluator item 2 fix (STRUCTURAL):
-        // the facade wires every COLLABORATOR the command and
-        // interaction dispatchers depend on (HTTP clients, audit
-        // recorders, renderer, ephemeral responder, rate limiter,
-        // SlackDirectApiClient / ISlackViewsOpenClient /
-        // ISlackChatUpdateClient, null thread-mapping lookup default,
-        // modal-audit recorder) so hosts calling AddSlackMessenger
-        // get the full facade surface -- the Stage 8.1 contract that
-        // "AddSlackMessenger registers all internal collaborators".
+        // 6. Stage 5.x async handler dispatchers: the facade binds the
+        // production ISlackCommandHandler / ISlackAppMentionHandler /
+        // ISlackInteractionHandler / ISlackInteractionFastPathHandler
+        // implementations so a host that calls only AddSlackMessenger
+        // gets a working inbound dispatch path. Both extensions are
+        // idempotent (RemoveAll<T>() + AddSingleton<T>()) so re-invoking
+        // the facade does not duplicate bindings, and a host that
+        // pre-registered an alternative ISlackCommandHandler /
+        // ISlackInteractionHandler binding sees its earlier registration
+        // unconditionally replaced (the same behaviour Stage 5.1 / 5.2 /
+        // 5.3 documented for the public AddSlackCommandDispatcher /
+        // AddSlackInteractionDispatcher extensions before they became
+        // part of the facade).
         //
-        // It does NOT bind ISlackCommandHandler /
-        // ISlackAppMentionHandler / ISlackInteractionHandler /
-        // ISlackInteractionFastPathHandler. The Stage 4.3
-        // Program.EnableDevelopmentHandlerStubsKey gate
-        // (WorkerHandlerStubGatingTests) requires that the Worker
-        // composition root choose the handler set explicitly:
+        // Stage 5.3 iter-2 evaluator item: the iter-1 split into
+        // "*Collaborators" helpers left a host that called only the
+        // facade (i.e. a non-Worker host that registered a real
+        // IAgentTaskService and stopped) with no ISlackCommandHandler /
+        // ISlackAppMentionHandler / ISlackInteractionHandler bindings
+        // AND the NoOpSlackInteractionFastPathHandler still installed
+        // by AddSlackInboundTransport. AddSlackMessenger documented
+        // itself as the "all internal handlers" entry point yet did
+        // not actually bind them; the contract is restored here.
         //
-        //   * AddSlackInboundDevelopmentHandlerStubs() -- TryAdd NoOp
-        //     handlers; the Worker calls this when
-        //     ShouldEnableDevelopmentHandlerStubs returns true
-        //     (Development default), OR
-        //   * AddSlackCommandDispatcher() / AddSlackInteractionDispatcher()
-        //     -- the production handler RemoveAll+AddSingleton path;
-        //     called explicitly when the host has wired a real
-        //     IAgentTaskService and wants the real handlers, OR
-        //   * neither, in which case Production hosts that did not
-        //     wire real handlers fail loudly at first envelope
-        //     dispatch (SlackInboundProcessingPipeline ctor throws
-        //     when resolving ISlackCommandHandler).
-        //
-        // The previous behaviour -- AddSlackMessenger eagerly
-        // AddSlackCommandDispatcher() / AddSlackInteractionDispatcher()
-        // -- silently RemoveAll+AddSingleton'd the real handlers and
-        // bypassed the gate, ack-and-dropping in Production even when
-        // the operator had not opted in. Using the collaborators-only
-        // path here preserves the rich facade surface AND keeps the
-        // gate's invariant intact.
-        //
-        // (NoOpSlackInteractionFastPathHandler is registered as the
-        // baseline default by AddSlackInboundTransport above via
-        // TryAdd, so SlackInteractionsController's GetRequiredService
-        // resolves cleanly after the facade.)
-        services.AddSlackCommandDispatcherCollaborators();
-        services.AddSlackInteractionDispatcherCollaborators();
+        // The legacy Slack:Inbound:EnableDevelopmentHandlerStubs gate
+        // (NoOp ISlackCommandHandler / ISlackAppMentionHandler /
+        // ISlackInteractionHandler stand-ins) is unaffected because
+        // its TryAdd registrations now observe the real handlers bound
+        // here and no-op -- the same precedence the Worker relied on
+        // in iter-1 by calling AddSlackInboundDevelopmentHandlerStubs
+        // AFTER AddSlackCommandDispatcher.
+        services.AddSlackCommandDispatcher();
+        services.AddSlackInteractionDispatcher();
 
         // Stage 5.3 EF-backed thread-mapping lookup so the
         // interaction handler can resolve CorrelationId from the
