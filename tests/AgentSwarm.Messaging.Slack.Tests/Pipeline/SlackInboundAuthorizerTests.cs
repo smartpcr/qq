@@ -185,21 +185,151 @@ public sealed class SlackInboundAuthorizerTests
         sink.Records.Should().ContainSingle();
     }
 
+    [Fact]
+    public async Task AuthorizeAsync_posts_ephemeral_via_response_url_when_responder_wired_and_rejection_occurs()
+    {
+        // Stage 4.2 iter-2: AC-5 leg. A Socket Mode slash command
+        // rejected during async processing has no HTTP body to render
+        // an ephemeral into -- the WebSocket ACK frame only carries
+        // envelope_id. The authorizer MUST POST the configured
+        // rejection wording to envelope.ResponseUrl via the wired
+        // ISlackEphemeralResponder so the originating user still
+        // sees the rejection.
+        FakeWorkspaceStore stores = FakeWorkspaceStore.WithSingleEnabled("T1", channels: new[] { "C-allowed" }, groups: new[] { "G1" });
+        FakeAuthAuditSink sink = new();
+        FakeEphemeralResponder responder = new();
+        SlackInboundAuthorizer authorizer = BuildAuthorizer(stores, FakeMembershipResolver.Yes(), sink, responder: responder);
+
+        SlackInboundEnvelope envelope = BuildEnvelope("cmd:T1:U1:/agent:trig", "T1", "C-denied", "U1") with
+        {
+            ResponseUrl = "https://hooks.slack.com/commands/T1/AC1",
+        };
+
+        SlackInboundAuthorizationResult result = await authorizer.AuthorizeAsync(envelope, CancellationToken.None);
+
+        result.IsAuthorized.Should().BeFalse();
+        result.Reason.Should().Be(SlackAuthorizationRejectionReason.DisallowedChannel);
+        responder.Captures.Should().ContainSingle(
+            "AC-5 brief: a denied-channel Socket Mode envelope MUST produce exactly one ephemeral POST to response_url so the originating user sees the rejection")
+            .Which.ResponseUrl.Should().Be("https://hooks.slack.com/commands/T1/AC1");
+        responder.Captures[0].Message.Should().Be(
+            SlackAuthorizationOptions.DefaultRejectionMessage,
+            "the authorizer MUST send the operator-configured rejection wording -- DefaultRejectionMessage when RejectionMessage is unset -- so both authorisation surfaces deliver the same user-visible text");
+    }
+
+    [Fact]
+    public async Task AuthorizeAsync_does_not_post_ephemeral_when_envelope_has_no_response_url()
+    {
+        // Events API callbacks (and any other source without a
+        // response_url) MUST NOT trigger an ephemeral POST -- there
+        // is no per-invocation Slack URL to target. The audit row
+        // is still written; the responder is simply not invoked.
+        FakeWorkspaceStore stores = FakeWorkspaceStore.WithSingleEnabled("T1", channels: new[] { "C-allowed" }, groups: new[] { "G1" });
+        FakeAuthAuditSink sink = new();
+        FakeEphemeralResponder responder = new();
+        SlackInboundAuthorizer authorizer = BuildAuthorizer(stores, FakeMembershipResolver.Yes(), sink, responder: responder);
+
+        SlackInboundEnvelope envelope = BuildEnvelope("event:Ev1", "T1", "C-denied", "U1");
+        // BuildEnvelope leaves ResponseUrl null.
+
+        SlackInboundAuthorizationResult result = await authorizer.AuthorizeAsync(envelope, CancellationToken.None);
+
+        result.IsAuthorized.Should().BeFalse();
+        sink.Records.Should().ContainSingle();
+        responder.Captures.Should().BeEmpty(
+            "envelopes without a response_url (Events API, Socket Mode events) MUST NOT trigger an ephemeral POST -- there is no Slack-supported user-reply target");
+    }
+
+    [Fact]
+    public async Task AuthorizeAsync_does_not_throw_when_ephemeral_responder_fails()
+    {
+        // The responder contract is best-effort -- a transient
+        // HTTP failure inside the responder MUST NOT escalate into
+        // an authorization-level exception, because the rejection
+        // is the terminal disposition and the audit row is already
+        // durable.
+        FakeWorkspaceStore stores = FakeWorkspaceStore.WithSingleEnabled("T1", channels: new[] { "C-allowed" }, groups: new[] { "G1" });
+        FakeAuthAuditSink sink = new();
+        FakeEphemeralResponder responder = new() { ThrowOnSend = new InvalidOperationException("transport down") };
+        SlackInboundAuthorizer authorizer = BuildAuthorizer(stores, FakeMembershipResolver.Yes(), sink, responder: responder);
+
+        SlackInboundEnvelope envelope = BuildEnvelope("cmd:T1:U1:/agent:trig", "T1", "C-denied", "U1") with
+        {
+            ResponseUrl = "https://hooks.slack.com/commands/T1/AC1",
+        };
+
+        SlackInboundAuthorizationResult result = await authorizer.AuthorizeAsync(envelope, CancellationToken.None);
+
+        result.IsAuthorized.Should().BeFalse();
+        result.Reason.Should().Be(SlackAuthorizationRejectionReason.DisallowedChannel);
+        sink.Records.Should().ContainSingle(
+            "the rejection audit row MUST be persisted even when the ephemeral responder fails -- audit is the durable record, the ephemeral is best-effort");
+    }
+
+    [Fact]
+    public async Task AuthorizeAsync_populates_command_text_from_socket_mode_json_payload()
+    {
+        // Stage 4.2 iter-2: the rejected_auth audit row's
+        // command_text MUST carry the verbatim slash command an
+        // operator needs to triage the rejection. Socket Mode
+        // slash_commands frames deliver JSON bodies (not form-
+        // encoded), so the audit-field helper's JSON branch is the
+        // one exercised here.
+        FakeWorkspaceStore stores = FakeWorkspaceStore.WithSingleEnabled("T1", channels: new[] { "C-allowed" }, groups: new[] { "G1" });
+        FakeAuthAuditSink sink = new();
+        SlackInboundAuthorizer authorizer = BuildAuthorizer(stores, FakeMembershipResolver.Yes(), sink);
+
+        const string SocketModeJson = "{\"team_id\":\"T1\",\"channel_id\":\"C-denied\",\"user_id\":\"U1\","
+            + "\"command\":\"/agent\",\"text\":\"ask generate implementation plan\","
+            + "\"trigger_id\":\"trig\",\"response_url\":\"https://hooks.slack.com/commands/T1/AC1\"}";
+
+        SlackInboundEnvelope envelope = new(
+            IdempotencyKey: "cmd:T1:U1:/agent:trig",
+            SourceType: SlackInboundSourceType.Command,
+            TeamId: "T1",
+            ChannelId: "C-denied",
+            UserId: "U1",
+            RawPayload: SocketModeJson,
+            TriggerId: "trig",
+            ReceivedAt: DateTimeOffset.UtcNow);
+
+        SlackInboundAuthorizationResult result = await authorizer.AuthorizeAsync(envelope, CancellationToken.None);
+
+        result.IsAuthorized.Should().BeFalse();
+        sink.Records.Should().ContainSingle();
+        sink.Records[0].CommandText.Should().Be(
+            "/agent ask generate implementation plan",
+            "the rejected_auth row's command_text MUST be extracted via SlackInboundEnvelopeAuditFields.Extract, which auto-detects JSON-shaped Socket Mode payloads; a null command_text would leak the synthetic 'ingestor://' marker into the row and break audit triage");
+    }
+
     private static SlackInboundAuthorizer BuildAuthorizer(
         FakeWorkspaceStore store,
         FakeMembershipResolver resolver,
         FakeAuthAuditSink sink,
-        bool enabled = true)
+        bool enabled = true,
+        ISlackEphemeralResponder? responder = null)
     {
         SlackAuthorizationOptions opts = new() { Enabled = enabled };
         IOptionsMonitor<SlackAuthorizationOptions> monitor = new TestOptionsMonitor<SlackAuthorizationOptions>(opts);
+        if (responder is null)
+        {
+            return new SlackInboundAuthorizer(
+                store,
+                resolver,
+                sink,
+                monitor,
+                NullLogger<SlackInboundAuthorizer>.Instance,
+                TimeProvider.System);
+        }
+
         return new SlackInboundAuthorizer(
             store,
             resolver,
             sink,
             monitor,
             NullLogger<SlackInboundAuthorizer>.Instance,
-            TimeProvider.System);
+            TimeProvider.System,
+            responder);
     }
 
     private static SlackInboundEnvelope BuildEnvelope(string key, string team, string? channel, string user) => new(
@@ -276,6 +406,28 @@ public sealed class SlackInboundAuthorizerTests
             this.records.Enqueue(record);
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class FakeEphemeralResponder : ISlackEphemeralResponder
+    {
+        private readonly ConcurrentQueue<EphemeralCapture> captures = new();
+
+        public Exception? ThrowOnSend { get; init; }
+
+        public IReadOnlyList<EphemeralCapture> Captures => this.captures.ToArray();
+
+        public Task SendEphemeralAsync(string? responseUrl, string message, CancellationToken ct)
+        {
+            this.captures.Enqueue(new EphemeralCapture(responseUrl, message));
+            if (this.ThrowOnSend is not null)
+            {
+                throw this.ThrowOnSend;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public sealed record EphemeralCapture(string? ResponseUrl, string Message);
     }
 
     private sealed class TestOptionsMonitor<TOptions> : IOptionsMonitor<TOptions>

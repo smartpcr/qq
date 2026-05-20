@@ -112,9 +112,19 @@ internal readonly record struct SlackInboundEnvelopeAuditFields(
 
     private static SlackInboundEnvelopeAuditFields ExtractCommand(string raw)
     {
-        IDictionary<string, StringValues> fields = QueryHelpers.ParseQuery(raw);
-        string? command = GetFormValue(fields, "command");
-        string? text = GetFormValue(fields, "text");
+        // Iter-2 follow-on for Stage 4.2 Socket Mode: delegate to the
+        // shared payload parser, which auto-detects JSON (Socket Mode
+        // slash_commands frames) vs form-encoded (HTTP slash webhook)
+        // bodies. The previous implementation used QueryHelpers
+        // verbatim, which silently returned empty fields for the JSON
+        // body the Socket Mode normalizer stores on
+        // SlackInboundEnvelope.RawPayload -- so a denied-channel
+        // Socket Mode rejection produced a rejected_auth row with
+        // CommandText=null and AC-5's "audit row carries the verbatim
+        // command" requirement failed.
+        SlackCommandPayload payload = SlackInboundPayloadParser.ParseCommand(raw);
+        string? command = NullIfEmpty(payload.Command);
+        string? text = NullIfEmpty(payload.Text);
 
         string? commandText = (command, text) switch
         {
@@ -129,6 +139,9 @@ internal readonly record struct SlackInboundEnvelopeAuditFields(
             ThreadTs: null,
             MessageTs: null);
     }
+
+    private static string? NullIfEmpty(string? value)
+        => string.IsNullOrEmpty(value) ? null : value;
 
     private static SlackInboundEnvelopeAuditFields ExtractInteraction(string raw)
     {
