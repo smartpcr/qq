@@ -73,21 +73,35 @@ public class Program
         "Data Source=slack-audit.db";
 
     /// <summary>
-    /// Configuration key (boolean) that gates the opt-in for the
-    /// no-op Slack handler stand-ins
-    /// (<see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>).
-    /// When unset, defaults to
-    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>:
-    /// Development hosts wire the stubs so the ingestor pipeline
-    /// resolves on a dev laptop; Production / Staging / Testing
-    /// hosts surface a fail-loud
-    /// <see cref="InvalidOperationException"/> from the pipeline ctor
-    /// the first time the ingestor lazily resolves it (the ingestor
-    /// then forwards the envelope to the last-resort
-    /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> instead of
-    /// silently ack-and-dropping it). Operators can explicitly opt
-    /// in (<c>true</c>) or out (<c>false</c>) per environment.
+    /// Legacy configuration key (boolean) for the obsolete
+    /// <see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>
+    /// gate. The key is retained ONLY for config-schema back-compat:
+    /// an operator's existing
+    /// <c>Slack:Inbound:EnableDevelopmentHandlerStubs</c> entry continues
+    /// to bind cleanly, but the value has no observable effect on the
+    /// resolved Slack handler types in this composition root.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stage 5.1 iter-3 evaluator items 1 + 2 wired the real
+    /// <see cref="Pipeline.SlackCommandHandler"/> /
+    /// <see cref="Pipeline.SlackAppMentionHandler"/> /
+    /// <see cref="Pipeline.SlackInteractionHandler"/> unconditionally
+    /// inside <see cref="BuildApp"/> via
+    /// <see cref="SlackCommandDispatchServiceCollectionExtensions.AddSlackCommandDispatcher"/>
+    /// and
+    /// <see cref="SlackInteractionDispatchServiceCollectionExtensions.AddSlackInteractionDispatcher"/>,
+    /// both of which use <c>RemoveAll&lt;&gt;+AddSingleton&lt;&gt;</c>
+    /// for the four handler contracts. The legacy
+    /// <see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>
+    /// extension only does <c>TryAddSingleton</c>, so its registrations
+    /// always observe the real handlers already bound and silently
+    /// no-op -- flipping this key to <c>true</c> or <c>false</c> cannot
+    /// change the resolved handler types. The gate's helper
+    /// (<see cref="ShouldEnableDevelopmentHandlerStubs"/>) accordingly
+    /// defaults to <c>false</c> in every environment.
+    /// </para>
+    /// </remarks>
     public const string EnableDevelopmentHandlerStubsKey =
         "Slack:Inbound:EnableDevelopmentHandlerStubs";
 
@@ -327,17 +341,27 @@ public class Program
         builder.Services.AddSlackCommandDispatcher();
         builder.Services.AddSlackInteractionDispatcher();
 
-        // Legacy Stage 4.3 dev-stub gate: now obsolete because Stage
-        // 5.1 / 5.2 / 5.3 real handlers exist and the
-        // AddSlackCommandDispatcher / AddSlackInteractionDispatcher
-        // calls above RemoveAll+AddSingleton them ahead of any
-        // TryAdd. The gate's call is kept under an explicit opt-in
-        // (default OFF in every environment) so operators driving a
-        // smoke test that intentionally exercises the no-op stubs
-        // can still toggle them on, but no environment-defaulted
-        // wiring fires here anymore. The constant + helper survive
-        // for back-compat with hosts that read the configuration
-        // key directly.
+        // Legacy Stage 4.3 dev-stub gate: NO-OP kept only for
+        // config-schema back-compat. The AddSlackCommandDispatcher() /
+        // AddSlackInteractionDispatcher() calls immediately above
+        // already RemoveAll+AddSingleton'd the four handler contracts
+        // (ISlackCommandHandler, ISlackAppMentionHandler,
+        // ISlackInteractionHandler, ISlackInteractionFastPathHandler),
+        // and AddSlackInboundDevelopmentHandlerStubs only does
+        // TryAddSingleton -- so this branch's TryAdds always observe
+        // the real handlers already bound and silently no-op,
+        // regardless of whether ShouldEnableDevelopmentHandlerStubs
+        // returns true or false. The constant, helper, and call site
+        // are retained ONLY so an operator's existing
+        // Slack:Inbound:EnableDevelopmentHandlerStubs configuration
+        // entry continues to bind without producing a missing-key
+        // warning; the resolved handler types are unaffected. Future
+        // readers should not spend time reasoning about this branch's
+        // effect on dispatch -- there is none.
+        //
+        // Pinned by WorkerHandlerStubGatingTests
+        // (Worker_in_testing_environment_with_explicit_legacy_opt_in_still_registers_real_command_handler
+        // and Worker_in_production_with_explicit_legacy_opt_out_still_registers_real_command_handler).
         if (ShouldEnableDevelopmentHandlerStubs(builder))
         {
             builder.Services.AddSlackInboundDevelopmentHandlerStubs();
@@ -436,28 +460,35 @@ public class Program
     }
 
     /// <summary>
-    /// Resolves the opt-in gate for the legacy no-op Slack handler
-    /// stand-ins. Reads the
-    /// <see cref="EnableDevelopmentHandlerStubsKey"/> value as a
-    /// boolean; if absent or unparseable defaults to <c>false</c>.
+    /// Resolves the opt-in gate for the legacy
+    /// <see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>
+    /// call. Reads the <see cref="EnableDevelopmentHandlerStubsKey"/>
+    /// value as a boolean; if absent or unparseable defaults to
+    /// <c>false</c>.
     /// </summary>
     /// <remarks>
-    /// Stage 5.1 iter-3 evaluator items 1 + 2: now that Stage 5
-    /// real handlers exist and <see cref="BuildApp"/> wires them
-    /// via <see cref="SlackCommandDispatchServiceCollectionExtensions.AddSlackCommandDispatcher"/>
-    /// and <see cref="SlackInteractionDispatchServiceCollectionExtensions.AddSlackInteractionDispatcher"/>
-    /// unconditionally, the no-op stand-ins are obsolete. The gate's
-    /// default flipped from <c>builder.Environment.IsDevelopment()</c>
-    /// to <c>false</c> so the dev-stub TryAdds no longer fire on a
-    /// dev laptop: a default dev run now exercises the real
+    /// <para>
+    /// <b>This gate is a no-op in <see cref="BuildApp"/>'s composition
+    /// root and is retained only for config-schema back-compat.</b>
+    /// Stage 5.1 iter-3 (items 1 + 2) wired the real
     /// <see cref="Pipeline.SlackCommandHandler"/> /
     /// <see cref="Pipeline.SlackAppMentionHandler"/> /
-    /// <see cref="Pipeline.SlackInteractionHandler"/>. Operators
-    /// running a smoke test that intentionally drives the no-op
-    /// pipeline can still flip the gate to <c>true</c> -- the
-    /// TryAdd registrations no-op when real handlers are already
-    /// bound, so the override is observable only in compositions
-    /// that have stripped the real wiring out.
+    /// <see cref="Pipeline.SlackInteractionHandler"/> unconditionally
+    /// via
+    /// <see cref="SlackCommandDispatchServiceCollectionExtensions.AddSlackCommandDispatcher"/>
+    /// and
+    /// <see cref="SlackInteractionDispatchServiceCollectionExtensions.AddSlackInteractionDispatcher"/>
+    /// (<c>RemoveAll&lt;&gt;+AddSingleton&lt;&gt;</c>) ABOVE the gate's
+    /// call site. Because
+    /// <see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>
+    /// only does <c>TryAddSingleton</c>, its registrations always
+    /// observe the real handlers already bound and silently no-op
+    /// regardless of the value this method returns. The default
+    /// therefore flipped from <c>builder.Environment.IsDevelopment()</c>
+    /// to <c>false</c>; the helper survives only so existing operator
+    /// configuration entries for <c>Slack:Inbound:EnableDevelopmentHandlerStubs</c>
+    /// still parse cleanly.
+    /// </para>
     /// </remarks>
     internal static bool ShouldEnableDevelopmentHandlerStubs(WebApplicationBuilder builder)
     {
