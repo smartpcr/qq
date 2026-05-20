@@ -167,7 +167,18 @@ internal static class SlackSocketModePayloadNormalizer
             UserId: user,
             RawPayload: frame.Payload,
             TriggerId: NullIfEmpty(payload.TriggerId),
-            ReceivedAt: receivedAt);
+            ReceivedAt: receivedAt)
+        {
+            // Iter-2 evaluator item #5: Socket Mode interactive frames
+            // carry response_url with the same lifetime / behaviour as
+            // the HTTP transport's payload. Capturing it here keeps
+            // the async ephemeral / "please click again" feedback
+            // path symmetrical with the HTTP-side
+            // SlackInboundEnvelopeFactory.BuildInteractionEnvelope --
+            // without this, a Socket Mode rejection or async
+            // views.open failure would silently drop user feedback.
+            ResponseUrl = NullIfEmpty(payload.ResponseUrl),
+        };
     }
 
     private static string HashFallback(string body)

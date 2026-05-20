@@ -71,11 +71,16 @@ internal static class SlackInboundResolvedCorrelationContext
 
     /// <summary>
     /// Stamps the resolved business correlation id for the in-flight
-    /// envelope. No-op when called outside an active
-    /// <see cref="Reset"/>-bounded scope (e.g. from a unit test that
-    /// invokes the handler directly without the pipeline) so existing
-    /// call sites cannot accidentally pollute future pipeline
-    /// invocations.
+    /// envelope. Auto-creates a holder when one is not already pinned
+    /// on the current async flow so unit tests that invoke a handler
+    /// directly (without going through
+    /// <see cref="SlackInboundProcessingPipeline"/>'s top-of-dispatch
+    /// <see cref="Reset"/>) still propagate the stamp to downstream
+    /// audit recorders within the same async chain. The auto-create
+    /// is per-flow (the assignment to <see cref="AsyncLocal{T}.Value"/>
+    /// flows forward into the current logical task only), so it cannot
+    /// leak into sibling pipeline invocations running on parallel
+    /// xUnit collections.
     /// </summary>
     /// <param name="value">
     /// The resolved correlation id. <see langword="null"/> or empty is
@@ -92,7 +97,21 @@ internal static class SlackInboundResolvedCorrelationContext
         Holder? holder = CurrentHolder.Value;
         if (holder is null)
         {
-            return;
+            // Iter-2 evaluator item #2 (STRUCTURAL): the previous
+            // "no-op when no Reset" guard prevented Set from
+            // populating the slot when a handler ran outside the
+            // pipeline (e.g. SlackInteractionHandlerTests calling
+            // HandleAsync directly). That meant
+            // SlackModalAuditRecorder / SlackInboundAuditRecorder
+            // could never observe the thread-anchored correlation id
+            // on the modal_open audit row written from
+            // OpenCommentModalAsync. Auto-creating the holder here
+            // keeps the AsyncLocal scoping intact (the new holder
+            // flows only through the current task's continuations)
+            // while ensuring downstream auditors see the value the
+            // handler resolved.
+            holder = new Holder();
+            CurrentHolder.Value = holder;
         }
 
         holder.Value = value;

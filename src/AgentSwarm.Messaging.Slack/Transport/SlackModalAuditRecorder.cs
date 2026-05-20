@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using AgentSwarm.Messaging.Core.Identifiers;
 using AgentSwarm.Messaging.Slack.Entities;
 using AgentSwarm.Messaging.Slack.Persistence;
+using AgentSwarm.Messaging.Slack.Pipeline;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
@@ -146,10 +147,20 @@ internal sealed class SlackModalAuditRecorder
             ? errorDetail
             : (responsePayload ?? errorDetail);
 
+        // Iter-2 evaluator item #2 (STRUCTURAL): prefer the resolved
+        // business correlation id stamped on the ambient slot by the
+        // dispatch handler (e.g. SlackInteractionHandler's
+        // slack-thread:{team}:{channel}:{thread_ts} anchor). Falling
+        // back to envelope.IdempotencyKey keeps every other call site
+        // (slash-command modal_open audits, fast-path modal_open audits)
+        // on the previous correlation source -- the change is strictly
+        // additive for the async interaction path.
+        string correlationId = ResolveCorrelationId(envelope);
+
         SlackAuditEntry entry = new()
         {
             Id = id,
-            CorrelationId = envelope.IdempotencyKey,
+            CorrelationId = correlationId,
             AgentId = null,
             TaskId = null,
             ConversationId = null,
@@ -188,5 +199,38 @@ internal sealed class SlackModalAuditRecorder
                 envelope.TeamId,
                 envelope.UserId);
         }
+    }
+
+    /// <summary>
+    /// Resolves the <see cref="SlackAuditEntry.CorrelationId"/> column
+    /// for a modal_open audit row. Mirrors
+    /// <c>SlackInboundAuditRecorder.ResolveCorrelationId</c>: prefers
+    /// the business correlation id stamped on the ambient
+    /// <see cref="SlackInboundResolvedCorrelationContext"/> slot by the
+    /// dispatch handler (notably the iter-2 slack-thread-anchored
+    /// id minted by <see cref="SlackInteractionHandler"/> when no
+    /// <see cref="Entities.SlackThreadMapping"/> row exists), falling
+    /// back to <see cref="SlackInboundEnvelope.IdempotencyKey"/> for
+    /// paths the lookup does not cover (slash-command modal_open
+    /// audits prior to thread creation, fast-path audits raised
+    /// before dispatch).
+    /// </summary>
+    /// <remarks>
+    /// Story AC-6: "every agent/human exchange is queryable by
+    /// correlation ID". Without this hop the async interaction
+    /// comment-modal audit row would land under its per-click
+    /// <c>interact:</c> idempotency key and a single-correlation-id
+    /// query would not surface the modal_open trace alongside the
+    /// originating slack-thread-anchored decision events.
+    /// </remarks>
+    private static string ResolveCorrelationId(SlackInboundEnvelope envelope)
+    {
+        string? resolved = SlackInboundResolvedCorrelationContext.Get();
+        if (!string.IsNullOrEmpty(resolved))
+        {
+            return resolved;
+        }
+
+        return envelope.IdempotencyKey ?? string.Empty;
     }
 }

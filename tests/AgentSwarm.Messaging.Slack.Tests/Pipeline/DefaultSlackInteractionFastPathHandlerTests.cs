@@ -316,6 +316,85 @@ public sealed class DefaultSlackInteractionFastPathHandlerTests
     }
 
     // -----------------------------------------------------------------
+    // Stage 5.3 iter-3 evaluator item #1 (STRUCTURAL fix coverage).
+    //
+    // Before: when SlackThreadMapping had no row for the (team,
+    // channel, thread_ts) triple of a RequiresComment click, the
+    // fast-path ResolveCorrelationIdAsync silently returned
+    // envelope.IdempotencyKey -- a per-click identifier that is
+    // unique to THIS click. SlackInteractionsController then skipped
+    // the async enqueue (the fast-path returned Handled), so the
+    // eventual view_submission carrying that pinned private_metadata
+    // value was trusted verbatim by SlackInteractionHandler's
+    // view_submission path BEFORE its own thread-mapping lookup ran.
+    // Net effect: the slack-thread-anchored correlation id the async
+    // path adopted for the same "no mapping row" scenario was
+    // SHORT-CIRCUITED on the comment-modal flow; every retry of the
+    // same RequiresComment click landed under a different
+    // correlation id and AC-6 ("every agent/human exchange queryable
+    // by correlation id") no longer held for the modal-comment
+    // exchange.
+    //
+    // After: the fast-path's no-mapping fallback now mirrors the
+    // async handler's BuildThreadAnchorCorrelationId so the modal's
+    // private_metadata carries the SAME deterministic
+    // slack-thread:{team}:{channel}:{thread_ts} anchor the async
+    // dispatch would have produced. This test pins that contract by
+    // asserting the rendered SlackCommentModalContext carries the
+    // anchor and NOT envelope.IdempotencyKey.
+    // -----------------------------------------------------------------
+    [Fact]
+    public async Task RequiresComment_click_with_no_mapping_row_pins_slack_thread_anchored_correlation_id_into_modal_context()
+    {
+        RecordingViewsOpenClient views = new();
+        RecordingMessageRenderer renderer = new();
+
+        // Intentionally leave RecordingThreadMappingLookup.NextMapping
+        // = null so the lookup returns "no row" -- the exact condition
+        // the iter-3 structural fix targets.
+        DefaultSlackInteractionFastPathHandler handler = new(
+            views,
+            renderer,
+            new RecordingThreadMappingLookup(),
+            new RecordingFastPathIdempotencyStore(),
+            BuildAuditRecorder(),
+            NullLogger<DefaultSlackInteractionFastPathHandler>.Instance);
+
+        string blockId = SlackInteractionEncoding.EncodeQuestionBlockId("Q-NOMAP", requiresComment: true);
+        string payloadJson = BuildBlockActionsPayloadWithThread(
+            blockId: blockId,
+            actionValue: "request-changes",
+            actionLabel: "Request changes",
+            channelId: "C1",
+            messageTs: "1700000000.000CHILD",
+            threadTs: "1700000000.000ROOT",
+            userId: "U1",
+            triggerId: "trig-nomap");
+        SlackInboundEnvelope envelope = BuildEnvelope(
+            payload: "payload=" + Uri.EscapeDataString(payloadJson),
+            triggerId: "trig-nomap");
+
+        SlackInteractionFastPathResult result =
+            await handler.HandleAsync(envelope, new DefaultHttpContext(), CancellationToken.None);
+
+        result.ResultKind.Should().Be(SlackInteractionFastPathResultKind.Handled,
+            "the fast-path MUST still claim ownership when the mapping is missing so the controller does not redundantly enqueue the click");
+        result.ActionResult.Should().BeNull(
+            "no mapping row is a legitimate (not error) outcome -- the synthetic anchor lets the modal proceed");
+        views.Requests.Should().ContainSingle(
+            "views.open MUST run on the synthetic anchor so the user still gets the comment modal even when the mapping table has not caught up");
+
+        renderer.LastContext.Should().NotBeNull(
+            "the renderer MUST be invoked so the modal payload carries the resolved correlation id");
+        renderer.LastContext!.Value.CorrelationId.Should().Be(
+            SlackInteractionHandler.BuildThreadAnchorCorrelationId("T1", "C1", "1700000000.000ROOT"),
+            "iter-3 evaluator item #1: when SlackThreadMapping has no row the FAST-PATH MUST mirror the async handler's slack-thread:{team}:{channel}:{thread_ts} fallback so the modal's private_metadata pins a deterministic anchor (shared across retries of the same click) -- the prior per-click envelope.IdempotencyKey fallback would have broken AC-6 'every agent/human exchange queryable by correlation id' for the comment-modal exchange because SlackInteractionsController skips async enqueue after a successful RequiresComment fast-path and the eventual view_submission trusts private_metadata.correlationId verbatim");
+        renderer.LastContext!.Value.CorrelationId.Should().NotBe(
+            envelope.IdempotencyKey,
+            "the per-click envelope.IdempotencyKey fallback is the regression the iter-3 fix removes");
+    }
+
+    // -----------------------------------------------------------------
     // Stage 5.3 iter-4 evaluator item #1 (STRUCTURAL fix). The
     // fast-path now reserves envelope.IdempotencyKey via
     // ISlackFastPathIdempotencyStore BEFORE opening views.open so

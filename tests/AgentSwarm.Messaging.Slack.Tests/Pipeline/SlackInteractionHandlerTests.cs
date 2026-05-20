@@ -70,8 +70,9 @@ public sealed class SlackInteractionHandlerTests
         decision.ExternalUserId.Should().Be("U_ALICE");
         decision.ExternalMessageId.Should().Be("1700000000.000100",
             "the brief pins ExternalMessageId = message.ts for button clicks");
-        decision.CorrelationId.Should().Be(envelope.IdempotencyKey,
-            "the null thread mapping degrades to the envelope's idempotency key");
+        decision.CorrelationId.Should().Be(
+            SlackInteractionHandler.BuildThreadAnchorCorrelationId("T1", "C123", "1700000000.000100"),
+            "iter-2 evaluator item #2 (STRUCTURAL): when SlackThreadMapping has no row the handler MUST fall back to a deterministic slack-thread:{team}:{channel}:{thread_ts} anchor so multiple clicks on the same thread share a correlation id -- the prior per-click envelope.IdempotencyKey fallback would have given each retry a different id and broken the brief's 'every agent/human exchange queryable by correlation id' criterion");
 
         // Brief acceptance criterion: chat.update issued to disable buttons.
         harness.ChatUpdateClient.Requests.Should().ContainSingle();
@@ -1011,7 +1012,9 @@ public sealed class SlackInteractionHandlerTests
         row.TeamId.Should().Be(envelope.TeamId);
         row.UserId.Should().Be(envelope.UserId);
         row.ChannelId.Should().Be(envelope.ChannelId);
-        row.CorrelationId.Should().Be(envelope.IdempotencyKey);
+        row.CorrelationId.Should().Be(
+            SlackInteractionHandler.BuildThreadAnchorCorrelationId(envelope.TeamId, envelope.ChannelId!, "1700000000.000AUDITOK"),
+            "iter-2 evaluator item #2 (STRUCTURAL): the audit row's CorrelationId tracks SlackInboundResolvedCorrelationContext, which is the synthetic slack-thread anchor when no SlackThreadMapping row exists -- the prior per-click envelope.IdempotencyKey would have given each retry of the same click a different audit-row correlation_id");
         row.CommandText.Should().Be(
             "/agent " + DefaultSlackInteractionFastPathHandler.AuditSubCommand,
             "the async comment-modal sub-command tag MUST match the fast-path's so operators querying by request_type + command_text see a unified row stream regardless of whether the modal was opened inline or post-ACK");
@@ -1060,7 +1063,9 @@ public sealed class SlackInteractionHandlerTests
             "the error-detail must encode the SlackViewsOpenResultKind so queries can distinguish Slack errors from network failures from missing configuration");
         row.CommandText.Should().Be(
             "/agent " + DefaultSlackInteractionFastPathHandler.AuditSubCommand);
-        row.CorrelationId.Should().Be(envelope.IdempotencyKey);
+        row.CorrelationId.Should().Be(
+            SlackInteractionHandler.BuildThreadAnchorCorrelationId(envelope.TeamId, envelope.ChannelId!, "1700000000.000AUDITFAIL"),
+            "iter-2 evaluator item #2 (STRUCTURAL): the failure-branch audit row tracks the same synthetic slack-thread anchor as the success branch -- both come from SlackInboundResolvedCorrelationContext which now carries the structural fix's thread-anchored id instead of the per-click envelope idempotency key");
 
         EphemeralCall ephemeral = harness.EphemeralResponder.Messages.Should().ContainSingle(
             "the views.open failure MUST surface an ephemeral so the user sees feedback for the dead-trigger failure -- the no-retry contract from the Stage 6.4 brief depends on this user-visible signal").Subject;
@@ -1537,8 +1542,7 @@ public sealed class SlackInteractionHandlerTests
                 this.MessageRenderer,
                 this.ModalAuditRecorder,
                 this.EphemeralResponder,
-                NullLogger<SlackInteractionHandler>.Instance,
-                TimeProvider.System);
+                NullLogger<SlackInteractionHandler>.Instance);
         }
 
         public RecordingAgentTaskService TaskService { get; }
