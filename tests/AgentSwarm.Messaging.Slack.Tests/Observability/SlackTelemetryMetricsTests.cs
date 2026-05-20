@@ -21,6 +21,7 @@ using AgentSwarm.Messaging.Slack.Retry;
 using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
 using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -65,8 +66,7 @@ public sealed class SlackTelemetryMetricsTests
         FakeInboundQueue queue = new();
         SlackInboundIngestor ingestor = new(
             queue,
-            pipeline,
-            new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance),
+            BuildIngestorServices(pipeline, new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance)),
             NullLogger<SlackInboundIngestor>.Instance);
 
         for (int i = 0; i < 5; i++)
@@ -223,6 +223,23 @@ public sealed class SlackTelemetryMetricsTests
         RawPayload: "team_id=" + teamId + "&user_id=U1&command=/agent",
         TriggerId: "trig",
         ReceivedAt: DateTimeOffset.UtcNow);
+
+    // Stage 4.3 (commit 1958ccd) refactored SlackInboundIngestor's
+    // ctor to accept IServiceProvider instead of (pipeline,
+    // dlqFallbackSink) directly. These observability tests pre-dated
+    // that refactor; this helper wraps the pipeline + last-resort DLQ
+    // sink in a minimal IServiceProvider so the ingestor's lazy
+    // resolution finds both contracts. Identical pattern to
+    // Pipeline/SlackInboundIngestorTests.BuildIngestorServices.
+    private static IServiceProvider BuildIngestorServices(
+        SlackInboundProcessingPipeline pipeline,
+        ISlackInboundEnqueueDeadLetterSink fallbackSink)
+    {
+        ServiceCollection services = new();
+        services.AddSingleton(pipeline);
+        services.AddSingleton(fallbackSink);
+        return services.BuildServiceProvider();
+    }
 
     /// <summary>
     /// Subscribes to a single counter instrument by name and sums its
