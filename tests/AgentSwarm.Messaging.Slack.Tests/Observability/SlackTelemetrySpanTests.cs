@@ -29,6 +29,7 @@ using AgentSwarm.Messaging.Slack.Security;
 using AgentSwarm.Messaging.Slack.Transport;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -165,8 +166,7 @@ public sealed class SlackTelemetrySpanTests
         SlackInboundProcessingPipeline pipeline = BuildPipeline(out _);
         SlackInboundIngestor ingestor = new(
             queue,
-            pipeline,
-            new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance),
+            BuildIngestorServices(pipeline, new InMemorySlackInboundEnqueueDeadLetterSink(NullLogger<InMemorySlackInboundEnqueueDeadLetterSink>.Instance)),
             NullLogger<SlackInboundIngestor>.Instance);
 
         SlackInboundEnvelope env = BuildCommandEnvelope("cmd:T1:U1:/agent:span-ingestor-" + Guid.NewGuid().ToString("N"));
@@ -240,6 +240,22 @@ public sealed class SlackTelemetrySpanTests
         RawPayload: "team_id=T1&user_id=U1&command=/agent",
         TriggerId: "trig",
         ReceivedAt: DateTimeOffset.UtcNow);
+
+    // Stage 4.3 (commit 1958ccd) refactored SlackInboundIngestor's
+    // ctor to accept IServiceProvider instead of (pipeline,
+    // dlqFallbackSink) directly. This helper wraps the pipeline +
+    // last-resort DLQ sink in a minimal IServiceProvider so the
+    // ingestor's lazy resolution finds both contracts. Identical
+    // pattern to Pipeline/SlackInboundIngestorTests.BuildIngestorServices.
+    private static IServiceProvider BuildIngestorServices(
+        SlackInboundProcessingPipeline pipeline,
+        ISlackInboundEnqueueDeadLetterSink fallbackSink)
+    {
+        ServiceCollection services = new();
+        services.AddSingleton(pipeline);
+        services.AddSingleton(fallbackSink);
+        return services.BuildServiceProvider();
+    }
 
     private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
     {
