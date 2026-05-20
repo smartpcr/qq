@@ -27,14 +27,14 @@ using Xunit;
 /// (<see cref="SlackSignatureValidator"/>),
 /// MVC authorization filter (<see cref="SlackAuthorizationFilter"/>),
 /// transport-layer envelope enqueue
-/// (<see cref="Transport.SlackInboundEnvelopeFactory"/> →
+/// (<see cref="Transport.SlackInboundEnvelopeFactory"/> ΓåÆ
 /// <see cref="Queues.ISlackInboundQueue"/>), background-service
 /// ingestor drain (<see cref="Pipeline.SlackInboundIngestor"/>), and
 /// pipeline dispatch (<see cref="Pipeline.SlackInboundProcessingPipeline"/>
-/// → <see cref="Pipeline.SlackCommandHandler.HandleAskAsync"/>) -- and
+/// ΓåÆ <see cref="Pipeline.SlackCommandHandler.HandleAskAsync"/>) -- and
 /// reaches <see cref="IAgentTaskService.CreateTaskAsync"/> with the
 /// VERBATIM prompt text. The Stage 5.1 brief's first acceptance
-/// scenario (<c>/agent ask generate implementation plan</c> →
+/// scenario (<c>/agent ask generate implementation plan</c> ΓåÆ
 /// <c>IAgentTaskService.CreateTaskAsync</c>) is verified end-to-end at
 /// the HTTP boundary, not at the handler unit level.
 /// </summary>
@@ -108,9 +108,9 @@ public sealed class Stage5_1SlashCommandHttpDispatchTests
             HttpStatusCode.OK,
             "Stage 5.1: a signed /agent ask command from an authorized channel+user MUST be ACK'd with HTTP 200 within Slack's 3-second budget; any other status proves the HTTP hop (signature middleware OR SlackAuthorizationFilter OR SlackCommandsController) rejected the request");
 
-        // -- Hops 2-5: ISlackInboundQueue enqueue → SlackInboundIngestor
-        // background-service drain → SlackInboundProcessingPipeline
-        // dispatch → SlackCommandHandler.HandleAskAsync →
+        // -- Hops 2-5: ISlackInboundQueue enqueue ΓåÆ SlackInboundIngestor
+        // background-service drain ΓåÆ SlackInboundProcessingPipeline
+        // dispatch ΓåÆ SlackCommandHandler.HandleAskAsync ΓåÆ
         // IAgentTaskService.CreateTaskAsync. WaitForCreateAsync polls
         // RecordingAgentTaskService.CreateRequests with a 10s timeout
         // so a transient scheduling delay does not flake the test
@@ -184,11 +184,34 @@ public sealed class Stage5_1SlashCommandHttpDispatchTests
             HttpStatusCode.OK,
             "Slack requires HTTP 200 for every slash command regardless of validation outcome; the ephemeral error is delivered via response_url, not via the HTTP status code");
 
-        // Allow the ingestor enough time to fully drain the
-        // envelope before asserting the negative side-effect (no
-        // CreateTaskAsync). 500ms is comfortably longer than the
-        // typical drain latency in this in-process fixture.
-        await Task.Delay(500);
+        // Stage 5.1 iter-4 review feedback (negative-assertion
+        // quiescence): the previous `await Task.Delay(500)` here was
+        // timing-dependent -- under CI load or a GC pause the
+        // SlackInboundIngestor drain could exceed 500ms, the
+        // assertion below would run BEFORE the envelope had been
+        // processed, and a regression that silently dispatched an
+        // unknown sub-command to the orchestrator would slip through
+        // as a (false) PASS because CreateRequests had not yet been
+        // populated. We now poll CreateRequests for a generous
+        // quiescence window: if a CreateTaskAsync call surfaces at
+        // ANY point during the window we break out early so the
+        // BeEmpty assertion below surfaces the regression
+        // immediately; if the window elapses with no call we have
+        // given the ingestor ample time to drain so the negative
+        // assertion is meaningful. This mirrors the positive-case
+        // pattern (WaitForCreateAsync polls with a timeout) with the
+        // assertion polarity inverted, satisfying the reviewer's
+        // request to "poll CreateRequests in a loop with a timeout
+        // and assert emptiness only after the timeout elapses".
+        TimeSpan quiescenceWindow = TimeSpan.FromSeconds(3);
+        TimeSpan pollInterval = TimeSpan.FromMilliseconds(50);
+        DateTimeOffset deadline = DateTimeOffset.UtcNow + quiescenceWindow;
+        while (DateTimeOffset.UtcNow < deadline
+            && fixture.AgentTaskService.CreateRequests.Count == 0)
+        {
+            await Task.Delay(pollInterval);
+        }
+
         fixture.AgentTaskService.CreateRequests.Should().BeEmpty(
             "Stage 5.1 brief Test Scenario 3: an unrecognized sub-command MUST NOT reach IAgentTaskService.CreateTaskAsync -- SlackCommandHandler MUST surface an ephemeral error (\"Valid sub-commands: ...\") via response_url without dispatching any orchestrator work");
     }
