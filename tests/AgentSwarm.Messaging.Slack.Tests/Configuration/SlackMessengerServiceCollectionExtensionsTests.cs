@@ -375,12 +375,15 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         // Iter-3 item 2: explicit dev-defaults opt-in (the facade no
         // longer auto-installs the NoOp orchestrator stub).
         services.AddSlackCommandDispatcherDevelopmentDefaults();
-        // Stage 5.1 iter-2 evaluator item 2: facade no longer
-        // registers handler dispatchers; tests opt into the NoOp
-        // stand-ins explicitly so SlackInboundProcessingPipeline
-        // (which takes the three handler contracts by ctor) resolves
-        // under ValidateOnBuild.
-        services.AddSlackInboundDevelopmentHandlerStubs();
+        // Stage 5.2 iter-2 evaluator item 1: facade restores its
+        // documented contract and binds the three handler
+        // contracts via the real dispatchers, so the acceptance
+        // suite no longer needs an explicit
+        // AddSlackInboundDevelopmentHandlerStubs() opt-in to keep
+        // ValidateOnBuild happy. The real Stage 5 handlers
+        // resolve cleanly because every collaborator they need is
+        // wired by AddSlackCommandDispatcher /
+        // AddSlackInteractionDispatcher inside the facade.
         services.AddSlackMessenger(configuration);
 
         Action act = () => services.BuildServiceProvider(new ServiceProviderOptions
@@ -539,6 +542,160 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
             "the facade still wraps the real orchestrator with the buffering decorator");
     }
 
+    [Fact]
+    public void AddSlackMessenger_binds_real_handler_contracts_without_explicit_dispatcher_opt_in()
+    {
+        // Stage 5.2 iter-2 evaluator item 1 (PRIMARY GAP):
+        // pin the restored facade contract that
+        // "AddSlackMessenger registers all internal handlers and
+        // the command / app-mention / interaction dispatchers".
+        // The iter-1 split into collaborators-only helpers left
+        // ISlackCommandHandler / ISlackAppMentionHandler /
+        // ISlackInteractionHandler UNBOUND for hosts that
+        // followed the documented contract -- the ingestor's
+        // SlackInboundProcessingPipeline ctor then threw at
+        // first envelope. Iter-2 wires the real dispatchers back
+        // into the facade; this test catches a future split that
+        // would silently regress the contract.
+        using ServiceProvider provider = BuildFacadeContainer();
+
+        provider.GetService<ISlackCommandHandler>().Should().BeOfType<SlackCommandHandler>(
+            "Stage 5.2 iter-2 evaluator item 1: AddSlackMessenger MUST wire the real SlackCommandHandler so a host that follows the documented facade contract resolves ISlackCommandHandler without an extra AddSlackCommandDispatcher call");
+        provider.GetService<ISlackAppMentionHandler>().Should().BeOfType<SlackAppMentionHandler>(
+            "Stage 5.2 iter-2 evaluator item 1: AddSlackMessenger MUST wire the real SlackAppMentionHandler so an app_mention envelope dispatches through the production code path");
+        provider.GetService<ISlackInteractionHandler>().Should().BeOfType<SlackInteractionHandler>(
+            "Stage 5.2 iter-2 evaluator item 1: AddSlackMessenger MUST wire the real SlackInteractionHandler so interactive payloads dispatch through the production code path");
+
+        // The facade also constructs SlackInboundProcessingPipeline
+        // cleanly without any dispatcher opt-in by the host -- the
+        // ctor requires all three handler contracts, so resolving
+        // it is the tightest end-to-end assertion of the restored
+        // contract.
+        SlackInboundProcessingPipeline pipeline =
+            provider.GetRequiredService<SlackInboundProcessingPipeline>();
+        pipeline.Should().NotBeNull(
+            "Stage 5.2 iter-2 evaluator item 1: the inbound processing pipeline MUST resolve directly from the facade, with no extra dispatcher opt-in -- the iter-1 gap was precisely that the pipeline ctor threw because no handler was bound");
+    }
+
+    [Fact]
+    public void ValidateHandlerRegistration_throws_when_ISlackCommandHandler_descriptor_is_missing()
+    {
+        // Stage 5.2 iter-2 evaluator item 1 -- defence-in-depth:
+        // the descriptor-level validator MUST raise a precise
+        // InvalidOperationException when ISlackCommandHandler is
+        // not registered, with remediation guidance pointing at
+        // AddSlackCommandDispatcher or the dev stub opt-in.
+        ServiceCollection services = new();
+
+        // Register only the other two handler contracts so the
+        // missing-handler detection is narrow.
+        services.AddSingleton<ISlackAppMentionHandler, NoOpSlackAppMentionHandler>();
+        services.AddSingleton<ISlackInteractionHandler, NoOpSlackInteractionHandler>();
+
+        Action act = () =>
+            SlackMessengerServiceCollectionExtensions
+                .ValidateHandlerRegistration(services);
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*ISlackCommandHandler*",
+                "the validator MUST name the missing contract so the operator sees exactly which extension to call");
+    }
+
+    [Fact]
+    public void ValidateHandlerRegistration_throws_when_ISlackAppMentionHandler_descriptor_is_missing()
+    {
+        ServiceCollection services = new();
+        services.AddSingleton<ISlackCommandHandler, NoOpSlackCommandHandler>();
+        services.AddSingleton<ISlackInteractionHandler, NoOpSlackInteractionHandler>();
+
+        Action act = () =>
+            SlackMessengerServiceCollectionExtensions
+                .ValidateHandlerRegistration(services);
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*ISlackAppMentionHandler*",
+                "the Stage 5.2 brief contract requires the app-mention handler to be registered; the validator MUST name it when missing");
+    }
+
+    [Fact]
+    public void ValidateHandlerRegistration_throws_when_ISlackInteractionHandler_descriptor_is_missing()
+    {
+        ServiceCollection services = new();
+        services.AddSingleton<ISlackCommandHandler, NoOpSlackCommandHandler>();
+        services.AddSingleton<ISlackAppMentionHandler, NoOpSlackAppMentionHandler>();
+
+        Action act = () =>
+            SlackMessengerServiceCollectionExtensions
+                .ValidateHandlerRegistration(services);
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*ISlackInteractionHandler*");
+    }
+
+    [Fact]
+    public void ValidateHandlerRegistration_message_names_every_missing_contract()
+    {
+        // A composition with NO handler bindings at all MUST
+        // surface all three missing names in one shot so an
+        // operator does not have to iterate "fix one, re-run,
+        // see the next".
+        ServiceCollection services = new();
+
+        Action act = () =>
+            SlackMessengerServiceCollectionExtensions
+                .ValidateHandlerRegistration(services);
+
+        act.Should().Throw<InvalidOperationException>()
+            .Where(ex => ex.Message.Contains("ISlackCommandHandler")
+                && ex.Message.Contains("ISlackAppMentionHandler")
+                && ex.Message.Contains("ISlackInteractionHandler"),
+                "the validator MUST list every missing contract in a single message so the operator sees the full remediation scope, not just the first gap");
+    }
+
+    [Fact]
+    public void ValidateHandlerRegistration_passes_when_all_three_handlers_registered()
+    {
+        // Sister positive case: the validator does NOT throw when
+        // every contract has a descriptor (regardless of the
+        // implementation type -- the validator is descriptor-only).
+        ServiceCollection services = new();
+        services.AddSingleton<ISlackCommandHandler, NoOpSlackCommandHandler>();
+        services.AddSingleton<ISlackAppMentionHandler, NoOpSlackAppMentionHandler>();
+        services.AddSingleton<ISlackInteractionHandler, NoOpSlackInteractionHandler>();
+
+        Action act = () =>
+            SlackMessengerServiceCollectionExtensions
+                .ValidateHandlerRegistration(services);
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void AddSlackMessenger_does_not_throw_for_handler_registration_when_facade_owns_dispatchers()
+    {
+        // End-to-end positive: when a host follows the documented
+        // contract (register IAgentTaskService, call AddSlackMessenger)
+        // the new ValidateHandlerRegistration MUST pass because the
+        // facade itself binds the three handlers via the real
+        // dispatcher extensions. The iter-1 regression -- the
+        // facade returning with no handlers bound -- would have
+        // surfaced as an InvalidOperationException here.
+        IConfiguration configuration = BuildFacadeConfiguration();
+        ServiceCollection services = new();
+        services.AddLogging();
+        services.AddDbContext<SlackPersistenceDbContext>(opts =>
+            opts.UseSqlite("Data Source=:memory:"));
+        services.AddMessagingCore(configuration);
+        services.AddMessagingPersistence(configuration);
+        services.AddSecretProvider(configuration);
+        services.AddSlackCommandDispatcherDevelopmentDefaults();
+
+        Action act = () => services.AddSlackMessenger(configuration);
+
+        act.Should().NotThrow(
+            "the iter-2 facade binds ISlackCommandHandler / ISlackAppMentionHandler / ISlackInteractionHandler internally, so ValidateHandlerRegistration MUST observe all three descriptors and pass without throwing");
+    }
+
     private static ServiceProvider BuildFacadeContainer()
     {
         IConfiguration configuration = BuildFacadeConfiguration();
@@ -566,16 +723,16 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         // dev-defaults shim BEFORE invoking AddSlackMessenger.
         services.AddSlackCommandDispatcherDevelopmentDefaults();
 
-        // Stage 5.1 iter-2 evaluator item 2 fix: the facade no
-        // longer registers ISlackCommandHandler / ISlackInteractionHandler
-        // / ISlackAppMentionHandler unconditionally (which used to
-        // silently replace the Stage 4.3 NoOp stand-ins). Acceptance
-        // tests that drive the full DI container (ValidateOnBuild
-        // walks every singleton ctor, including
-        // SlackInboundProcessingPipeline whose ctor requires all
-        // three handler contracts) opt in to the NoOp stubs
-        // explicitly so the pipeline ctor resolves.
-        services.AddSlackInboundDevelopmentHandlerStubs();
+        // Stage 5.2 iter-2 evaluator item 1 (STRUCTURAL fix): the
+        // facade restored its documented contract of binding the
+        // three inbound handler interfaces (ISlackCommandHandler /
+        // ISlackAppMentionHandler / ISlackInteractionHandler) via
+        // AddSlackCommandDispatcher + AddSlackInteractionDispatcher,
+        // so this acceptance container no longer needs to opt in
+        // explicitly to AddSlackInboundDevelopmentHandlerStubs --
+        // the real Stage 5 handlers wire themselves through the
+        // facade and ValidateOnBuild can construct
+        // SlackInboundProcessingPipeline cleanly.
 
         // The facade under test.
         services.AddSlackMessenger(configuration);

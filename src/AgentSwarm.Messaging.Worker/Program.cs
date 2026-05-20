@@ -73,21 +73,28 @@ public class Program
         "Data Source=slack-audit.db";
 
     /// <summary>
-    /// Configuration key (boolean) that gates the opt-in for the
-    /// no-op Slack handler stand-ins
+    /// Legacy Stage 4.3 configuration key (boolean) that gates the
+    /// opt-in for the now-obsolete no-op Slack handler stand-ins
     /// (<see cref="SlackInboundIngestorServiceCollectionExtensions.AddSlackInboundDevelopmentHandlerStubs"/>).
-    /// When unset, defaults to
-    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>:
-    /// Development hosts wire the stubs so the ingestor pipeline
-    /// resolves on a dev laptop; Production / Staging / Testing
-    /// hosts surface a fail-loud
-    /// <see cref="InvalidOperationException"/> from the pipeline ctor
-    /// the first time the ingestor lazily resolves it (the ingestor
-    /// then forwards the envelope to the last-resort
-    /// <see cref="ISlackInboundEnqueueDeadLetterSink"/> instead of
-    /// silently ack-and-dropping it). Operators can explicitly opt
-    /// in (<c>true</c>) or out (<c>false</c>) per environment.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stage 5.2 iter-2: this gate is obsolete. The
+    /// <see cref="SlackMessengerServiceCollectionExtensions.AddSlackMessenger(IServiceCollection, IConfiguration)"/>
+    /// facade now binds the real Stage 5
+    /// <see cref="Pipeline.SlackCommandHandler"/> /
+    /// <see cref="Pipeline.SlackAppMentionHandler"/> /
+    /// <see cref="Pipeline.SlackInteractionHandler"/> via
+    /// <c>RemoveAll&lt;&gt;+AddSingleton&lt;&gt;</c>, so any opt-in
+    /// to the NoOp stand-ins via this key fires AFTER the real
+    /// handlers are already bound and TryAdd-no-ops. The constant
+    /// survives for back-compat with hosts that read the
+    /// configuration key directly. The default in every environment
+    /// is <c>false</c>; operators driving a smoke test that
+    /// intentionally exercises the NoOp pipeline can still flip the
+    /// key to <c>true</c>.
+    /// </para>
+    /// </remarks>
     public const string EnableDevelopmentHandlerStubsKey =
         "Slack:Inbound:EnableDevelopmentHandlerStubs";
 
@@ -253,13 +260,20 @@ public class Program
         // startup diagnostics, telemetry, and the inbound
         // MessengerEvent buffer SlackConnector.ReceiveAsync drains.
         //
-        // Stage 5.1 iter-4 evaluator item 4: the per-stage
-        // AddSlackInboundTransport / AddSlackSocketModeTransport /
+        // Stage 5.1 iter-4 evaluator item 4 + Stage 5.2 iter-2 item 3:
+        // the per-stage AddSlackInboundTransport / AddSlackSocketModeTransport /
         // AddSlackFastPathDurableIdempotency / AddSlackInboundIngestor
         // calls that previously sat after this line have been removed
         // -- the facade composes them all and the duplicates risked
         // hosting two copies of a hosted service if a future TryAdd
-        // semantics change.
+        // semantics change. The Stage 5.1 / 5.3 dispatcher extensions
+        // (AddSlackCommandDispatcher / AddSlackInteractionDispatcher)
+        // are likewise OWNED BY THE FACADE since Stage 5.2 iter-2 --
+        // see SlackMessengerServiceCollectionExtensions for the
+        // restored contract. The Worker therefore no longer calls
+        // those extensions again here; doing so would silently
+        // duplicate the RemoveAll+AddSingleton handler bindings and
+        // contradict the facade-collapse story.
         builder.Services.AddSlackMessenger(builder.Configuration);
 
         // Stage 3.2 / 4.1: mount the SlackAuthorizationFilter as a global
@@ -295,49 +309,30 @@ public class Program
             builder.Services.AddFileSystemSlackDeadLetterQueue(dlqDir);
         }
 
-        // Stage 5.1 / 5.2 / 5.3: wire the REAL production handlers.
-        // AddSlackCommandDispatcher() RemoveAll+AddSingleton's
-        // ISlackCommandHandler -> SlackCommandHandler and
-        // ISlackAppMentionHandler -> SlackAppMentionHandler.
-        // AddSlackInteractionDispatcher() does the same for
-        // ISlackInteractionHandler -> SlackInteractionHandler and
-        // ISlackInteractionFastPathHandler -> DefaultSlackInteractionFastPathHandler.
-        // Both extensions also TryAdd every collaborator they need
-        // (HTTP-backed ephemeral responder, message renderer, threaded
-        // reply poster, modal-audit recorder, chat.update / views.open
-        // clients, rate limiter, null thread-mapping lookup default).
-        // The earlier AddSlackMessenger call already TryAdded the same
-        // collaborators so these calls de-duplicate cleanly; the only
-        // new effect is binding the four handler contracts.
-        //
-        // Stage 5.1 iter-3 evaluator items 1 + 2: the previous gate
-        // (AddSlackInboundDevelopmentHandlerStubs() under an env-based
-        // condition) registered NoOp stubs that silently ack-and-dropped
-        // every Slack command in dev AND left production resolving no
-        // handler at all -- the first /agent ask either dead-letters
-        // on missing handler resolution (production) or completes
-        // without producing an agent task (development). Wiring the
-        // real handlers here unconditionally means /agent ask actually
-        // dispatches through SlackCommandHandler in both modes;
-        // IAgentTaskService falls back to NoOpAgentTaskService when
-        // the EnableNoOpAgentTaskServiceKey gate above admits it
-        // (default = Development only), otherwise production hosts
-        // fail loud at pipeline resolution until a real orchestrator
-        // client is wired.
-        builder.Services.AddSlackCommandDispatcher();
-        builder.Services.AddSlackInteractionDispatcher();
+        // Stage 5.2 iter-2 evaluator item 3: the explicit
+        // AddSlackCommandDispatcher() / AddSlackInteractionDispatcher()
+        // calls that previously sat here are now redundant because
+        // AddSlackMessenger composes them itself (the iter-1 split
+        // into collaborators-only helpers was reverted -- see the
+        // SlackMessengerServiceCollectionExtensions header for the
+        // restored contract). Leaving them here would produce a
+        // second RemoveAll+AddSingleton of the same singleton handler
+        // bindings, which (a) silently churns one extra DI descriptor
+        // per handler interface, and (b) contradicts the
+        // facade-collapse Stage 8.1 narrative this Program.cs has
+        // been pinning since iter-1. Removing the calls lets the
+        // facade own the Stage 5 wiring exclusively.
 
         // Legacy Stage 4.3 dev-stub gate: now obsolete because Stage
-        // 5.1 / 5.2 / 5.3 real handlers exist and the
-        // AddSlackCommandDispatcher / AddSlackInteractionDispatcher
-        // calls above RemoveAll+AddSingleton them ahead of any
-        // TryAdd. The gate's call is kept under an explicit opt-in
-        // (default OFF in every environment) so operators driving a
-        // smoke test that intentionally exercises the no-op stubs
-        // can still toggle them on, but no environment-defaulted
-        // wiring fires here anymore. The constant + helper survive
-        // for back-compat with hosts that read the configuration
-        // key directly.
+        // 5.1 / 5.2 / 5.3 real handlers exist and AddSlackMessenger
+        // (above) RemoveAll+AddSingleton's them ahead of any TryAdd.
+        // The gate's call is kept under an explicit opt-in (default
+        // OFF in every environment) so operators driving a smoke
+        // test that intentionally exercises the no-op stubs can
+        // still toggle them on, but no environment-defaulted wiring
+        // fires here anymore. The constant + helper survive for
+        // back-compat with hosts that read the configuration key
+        // directly.
         if (ShouldEnableDevelopmentHandlerStubs(builder))
         {
             builder.Services.AddSlackInboundDevelopmentHandlerStubs();
