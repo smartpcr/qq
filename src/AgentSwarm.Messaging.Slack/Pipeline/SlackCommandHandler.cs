@@ -387,9 +387,18 @@ internal sealed class SlackCommandHandler : ISlackCommandHandler
             envelope.TeamId,
             envelope.UserId);
 
+        // Stage 5.1 iter-3 evaluator item 3 fix: ALWAYS prepend the
+        // created TaskId to the ephemeral acknowledgement so the
+        // Slack user sees the task id even when the orchestrator
+        // supplies its own free-text acknowledgement. The story's
+        // AC ("User can invoke /agent ask ... Agent creates a Slack
+        // thread with task status and follow-up questions") implies
+        // the user must be able to correlate the ack back to the
+        // created task; prior behaviour swallowed the task id when
+        // result.Acknowledgement was non-empty.
         string ack = string.IsNullOrEmpty(result.Acknowledgement)
             ? $"Task `{result.TaskId}` created. The agent will reply in this thread."
-            : result.Acknowledgement;
+            : $"Task `{result.TaskId}` created. {result.Acknowledgement}";
 
         await responder
             .SendEphemeralAsync(payload.ResponseUrl, ack, ct)

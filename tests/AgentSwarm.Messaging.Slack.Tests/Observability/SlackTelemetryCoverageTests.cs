@@ -159,20 +159,37 @@ public sealed class SlackTelemetryCoverageTests
         // MUST be emitted on every dispatch. The earlier iter-1 tests only
         // pinned slack.inbound.count + slack.idempotency.duplicate_count;
         // this test closes the outbound-side gap.
+        //
+        // Stage 5.1 iter-4 evaluator item 1 (test-pollution fix): the
+        // SlackTelemetry counter is process-wide and other tests in
+        // sibling collections (SlackOutboundDispatcherTests,
+        // SlackDirectApiClientDispatcherIntegrationTests) also emit
+        // slack.outbound.count with operation_kind=PostMessage +
+        // outcome=success concurrently. Filtering on operation_kind
+        // alone made `SuccessCount.Should().Be(1)` flake under
+        // parallel test execution. The fix: pin a unique team_id for
+        // this test's mapping and require BOTH tags via
+        // TagBackedCounterCollector so cross-test increments are
+        // ignored.
         const string TestOperationKind = nameof(SlackOutboundOperationKind.PostMessage);
-        using CounterTagCollector outboundCounter = CounterTagCollector.Subscribe(
+        const string TestTeamId = "T-METRIC-COUNT";
+        using TagBackedCounterCollector outboundCounter = TagBackedCounterCollector.Subscribe(
             SlackTelemetry.MetricOutboundCount,
-            filterKey: SlackTelemetry.AttributeOperationKind,
-            filterValue: TestOperationKind);
+            requiredTags: new Dictionary<string, string>
+            {
+                [SlackTelemetry.AttributeOperationKind] = TestOperationKind,
+                [SlackTelemetry.AttributeOutcome] = SlackOutboundDispatcher.OutcomeSuccess,
+                [SlackTelemetry.AttributeTeamId] = TestTeamId,
+            });
         using HistogramTagCollector latencyCollector = HistogramTagCollector.Subscribe(
             SlackTelemetry.MetricOutboundLatencyMs,
-            filterKey: SlackTelemetry.AttributeOperationKind,
-            filterValue: TestOperationKind);
+            filterKey: SlackTelemetry.AttributeTeamId,
+            filterValue: TestTeamId);
 
         ChannelBasedSlackOutboundQueue queue = new();
         RecordingDeadLetterQueue dlq = new();
         InMemorySlackAuditEntryWriter audit = new();
-        StubThreadManager threads = new(BuildMapping("TASK-METRIC"));
+        StubThreadManager threads = new(BuildMapping("TASK-METRIC", teamIdOverride: TestTeamId));
         RecordingDispatchClient dispatch = new();
         dispatch.NextResult = SlackOutboundDispatchResult.Success(200, ThreadTs, "{\"ok\":true}");
 
@@ -189,14 +206,14 @@ public sealed class SlackTelemetryCoverageTests
         Task run = dispatcher.StartAsync(cts.Token);
 
         await WaitUntilAsync(() => dispatch.Calls.Count >= 1, TimeSpan.FromSeconds(10));
-        await WaitUntilAsync(() => outboundCounter.SuccessCount >= 1, TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => outboundCounter.Total >= 1, TimeSpan.FromSeconds(5));
 
         await dispatcher.StopAsync(CancellationToken.None);
         cts.Cancel();
         await SuppressCancel(run);
 
-        outboundCounter.SuccessCount.Should().Be(1,
-            "slack.outbound.count MUST be incremented exactly once per successful dispatch with outcome=success");
+        outboundCounter.Total.Should().Be(1,
+            "slack.outbound.count MUST be incremented exactly once per successful dispatch with outcome=success, isolated by the unique TestTeamId from any sibling test class also dispatching PostMessage");
         latencyCollector.MeasurementCount.Should().BeGreaterThanOrEqualTo(1,
             "slack.outbound.latency_ms MUST be recorded for every dispatch attempt so dashboards can compute p50/p95");
         latencyCollector.LastValueMs.Should().BeGreaterThanOrEqualTo(0,
@@ -533,10 +550,10 @@ public sealed class SlackTelemetryCoverageTests
             TimeProvider.System);
     }
 
-    private static SlackThreadMapping BuildMapping(string taskId, string agentId = "agent-x") => new()
+    private static SlackThreadMapping BuildMapping(string taskId, string agentId = "agent-x", string? teamIdOverride = null) => new()
     {
         TaskId = taskId,
-        TeamId = TeamId,
+        TeamId = teamIdOverride ?? TeamId,
         ChannelId = ChannelId,
         ThreadTs = ThreadTs,
         AgentId = agentId,

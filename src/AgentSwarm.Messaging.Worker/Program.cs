@@ -91,6 +91,57 @@ public class Program
     public const string EnableDevelopmentHandlerStubsKey =
         "Slack:Inbound:EnableDevelopmentHandlerStubs";
 
+    /// <summary>
+    /// Configuration key (boolean) that gates the opt-in for the
+    /// <see cref="Pipeline.NoOpAgentTaskService"/> orchestrator
+    /// stub. When unset, defaults to <c>false</c> in every
+    /// environment: the Worker NEVER auto-registers the no-op
+    /// orchestrator on its own. Hosts that intentionally want to
+    /// boot without a real orchestrator (dev laptops, smoke tests,
+    /// CI integration runs) explicitly opt in with <c>true</c>;
+    /// hosts without either an explicit opt-in OR a real
+    /// <see cref="AgentSwarm.Messaging.Abstractions.IAgentTaskService"/>
+    /// registration fail loudly inside
+    /// <see cref="SlackMessengerServiceCollectionExtensions.AddSlackMessenger(IServiceCollection, IConfiguration)"/>
+    /// via
+    /// <see cref="SlackMessengerServiceCollectionExtensions.ValidateAgentTaskServiceRegistration"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stage 5.1 iter-4 evaluator item 3 (STRUCTURAL fix, redone):
+    /// the previous iter-3 gate defaulted to
+    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>,
+    /// so a default Development Worker still wired
+    /// <see cref="Pipeline.NoOpAgentTaskService"/> and acknowledged
+    /// <c>/agent ask</c> with synthetic <c>stub-*</c> task ids --
+    /// agent work never actually started. The iter-4 evaluator
+    /// flagged that the "default Worker path" must not produce
+    /// that stub-only behaviour. The structural fix flips the
+    /// default to <c>false</c> in every environment so:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>Default dev / staging / prod Workers
+    ///   without a real
+    ///   <see cref="AgentSwarm.Messaging.Abstractions.IAgentTaskService"/>
+    ///   FAIL LOUDLY at host startup with the explicit
+    ///   <c>ValidateAgentTaskServiceRegistration</c> remediation
+    ///   message -- the operator sees the misconfiguration before
+    ///   the first Slack request lands.</description></item>
+    ///   <item><description>Test fixtures and dev laptops that
+    ///   intentionally exercise the no-op orchestrator opt in
+    ///   explicitly via
+    ///   <c>Slack:Inbound:EnableNoOpAgentTaskService=true</c> --
+    ///   the opt-in is visible in configuration and trivially
+    ///   greppable, not buried in an environment-dependent
+    ///   default.</description></item>
+    ///   <item><description>Production hosts can never silently
+    ///   degrade into the stub orchestrator regardless of
+    ///   ambient <c>ASPNETCORE_ENVIRONMENT</c> drift.</description></item>
+    /// </list>
+    /// </remarks>
+    public const string EnableNoOpAgentTaskServiceKey =
+        "Slack:Inbound:EnableNoOpAgentTaskService";
+
     public static void Main(string[] args)
     {
         WebApplication app = BuildApp(args);
@@ -164,23 +215,51 @@ public class Program
         // buffer SlackConnector.ReceiveAsync drains. The host MUST
         // register SlackPersistenceDbContext (above) before this call.
         //
-        // The Slack facade does NOT install a default NoOpAgentTaskService
-        // stub (silent /agent ask acknowledgement is a footgun). The
-        // Worker is still in pre-orchestrator-client mode, so explicitly
-        // opt in to the dev stub here; the call is observable in the
-        // composition root, and a future commit that wires the real
-        // orchestrator simply deletes this single line. Production hosts
-        // that register a real orchestrator client BEFORE this call get
-        // TryAdd semantics (their real registration wins).
-        builder.Services.AddSlackCommandDispatcherDevelopmentDefaults();
+        // Stage 5.1 iter-4 evaluator item 3 (STRUCTURAL fix, redone):
+        // the dev orchestrator stub (NoOpAgentTaskService ->
+        // IAgentTaskService) is GATED on EnableNoOpAgentTaskServiceKey
+        // with default = false in EVERY environment. The previous
+        // iter-3 default of IsDevelopment() still let a default dev
+        // Worker silently ACK /agent ask with synthetic stub task
+        // ids; the iter-4 default of `false` means the Worker
+        // NEVER auto-registers the no-op stub on its own. Operators
+        // who intentionally want to boot without a real
+        // IAgentTaskService (dev laptops, smoke tests, CI integration
+        // runs) explicitly set
+        // Slack:Inbound:EnableNoOpAgentTaskService=true; anyone else
+        // gets a fail-loud ValidateAgentTaskServiceRegistration
+        // exception at host startup with explicit remediation
+        // guidance.
+        if (ShouldEnableNoOpAgentTaskService(builder))
+        {
+            builder.Services.AddSlackCommandDispatcherDevelopmentDefaults();
+        }
 
-        // AddSlackMessenger composes BOTH AddSlackInboundTransport
-        // (Events API) AND AddSlackSocketModeTransport (Socket Mode)
-        // internally, so every host that calls AddSlackMessenger
-        // automatically wires ISlackInboundTransportFactory,
-        // ISlackSocketModeConnectionFactory, SlackSocketModeOptions
-        // (bound to Slack:SocketMode), and SlackInboundTransportHostedService
-        // -- no per-host duplication.
+        // AddSlackMessenger composes EVERYTHING: options binding,
+        // persistence (audit + workspace + idempotency + thread
+        // mapping), signature validation + authorization, BOTH the
+        // Stage 4.1 HTTP inbound transport (controllers, envelope
+        // factory, in-process queue, modal fast-path defaults,
+        // SlackDirectApiClient) AND the Stage 4.2 Socket Mode
+        // transport (ISlackSocketModeConnectionFactory,
+        // ISlackInboundTransportFactory, SlackSocketModeOptions
+        // bound to Slack:SocketMode, SlackInboundTransportHostedService),
+        // durable fast-path idempotency, the inbound ingestor
+        // BackgroundService, command/interaction collaborators
+        // (renderer, ephemeral responder, modal audit recorder,
+        // views.open / chat.update clients, rate limiter, thread
+        // mapping lookup), thread lifecycle, outbound dispatcher +
+        // SlackConnector, file-system queues + DLQs, health checks,
+        // startup diagnostics, telemetry, and the inbound
+        // MessengerEvent buffer SlackConnector.ReceiveAsync drains.
+        //
+        // Stage 5.1 iter-4 evaluator item 4: the per-stage
+        // AddSlackInboundTransport / AddSlackSocketModeTransport /
+        // AddSlackFastPathDurableIdempotency / AddSlackInboundIngestor
+        // calls that previously sat after this line have been removed
+        // -- the facade composes them all and the duplicates risked
+        // hosting two copies of a hosted service if a future TryAdd
+        // semantics change.
         builder.Services.AddSlackMessenger(builder.Configuration);
 
         // Stage 3.2 / 4.1: mount the SlackAuthorizationFilter as a global
@@ -199,36 +278,6 @@ public class Program
             })
             .AddSlackInboundControllers();
 
-        // Stage 4.1: register the inbound HTTP transport services
-        // (envelope factory, in-process ISlackInboundQueue, default
-        // modal fast-path handler). The TryAdd-style bindings let a
-        // future composition root swap in durable queue implementations
-        // (Service Bus, SQL outbox/inbox) supplied by
-        // AgentSwarm.Messaging.Core without changing this call site.
-        builder.Services.AddSlackInboundTransport();
-
-        // Stage 4.2: register the Socket Mode WebSocket transport
-        // services (connection factory, transport-factory selector,
-        // SlackSocketModeOptions) AND the
-        // SlackInboundTransportHostedService that enumerates
-        // ISlackWorkspaceConfigStore on host boot and starts the
-        // appropriate transport per workspace. Binding builder.Configuration
-        // exposes the Slack:SocketMode section so operators can override
-        // reconnect bounds, ACK timeout, and receive-buffer size from
-        // appsettings.json / environment variables without rebuilding.
-        builder.Services.AddSlackSocketModeTransport(builder.Configuration);
-
-        // Stage 4.1: swap the default in-process-only
-        // ISlackFastPathIdempotencyStore for the durable two-level
-        // composite (in-process L1 + EF L2 backed by the
-        // slack_inbound_request_record table). Without this call the
-        // modal fast-path falls back to in-memory dedup that does not
-        // survive a process restart, allowing a Slack retry that
-        // crosses a deployment to open a second modal for the same
-        // trigger_id.
-        builder.Services
-            .AddSlackFastPathDurableIdempotency<SlackPersistenceDbContext>();
-
         // Stage 4.3: opt the Worker into the disk-backed dead-letter
         // queue BEFORE the ingestor wires its own
         // TryAdd<ISlackDeadLetterQueue, InMemorySlackDeadLetterQueue>
@@ -246,39 +295,49 @@ public class Program
             builder.Services.AddFileSystemSlackDeadLetterQueue(dlqDir);
         }
 
-        // Stage 4.3 (workstream:
-        // ws-qq-slack-messenger-supp-phase-inbound-transport-stage-inbound-ingestor-and-deduplication):
-        // register the SlackInboundIngestor BackgroundService and the
-        // full processing pipeline (EF-backed idempotency guard,
-        // envelope authorizer, retry policy, in-memory DLQ,
-        // routing-by-source-type, audit recorder). Without this call
-        // envelopes pushed onto ISlackInboundQueue by Stage 4.1 /
-        // 4.2 transports would accumulate forever -- the BackgroundService
-        // is the dedicated drainer required by Stage 4.3 of
-        // implementation-plan.md. Must follow
-        // AddSlackFastPathDurableIdempotency so the guard's EF
-        // SlackInboundRequestRecord wiring is already in DI.
-        builder.Services
-            .AddSlackInboundIngestor<SlackPersistenceDbContext>();
-
-        // Gate the no-op handler stand-ins on
-        // Slack:Inbound:EnableDevelopmentHandlerStubs (defaults: true
-        // in Development, false elsewhere). Production / Staging /
-        // Testing hosts without real Stage 5 handlers therefore fail
-        // loudly the first time the ingestor lazily resolves the
-        // pipeline; the resolve-failure envelope is forwarded to the
-        // last-resort ISlackInboundEnqueueDeadLetterSink so nothing
-        // is lost. The host itself still starts cleanly so health
-        // probes, signature middleware, and the audit schema
-        // bootstrap remain available. Operators override the gate
-        // explicitly via configuration.
+        // Stage 5.1 / 5.2 / 5.3: wire the REAL production handlers.
+        // AddSlackCommandDispatcher() RemoveAll+AddSingleton's
+        // ISlackCommandHandler -> SlackCommandHandler and
+        // ISlackAppMentionHandler -> SlackAppMentionHandler.
+        // AddSlackInteractionDispatcher() does the same for
+        // ISlackInteractionHandler -> SlackInteractionHandler and
+        // ISlackInteractionFastPathHandler -> DefaultSlackInteractionFastPathHandler.
+        // Both extensions also TryAdd every collaborator they need
+        // (HTTP-backed ephemeral responder, message renderer, threaded
+        // reply poster, modal-audit recorder, chat.update / views.open
+        // clients, rate limiter, null thread-mapping lookup default).
+        // The earlier AddSlackMessenger call already TryAdded the same
+        // collaborators so these calls de-duplicate cleanly; the only
+        // new effect is binding the four handler contracts.
         //
-        // TODO(qq:SLACK-MESSENGER-SUPP Stage 5.x): replace this gate
-        // with real handler registrations (5.1 command dispatcher,
-        // 5.2 @mention dispatcher, 5.3 interaction -> HumanDecisionEvent
-        // dispatcher) and delete both the constant and the opt-in
-        // call. The production Worker MUST NOT ship the no-op stubs
-        // once real handlers exist.
+        // Stage 5.1 iter-3 evaluator items 1 + 2: the previous gate
+        // (AddSlackInboundDevelopmentHandlerStubs() under an env-based
+        // condition) registered NoOp stubs that silently ack-and-dropped
+        // every Slack command in dev AND left production resolving no
+        // handler at all -- the first /agent ask either dead-letters
+        // on missing handler resolution (production) or completes
+        // without producing an agent task (development). Wiring the
+        // real handlers here unconditionally means /agent ask actually
+        // dispatches through SlackCommandHandler in both modes;
+        // IAgentTaskService falls back to NoOpAgentTaskService when
+        // the EnableNoOpAgentTaskServiceKey gate above admits it
+        // (default = Development only), otherwise production hosts
+        // fail loud at pipeline resolution until a real orchestrator
+        // client is wired.
+        builder.Services.AddSlackCommandDispatcher();
+        builder.Services.AddSlackInteractionDispatcher();
+
+        // Legacy Stage 4.3 dev-stub gate: now obsolete because Stage
+        // 5.1 / 5.2 / 5.3 real handlers exist and the
+        // AddSlackCommandDispatcher / AddSlackInteractionDispatcher
+        // calls above RemoveAll+AddSingleton them ahead of any
+        // TryAdd. The gate's call is kept under an explicit opt-in
+        // (default OFF in every environment) so operators driving a
+        // smoke test that intentionally exercises the no-op stubs
+        // can still toggle them on, but no environment-defaulted
+        // wiring fires here anymore. The constant + helper survive
+        // for back-compat with hosts that read the configuration
+        // key directly.
         if (ShouldEnableDevelopmentHandlerStubs(builder))
         {
             builder.Services.AddSlackInboundDevelopmentHandlerStubs();
@@ -377,14 +436,29 @@ public class Program
     }
 
     /// <summary>
-    /// Resolves the opt-in gate for the no-op Slack handler stand-ins.
-    /// Reads the <see cref="EnableDevelopmentHandlerStubsKey"/> value
-    /// as a boolean; if absent or unparseable, defaults to
-    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>.
-    /// The gate is environment-defaulted, not environment-locked, so
-    /// an operator can force the stubs on in Production for a smoke
-    /// test or force them off on a dev laptop for a fail-fast check.
+    /// Resolves the opt-in gate for the legacy no-op Slack handler
+    /// stand-ins. Reads the
+    /// <see cref="EnableDevelopmentHandlerStubsKey"/> value as a
+    /// boolean; if absent or unparseable defaults to <c>false</c>.
     /// </summary>
+    /// <remarks>
+    /// Stage 5.1 iter-3 evaluator items 1 + 2: now that Stage 5
+    /// real handlers exist and <see cref="BuildApp"/> wires them
+    /// via <see cref="SlackCommandDispatchServiceCollectionExtensions.AddSlackCommandDispatcher"/>
+    /// and <see cref="SlackInteractionDispatchServiceCollectionExtensions.AddSlackInteractionDispatcher"/>
+    /// unconditionally, the no-op stand-ins are obsolete. The gate's
+    /// default flipped from <c>builder.Environment.IsDevelopment()</c>
+    /// to <c>false</c> so the dev-stub TryAdds no longer fire on a
+    /// dev laptop: a default dev run now exercises the real
+    /// <see cref="Pipeline.SlackCommandHandler"/> /
+    /// <see cref="Pipeline.SlackAppMentionHandler"/> /
+    /// <see cref="Pipeline.SlackInteractionHandler"/>. Operators
+    /// running a smoke test that intentionally drives the no-op
+    /// pipeline can still flip the gate to <c>true</c> -- the
+    /// TryAdd registrations no-op when real handlers are already
+    /// bound, so the override is observable only in compositions
+    /// that have stripped the real wiring out.
+    /// </remarks>
     internal static bool ShouldEnableDevelopmentHandlerStubs(WebApplicationBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -395,6 +469,56 @@ public class Program
             return explicitValue;
         }
 
-        return builder.Environment.IsDevelopment();
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves the opt-in gate for the
+    /// <see cref="Pipeline.NoOpAgentTaskService"/> orchestrator stub.
+    /// Reads the <see cref="EnableNoOpAgentTaskServiceKey"/> value as a
+    /// boolean; if absent or unparseable defaults to <c>false</c> in
+    /// every environment.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stage 5.1 iter-4 evaluator item 3 (STRUCTURAL fix, redone):
+    /// the iter-3 gate defaulted to
+    /// <see cref="HostEnvironmentEnvExtensions.IsDevelopment(Microsoft.Extensions.Hosting.IHostEnvironment)"/>,
+    /// so a default Development Worker still wired
+    /// <see cref="Pipeline.NoOpAgentTaskService"/> and acknowledged
+    /// <c>/agent ask</c> with synthetic <c>stub-*</c> task ids; the
+    /// iter-4 evaluator flagged that the "default Worker path"
+    /// still produces the stub-only behaviour. Flipping the default
+    /// to <c>false</c> in every environment means the Worker
+    /// NEVER auto-registers
+    /// <see cref="Pipeline.NoOpAgentTaskService"/> on its own --
+    /// the only way to get the stub is the explicit
+    /// <c>Slack:Inbound:EnableNoOpAgentTaskService=true</c>
+    /// configuration toggle.
+    /// </para>
+    /// <para>
+    /// A default Worker without either toggle OR a real
+    /// <see cref="AgentSwarm.Messaging.Abstractions.IAgentTaskService"/>
+    /// fails loudly at host startup via
+    /// <see cref="SlackMessengerServiceCollectionExtensions.ValidateAgentTaskServiceRegistration"/>;
+    /// the exception message includes the exact remediation
+    /// steps (register a real orchestrator client OR flip the
+    /// toggle). Operators see the misconfiguration before the
+    /// first Slack request lands, instead of discovering it during
+    /// incident triage when the swarm silently never picks up a
+    /// queued task.
+    /// </para>
+    /// </remarks>
+    internal static bool ShouldEnableNoOpAgentTaskService(WebApplicationBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        string? raw = builder.Configuration[EnableNoOpAgentTaskServiceKey];
+        if (!string.IsNullOrWhiteSpace(raw) && bool.TryParse(raw, out bool explicitValue))
+        {
+            return explicitValue;
+        }
+
+        return false;
     }
 }

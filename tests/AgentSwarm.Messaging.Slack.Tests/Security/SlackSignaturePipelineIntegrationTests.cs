@@ -429,6 +429,15 @@ public sealed class SlackSignaturePipelineIntegrationTests : IDisposable
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
+
+            // Stage 5.1 iter-4 evaluator item 3 (downstream test
+            // impact): Program.BuildApp gates the no-op stub on
+            // EnableNoOpAgentTaskService (default = IsDevelopment),
+            // and Testing is non-Development, so opt in explicitly
+            // here so AddSlackMessenger's validation guard observes
+            // a registered IAgentTaskService.
+            builder.UseSetting(Program.EnableNoOpAgentTaskServiceKey, "true");
+
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 Dictionary<string, string?> overrides = new()

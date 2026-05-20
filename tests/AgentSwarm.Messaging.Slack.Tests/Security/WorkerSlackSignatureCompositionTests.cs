@@ -180,6 +180,7 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
             "--Slack:Signature:PathPrefix=/slack-gateway",
             $"--{AgentSwarm.Messaging.Slack.Transport.SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
+            $"--{Program.EnableNoOpAgentTaskServiceKey}=true",
         };
 
         WebApplication app = Program.BuildApp(args);
@@ -250,6 +251,15 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
         {
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
             $"--{AgentSwarm.Messaging.Slack.Transport.SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
+
+            // Stage 5.1 iter-4 evaluator item 3 (downstream test
+            // impact): the no-op IAgentTaskService stub is now
+            // gated on EnableNoOpAgentTaskService (default =
+            // IsDevelopment) and these tests run under default
+            // Production environment. Opt in so
+            // AddSlackMessenger's ValidateAgentTaskServiceRegistration
+            // observes a registered IAgentTaskService.
+            $"--{Program.EnableNoOpAgentTaskServiceKey}=true",
         };
     }
 }
