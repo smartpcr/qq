@@ -59,9 +59,14 @@ public sealed class SlackCommandHandlerTests
         harness.ViewsOpenClient.Requests.Should().BeEmpty();
 
         // The user should receive an ephemeral acknowledgement
-        // (post-ACK response_url reply).
+        // (post-ACK response_url reply) and the response body MUST
+        // contain the created task id so the user can correlate the
+        // ack back to the agent task they just created (Stage 5.1
+        // iter-3 evaluator item 3).
         harness.Responder.Messages.Should().ContainSingle();
         harness.Responder.Messages[0].Url.Should().Be("https://hooks.slack.com/resp/abc");
+        harness.Responder.Messages[0].Message.Should().Contain("TASK-stub",
+            "the ephemeral ack MUST surface the created TaskId so the Slack user can correlate the ack back to the task; the prior behaviour silently dropped the id when result.Acknowledgement was non-empty");
     }
 
     // -----------------------------------------------------------------

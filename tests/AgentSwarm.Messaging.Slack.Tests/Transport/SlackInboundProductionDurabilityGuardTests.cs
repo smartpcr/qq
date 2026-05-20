@@ -186,10 +186,20 @@ public sealed class SlackInboundProductionDurabilityGuardTests : IDisposable
 
     private string[] BuildArgsWithoutOptIn()
     {
+        // Stage 5.1 iter-4 evaluator item 3 (downstream test impact):
+        // Program.BuildApp now gates AddSlackCommandDispatcherDevelopmentDefaults
+        // on EnableNoOpAgentTaskService (default = IsDevelopment).
+        // These tests probe the in-memory-queue durability guard
+        // in Production and expect that guard (not the orchestrator
+        // guard) to throw, so opt in to the no-op stub here so
+        // AddSlackMessenger's ValidateAgentTaskServiceRegistration
+        // is satisfied and the test exercises the queue check it
+        // was written for.
         return new[]
         {
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
             $"--Slack:Inbound:DeadLetterDirectory={this.deadLetterDir}",
+            $"--{Program.EnableNoOpAgentTaskServiceKey}=true",
         };
     }
 

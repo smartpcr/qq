@@ -183,9 +183,7 @@ internal sealed class SlackInboundAuditRecorder
         SlackAuditEntry entry = new()
         {
             Id = id,
-            CorrelationId = string.IsNullOrEmpty(envelope.IdempotencyKey)
-                ? id
-                : envelope.IdempotencyKey,
+            CorrelationId = ResolveCorrelationId(envelope, id),
             AgentId = null,
             TaskId = null,
             ConversationId = conversationId,
@@ -224,5 +222,41 @@ internal sealed class SlackInboundAuditRecorder
                 envelope.TeamId,
                 envelope.UserId);
         }
+    }
+
+    /// <summary>
+    /// Resolves the <see cref="SlackAuditEntry.CorrelationId"/> column.
+    /// Prefers the business correlation id stamped by a dispatch
+    /// handler via <see cref="SlackInboundResolvedCorrelationContext"/>
+    /// (e.g. <see cref="SlackInteractionHandler"/> looks up the
+    /// originating command's correlation id from the
+    /// <see cref="Entities.SlackThreadMapping"/> table when a
+    /// click/modal envelope lands in a thread). Falls back to the
+    /// transport-derived <see cref="SlackInboundEnvelope.IdempotencyKey"/>
+    /// when no handler stamped a resolved id -- this is the previous
+    /// behaviour and is preserved for paths the lookup does not cover
+    /// (slash-command envelopes prior to thread creation, app-mention
+    /// callbacks, error rows raised before dispatch).
+    /// </summary>
+    /// <remarks>
+    /// Stage 8.2 / story AC-6 ("every agent/human exchange is
+    /// queryable by correlation ID"). Without this hop a button-click
+    /// or modal-submission audit row would land under its own
+    /// <c>interact:</c> idempotency key and the brief's
+    /// "single-correlation-id query returns the full exchange"
+    /// promise (architecture.md §3.5, tech-spec.md §5.4,
+    /// e2e-scenarios.md scenario 12.1) would not hold.
+    /// </remarks>
+    private static string ResolveCorrelationId(SlackInboundEnvelope envelope, string fallbackId)
+    {
+        string? resolved = SlackInboundResolvedCorrelationContext.Get();
+        if (!string.IsNullOrEmpty(resolved))
+        {
+            return resolved;
+        }
+
+        return string.IsNullOrEmpty(envelope.IdempotencyKey)
+            ? fallbackId
+            : envelope.IdempotencyKey;
     }
 }

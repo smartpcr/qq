@@ -52,6 +52,56 @@ public static class SlackInteractionDispatchServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        services.AddSlackInteractionDispatcherCollaborators();
+
+        // Real interaction handler -- REPLACES any earlier
+        // ISlackInteractionHandler registration (notably the Stage 4.3
+        // NoOpSlackInteractionHandler dev-stub).
+        services.RemoveAll<ISlackInteractionHandler>();
+        services.AddSingleton<SlackInteractionHandler>();
+        services.AddSingleton<ISlackInteractionHandler>(sp => sp.GetRequiredService<SlackInteractionHandler>());
+
+        // Replace the NoOp interaction fast-path registered as the
+        // default by AddSlackInboundTransport with the real
+        // DefaultSlackInteractionFastPathHandler. The fast-path opens
+        // RequiresComment follow-up modals inline (before the HTTP
+        // ACK flushes) so views.open lands while the trigger_id is
+        // still valid -- the async path cannot meet the ~3-second
+        // expiry because it intentionally defers the enqueue until
+        // AFTER the ACK.
+        services.RemoveAll<ISlackInteractionFastPathHandler>();
+        services.AddSingleton<ISlackInteractionFastPathHandler, DefaultSlackInteractionFastPathHandler>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers ONLY the collaborator dependencies of
+    /// <see cref="SlackInteractionHandler"/> -- the HTTP-backed
+    /// chat.update / views.open clients, message renderer, rate
+    /// limiter, ephemeral responder, modal-audit recorder, and the
+    /// null thread-mapping lookup default -- without binding any
+    /// <see cref="ISlackInteractionHandler"/> /
+    /// <see cref="ISlackInteractionFastPathHandler"/> implementation.
+    /// </summary>
+    /// <remarks>
+    /// Stage 5.1 iter-2 evaluator item 2 (STRUCTURAL): the Stage 8.1
+    /// <see cref="Configuration.SlackMessengerServiceCollectionExtensions.AddSlackMessenger{TContext}"/>
+    /// facade calls this so production hosts get the rich facade
+    /// surface (every collaborator pinned by the
+    /// <c>AddSlackMessenger_registers_every_internal_pipeline_collaborator</c>
+    /// acceptance test) WITHOUT the facade pre-binding the three
+    /// handler contracts that would silently bypass the Stage 4.3
+    /// <c>Slack:Inbound:EnableDevelopmentHandlerStubs</c> gate. Hosts
+    /// that want the production handler call the public
+    /// <see cref="AddSlackInteractionDispatcher"/> AFTER the facade
+    /// (or wire their own <see cref="ISlackInteractionHandler"/>
+    /// binding before it).
+    /// </remarks>
+    internal static IServiceCollection AddSlackInteractionDispatcherCollaborators(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
         // Stage 5.1 renderer also produces the comment modal payload.
         services.TryAddSingleton<ISlackMessageRenderer, DefaultSlackMessageRenderer>();
 
@@ -107,24 +157,6 @@ public static class SlackInteractionDispatchServiceCollectionExtensions
         // roots opt in to the EF-backed lookup via
         // AddSlackEntityFrameworkThreadMappingLookup<TContext>().
         services.TryAddSingleton<ISlackThreadMappingLookup, NullSlackThreadMappingLookup>();
-
-        // Real interaction handler -- REPLACES any earlier
-        // ISlackInteractionHandler registration (notably the Stage 4.3
-        // NoOpSlackInteractionHandler dev-stub).
-        services.RemoveAll<ISlackInteractionHandler>();
-        services.AddSingleton<SlackInteractionHandler>();
-        services.AddSingleton<ISlackInteractionHandler>(sp => sp.GetRequiredService<SlackInteractionHandler>());
-
-        // Replace the NoOp interaction fast-path registered as the
-        // default by AddSlackInboundTransport with the real
-        // DefaultSlackInteractionFastPathHandler. The fast-path opens
-        // RequiresComment follow-up modals inline (before the HTTP
-        // ACK flushes) so views.open lands while the trigger_id is
-        // still valid -- the async path cannot meet the ~3-second
-        // expiry because it intentionally defers the enqueue until
-        // AFTER the ACK.
-        services.RemoveAll<ISlackInteractionFastPathHandler>();
-        services.AddSingleton<ISlackInteractionFastPathHandler, DefaultSlackInteractionFastPathHandler>();
 
         return services;
     }

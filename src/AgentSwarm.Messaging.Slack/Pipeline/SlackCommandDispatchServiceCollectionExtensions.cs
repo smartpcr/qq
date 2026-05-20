@@ -68,6 +68,56 @@ public static class SlackCommandDispatchServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        services.AddSlackCommandDispatcherCollaborators();
+
+        // Real command handler -- REPLACES any earlier ISlackCommandHandler
+        // registration (notably the Stage 4.3 NoOpSlackCommandHandler
+        // dev-stub). The Stage 4.3 ingestor extension intentionally
+        // does NOT register a default for this interface, so production
+        // hosts that forget to call AddSlackCommandDispatcher will fail
+        // fast at DI resolve time (the ingestor pipeline ctor takes
+        // ISlackCommandHandler by parameter).
+        services.RemoveAll<ISlackCommandHandler>();
+        services.AddSingleton<SlackCommandHandler>();
+        services.AddSingleton<ISlackCommandHandler>(sp => sp.GetRequiredService<SlackCommandHandler>());
+
+        // Stage 5.2 app-mention handler. Same RemoveAll + AddSingleton
+        // pattern as ISlackCommandHandler so the Stage 4.3
+        // NoOpSlackAppMentionHandler dev stand-in (registered by the
+        // explicit AddSlackInboundDevelopmentHandlerStubs opt-in) is
+        // unconditionally replaced. The handler depends on the
+        // concrete SlackCommandHandler (to access the internal
+        // DispatchAsync entry point that takes a per-call responder),
+        // ISlackThreadedReplyPoster (registered above), and the host
+        // logger -- every other Stage 5.1 collaborator is reachable
+        // transitively through SlackCommandHandler so the wiring stays
+        // a single extension call.
+        services.RemoveAll<ISlackAppMentionHandler>();
+        services.AddSingleton<SlackAppMentionHandler>();
+        services.AddSingleton<ISlackAppMentionHandler>(sp => sp.GetRequiredService<SlackAppMentionHandler>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers ONLY the collaborator dependencies of
+    /// <see cref="SlackCommandHandler"/> -- the HTTP-backed ephemeral
+    /// responder, message renderer, threaded-reply poster, and the
+    /// shared modal-audit recorder -- without binding any
+    /// <see cref="ISlackCommandHandler"/> / <see cref="ISlackAppMentionHandler"/>
+    /// implementation. Stage 8.1 <see cref="Configuration.SlackMessengerServiceCollectionExtensions.AddSlackMessenger"/>
+    /// calls this so production hosts get the rich facade surface
+    /// without the facade pre-binding a handler that would silently
+    /// bypass the Stage 4.3 <c>EnableDevelopmentHandlerStubsKey</c>
+    /// gate. Hosts that want the production handler call the public
+    /// <see cref="AddSlackCommandDispatcher"/> AFTER the facade
+    /// (or wire their own <see cref="ISlackCommandHandler"/> binding
+    /// before it).
+    /// </summary>
+    internal static IServiceCollection AddSlackCommandDispatcherCollaborators(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
         // Ephemeral responder posts to response_url; the named
         // HttpClient lets hosts layer resilience handlers (retry,
         // circuit-breaker) by name without subclassing the responder.
@@ -100,32 +150,6 @@ public static class SlackCommandDispatchServiceCollectionExtensions
         services.TryAddSingleton<ISlackAuditEntryWriter>(sp =>
             sp.GetRequiredService<InMemorySlackAuditEntryWriter>());
         services.TryAddSingleton<SlackModalAuditRecorder>();
-
-        // Real command handler -- REPLACES any earlier ISlackCommandHandler
-        // registration (notably the Stage 4.3 NoOpSlackCommandHandler
-        // dev-stub). The Stage 4.3 ingestor extension intentionally
-        // does NOT register a default for this interface, so production
-        // hosts that forget to call AddSlackCommandDispatcher will fail
-        // fast at DI resolve time (the ingestor pipeline ctor takes
-        // ISlackCommandHandler by parameter).
-        services.RemoveAll<ISlackCommandHandler>();
-        services.AddSingleton<SlackCommandHandler>();
-        services.AddSingleton<ISlackCommandHandler>(sp => sp.GetRequiredService<SlackCommandHandler>());
-
-        // Stage 5.2 app-mention handler. Same RemoveAll + AddSingleton
-        // pattern as ISlackCommandHandler so the Stage 4.3
-        // NoOpSlackAppMentionHandler dev stand-in (registered by the
-        // explicit AddSlackInboundDevelopmentHandlerStubs opt-in) is
-        // unconditionally replaced. The handler depends on the
-        // concrete SlackCommandHandler (to access the internal
-        // DispatchAsync entry point that takes a per-call responder),
-        // ISlackThreadedReplyPoster (registered above), and the host
-        // logger -- every other Stage 5.1 collaborator is reachable
-        // transitively through SlackCommandHandler so the wiring stays
-        // a single extension call.
-        services.RemoveAll<ISlackAppMentionHandler>();
-        services.AddSingleton<SlackAppMentionHandler>();
-        services.AddSingleton<ISlackAppMentionHandler>(sp => sp.GetRequiredService<SlackAppMentionHandler>());
 
         return services;
     }

@@ -369,6 +369,15 @@ public sealed class SlackInboundControllerIntegrationTests : IDisposable
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
+
+            // Stage 5.1 iter-4 evaluator item 3 (downstream test
+            // impact): Program.BuildApp now gates AddSlackCommandDispatcherDevelopmentDefaults
+            // on EnableNoOpAgentTaskService (default = IsDevelopment).
+            // This fixture runs under Testing -- opt in to the dev
+            // stub so AddSlackMessenger's ValidateAgentTaskServiceRegistration
+            // guard observes a valid IAgentTaskService.
+            builder.UseSetting(Program.EnableNoOpAgentTaskServiceKey, "true");
+
             builder.ConfigureAppConfiguration((_, cfg) =>
             {
                 Dictionary<string, string?> overrides = new()

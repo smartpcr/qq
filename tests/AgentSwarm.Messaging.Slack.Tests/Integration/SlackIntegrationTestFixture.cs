@@ -182,6 +182,22 @@ internal sealed class SlackIntegrationTestFixture : WebApplicationFactory<Progra
     {
         builder.UseEnvironment("Testing");
 
+        // Stage 5.1 iter-4 evaluator item 3 (downstream test impact):
+        // Program.BuildApp now gates AddSlackCommandDispatcherDevelopmentDefaults
+        // on the EnableNoOpAgentTaskService flag (default = IsDevelopment).
+        // This fixture runs under the Testing environment to keep the
+        // production code path under test, so the stub IAgentTaskService
+        // wiring would not fire by default and AddSlackMessenger's
+        // ValidateAgentTaskServiceRegistration guard would throw. The
+        // fixture overrides the live IAgentTaskService via
+        // ConfigureTestServices below, but that runs AFTER BuildApp --
+        // opt in to the dev stub here so AddSlackMessenger's guard
+        // observes a valid registration at BuildApp time and the
+        // post-build RemoveAll+AddSingleton swap to RecordingAgentTaskService
+        // takes effect cleanly. UseSetting writes directly to the
+        // live ConfigurationManager that BuildApp reads.
+        builder.UseSetting(Program.EnableNoOpAgentTaskServiceKey, "true");
+
         builder.ConfigureAppConfiguration((_, cfg) =>
         {
             Dictionary<string, string?> overrides = new()
@@ -394,6 +410,26 @@ internal sealed class SlackIntegrationTestFixture : WebApplicationFactory<Progra
                 services.AddHttpClient(name)
                     .ConfigurePrimaryHttpMessageHandler(() => this.mockSlackWebApi.CreateRewritingHandler());
             }
+
+            // Stage 5.1 iter-2 evaluator item 2 fix: the
+            // AddSlackMessenger facade no longer wires the real
+            // Stage 5.1 / 5.3 handler dispatchers (which used to
+            // silently replace the Stage 4.3 NoOp stand-ins and
+            // therefore broke the Worker's
+            // EnableDevelopmentHandlerStubsKey gate). The integration
+            // fixture is the canonical "production with a real
+            // orchestrator" composition root and explicitly opts
+            // into the real SlackCommandHandler / SlackInteractionHandler
+            // here so the /agent ask -> question -> approve flow
+            // these tests exercise actually runs the production code
+            // path. Both extensions use RemoveAll<>+AddSingleton<>
+            // so they replace the recording fakes only after the
+            // recording IAgentTaskService is in place (already wired
+            // above), which is the same ordering the Worker's
+            // future-state composition root will use once the real
+            // orchestrator client lands.
+            services.AddSlackCommandDispatcher();
+            services.AddSlackInteractionDispatcher();
 
             // Iter-7 evaluator item #1 (STRUCTURAL): the prior
             // bypassMvcAuthorizationFilter PostConfigure<MvcOptions>

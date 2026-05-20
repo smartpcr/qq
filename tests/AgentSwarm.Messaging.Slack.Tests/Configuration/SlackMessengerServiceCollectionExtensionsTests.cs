@@ -375,6 +375,12 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         // Iter-3 item 2: explicit dev-defaults opt-in (the facade no
         // longer auto-installs the NoOp orchestrator stub).
         services.AddSlackCommandDispatcherDevelopmentDefaults();
+        // Stage 5.1 iter-2 evaluator item 2: facade no longer
+        // registers handler dispatchers; tests opt into the NoOp
+        // stand-ins explicitly so SlackInboundProcessingPipeline
+        // (which takes the three handler contracts by ctor) resolves
+        // under ValidateOnBuild.
+        services.AddSlackInboundDevelopmentHandlerStubs();
         services.AddSlackMessenger(configuration);
 
         Action act = () => services.BuildServiceProvider(new ServiceProviderOptions
@@ -559,6 +565,17 @@ public sealed class SlackMessengerServiceCollectionExtensionsTests
         // Worker's composition root by explicitly opting in to the
         // dev-defaults shim BEFORE invoking AddSlackMessenger.
         services.AddSlackCommandDispatcherDevelopmentDefaults();
+
+        // Stage 5.1 iter-2 evaluator item 2 fix: the facade no
+        // longer registers ISlackCommandHandler / ISlackInteractionHandler
+        // / ISlackAppMentionHandler unconditionally (which used to
+        // silently replace the Stage 4.3 NoOp stand-ins). Acceptance
+        // tests that drive the full DI container (ValidateOnBuild
+        // walks every singleton ctor, including
+        // SlackInboundProcessingPipeline whose ctor requires all
+        // three handler contracts) opt in to the NoOp stubs
+        // explicitly so the pipeline ctor resolves.
+        services.AddSlackInboundDevelopmentHandlerStubs();
 
         // The facade under test.
         services.AddSlackMessenger(configuration);

@@ -7,8 +7,11 @@
 namespace AgentSwarm.Messaging.Slack.Pipeline;
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using AgentSwarm.Messaging.Slack.Observability;
 using AgentSwarm.Messaging.Slack.Queues;
 using AgentSwarm.Messaging.Slack.Transport;
 using Microsoft.Extensions.DependencyInjection;
@@ -149,9 +152,28 @@ internal sealed class SlackInboundIngestor : BackgroundService
 
                 try
                 {
+                    using Activity? receiveSpan = SlackTelemetry.StartInboundSpan(
+                        SlackTelemetry.InboundReceiveSpanName,
+                        envelope,
+                        ActivityKind.Consumer);
+
+                    // Stage 7.2 metrics emission: bump slack.inbound.count
+                    // once per envelope drained from the queue. Tagged
+                    // with slack.source_type (Command / Interaction /
+                    // Event) so dashboards split inbound volume by
+                    // request shape, and team_id so per-workspace
+                    // tenancy is observable. This is the production
+                    // emission site SlackTelemetryMetricsTests pins.
+                    SlackTelemetry.InboundCount.Add(
+                        1,
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeSourceType, envelope.SourceType.ToString()),
+                        new KeyValuePair<string, object?>(SlackTelemetry.AttributeTeamId, envelope.TeamId ?? string.Empty));
+
                     SlackInboundProcessingOutcome outcome = await pipeline
                         .ProcessAsync(envelope, stoppingToken)
                         .ConfigureAwait(false);
+
+                    receiveSpan?.SetTag("slack.inbound.outcome", outcome.ToString());
 
                     this.logger.LogDebug(
                         "SlackInboundIngestor processed envelope idempotency_key={IdempotencyKey} source={SourceType} outcome={Outcome}.",

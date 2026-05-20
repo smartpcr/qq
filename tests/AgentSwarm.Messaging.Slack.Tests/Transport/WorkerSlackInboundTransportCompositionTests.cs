@@ -204,6 +204,16 @@ public sealed class WorkerSlackInboundTransportCompositionTests : IDisposable
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
             $"--Slack:Inbound:DeadLetterDirectory={this.deadLetterDir}",
             $"--{SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
+
+            // Stage 5.1 iter-4 evaluator item 3 (downstream test
+            // impact): Program.BuildApp now gates the NoOp orchestrator
+            // stub on EnableNoOpAgentTaskService (default = IsDevelopment).
+            // The composition tests run under the default Production
+            // environment so they MUST opt in to the dev stub
+            // explicitly -- otherwise AddSlackMessenger's
+            // ValidateAgentTaskServiceRegistration guard short-circuits
+            // before any of the composition shape under test is wired.
+            $"--{Program.EnableNoOpAgentTaskServiceKey}=true",
         };
     }
 }
