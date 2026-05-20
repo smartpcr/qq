@@ -7,6 +7,7 @@
 namespace AgentSwarm.Messaging.Slack.Tests.Integration;
 
 using System;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
@@ -27,14 +28,14 @@ using Xunit;
 /// (<see cref="SlackSignatureValidator"/>),
 /// MVC authorization filter (<see cref="SlackAuthorizationFilter"/>),
 /// transport-layer envelope enqueue
-/// (<see cref="Transport.SlackInboundEnvelopeFactory"/> ΓåÆ
+/// (<see cref="Transport.SlackInboundEnvelopeFactory"/> →
 /// <see cref="Queues.ISlackInboundQueue"/>), background-service
 /// ingestor drain (<see cref="Pipeline.SlackInboundIngestor"/>), and
 /// pipeline dispatch (<see cref="Pipeline.SlackInboundProcessingPipeline"/>
-/// ΓåÆ <see cref="Pipeline.SlackCommandHandler.HandleAskAsync"/>) -- and
+/// → <see cref="Pipeline.SlackCommandHandler.HandleAskAsync"/>) -- and
 /// reaches <see cref="IAgentTaskService.CreateTaskAsync"/> with the
 /// VERBATIM prompt text. The Stage 5.1 brief's first acceptance
-/// scenario (<c>/agent ask generate implementation plan</c> ΓåÆ
+/// scenario (<c>/agent ask generate implementation plan</c> →
 /// <c>IAgentTaskService.CreateTaskAsync</c>) is verified end-to-end at
 /// the HTTP boundary, not at the handler unit level.
 /// </summary>
@@ -67,6 +68,28 @@ using Xunit;
 /// </remarks>
 public sealed class Stage5_1SlashCommandHttpDispatchTests
 {
+    /// <summary>
+    /// Quiet-period window used by the negative-side regression
+    /// (<see cref="Stage5_1_signed_unknown_sub_command_http_post_does_not_reach_AgentTaskService_CreateTaskAsync"/>)
+    /// to confirm that the unknown sub-command never reaches
+    /// <see cref="IAgentTaskService.CreateTaskAsync"/>. Sized to be
+    /// comfortably longer than the typical in-process ingestor drain
+    /// latency PLUS realistic CI-load and GC-pause headroom -- the
+    /// positive-case <c>WaitForCreateAsync</c> already tolerates 10s
+    /// for the same drain, so a 3s quiet window is conservatively
+    /// generous for the negative case while keeping the per-test
+    /// budget bounded.
+    /// </summary>
+    private static readonly TimeSpan NegativeAssertionQuietPeriod = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Poll cadence used during <see cref="NegativeAssertionQuietPeriod"/>.
+    /// Short enough that a stray <c>CreateTaskAsync</c> is surfaced
+    /// almost immediately (fail-fast on a real bug) yet coarse enough
+    /// to avoid burning the test process on a tight spin loop.
+    /// </summary>
+    private static readonly TimeSpan NegativeAssertionPollInterval = TimeSpan.FromMilliseconds(50);
+
     /// <summary>
     /// Stage 5.1 brief Test Scenario 1 ("Ask command creates task"):
     /// Given a signed <c>POST /api/slack/commands</c> with form body
@@ -108,9 +131,9 @@ public sealed class Stage5_1SlashCommandHttpDispatchTests
             HttpStatusCode.OK,
             "Stage 5.1: a signed /agent ask command from an authorized channel+user MUST be ACK'd with HTTP 200 within Slack's 3-second budget; any other status proves the HTTP hop (signature middleware OR SlackAuthorizationFilter OR SlackCommandsController) rejected the request");
 
-        // -- Hops 2-5: ISlackInboundQueue enqueue ΓåÆ SlackInboundIngestor
-        // background-service drain ΓåÆ SlackInboundProcessingPipeline
-        // dispatch ΓåÆ SlackCommandHandler.HandleAskAsync ΓåÆ
+        // -- Hops 2-5: ISlackInboundQueue enqueue → SlackInboundIngestor
+        // background-service drain → SlackInboundProcessingPipeline
+        // dispatch → SlackCommandHandler.HandleAskAsync →
         // IAgentTaskService.CreateTaskAsync. WaitForCreateAsync polls
         // RecordingAgentTaskService.CreateRequests with a 10s timeout
         // so a transient scheduling delay does not flake the test
@@ -184,36 +207,71 @@ public sealed class Stage5_1SlashCommandHttpDispatchTests
             HttpStatusCode.OK,
             "Slack requires HTTP 200 for every slash command regardless of validation outcome; the ephemeral error is delivered via response_url, not via the HTTP status code");
 
-        // Stage 5.1 iter-4 review feedback (negative-assertion
-        // quiescence): the previous `await Task.Delay(500)` here was
-        // timing-dependent -- under CI load or a GC pause the
-        // SlackInboundIngestor drain could exceed 500ms, the
-        // assertion below would run BEFORE the envelope had been
-        // processed, and a regression that silently dispatched an
-        // unknown sub-command to the orchestrator would slip through
-        // as a (false) PASS because CreateRequests had not yet been
-        // populated. We now poll CreateRequests for a generous
-        // quiescence window: if a CreateTaskAsync call surfaces at
-        // ANY point during the window we break out early so the
-        // BeEmpty assertion below surfaces the regression
-        // immediately; if the window elapses with no call we have
-        // given the ingestor ample time to drain so the negative
-        // assertion is meaningful. This mirrors the positive-case
-        // pattern (WaitForCreateAsync polls with a timeout) with the
-        // assertion polarity inverted, satisfying the reviewer's
-        // request to "poll CreateRequests in a loop with a timeout
-        // and assert emptiness only after the timeout elapses".
-        TimeSpan quiescenceWindow = TimeSpan.FromSeconds(3);
-        TimeSpan pollInterval = TimeSpan.FromMilliseconds(50);
-        DateTimeOffset deadline = DateTimeOffset.UtcNow + quiescenceWindow;
-        while (DateTimeOffset.UtcNow < deadline
-            && fixture.AgentTaskService.CreateRequests.Count == 0)
+        // -- Negative-side regression: prove the unknown sub-command
+        // NEVER reaches IAgentTaskService.CreateTaskAsync. Iter-5
+        // evaluator review flagged that a fixed `Task.Delay(500)` +
+        // single `BeEmpty()` assertion is timing-dependent: under CI
+        // load or GC pauses the ingestor drain could miss the 500 ms
+        // window, masking a latent dispatch that arrives at t=600 ms.
+        // The fix mirrors the positive-case `WaitForCreateAsync`
+        // polling pattern -- inverted to prove STEADY emptiness over
+        // a quiet-period window rather than eventual presence:
+        //
+        //   * Fail-fast: at each poll step, assert CreateRequests is
+        //     empty. If the pipeline did wrongly dispatch, the
+        //     assertion fires within ~50 ms of the dispatch (not at
+        //     the end of a fixed delay), giving a precise failure
+        //     signal.
+        //   * Steady-state: after the full quiet-period elapses with
+        //     no observed dispatch, a final post-window assertion
+        //     pins emptiness as the definitive result.
+        await AssertNoCreateTaskAsyncDispatchAsync(
+            fixture.AgentTaskService,
+            NegativeAssertionQuietPeriod);
+    }
+
+    /// <summary>
+    /// Polls <see cref="RecordingAgentTaskService.CreateRequests"/>
+    /// over the supplied <paramref name="quietPeriod"/> and asserts
+    /// that no <c>CreateTaskAsync</c> dispatch ever occurs --
+    /// fail-fast inside the loop on the first observed dispatch,
+    /// final emptiness assertion after the window elapses.
+    /// </summary>
+    /// <param name="service">The recording double the Worker
+    /// pipeline writes <see cref="IAgentTaskService.CreateTaskAsync"/>
+    /// invocations to.</param>
+    /// <param name="quietPeriod">How long to require the empty state
+    /// to hold. Must be comfortably longer than the typical inbound
+    /// drain latency for the test fixture under realistic CI load
+    /// (see <see cref="NegativeAssertionQuietPeriod"/>).</param>
+    private static async Task AssertNoCreateTaskAsyncDispatchAsync(
+        RecordingAgentTaskService service,
+        TimeSpan quietPeriod)
+    {
+        const string Because =
+            "Stage 5.1 brief Test Scenario 3: an unrecognized sub-command MUST NOT reach IAgentTaskService.CreateTaskAsync -- SlackCommandHandler MUST surface an ephemeral error (\"Valid sub-commands: ...\") via response_url without dispatching any orchestrator work";
+
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < quietPeriod)
         {
-            await Task.Delay(pollInterval);
+            // Fail-fast: if any concurrent pipeline dispatch slipped
+            // through, surface it as soon as it appears rather than
+            // waiting for the full quiet-period to elapse. This is
+            // strictly stronger than a single post-window check
+            // because it pins the FIRST observation of a stray
+            // dispatch (closer to the actual fault) rather than the
+            // post-hoc count.
+            service.CreateRequests.Should().BeEmpty(Because);
+            await Task.Delay(NegativeAssertionPollInterval).ConfigureAwait(false);
         }
 
-        fixture.AgentTaskService.CreateRequests.Should().BeEmpty(
-            "Stage 5.1 brief Test Scenario 3: an unrecognized sub-command MUST NOT reach IAgentTaskService.CreateTaskAsync -- SlackCommandHandler MUST surface an ephemeral error (\"Valid sub-commands: ...\") via response_url without dispatching any orchestrator work");
+        // Definitive post-quiet-period steady-state check: after a
+        // window comfortably longer than the typical drain latency
+        // (plus CI-load and GC-pause headroom) the recorder MUST
+        // still hold zero CreateTaskAsync calls. A delayed dispatch
+        // observed here would still violate the negative contract
+        // even though the fail-fast loop above did not catch it.
+        service.CreateRequests.Should().BeEmpty(Because);
     }
 
     private static string BuildAskCommandFormBody(
