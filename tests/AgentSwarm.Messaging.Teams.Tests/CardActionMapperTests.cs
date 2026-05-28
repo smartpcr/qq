@@ -342,4 +342,141 @@ public sealed class CardActionMapperTests
         Assert.Equal("reject-action", typedPayload.ActionId);
         Assert.Equal("reject", typedPayload.ActionValue);
     }
+
+    /// <summary>
+    /// Cross-component round-trip for the incident-escalation card (impl-plan §3.1 step 4
+    /// — Escalate / Acknowledge buttons). Extends the Stage 3.1 brief's "Card action
+    /// round-trip" test scenario from question cards to incident cards: render the card
+    /// via <see cref="AdaptiveCardBuilder.RenderIncidentCard"/>, pluck the chosen action's
+    /// data dict out of the rendered JSON, and feed it through
+    /// <see cref="CardActionMapper.Map"/>. The resulting <c>HumanDecisionEvent</c> must
+    /// carry the per-acknowledger <c>QuestionId</c>, the canonical action value, and the
+    /// shared correlation id — proving the renderer and mapper agree on the payload
+    /// contract for incident cards too.
+    /// </summary>
+    [Theory]
+    [InlineData("Escalate", "escalate", "incident.escalate")]
+    [InlineData("Acknowledge", "acknowledge", "incident.acknowledge")]
+    public void RenderIncidentThenMap_RoundTripPayload_ProducesHumanDecisionEventForChosenButton(
+        string buttonTitle,
+        string expectedActionValue,
+        string expectedActionId)
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var incident = new IncidentSummary(
+            IncidentId: "inc-cross-roundtrip",
+            QuestionId: "Q-inc-roundtrip-alice",
+            TaskId: "task-77",
+            AgentId: "release-agent-01",
+            AffectedAgents: new[] { "release-agent-01", "deploy-agent-03" },
+            Severity: AgentSwarm.Messaging.Abstractions.MessageSeverities.Critical,
+            Title: "Production deploy failed",
+            Description: "Rollback initiated due to schema migration error.",
+            OccurredAt: DateTimeOffset.Parse("2025-02-01T03:14:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: "corr-incident-cross-roundtrip");
+
+        var attachment = renderer.RenderIncidentCard(incident);
+        var card = (JObject)attachment.Content;
+        var action = ((JArray)card["actions"]!)
+            .Single(a => (string?)a["title"] == buttonTitle);
+        var data = (JObject)action["data"]!;
+
+        // The renderer must have stamped the per-acknowledger QuestionId — NOT the IncidentId.
+        Assert.Equal("Q-inc-roundtrip-alice", (string?)data[CardActionDataKeys.QuestionId]);
+        Assert.Equal(expectedActionId, (string?)data[CardActionDataKeys.ActionId]);
+        Assert.Equal(expectedActionValue, (string?)data[CardActionDataKeys.ActionValue]);
+        Assert.Equal("corr-incident-cross-roundtrip", (string?)data[CardActionDataKeys.CorrelationId]);
+
+        var decision = new CardActionMapper().Map(
+            data,
+            messenger: "Teams",
+            externalUserId: "aad-acknowledger",
+            externalMessageId: "act-incident-roundtrip",
+            receivedAt: ReceivedAt);
+
+        Assert.Equal("Q-inc-roundtrip-alice", decision.QuestionId);
+        Assert.Equal(expectedActionValue, decision.ActionValue);
+        Assert.Equal("corr-incident-cross-roundtrip", decision.CorrelationId);
+        Assert.Null(decision.Comment); // incident cards don't render a comment input
+        Assert.Equal("aad-acknowledger", decision.ExternalUserId);
+        Assert.Equal("Teams", decision.Messenger);
+
+        // ReadPayload must surface the same ActionId the renderer stamped — Stage 3.3's
+        // CardActionHandler uses this to resolve the originating button on the stored
+        // per-acknowledger AgentQuestion (per architecture.md §6.3 step 4).
+        var typedPayload = new CardActionMapper().ReadPayload(data);
+        Assert.Equal(expectedActionId, typedPayload.ActionId);
+        Assert.Equal(expectedActionValue, typedPayload.ActionValue);
+    }
+
+    /// <summary>
+    /// Cross-component round-trip for the release-gate card (impl-plan §3.1 step 5 —
+    /// Approve / Reject / Defer buttons; architecture.md §6.3.1 multi-approver modeling).
+    /// Each of the three release-gate buttons must round-trip through the mapper to a
+    /// <c>HumanDecisionEvent</c> carrying the <i>per-approver</i> <c>QuestionId</c> from
+    /// the <see cref="ReleaseGateRequest"/> (NOT the shared <c>GateId</c>) so Stage 3.3's
+    /// <c>CardActionHandler</c> can run the standard single-decision first-writer-wins
+    /// lifecycle independently for each approver. The orchestrator's workflow layer
+    /// computes the "N of M" threshold rollup, NOT this code path.
+    /// </summary>
+    [Theory]
+    [InlineData("Approve", "approve", "gate.approve")]
+    [InlineData("Reject", "reject", "gate.reject")]
+    [InlineData("Defer", "defer", "gate.defer")]
+    public void RenderReleaseGateThenMap_RoundTripPayload_ProducesHumanDecisionEventForChosenButton(
+        string buttonTitle,
+        string expectedActionValue,
+        string expectedActionId)
+    {
+        var renderer = new AdaptiveCardBuilder();
+        var gate = new ReleaseGateRequest(
+            GateId: "gate-cross-roundtrip",
+            // Per-approver QuestionId — each approver renders their own card with their
+            // own QuestionId, sharing only the gate metadata (per architecture.md §6.3.1).
+            QuestionId: "Q-gate-roundtrip-alice",
+            TaskId: "task-release-99",
+            GateName: "Production Deploy Gate",
+            ReleaseVersion: "v1.42.0",
+            Environment: "Production",
+            GateConditions: new[]
+            {
+                new ReleaseGateCondition("All tests pass", true),
+                new ReleaseGateCondition("Security scan clean", true),
+                new ReleaseGateCondition("SRE sign-off", false),
+            },
+            GateStatus: "Pending",
+            Deadline: DateTimeOffset.Parse("2025-03-01T18:00:00Z", System.Globalization.CultureInfo.InvariantCulture),
+            CorrelationId: "corr-gate-cross-roundtrip");
+
+        var attachment = renderer.RenderReleaseGateCard(gate);
+        var card = (JObject)attachment.Content;
+        var action = ((JArray)card["actions"]!)
+            .Single(a => (string?)a["title"] == buttonTitle);
+        var data = (JObject)action["data"]!;
+
+        // The renderer must stamp the per-approver QuestionId, NOT the shared GateId.
+        Assert.Equal("Q-gate-roundtrip-alice", (string?)data[CardActionDataKeys.QuestionId]);
+        Assert.NotEqual("gate-cross-roundtrip", (string?)data[CardActionDataKeys.QuestionId]);
+        Assert.Equal(expectedActionId, (string?)data[CardActionDataKeys.ActionId]);
+        Assert.Equal(expectedActionValue, (string?)data[CardActionDataKeys.ActionValue]);
+        Assert.Equal("corr-gate-cross-roundtrip", (string?)data[CardActionDataKeys.CorrelationId]);
+
+        var decision = new CardActionMapper().Map(
+            data,
+            messenger: "Teams",
+            externalUserId: "aad-approver",
+            externalMessageId: "act-gate-roundtrip",
+            receivedAt: ReceivedAt);
+
+        Assert.Equal("Q-gate-roundtrip-alice", decision.QuestionId);
+        Assert.Equal(expectedActionValue, decision.ActionValue);
+        Assert.Equal("corr-gate-cross-roundtrip", decision.CorrelationId);
+        Assert.Null(decision.Comment); // release-gate cards don't render a comment input
+        Assert.Equal("aad-approver", decision.ExternalUserId);
+        Assert.Equal("Teams", decision.Messenger);
+
+        var typedPayload = new CardActionMapper().ReadPayload(data);
+        Assert.Equal(expectedActionId, typedPayload.ActionId);
+        Assert.Equal(expectedActionValue, typedPayload.ActionValue);
+    }
 }
