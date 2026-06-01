@@ -130,12 +130,23 @@ public sealed class InMemorySecretProviderTests
     }
 
     [Fact]
-    public void Constructor_accepts_null_seed_and_yields_an_empty_store()
+    public async Task Constructor_accepts_null_seed_and_yields_an_empty_store()
     {
+        // Iter-3 evaluator fix: the prior revision of this fact declared
+        // the test as `void` and called `act.Should().ThrowAsync<...>()`
+        // without awaiting the resulting Task. That made the assertion a
+        // no-op (FluentAssertions never actually invoked `act`, never
+        // observed an exception, and the test passed regardless of the
+        // provider's behaviour). Switching to `async Task` and `await`
+        // restores the assertion's correctness AND removes the
+        // CS4014/AsyncFixer "unawaited Task" warning that
+        // TreatWarningsAsErrors would otherwise promote to a build
+        // failure.
         InMemorySecretProvider provider = new(seed: null);
 
         Func<Task> act = async () => await provider.GetSecretAsync("anything", CancellationToken.None);
-        act.Should().ThrowAsync<SecretNotFoundException>();
+
+        await act.Should().ThrowAsync<SecretNotFoundException>();
     }
 
     [Fact]
