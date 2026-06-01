@@ -244,6 +244,204 @@ public sealed class OutboxToCardManagerIntegrationTests
         Assert.Equal(TeamsCardStatuses.Expired, statusUpdate.NewStatus);
     }
 
+    /// <summary>
+    /// Iter-3 evaluator feedback item 1 — work-item scenario 9 ("Card delete inline
+    /// retry"). The Phase-1 dispatcher delivers the card, then Phase-2's
+    /// <see cref="TeamsMessengerConnector.DeleteCardAsync"/> sees a transient HTTP 503
+    /// on the first <see cref="ITurnContext.DeleteActivityAsync(string, CancellationToken)"/>
+    /// and succeeds on the second. Proves the inline retry path (1) classifies the
+    /// failure as transient, (2) retries the WHOLE
+    /// <see cref="CloudAdapter.ContinueConversationAsync"/> wrap, (3) lands the
+    /// terminal <c>Expired</c> status only after the retried delete succeeds.
+    /// </summary>
+    [Fact]
+    public async Task OutboxDeliveredQuestion_DeleteWithTransientFailure_RetriesAndSucceeds()
+    {
+        var adapter = new TransientThenSuccessDeleteAdapter(failuresBeforeSuccess: 1)
+        {
+            FixedActivityId = DeliveredActivityId,
+            FixedConversationId = DeliveredConversationId,
+        };
+        var sharedCardStore = new ProductionLikeCardStateStore();
+        var questionStore = new RecordingAgentQuestionStore();
+        var outbox = new InMemoryOutbox();
+        var renderer = new AdaptiveCardBuilder();
+        var options = new TeamsMessagingOptions
+        {
+            MicrosoftAppId = AppId,
+            MaxRetryAttempts = 3,
+            RetryBaseDelaySeconds = 1, // floored to 1s by ExecuteWithInlineRetryAsync
+        };
+
+        var dispatcher = new TeamsOutboxDispatcher(
+            adapter, options, outbox, sharedCardStore, questionStore, renderer,
+            NullLogger<TeamsOutboxDispatcher>.Instance);
+        var question = BuildQuestion("q-it-del-retry");
+        var entry = BuildOutboxEntry("e-it-del-retry", question, BuildConversationReferenceJson());
+
+        var dispatchResult = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+        Assert.Equal(OutboxDispatchOutcome.Success, dispatchResult.Outcome);
+
+        ITeamsCardManager cardManager = new TeamsMessengerConnector(
+            adapter, options,
+            new InertConversationReferenceStore(),
+            new InertConversationReferenceRouter(),
+            questionStore, sharedCardStore, renderer,
+            new ChannelInboundEventPublisher(),
+            NullLogger<TeamsMessengerConnector>.Instance);
+
+        await cardManager.DeleteCardAsync(question.QuestionId, CancellationToken.None);
+
+        // Inline retry MUST have invoked DeleteActivityAsync exactly twice (1 transient
+        // failure + 1 success). The card-state status MUST land at Expired ONLY after
+        // the retried delete succeeds — proving UpdateStatusAsync runs after the
+        // operation lambda returns from ExecuteWithInlineRetryAsync, not inside the
+        // failed attempt's exception path.
+        Assert.Equal(2, adapter.DeleteAttempts);
+        // Three ContinueConversationAsync calls total: 1 dispatcher send + 2 manager
+        // retry attempts (the retry loop wraps the WHOLE ContinueConversationAsync).
+        Assert.Equal(3, adapter.ContinueCalls.Count);
+
+        var statusUpdate = Assert.Single(sharedCardStore.StatusUpdates);
+        Assert.Equal(question.QuestionId, statusUpdate.QuestionId);
+        Assert.Equal(TeamsCardStatuses.Expired, statusUpdate.NewStatus);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback item 2 — assert the dispatcher's POST-SEND
+    /// durability ordering: <see cref="IMessageOutbox.RecordSendReceiptAsync"/> MUST
+    /// be called BEFORE <see cref="ICardStateStore.SaveAsync"/>. The receipt is the
+    /// durable marker that lets a subsequent retry safely skip the BF re-send via
+    /// the layer-1 idempotency check; if the order is reversed a cardstate-save
+    /// failure would leave the outbox row with no <c>ActivityId</c> and the retry
+    /// would produce a duplicate card. Proven with a shared call-order log so the
+    /// ordering is observable across both the outbox AND the card-state stores.
+    /// </summary>
+    [Fact]
+    public async Task OutboxDispatcher_RecordSendReceipt_RunsBeforeCardStateSave()
+    {
+        var callOrder = new List<string>();
+        var adapter = new HybridCloudAdapter
+        {
+            FixedActivityId = DeliveredActivityId,
+            FixedConversationId = DeliveredConversationId,
+        };
+        var sharedCardStore = new ProductionLikeCardStateStore(call => callOrder.Add(call));
+        var outbox = new InMemoryOutbox(call => callOrder.Add(call));
+        var questionStore = new RecordingAgentQuestionStore();
+        var renderer = new AdaptiveCardBuilder();
+        var options = new TeamsMessagingOptions { MicrosoftAppId = AppId };
+
+        var dispatcher = new TeamsOutboxDispatcher(
+            adapter, options, outbox, sharedCardStore, questionStore, renderer,
+            NullLogger<TeamsOutboxDispatcher>.Instance);
+        var question = BuildQuestion("q-it-order");
+        var entry = BuildOutboxEntry("e-it-order", question, BuildConversationReferenceJson());
+
+        var result = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+        Assert.Equal(OutboxDispatchOutcome.Success, result.Outcome);
+
+        // Both calls MUST be present.
+        Assert.Contains("outbox.RecordSendReceipt", callOrder);
+        Assert.Contains("cardstate.Save", callOrder);
+
+        // Strict ordering: receipt persisted FIRST, cardstate save SECOND.
+        var receiptIdx = callOrder.IndexOf("outbox.RecordSendReceipt");
+        var saveIdx = callOrder.IndexOf("cardstate.Save");
+        Assert.True(receiptIdx < saveIdx,
+            $"IMessageOutbox.RecordSendReceiptAsync must run BEFORE ICardStateStore.SaveAsync (receipt index {receiptIdx}, save index {saveIdx}). Call order: [{string.Join(", ", callOrder)}].");
+
+        // The receipt persisted to the outbox MUST carry the SAME identifiers later
+        // saved into card-state — proving the dispatcher hands the same captured data
+        // to both stores.
+        var receipt = Assert.Single(outbox.Receipts);
+        Assert.Equal(entry.OutboxEntryId, receipt.EntryId);
+        Assert.Equal(DeliveredActivityId, receipt.Receipt.ActivityId);
+        Assert.Equal(DeliveredConversationId, receipt.Receipt.ConversationId);
+
+        var saved = Assert.Single(sharedCardStore.Saved);
+        Assert.Equal(receipt.Receipt.ActivityId, saved.ActivityId);
+        Assert.Equal(receipt.Receipt.ConversationId, saved.ConversationId);
+    }
+
+    /// <summary>
+    /// Iter-3 evaluator feedback item 3 — work-item core outbox guarantee: the
+    /// layer-1 idempotent replay path in <see cref="TeamsOutboxDispatcher.DispatchAsync"/>.
+    /// Simulates a prior partial-success attempt where the Bot Framework send
+    /// succeeded (<see cref="OutboxEntry.ActivityId"/>/<see cref="OutboxEntry.ConversationId"/>
+    /// were stamped onto the row via <see cref="IMessageOutbox.RecordSendReceiptAsync"/>)
+    /// but the post-send <see cref="ICardStateStore.SaveAsync"/> failed and the
+    /// engine rescheduled the entry. On the next dispatch attempt the dispatcher MUST
+    /// NOT re-send the card — it MUST replay ONLY the post-send persistence using the
+    /// row's identifiers. Proven by configuring a <see cref="HybridCloudAdapter"/>
+    /// that records ALL outbound calls and asserting they remain at zero after the
+    /// replay dispatch returns Success.
+    /// </summary>
+    [Fact]
+    public async Task DispatchAsync_Layer1IdempotentReplay_EntryHasActivityId_HydratesCardStateWithoutResending()
+    {
+        const string priorAttemptActivityId = "act-prior-attempt";
+        const string priorAttemptConversationId = "19:prior-attempt@thread.tacv2";
+
+        var adapter = new HybridCloudAdapter
+        {
+            // Distinct from prior-attempt ids so a buggy "re-send anyway" would
+            // surface as cardstate with the wrong (post-resend) identifiers.
+            FixedActivityId = "act-WRONG-if-resent",
+            FixedConversationId = "19:WRONG-if-resent@thread.tacv2",
+        };
+        var sharedCardStore = new ProductionLikeCardStateStore();
+        var questionStore = new RecordingAgentQuestionStore();
+        var outbox = new InMemoryOutbox();
+        var renderer = new AdaptiveCardBuilder();
+        var options = new TeamsMessagingOptions { MicrosoftAppId = AppId };
+
+        var dispatcher = new TeamsOutboxDispatcher(
+            adapter, options, outbox, sharedCardStore, questionStore, renderer,
+            NullLogger<TeamsOutboxDispatcher>.Instance);
+
+        var question = BuildQuestion("q-it-replay");
+        // Build the entry as if a prior attempt already completed the BF send and
+        // persisted the receipt onto the row via RecordSendReceiptAsync. The
+        // dispatcher's Layer-1 idempotency check MUST detect this and replay only
+        // the post-send persistence.
+        var entry = BuildOutboxEntry("e-it-replay", question, BuildConversationReferenceJson()) with
+        {
+            ActivityId = priorAttemptActivityId,
+            ConversationId = priorAttemptConversationId,
+        };
+
+        var result = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+
+        Assert.Equal(OutboxDispatchOutcome.Success, result.Outcome);
+
+        // CRITICAL no-resend assertions — proves the layer-1 replay path skipped the
+        // proactive turn entirely (no ContinueConversationAsync, no SendActivitiesAsync).
+        Assert.Empty(adapter.ContinueCalls);
+        Assert.Empty(adapter.SendActivityCalls);
+
+        // Card state MUST be hydrated using the PRIOR-ATTEMPT identifiers from the row,
+        // not the adapter's fixed-value defaults (which would have surfaced if the
+        // dispatcher mistakenly re-sent the card).
+        var saved = Assert.Single(sharedCardStore.Saved);
+        Assert.Equal(question.QuestionId, saved.QuestionId);
+        Assert.Equal(priorAttemptActivityId, saved.ActivityId);
+        Assert.Equal(priorAttemptConversationId, saved.ConversationId);
+
+        // Receipt on the dispatcher result MUST also reflect the prior-attempt
+        // identifiers so the engine acknowledges the row with the canonical receipt.
+        Assert.NotNull(result.Receipt);
+        Assert.Equal(priorAttemptActivityId, result.Receipt!.Value.ActivityId);
+        Assert.Equal(priorAttemptConversationId, result.Receipt!.Value.ConversationId);
+
+        // The AgentQuestion's conversation id MUST also be stamped during the replay
+        // so CardActionHandler's bare approve/reject resolution path works even when
+        // the original send completed before any cardstate write.
+        var convoUpdate = Assert.Single(questionStore.ConversationIdUpdates);
+        Assert.Equal(question.QuestionId, convoUpdate.QuestionId);
+        Assert.Equal(priorAttemptConversationId, convoUpdate.ConversationId);
+    }
+
     // ----- helpers --------------------------------------------------------------
 
     private static AgentQuestion BuildQuestion(string id) => new()
@@ -307,7 +505,7 @@ public sealed class OutboxToCardManagerIntegrationTests
     /// <see cref="FixedConversationId"/> so the dispatcher captures a stable
     /// <see cref="OutboxEntry.ConversationId"/>.
     /// </summary>
-    private sealed class HybridCloudAdapter : CloudAdapter
+    private class HybridCloudAdapter : CloudAdapter
     {
         public string FixedActivityId { get; init; } = "act-default";
         public string FixedConversationId { get; init; } = "conv-default";
@@ -360,6 +558,45 @@ public sealed class OutboxToCardManagerIntegrationTests
     }
 
     /// <summary>
+    /// Hybrid adapter variant that fails the FIRST <see cref="DeleteActivityAsync"/>
+    /// calls with a transient HTTP 503 (<see cref="ErrorResponseException"/> per the
+    /// canonical Teams whitelist) before succeeding. Used to drive the inline-retry
+    /// path in <see cref="TeamsMessengerConnector.DeleteCardAsync"/> from an
+    /// integration test that ALSO exercises the dispatcher's prior delivery.
+    /// </summary>
+    private sealed class TransientThenSuccessDeleteAdapter : HybridCloudAdapter
+    {
+        private readonly int _failuresBeforeSuccess;
+
+        public TransientThenSuccessDeleteAdapter(int failuresBeforeSuccess)
+        {
+            _failuresBeforeSuccess = failuresBeforeSuccess;
+        }
+
+        public int DeleteAttempts { get; private set; }
+
+        public override Task DeleteActivityAsync(
+            ITurnContext turnContext,
+            ConversationReference reference,
+            CancellationToken cancellationToken)
+        {
+            DeleteAttempts++;
+            if (DeleteAttempts <= _failuresBeforeSuccess)
+            {
+                throw new Microsoft.Bot.Schema.ErrorResponseException("HTTP 503")
+                {
+                    Response = new Microsoft.Rest.HttpResponseMessageWrapper(
+                        new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable),
+                        string.Empty),
+                };
+            }
+
+            DeleteActivityCalls.Add(reference.ActivityId!);
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
     /// Card-state store that behaves like the production
     /// <c>SqlCardStateStore</c> in the dimension the integration test cares about:
     /// <see cref="SaveAsync"/> persists by <see cref="TeamsCardState.QuestionId"/> and
@@ -370,12 +607,21 @@ public sealed class OutboxToCardManagerIntegrationTests
     private sealed class ProductionLikeCardStateStore : ICardStateStore
     {
         private readonly Dictionary<string, TeamsCardState> _byQuestionId = new(StringComparer.Ordinal);
+        private readonly Action<string>? _recordCall;
 
         public List<TeamsCardState> Saved { get; } = new();
         public List<(string QuestionId, string NewStatus)> StatusUpdates { get; } = new();
 
+        public ProductionLikeCardStateStore() : this(null) { }
+
+        public ProductionLikeCardStateStore(Action<string>? recordCall)
+        {
+            _recordCall = recordCall;
+        }
+
         public Task SaveAsync(TeamsCardState state, CancellationToken ct)
         {
+            _recordCall?.Invoke("cardstate.Save");
             Saved.Add(state);
             _byQuestionId[state.QuestionId] = state;
             return Task.CompletedTask;
@@ -401,8 +647,17 @@ public sealed class OutboxToCardManagerIntegrationTests
 
     private sealed class InMemoryOutbox : IMessageOutbox
     {
+        private readonly Action<string>? _recordCall;
+
         public List<(string EntryId, OutboxDeliveryReceipt Receipt)> Receipts { get; } = new();
         public List<(string EntryId, OutboxDeliveryReceipt Receipt)> Acks { get; } = new();
+
+        public InMemoryOutbox() : this(null) { }
+
+        public InMemoryOutbox(Action<string>? recordCall)
+        {
+            _recordCall = recordCall;
+        }
 
         public Task EnqueueAsync(OutboxEntry entry, CancellationToken ct) => Task.CompletedTask;
         public Task<IReadOnlyList<OutboxEntry>> DequeueAsync(int batchSize, CancellationToken ct)
@@ -416,6 +671,7 @@ public sealed class OutboxToCardManagerIntegrationTests
 
         public Task RecordSendReceiptAsync(string outboxEntryId, OutboxDeliveryReceipt receipt, CancellationToken ct)
         {
+            _recordCall?.Invoke("outbox.RecordSendReceipt");
             Receipts.Add((outboxEntryId, receipt));
             return Task.CompletedTask;
         }
