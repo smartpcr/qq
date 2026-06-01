@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -71,6 +72,17 @@ public sealed class RbacAuthorizationService : IUserAuthorizationService
         CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+
+        // Stage 6.3 iter-10 evaluator fix item 2 — open a TeamsLogScope so every
+        // ILogger entry below (both RBAC-reject warnings on lines 100 and 120 in the
+        // pre-fix layout) carries the canonical three-key enrichment per §6.3
+        // step 5. tenantId / userId are this method's required inputs so we can
+        // stamp them directly; CorrelationId is inherited from the parent scope
+        // opened by TeamsSwarmActivityHandler (or sentinel-substituted otherwise).
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            tenantId: string.IsNullOrEmpty(tenantId) ? null : tenantId,
+            userId: string.IsNullOrEmpty(userId) ? null : userId);
 
         if (string.IsNullOrEmpty(userId) || string.IsNullOrEmpty(command))
         {

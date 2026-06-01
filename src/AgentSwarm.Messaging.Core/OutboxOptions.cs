@@ -88,7 +88,7 @@ public sealed class OutboxOptions
     /// <summary>
     /// Histogram / counter / gauge meter name under which the engine publishes the
     /// canonical <c>teams.card.delivery.duration_ms</c>,
-    /// <c>teams.outbox.pending_count</c>, and related signals listed in
+    /// <c>teams.outbox.queue_depth</c>, and related signals listed in
     /// <c>architecture.md</c> §8.1. Default is the same value used in the architecture
     /// document so dashboards and alerts wire up out of the box.
     /// </summary>

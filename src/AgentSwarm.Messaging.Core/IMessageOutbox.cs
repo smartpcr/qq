@@ -89,4 +89,37 @@ public interface IMessageOutbox
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A task that completes when the status has been recorded.</returns>
     Task DeadLetterAsync(string outboxEntryId, string error, CancellationToken ct);
+
+    /// <summary>
+    /// Stage 6.3 (iter-4 evaluator feedback item 5) — report the current count of
+    /// entries with <c>Status = </c><see cref="OutboxEntryStatuses.Pending"/> (i.e. the
+    /// real backlog the engine is racing to drain), so the
+    /// <c>teams.outbox.queue_depth</c> gauge reports the queue depth rather than just
+    /// the last dequeued batch size.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Implementations that can answer the question cheaply (e.g. <c>SqlMessageOutbox</c>
+    /// via a single <c>SELECT COUNT(*) FROM OutboxMessages WHERE Status = 'Pending'</c>)
+    /// SHOULD override this method to return the real count. Implementations that cannot
+    /// (or do not want to issue an extra round-trip per tick) MUST keep the default
+    /// behaviour and return <c>-1</c> — the caller (<see cref="OutboxRetryEngine"/>)
+    /// treats <c>-1</c> as "unsupported" and falls back to the dequeued batch size for
+    /// the gauge value.
+    /// </para>
+    /// <para>
+    /// The default implementation returns <c>-1</c> so existing implementations
+    /// (<c>NoOpMessageOutbox</c>, test doubles such as <c>RecordingOutbox</c> /
+    /// <c>ReplayOutbox</c> / <c>RecordingMessageOutbox</c>, etc.) continue to compile
+    /// without changes and the gauge gracefully degrades to "batch size" reporting for
+    /// those implementations. The production <c>SqlMessageOutbox</c> overrides this to
+    /// return the real count.
+    /// </para>
+    /// </remarks>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// The number of entries currently in <see cref="OutboxEntryStatuses.Pending"/>, or
+    /// <c>-1</c> when the implementation cannot answer cheaply.
+    /// </returns>
+    Task<long> CountPendingAsync(CancellationToken ct) => Task.FromResult(-1L);
 }

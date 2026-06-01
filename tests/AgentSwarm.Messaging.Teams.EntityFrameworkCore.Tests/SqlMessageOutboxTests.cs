@@ -90,6 +90,75 @@ public sealed class SqlMessageOutboxTests
         Assert.Equal("e2", batch[0].OutboxEntryId);
     }
 
+    /// <summary>
+    /// Stage 6.3 iter-5 evaluator feedback item 6 — <see cref="SqlMessageOutbox.CountPendingAsync"/>
+    /// must mirror the dequeue predicate so the <c>teams.outbox.queue_depth</c>
+    /// gauge reflects the DRAINABLE pending backlog (Pending rows whose
+    /// <c>NextRetryAt</c> is null or has elapsed) rather than every Pending row
+    /// regardless of schedule. Pre-fix, a backlog of (1 drainable + 9 future-scheduled)
+    /// reported queue_depth=10 even though only 1 row was claimable, misleading
+    /// operators into provisioning more drain capacity than the engine could use.
+    /// </summary>
+    [Fact]
+    public async Task CountPendingAsync_FiltersFutureNextRetryAt_MirrorsDequeuePredicate()
+    {
+        var clock = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 10, 0, 0, TimeSpan.Zero));
+        await using var fixture = new OutboxStoreFixture(timeProvider: clock);
+
+        // Mix of: 2 freshly enqueued (NextRetryAt = null), 1 scheduled for the past
+        // (drainable), and 3 scheduled for the future (NOT drainable on this tick).
+        for (var i = 0; i < 6; i++)
+        {
+            await fixture.Store.EnqueueAsync(NewEntry($"e{i}"), CancellationToken.None);
+        }
+
+        // Reschedule e0 into the past (still drainable — NextRetryAt <= now).
+        await fixture.Store.RescheduleAsync(
+            "e0",
+            clock.GetUtcNow().AddMinutes(-5),
+            "transient",
+            CancellationToken.None);
+
+        // Reschedule e3, e4, e5 into the future (NOT drainable on this tick).
+        await fixture.Store.RescheduleAsync("e3", clock.GetUtcNow().AddMinutes(10), "transient", CancellationToken.None);
+        await fixture.Store.RescheduleAsync("e4", clock.GetUtcNow().AddMinutes(20), "transient", CancellationToken.None);
+        await fixture.Store.RescheduleAsync("e5", clock.GetUtcNow().AddMinutes(30), "transient", CancellationToken.None);
+
+        // Drainable: e1 (NextRetryAt = null), e2 (NextRetryAt = null), e0 (past).
+        // Not drainable: e3, e4, e5 (future).
+        var pendingCount = await fixture.Store.CountPendingAsync(CancellationToken.None);
+        var dequeueable = await fixture.Store.DequeueAsync(batchSize: 100, CancellationToken.None);
+
+        Assert.Equal(3, pendingCount);
+        Assert.Equal(3, dequeueable.Count);
+        // Identical row set → identical count. The gauge contract is "what the
+        // engine could claim on the next tick", not "every Pending row ever".
+        Assert.Equal(dequeueable.Count, pendingCount);
+    }
+
+    /// <summary>
+    /// Stage 6.3 iter-5 evaluator feedback item 6 — after advancing the clock past
+    /// the rescheduled retry timestamp, the previously-not-drainable rows become
+    /// drainable and <see cref="SqlMessageOutbox.CountPendingAsync"/> reflects
+    /// the new count. Pins the time-dependence of the predicate.
+    /// </summary>
+    [Fact]
+    public async Task CountPendingAsync_RowsBecomeDrainableAsClockAdvances()
+    {
+        var clock = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 10, 0, 0, TimeSpan.Zero));
+        await using var fixture = new OutboxStoreFixture(timeProvider: clock);
+
+        await fixture.Store.EnqueueAsync(NewEntry("e1"), CancellationToken.None);
+        await fixture.Store.RescheduleAsync("e1", clock.GetUtcNow().AddMinutes(15), "transient", CancellationToken.None);
+
+        // Before the retry timestamp — not drainable, count must be 0.
+        Assert.Equal(0, await fixture.Store.CountPendingAsync(CancellationToken.None));
+
+        // Advance past the retry timestamp — row becomes drainable.
+        clock.Advance(TimeSpan.FromMinutes(20));
+        Assert.Equal(1, await fixture.Store.CountPendingAsync(CancellationToken.None));
+    }
+
     [Fact]
     public async Task DequeueAsync_ReclaimsExpiredLeases()
     {

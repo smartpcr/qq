@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 namespace AgentSwarm.Messaging.Teams.Outbox;
@@ -36,22 +37,6 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// is fully self-describing.
 /// </para>
 /// <para>
-/// <b>Why <see cref="SendQuestionAsync"/> resolves via the canonical store
-/// (<see cref="IConversationReferenceStore"/>), not the router.</b>
-/// <see cref="AgentQuestion.TargetUserId"/> / <see cref="AgentQuestion.TargetChannelId"/>
-/// are orchestrator-native natural keys (internal user ID, Teams channel ID) — they are
-/// <i>not</i> Bot Framework <c>ConversationId</c>s and routing them through
-/// <see cref="IConversationReferenceRouter.GetByConversationIdAsync"/> would (a) miss
-/// every legitimately registered proactive target whose internal user / channel ID does
-/// not happen to equal a stored conversation ID, and (b) bypass the tenant scope on
-/// <see cref="AgentQuestion.TenantId"/>. The natural-key lookups
-/// (<see cref="IConversationReferenceStore.GetByInternalUserIdAsync"/> and
-/// <see cref="IConversationReferenceStore.GetByChannelIdAsync"/>) are the same contract
-/// the canonical <see cref="TeamsMessengerConnector.SendQuestionAsync"/> uses at
-/// dispatch time, keeping the outbox-backed decorator and the direct connector in lock
-/// step.
-/// </para>
-/// <para>
 /// <b>Stage 6.2 step 4 — outbound deduplication with in-flight coordination.</b> Before
 /// enqueueing an outbox entry the decorator consults the optional
 /// <see cref="OutboundMessageDeduplicator"/> singleton via its <see cref="OutboundMessageDeduplicator.Claim"/>
@@ -66,7 +51,8 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// themselves as the new owner. This guarantees that exactly one outbox row lands per
 /// <c>(CorrelationId, DestinationId)</c> tuple within the window <i>even when</i>
 /// concurrent sends race and the first attempt fails after the loser has already
-/// observed the claim.
+/// observed the claim. Iter-3 evaluator fix #1 closes the prior gap where a loser
+/// could return success-shaped while the winner rolled back, dropping the send.
 /// </para>
 /// <para>
 /// <b>Failure-mode taxonomy.</b> Two distinct error shapes can surface from
@@ -89,7 +75,9 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// <see cref="OutboundDeduplicationException.ConversationId"/>, and
 /// <see cref="OutboundDeduplicationException.Attempts"/> so upstream retry policies can
 /// filter on the exception type (no string parsing required) and surface a per-key
-/// retry signal.
+/// retry signal. Iter-4 evaluator fix: previously both failure modes shared the
+/// <see cref="InvalidOperationException"/> type, forcing message-string inspection to
+/// distinguish them.
 /// </description>
 /// </item>
 /// </list>
@@ -122,8 +110,9 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<OutboxBackedMessengerConnector> _logger;
     private readonly OutboundMessageDeduplicator? _outboundDeduplicator;
+    private readonly TeamsConnectorTelemetry? _telemetry;
 
-    /// <summary>Construct the decorator (legacy 6-arg overload — no outbound deduplicator wired).</summary>
+    /// <summary>Construct the decorator (legacy 5-arg overload — no outbound deduplicator wired).</summary>
     /// <param name="innerConnector">The wrapped <see cref="TeamsMessengerConnector"/>. Used for <see cref="ReceiveAsync"/> only.</param>
     /// <param name="outbox">Outbox queue for outbound deliveries.</param>
     /// <param name="conversationReferenceRouter">Router used by <see cref="SendMessageAsync"/> to resolve the tenant scope for
@@ -144,7 +133,7 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         IAgentQuestionStore agentQuestionStore,
         ILogger<OutboxBackedMessengerConnector> logger,
         TimeProvider? timeProvider = null)
-        : this(innerConnector, outbox, conversationReferenceRouter, conversationReferenceStore, agentQuestionStore, logger, timeProvider, outboundDeduplicator: null)
+        : this(innerConnector, outbox, conversationReferenceRouter, conversationReferenceStore, agentQuestionStore, logger, timeProvider, outboundDeduplicator: null, telemetry: null)
     {
     }
 
@@ -156,6 +145,20 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
     /// <see cref="MessengerMessage.ConversationId"/>) within the configured window are
     /// suppressed at the decorator boundary.
     /// </summary>
+    /// <remarks>
+    /// Stage 6.3 iter-6 evaluator feedback item 2 — the optional
+    /// <paramref name="telemetry"/> parameter receives the canonical
+    /// <see cref="TeamsConnectorTelemetry"/> singleton from DI so this decorator
+    /// (which is the production <see cref="IMessengerConnector"/> in every
+    /// outbox-engine composition — see
+    /// <c>TeamsOutboxServiceCollectionExtensions.AddTeamsOutboxEngine</c>) emits the
+    /// canonical <c>teams.messages.sent</c> counter for every accepted enqueue.
+    /// Without this, the §6.3 step 2 sent-message metric was incremented only by
+    /// the inner <see cref="TeamsMessengerConnector"/>'s in-process synchronous
+    /// path — which the outbox-engine composition NEVER invokes for outbound sends
+    /// (the inner connector is consumed only for <see cref="ReceiveAsync"/>
+    /// forwarding) — leaving the metric flat at zero on production deployments.
+    /// </remarks>
     public OutboxBackedMessengerConnector(
         IMessengerConnector innerConnector,
         IMessageOutbox outbox,
@@ -164,7 +167,8 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         IAgentQuestionStore agentQuestionStore,
         ILogger<OutboxBackedMessengerConnector> logger,
         TimeProvider? timeProvider,
-        OutboundMessageDeduplicator? outboundDeduplicator)
+        OutboundMessageDeduplicator? outboundDeduplicator,
+        TeamsConnectorTelemetry? telemetry = null)
     {
         _innerConnector = innerConnector ?? throw new ArgumentNullException(nameof(innerConnector));
         _outbox = outbox ?? throw new ArgumentNullException(nameof(outbox));
@@ -174,12 +178,25 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _timeProvider = timeProvider ?? TimeProvider.System;
         _outboundDeduplicator = outboundDeduplicator;
+        _telemetry = telemetry;
     }
 
     /// <inheritdoc />
     public async Task SendMessageAsync(MessengerMessage message, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(message);
+
+        // Iter-7 evaluator fix item 1 — open the canonical Stage 6.3 log scope at the
+        // outer boundary so EVERY log entry the decorator emits (the dedupe-coordination
+        // Information at the loser path, the retry-exhaustion Warning, and the inner
+        // EnqueueCoreAsync logs) carries the CorrelationId enrichment. MessengerMessage
+        // does not carry TenantId / UserId fields (the payload is platform-agnostic),
+        // so this outer scope is correlation-only — the nested scope inside
+        // EnqueueCoreAsync layers tenant + user enrichment on top once the conversation
+        // reference has resolved.
+        using var outerLogScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: message.CorrelationId);
 
         // Fast path — no deduplicator wired (legacy 5-arg constructor) or the message
         // lacks the keys needed for dedupe. Run the pipeline directly without any
@@ -195,10 +212,16 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         // Stage 6.2 step 4 — suppress duplicate (CorrelationId, ConversationId) pairs
         // within the configured window with in-flight coordination so concurrent
         // losers do NOT return success-shaped while the winner is still mid-enqueue.
-        // The Claim API exposes the winner's outcome task so the loser blocks until
-        // the winner commits (suppress as real duplicate) or rolls back (re-claim
-        // and retry as the new owner). A bounded retry loop prevents pathological
-        // churn if every claimed owner crashes immediately.
+        //
+        // Iter-3 evaluator fix #1: previously the loser short-circuited as soon as
+        // TryRegister observed an existing entry, even if the winning thread had not
+        // yet reached EnqueueAsync. If the winner then threw (transient infrastructure
+        // failure) and rolled back the slot via Remove, the loser's caller had already
+        // received a successful-no-op response and would never retry — silently
+        // dropping the send. The Claim API now exposes the winner's outcome task so
+        // the loser blocks until the winner commits (suppress as real duplicate) or
+        // rolls back (re-claim and retry as the new owner). A bounded retry loop
+        // prevents pathological churn if every claimed owner crashes immediately.
         for (var attempt = 1; ; attempt++)
         {
             var claim = _outboundDeduplicator.Claim(message.CorrelationId, message.ConversationId);
@@ -250,13 +273,15 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
 
             // Winner rolled back. Re-claim as the new owner and retry the pipeline
             // ourselves — bounded so a pathological pattern (every claim's first owner
-            // crashes immediately) cannot spin forever. The exhaustion failure is
-            // surfaced as a dedicated OutboundDeduplicationException carrying
-            // CorrelationId / ConversationId / Attempts so upstream retry policies
-            // can filter on the exception TYPE (and inspect structured properties)
-            // instead of string-matching against the InvalidOperationException raised
-            // by EnqueueCoreAsync's missing-reference path — which is a permanent
-            // failure that must NOT be looped on.
+            // crashes immediately) cannot spin forever.
+            //
+            // Iter-4 evaluator fix: the exhaustion failure is surfaced as a dedicated
+            // OutboundDeduplicationException carrying CorrelationId / ConversationId /
+            // Attempts so upstream retry policies can filter on the exception TYPE
+            // (and inspect structured properties) instead of string-matching against
+            // the InvalidOperationException raised by EnqueueCoreAsync's
+            // missing-reference path — which is a permanent failure that must NOT be
+            // looped on.
             if (attempt >= MaxClaimAttempts)
             {
                 _logger.LogWarning(
@@ -285,39 +310,99 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
     /// </summary>
     private async Task EnqueueCoreAsync(MessengerMessage message, CancellationToken ct)
     {
-        // Resolve the persisted reference via the router so we can capture the snapshot
-        // and the tenant ID. The lookup is intentionally identical to what
-        // TeamsMessengerConnector.SendMessageAsync does at dispatch time — failing here
-        // surfaces missing-reference errors at enqueue rather than after the delivery
-        // window opens.
-        var stored = await _conversationReferenceRouter
-            .GetByConversationIdAsync(message.ConversationId, ct)
-            .ConfigureAwait(false)
-            ?? throw new InvalidOperationException(
-                $"No TeamsConversationReference is registered for ConversationId '{message.ConversationId}'; refusing to enqueue an outbound MessengerMessage that cannot be routed.");
-
-        var entry = new OutboxEntry
-        {
-            OutboxEntryId = Guid.NewGuid().ToString("N"),
-            CorrelationId = message.CorrelationId,
-            Destination = $"teams://{Uri.EscapeDataString(stored.TenantId)}/conversation/{Uri.EscapeDataString(message.ConversationId)}",
-            DestinationType = null,
-            DestinationId = message.ConversationId,
-            PayloadType = OutboxPayloadTypes.MessengerMessage,
-            PayloadJson = System.Text.Json.JsonSerializer.Serialize(
-                new TeamsOutboxPayloadEnvelope { Message = message },
-                TeamsOutboxPayloadEnvelope.JsonOptions),
-            ConversationReferenceJson = stored.ReferenceJson,
-            CreatedAt = _timeProvider.GetUtcNow(),
-        };
-
-        await _outbox.EnqueueAsync(entry, ct).ConfigureAwait(false);
-        _logger.LogInformation(
-            "Enqueued outbox entry {OutboxEntryId} for outbound MessengerMessage {MessageId} (correlation {CorrelationId}) -> conversation {ConversationId}.",
-            entry.OutboxEntryId,
-            message.MessageId,
+        // Iter-7 evaluator fix item 2 — open the canonical TeamsConnector.SendMessage
+        // OpenTelemetry span at the production outbox-backed boundary. The reliable
+        // deployment composition (AddTeamsOutboxEngine) makes this decorator the
+        // public IMessengerConnector — the inner TeamsMessengerConnector.SendMessageAsync
+        // (which holds the original span) is NEVER invoked for outbound sends. Without
+        // this hook, traces emitted by orchestrators that call IMessengerConnector.SendMessageAsync
+        // on production deployments would have no SendMessage span at all.
+        // The span scope wraps the reference lookup, dedupe-coordinated enqueue, and
+        // log emission so trace consumers see the end-to-end accept latency the caller
+        // observed. The OutboxRetryEngine path layers its own dispatch span on the
+        // worker side when the entry is actually delivered to Bot Framework.
+        using var activity = _telemetry?.StartSendActivity(
+            TeamsConnectorTelemetry.SendMessageActivityName,
             message.CorrelationId,
-            message.ConversationId);
+            TeamsConnectorTelemetry.MessageTypeMessengerMessage,
+            TeamsConnectorTelemetry.DestinationTypeConversation);
+
+        try
+        {
+            // Resolve the persisted reference via the router so we can capture the snapshot
+            // and the tenant ID. The lookup is intentionally identical to what
+            // TeamsMessengerConnector.SendMessageAsync does at dispatch time — failing here
+            // surfaces missing-reference errors at enqueue rather than after the delivery
+            // window opens.
+            var stored = await _conversationReferenceRouter
+                .GetByConversationIdAsync(message.ConversationId, ct)
+                .ConfigureAwait(false)
+                ?? throw new InvalidOperationException(
+                    $"No TeamsConversationReference is registered for ConversationId '{message.ConversationId}'; refusing to enqueue an outbound MessengerMessage that cannot be routed.");
+
+            // Iter-7 evaluator fix item 1 — layer tenant + user enrichment on top of the
+            // outer correlation-only scope opened by SendMessageAsync now that the
+            // reference has resolved. The LogInformation below (and any inner adapter
+            // log emitted before this method returns) is now stamped with the full
+            // (CorrelationId, TenantId, UserId) three-key contract mandated by §6.3
+            // step 5.
+            using var enrichedLogScope = TeamsLogScope.BeginScope(
+                _logger,
+                correlationId: null,
+                tenantId: stored.TenantId,
+                userId: stored.InternalUserId);
+
+            var entry = new OutboxEntry
+            {
+                OutboxEntryId = Guid.NewGuid().ToString("N"),
+                CorrelationId = message.CorrelationId,
+                Destination = $"teams://{Uri.EscapeDataString(stored.TenantId)}/conversation/{Uri.EscapeDataString(message.ConversationId)}",
+                DestinationType = null,
+                DestinationId = message.ConversationId,
+                PayloadType = OutboxPayloadTypes.MessengerMessage,
+                PayloadJson = System.Text.Json.JsonSerializer.Serialize(
+                    new TeamsOutboxPayloadEnvelope { Message = message },
+                    TeamsOutboxPayloadEnvelope.JsonOptions),
+                ConversationReferenceJson = stored.ReferenceJson,
+                CreatedAt = _timeProvider.GetUtcNow(),
+            };
+
+            await _outbox.EnqueueAsync(entry, ct).ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "Enqueued outbox entry {OutboxEntryId} for outbound MessengerMessage {MessageId} (correlation {CorrelationId}) -> conversation {ConversationId}.",
+                entry.OutboxEntryId,
+                message.MessageId,
+                message.CorrelationId,
+                message.ConversationId);
+        }
+        catch (Exception ex) when (activity is not null)
+        {
+            activity.SetStatus(System.Diagnostics.ActivityStatusCode.Error, ex.Message);
+            activity.SetTag("exception.type", ex.GetType().FullName);
+            throw;
+        }
+        finally
+        {
+            // Stage 6.3 iter-8 evaluator fix item 3 — emit the canonical
+            // `teams.messages.sent` counter under "attempt" semantics: one increment
+            // per outbound boundary call regardless of outcome (success, missing
+            // reference, transient outbox failure, ...). This aligns with the
+            // direct `TeamsMessengerConnector.SendMessageAsync` path — see
+            // `TeamsConnectorTelemetry.RecordMessageSent` xmldoc for the contract
+            // and the failure-rate derivation. Both classifier tags
+            // (messageType=MessengerMessage, destinationType=Conversation) are
+            // fixed for this method's payload shape so they are knowable BEFORE the
+            // reference lookup, which means the counter increments correctly even on
+            // the missing-reference failure path that throws inside the try block
+            // above. The `teams.outbox.deliveries{outcome="Success"}` counter from
+            // `OutboxMetrics` reports the success numerator separately so dashboards
+            // can compute attempt success rate with consistent denominators across
+            // both connector compositions.
+            _telemetry?.RecordMessageSent(
+                TeamsConnectorTelemetry.MessageTypeMessengerMessage,
+                TeamsConnectorTelemetry.DestinationTypeConversation);
+        }
     }
 
     /// <inheritdoc />
@@ -330,73 +415,131 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
         // (type, message) across every send surface.
         TeamsQuestionSendGuards.ValidateQuestion(question);
 
-        // Resolve via the question's own natural-key routing fields — exactly one of
-        // TargetUserId / TargetChannelId is set (enforced by Validate()). These are
-        // orchestrator-native identifiers (internal user ID, Teams channel ID) — NOT
-        // Bot Framework ConversationIds — so the lookup MUST go through the canonical
-        // IConversationReferenceStore.GetByInternalUserIdAsync / GetByChannelIdAsync
-        // contract, exactly as the direct TeamsMessengerConnector.SendQuestionAsync does
-        // at dispatch time. Routing the orchestrator-native ID through the router's
-        // GetByConversationIdAsync would (a) silently miss every legitimate proactive
-        // target whose internal user / channel ID does not equal a stored Bot Framework
-        // conversation ID, and (b) drop the TenantId scope (router is tenant-agnostic).
-        TeamsConversationReference stored;
-        string destinationType;
-        string destinationId;
-        string destination;
-        if (!string.IsNullOrWhiteSpace(question.TargetUserId))
-        {
-            stored = await _conversationReferenceStore
-                .GetByInternalUserIdAsync(question.TenantId, question.TargetUserId!, ct)
-                .ConfigureAwait(false)
-                ?? throw new InvalidOperationException(
-                    $"AgentQuestion '{question.QuestionId}' targets tenant '{question.TenantId}' user '{question.TargetUserId}' but no active TeamsConversationReference is registered for that natural key. The Teams app must be installed for the target user before proactive delivery can succeed.");
-            destinationType = OutboxDestinationTypes.Personal;
-            destinationId = question.TargetUserId!;
-            destination = $"teams://{Uri.EscapeDataString(question.TenantId)}/user/{Uri.EscapeDataString(destinationId)}";
-        }
-        else
-        {
-            stored = await _conversationReferenceStore
-                .GetByChannelIdAsync(question.TenantId, question.TargetChannelId!, ct)
-                .ConfigureAwait(false)
-                ?? throw new InvalidOperationException(
-                    $"AgentQuestion '{question.QuestionId}' targets tenant '{question.TenantId}' channel '{question.TargetChannelId}' but no active TeamsConversationReference is registered for that natural key. The Teams app must be installed in the target channel before proactive delivery can succeed.");
-            destinationType = OutboxDestinationTypes.Channel;
-            destinationId = question.TargetChannelId!;
-            destination = $"teams://{Uri.EscapeDataString(question.TenantId)}/channel/{Uri.EscapeDataString(destinationId)}";
-        }
+        // Iter-7 evaluator fix item 1 — open the canonical (CorrelationId, TenantId,
+        // UserId) Stage 6.3 log scope at the outer boundary so EVERY log entry
+        // emitted by the decorator (including the per-question pre-save log in
+        // PreEnqueueSaveQuestionAsync) carries the full three-key enrichment. Unlike
+        // MessengerMessage, AgentQuestion natively carries TenantId AND the natural-key
+        // user identifier so the scope can be opened up-front without waiting on the
+        // reference lookup. TargetUserId is null for channel-targeted questions;
+        // TeamsLogScope.BeginScope substitutes TeamsLogScope.EmptyValueSentinel ("-")
+        // into the UserId slot per the Stage 6.3 iter-10 every-log-entry contract so
+        // the scope ALWAYS carries all three keys — dashboards see "UserId=-" on
+        // channel-scoped sends rather than a missing slot.
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: question.CorrelationId,
+            tenantId: question.TenantId,
+            userId: question.TargetUserId);
 
-        // Stage 6.1 canonical pre-enqueue AgentQuestion persistence per
-        // implementation-plan.md §6.1 — see class remarks. SaveAsync MUST land before
-        // EnqueueAsync so CardActionHandler.GetByIdAsync(questionId) can immediately
-        // resolve the question row when the user taps approve/reject after the
-        // OutboxRetryEngine delivers the card, including the millisecond-fast case.
-        await PreEnqueueSaveQuestionAsync(question, ct).ConfigureAwait(false);
-
-        var entry = new OutboxEntry
-        {
-            OutboxEntryId = Guid.NewGuid().ToString("N"),
-            CorrelationId = question.CorrelationId,
-            Destination = destination,
-            DestinationType = destinationType,
-            DestinationId = destinationId,
-            PayloadType = OutboxPayloadTypes.AgentQuestion,
-            PayloadJson = System.Text.Json.JsonSerializer.Serialize(
-                new TeamsOutboxPayloadEnvelope { Question = question },
-                TeamsOutboxPayloadEnvelope.JsonOptions),
-            ConversationReferenceJson = stored.ReferenceJson,
-            CreatedAt = _timeProvider.GetUtcNow(),
-        };
-
-        await _outbox.EnqueueAsync(entry, ct).ConfigureAwait(false);
-        _logger.LogInformation(
-            "Enqueued outbox entry {OutboxEntryId} for AgentQuestion {QuestionId} (correlation {CorrelationId}) -> {DestinationType} {DestinationId}.",
-            entry.OutboxEntryId,
-            question.QuestionId,
+        // Iter-7 evaluator fix item 2 — start the canonical TeamsConnector.SendQuestion
+        // OpenTelemetry span on the production outbox-backed boundary so the span graph
+        // is symmetric across the synchronous send path and the reliable outbox-engine
+        // path. The destinationType tag is derived from the question's natural-key
+        // routing (User vs Channel) so trace consumers can slice the span volume by
+        // destination kind. The OutboxRetryEngine path layers its own dispatch span on
+        // the worker side when the entry is delivered to Bot Framework.
+        var spanDestinationType = !string.IsNullOrWhiteSpace(question.TargetUserId)
+            ? TeamsConnectorTelemetry.DestinationTypeUser
+            : TeamsConnectorTelemetry.DestinationTypeChannel;
+        using var activity = _telemetry?.StartSendActivity(
+            TeamsConnectorTelemetry.SendQuestionActivityName,
             question.CorrelationId,
-            destinationType,
-            destinationId);
+            TeamsConnectorTelemetry.MessageTypeAgentQuestion,
+            spanDestinationType);
+
+        try
+        {
+            // Resolve via the question's own natural-key routing fields — exactly one of
+            // TargetUserId / TargetChannelId is set (enforced by Validate()). These are
+            // orchestrator-native identifiers (internal user ID, Teams channel ID) — NOT
+            // Bot Framework ConversationIds — so the lookup MUST go through the canonical
+            // IConversationReferenceStore.GetByInternalUserIdAsync / GetByChannelIdAsync
+            // contract, exactly as the direct TeamsMessengerConnector.SendQuestionAsync does
+            // at dispatch time. Routing the orchestrator-native ID through the router's
+            // GetByConversationIdAsync would (a) silently miss every legitimate proactive
+            // target whose internal user / channel ID does not equal a stored Bot Framework
+            // conversation ID, and (b) drop the TenantId scope (router is tenant-agnostic).
+            TeamsConversationReference stored;
+            string destinationType;
+            string destinationId;
+            string destination;
+            if (!string.IsNullOrWhiteSpace(question.TargetUserId))
+            {
+                stored = await _conversationReferenceStore
+                    .GetByInternalUserIdAsync(question.TenantId, question.TargetUserId!, ct)
+                    .ConfigureAwait(false)
+                    ?? throw new InvalidOperationException(
+                        $"AgentQuestion '{question.QuestionId}' targets tenant '{question.TenantId}' user '{question.TargetUserId}' but no active TeamsConversationReference is registered for that natural key. The Teams app must be installed for the target user before proactive delivery can succeed.");
+                destinationType = OutboxDestinationTypes.Personal;
+                destinationId = question.TargetUserId!;
+                destination = $"teams://{Uri.EscapeDataString(question.TenantId)}/user/{Uri.EscapeDataString(destinationId)}";
+            }
+            else
+            {
+                stored = await _conversationReferenceStore
+                    .GetByChannelIdAsync(question.TenantId, question.TargetChannelId!, ct)
+                    .ConfigureAwait(false)
+                    ?? throw new InvalidOperationException(
+                        $"AgentQuestion '{question.QuestionId}' targets tenant '{question.TenantId}' channel '{question.TargetChannelId}' but no active TeamsConversationReference is registered for that natural key. The Teams app must be installed in the target channel before proactive delivery can succeed.");
+                destinationType = OutboxDestinationTypes.Channel;
+                destinationId = question.TargetChannelId!;
+                destination = $"teams://{Uri.EscapeDataString(question.TenantId)}/channel/{Uri.EscapeDataString(destinationId)}";
+            }
+
+            // Stage 6.1 canonical pre-enqueue AgentQuestion persistence per
+            // implementation-plan.md §6.1 — see class remarks. SaveAsync MUST land before
+            // EnqueueAsync so CardActionHandler.GetByIdAsync(questionId) can immediately
+            // resolve the question row when the user taps approve/reject after the
+            // OutboxRetryEngine delivers the card, including the millisecond-fast case.
+            await PreEnqueueSaveQuestionAsync(question, ct).ConfigureAwait(false);
+
+            var entry = new OutboxEntry
+            {
+                OutboxEntryId = Guid.NewGuid().ToString("N"),
+                CorrelationId = question.CorrelationId,
+                Destination = destination,
+                DestinationType = destinationType,
+                DestinationId = destinationId,
+                PayloadType = OutboxPayloadTypes.AgentQuestion,
+                PayloadJson = System.Text.Json.JsonSerializer.Serialize(
+                    new TeamsOutboxPayloadEnvelope { Question = question },
+                    TeamsOutboxPayloadEnvelope.JsonOptions),
+                ConversationReferenceJson = stored.ReferenceJson,
+                CreatedAt = _timeProvider.GetUtcNow(),
+            };
+
+            await _outbox.EnqueueAsync(entry, ct).ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "Enqueued outbox entry {OutboxEntryId} for AgentQuestion {QuestionId} (correlation {CorrelationId}) -> {DestinationType} {DestinationId}.",
+                entry.OutboxEntryId,
+                question.QuestionId,
+                question.CorrelationId,
+                destinationType,
+                destinationId);
+        }
+        catch (Exception ex) when (activity is not null)
+        {
+            activity.SetStatus(System.Diagnostics.ActivityStatusCode.Error, ex.Message);
+            activity.SetTag("exception.type", ex.GetType().FullName);
+            throw;
+        }
+        finally
+        {
+            // Stage 6.3 iter-8 evaluator fix item 3 — emit the canonical
+            // `teams.messages.sent` counter under the same "attempt" semantics the
+            // direct `TeamsMessengerConnector.SendQuestionAsync` uses: one increment
+            // per outbound boundary call regardless of outcome. The destinationType
+            // classifier is `spanDestinationType` (derived from the question's
+            // natural-key targeting BEFORE the reference lookup), so the counter
+            // increments correctly even when the reference-store lookup misses and
+            // throws inside the try block above. See
+            // `TeamsConnectorTelemetry.RecordMessageSent` xmldoc for the contract.
+            _telemetry?.RecordMessageSent(
+                TeamsConnectorTelemetry.MessageTypeAgentQuestion,
+                spanDestinationType);
+        }
     }
 
     /// <summary>
@@ -478,9 +621,10 @@ public sealed class OutboxBackedMessengerConnector : IMessengerConnector
 /// </description>
 /// </item>
 /// </list>
-/// The dedicated type (with structured properties) lets policies filter via a single
-/// <c>catch</c> clause rather than inspecting the exception message string to decide
-/// whether to loop.
+/// Iter-4 evaluator fix: previously both modes shared the
+/// <see cref="InvalidOperationException"/> type, forcing upstream retry policies to
+/// inspect the exception message string to decide whether to loop. A dedicated type
+/// (with structured properties) lets policies filter via a single <c>catch</c> clause.
 /// </para>
 /// <para>
 /// The structured properties (<see cref="CorrelationId"/>, <see cref="ConversationId"/>,

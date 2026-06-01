@@ -274,10 +274,27 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
 
         // Stage 6.3 — open a structured-logging scope so every ILogger entry below
         // (including the warning path on InstallationStateGate rejection) carries the
-        // canonical CorrelationId / TenantId / UserId enrichment without each call site
-        // having to repeat the structured args. The user / tenant fields are empty on a
-        // MessengerMessage (the payload carries only a ConversationId); only
-        // CorrelationId is meaningful here.
+        // canonical correlation enrichment without each call site having to repeat the
+        // structured args.
+        //
+        // Stage 6.3 iter-10 evaluator fix item 4 — the outer scope intentionally
+        // passes ONLY correlationId; the MessengerMessage payload carries no tenant /
+        // user identifier. TeamsLogScope.BeginScope substitutes
+        // TeamsLogScope.EmptyValueSentinel ("-") for the missing tenant / user slots
+        // so the pre-lookup InstallationGateRejected warning on the missing-reference
+        // path (line ~336 below) ALWAYS carries all three §6.3 step 5 keys — never
+        // a missing slot — regardless of whether the reference resolves successfully.
+        // When this connector is composed underneath OutboxRetryEngine's per-entry
+        // scope, the helper inherits the engine-supplied tenant / user values from
+        // the parent TeamsLogContext frame rather than overwriting them with the
+        // sentinel (the inheritance rule is documented on TeamsLogScope.BeginScope).
+        //
+        // Iter-7 evaluator fix item 3 — once the reference lookup succeeds at
+        // line ~344 below, a NESTED scope is pushed that layers TenantId +
+        // InternalUserId from the resolved TeamsConversationReference on top of this
+        // outer scope, replacing the sentinels with the real identity values for
+        // every log entry emitted on the happy path AND for any post-lookup failure
+        // (the inner adapter callback, persistence step, etc.).
         using var logScope = TeamsLogScope.BeginScope(_logger, correlationId: message.CorrelationId);
 
         // Stage 6.3 — start the OpenTelemetry span and the stopwatch BEFORE any
@@ -341,6 +358,26 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
                     $"The Teams app must be installed and a prior interaction must have captured a reference before proactive delivery can succeed.");
             }
 
+            // Iter-7 evaluator fix item 3 — layer tenant + user enrichment on top of
+            // the outer correlation-only scope opened at the top of SendMessageAsync now
+            // that the conversation reference has resolved. The LogInformation below
+            // (and the inner adapter callback invoked via ContinueConversationAsync —
+            // see TeamsLogContext for the AsyncLocal flow across the Bot Framework
+            // callback boundary) is now stamped with the full (CorrelationId, TenantId,
+            // UserId) three-key contract mandated by §6.3 step 5.
+            //
+            // Stage 6.3 iter-10 evaluator fix item 4 — the pre-lookup warning above
+            // already carries all three keys courtesy of TeamsLogScope's sentinel
+            // substitution on the outer scope; this nested scope simply replaces the
+            // sentinels with the real tenant / user identifiers once they become
+            // available so post-lookup log entries carry actionable identity rather
+            // than the "-" placeholder.
+            using var enrichedLogScope = TeamsLogScope.BeginScope(
+                _logger,
+                correlationId: null,
+                tenantId: stored.TenantId,
+                userId: stored.InternalUserId);
+
             var conversationReference = DeserializeReference(stored);
 
             _logger.LogInformation(
@@ -391,14 +428,12 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
                 // mix transient-error retry timing into the SLA bucket and pull P95
                 // away from the user-visible delivery latency the SLA targets.
                 Telemetry.RecordMessageSent(
-                    message.CorrelationId,
                     TeamsConnectorTelemetry.MessageTypeMessengerMessage,
                     TeamsConnectorTelemetry.DestinationTypeConversation);
                 if (succeeded)
                 {
                     Telemetry.RecordCardDeliveryDurationMs(
                         sw.Elapsed.TotalMilliseconds,
-                        message.CorrelationId,
                         TeamsConnectorTelemetry.MessageTypeMessengerMessage,
                         TeamsConnectorTelemetry.DestinationTypeConversation);
                 }
@@ -440,7 +475,11 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
 
         // Stage 6.3 — open the canonical CorrelationId / TenantId / UserId log scope.
         // AgentQuestion carries all three; TargetUserId is null for channel-scoped
-        // questions so the channel path does not emit a UserId enrichment.
+        // questions so the channel path delegates to TeamsLogScope.BeginScope's
+        // sentinel-substitution path (per Stage 6.3 iter-10 evaluator fix item 3) —
+        // the UserId slot lands as TeamsLogScope.EmptyValueSentinel ("-") rather than
+        // being omitted, satisfying the §6.3 step 5 "every log entry carries all
+        // three keys" contract on the channel path too.
         //
         // Iter-5 evaluator feedback item 1 — STRUCTURAL fix. Previously this site
         // passed `userId: destinationId`, which on the channel path resolves to
@@ -635,14 +674,12 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
                 // surrounding comment ("on every send attempt regardless of
                 // success") and made failure spikes invisible to operators.
                 Telemetry.RecordMessageSent(
-                    question.CorrelationId,
                     TeamsConnectorTelemetry.MessageTypeAgentQuestion,
                     destinationType);
                 if (succeeded)
                 {
                     Telemetry.RecordCardDeliveryDurationMs(
                         sw.Elapsed.TotalMilliseconds,
-                        question.CorrelationId,
                         TeamsConnectorTelemetry.MessageTypeAgentQuestion,
                         destinationType);
                 }
@@ -669,7 +706,6 @@ public sealed class TeamsMessengerConnector : IMessengerConnector, ITeamsCardMan
             }
 
             Telemetry?.RecordMessageReceived(
-                correlationId,
                 TeamsConnectorTelemetry.MessageTypeInboundEvent,
                 TeamsConnectorTelemetry.DestinationTypeInbound);
 

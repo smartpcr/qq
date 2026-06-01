@@ -242,20 +242,24 @@ public sealed class TeamsMessengerConnectorTests
     }
 
     // -----------------------------------------------------------------------------------
-    // Iter-5 evaluator feedback item 1 — channel-targeted SendQuestionAsync must NOT
-    // stamp the channel ID into the canonical TeamsLogScope UserId enrichment slot.
+    // Stage 6.3 iter-10 evaluator fix item 3 — channel-targeted SendQuestionAsync must
+    // emit the canonical (CorrelationId, TenantId, UserId) three-key shape with the
+    // UserId slot set to TeamsLogScope.EmptyValueSentinel ("-") rather than omitting
+    // the key. The §6.3 step 5 every-log-entry contract requires structural presence
+    // of all three keys; "missing key" emissions break dashboards that filter on the
+    // absence of an enrichment slot.
     // -----------------------------------------------------------------------------------
 
     [Fact]
-    public async Task SendQuestionAsync_ChannelTarget_LogScopeOmitsUserIdEnrichment()
+    public async Task SendQuestionAsync_ChannelTarget_LogScopeSubstitutesSentinelForUserId()
     {
-        // Iter-5 — Regression for the channel-as-UserId mislabel at
-        // TeamsMessengerConnector.SendQuestionAsync (formerly line ~390 in iter-4 layout).
         // When the orchestrator routes a question to a channel (TargetChannelId set,
         // TargetUserId null), the connector's logging scope MUST contain
-        // (CorrelationId, TenantId) only; UserId must be absent so dashboards and
-        // user-oriented RBAC queries are not polluted with channel IDs that look
-        // like user IDs.
+        // (CorrelationId, TenantId, UserId) all three keys with UserId =
+        // TeamsLogScope.EmptyValueSentinel so dashboards see "UserId=-" on
+        // channel-scoped sends rather than a missing slot — and so the channel ID
+        // is NOT mislabelled as a user identifier (preserving the iter-5 STRUCTURAL
+        // fix to RBAC / user-oriented queries).
         var logger = new ConnectorScopeRecordingLogger();
         var harness = ConnectorHarness.Build(logger: logger);
         var stored = NewChannelReference("ref-channel-scope", channelId: "19:team-channel-scope");
@@ -273,10 +277,13 @@ public sealed class TeamsMessengerConnectorTests
             d => d.TryGetValue(TeamsLogScope.CorrelationIdKey, out var c)
                  && (string?)c == question.CorrelationId);
         Assert.Equal(TenantId, dispatchScope[TeamsLogScope.TenantIdKey]);
-        Assert.False(
+        Assert.True(
             dispatchScope.ContainsKey(TeamsLogScope.UserIdKey),
-            "Channel-targeted SendQuestionAsync must not emit the UserId enrichment key. " +
-            $"Found UserId='{(dispatchScope.TryGetValue(TeamsLogScope.UserIdKey, out var v) ? v : null)}'.");
+            "Channel-targeted SendQuestionAsync must structurally carry the UserId enrichment key per §6.3 step 5.");
+        Assert.Equal(TeamsLogScope.EmptyValueSentinel, dispatchScope[TeamsLogScope.UserIdKey]);
+        Assert.NotEqual(
+            "19:team-channel-scope",
+            dispatchScope[TeamsLogScope.UserIdKey]);
     }
 
     [Fact]
@@ -322,6 +329,83 @@ public sealed class TeamsMessengerConnectorTests
         Assert.Empty(harness.CardStateStore.Saved);
         Assert.Empty(harness.AgentQuestionStore.ConversationIdUpdates);
         Assert.Empty(harness.Adapter.ContinueCalls);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Iter-7 evaluator feedback item 3 — TeamsMessengerConnector.SendMessageAsync MUST
+    // push the canonical Stage 6.3 three-key (CorrelationId, TenantId, UserId) enrichment
+    // onto every log entry that fires AFTER the conversation reference resolves. The
+    // outer scope opened at the boundary is correlation-only (MessengerMessage carries
+    // no tenant / user field on the payload itself); a NESTED scope MUST layer the
+    // tenant + user identity from the resolved TeamsConversationReference so the
+    // LogInformation at line ~346 (and any inner adapter log emitted via
+    // ContinueConversationAsync) carries all three keys per the §6.3 step 5 contract.
+    //
+    // Stage 6.3 iter-10 evaluator fix item 3+4 — even the OUTER (pre-lookup) scope
+    // now structurally carries all three keys, with TeamsLogScope.EmptyValueSentinel
+    // ("-") in the tenant/user slots since the MessengerMessage payload has no such
+    // identifiers. This pin asserts BOTH scope frames in the new iter-10 shape so a
+    // regression that drops sentinel substitution surfaces here.
+    // -----------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task SendMessageAsync_AfterReferenceResolved_LayersTenantAndUserEnrichmentOnTopOfCorrelationScope()
+    {
+        // Drive a happy-path SendMessageAsync against a logger that snapshots every
+        // BeginScope dictionary. We expect TWO scopes:
+        //   (1) outer scope opened at the connector boundary with CorrelationId real
+        //       AND TenantId / UserId = TeamsLogScope.EmptyValueSentinel — the
+        //       MessengerMessage payload carries no tenant / user identifier so the
+        //       helper substitutes the sentinel into those slots so the pre-lookup
+        //       InstallationGateRejected warning still carries the three-key shape.
+        //   (2) inner scope opened immediately after the router returns the resolved
+        //       TeamsConversationReference with TenantId + UserId real (and the
+        //       CorrelationId inherited from the parent TeamsLogContext frame via
+        //       TeamsLogScope's parent-inheritance rule).
+        // The test pins this layered structure so a future refactor that drops the
+        // sentinel substitution (regressing back to the iter-9 omit-empty-keys shape
+        // the iter-10 evaluator flagged) fails loudly here.
+        var logger = new ConnectorScopeRecordingLogger();
+        var harness = ConnectorHarness.Build(logger: logger);
+        var stored = NewPersonalReference("ref-1", aadObjectId: "aad-dave", internalUserId: "internal-dave");
+        harness.ConversationReferenceRouter.PreloadByConversationId[ConversationId] = stored;
+
+        var message = new MessengerMessage(
+            MessageId: "msg-scope-3key",
+            CorrelationId: "corr-scope-3key",
+            AgentId: "agent-build",
+            TaskId: "task-42",
+            ConversationId: ConversationId,
+            Body: "scope-test",
+            Severity: MessageSeverities.Info,
+            Timestamp: DateTimeOffset.UtcNow);
+
+        await harness.Connector.SendMessageAsync(message, CancellationToken.None);
+
+        // Outer scope — CorrelationId real, TenantId / UserId sentinel-substituted.
+        // The message payload carries no tenant / user identifier; sentinel
+        // substitution guarantees the pre-lookup warning at line ~336 still has
+        // the canonical three-key shape.
+        var outerScope = Assert.Single(
+            logger.ScopeDictionaries,
+            d => d.TryGetValue(TeamsLogScope.CorrelationIdKey, out var c)
+                 && (string?)c == "corr-scope-3key"
+                 && d.TryGetValue(TeamsLogScope.TenantIdKey, out var t)
+                 && (string?)t == TeamsLogScope.EmptyValueSentinel);
+        Assert.Equal(TeamsLogScope.EmptyValueSentinel, outerScope[TeamsLogScope.UserIdKey]);
+
+        // Inner scope — TenantId + UserId now carry the real values from the
+        // resolved reference; CorrelationId is inherited from the outer frame via
+        // TeamsLogContext's AsyncLocal parent pointer so a log entry emitted inside
+        // sees the inherited "corr-scope-3key".
+        var innerScope = Assert.Single(
+            logger.ScopeDictionaries,
+            d => d.TryGetValue(TeamsLogScope.TenantIdKey, out var t)
+                 && (string?)t == stored.TenantId);
+        Assert.Equal(stored.InternalUserId, innerScope[TeamsLogScope.UserIdKey]);
+        Assert.Equal(
+            "corr-scope-3key",
+            innerScope[TeamsLogScope.CorrelationIdKey]);
     }
 
     /// <summary>

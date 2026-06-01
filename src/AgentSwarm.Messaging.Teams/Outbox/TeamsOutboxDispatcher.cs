@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using AgentSwarm.Messaging.Abstractions;
@@ -47,9 +48,9 @@ namespace AgentSwarm.Messaging.Teams.Outbox;
 /// recorded the receipt via <see cref="IMessageOutbox.RecordSendReceiptAsync"/>. The
 /// dispatcher skips the Bot Framework call, retries only the post-send persistence
 /// (card-state save, conversation-id update), and returns
-/// <see cref="OutboxDispatchResult.Success"/> with the row's identifiers. This catches
-/// the "BF send succeeded → cardstate save failed → retry" race that would otherwise
-/// produce a duplicate card.</description></item>
+/// <see cref="OutboxDispatchResult.Success(OutboxDeliveryReceipt)"/> with the row's
+/// identifiers. This catches the "BF send succeeded → cardstate save failed →
+/// retry" race that would otherwise produce a duplicate card.</description></item>
 /// <item><description><b>Card-state row</b> — for <see cref="OutboxPayloadTypes.AgentQuestion"/>
 /// payloads, if <see cref="ICardStateStore.GetByQuestionIdAsync"/> already returns a row,
 /// the prior attempt fully completed (BF send + cardstate save) and only the engine's
@@ -123,10 +124,17 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
         // user identity; Channel deliveries' destinationId is a channel ID and
         // MUST NOT be stamped into the UserId enrichment slot (doing so corrupts
         // user-oriented dashboards / RBAC queries with channel IDs that look like
-        // users). For channel-scoped entries we therefore omit the UserId
-        // enrichment entirely — the canonical TeamsLogScope contract is (Correlation,
-        // Tenant, User) so a channel-id enrichment key would be a contract change
-        // beyond the scope of the §6.3 observability surface.
+        // users). For channel-scoped entries we therefore pass null for the
+        // UserId slot.
+        //
+        // Stage 6.3 iter-10 evaluator fix item 3 — TeamsLogScope.BeginScope
+        // substitutes TeamsLogScope.EmptyValueSentinel ("-") for the null UserId on
+        // channel-scoped deliveries so the canonical (CorrelationId, TenantId,
+        // UserId) three-key shape is ALWAYS present on every log entry per §6.3
+        // step 5. Dashboards that need to slice by destination kind can filter
+        // <c>WHERE UserId = '-'</c> (channel) vs. <c>WHERE UserId != '-'</c>
+        // (personal) without a brittle dual-source query for "missing-key"
+        // emissions.
         var (tenantId, destinationId) = SplitDestination(entry.Destination, entry.DestinationId);
         var scopeUserId = string.Equals(
             entry.DestinationType,
@@ -211,12 +219,21 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
                 "Idempotent replay of MessengerMessage outbox entry {OutboxEntryId}: row already has ActivityId {ActivityId}; skipping re-send.",
                 entry.OutboxEntryId,
                 entry.ActivityId);
+            // Stage 6.3 iter-12 fix item 1 — pin the ack moment to the decision
+            // point so the engine's histogram observes (dequeue → "we already
+            // delivered") rather than (dequeue → DispatchAsync return). Without
+            // this snapshot the engine falls back to the post-DispatchAsync
+            // wall-clock which is a few microseconds later, but the contract is
+            // explicit per IOutboxDispatcher.cs that dispatchers SHOULD supply
+            // the ack timestamp to keep the histogram boundary deterministic.
             return OutboxDispatchResult.Success(
-                new OutboxDeliveryReceipt(entry.ActivityId, entry.ConversationId, _timeProvider.GetUtcNow()));
+                new OutboxDeliveryReceipt(entry.ActivityId, entry.ConversationId, _timeProvider.GetUtcNow()),
+                Stopwatch.GetTimestamp());
         }
 
         string? deliveredActivityId = null;
         string? deliveredConversationId = null;
+        long? botConnectorAckTimestamp = null;
         var message = envelope.Message;
 
         try
@@ -228,6 +245,16 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
                 {
                     var reply = MessageFactory.Text(message.Body);
                     var response = await turnContext.SendActivityAsync(reply, innerCt).ConfigureAwait(false);
+                    // Stage 6.3 iter-12 fix item 1 — snapshot the Stopwatch
+                    // timestamp at the LITERAL Bot Connector HTTP acknowledgement
+                    // moment (immediately after SendActivityAsync returns the
+                    // ResourceResponse). Pre-iter-12 the timestamp came from the
+                    // post-DispatchAsync site in OutboxRetryEngine, which
+                    // structurally included this method's post-ack work (capturing
+                    // delivered ids, the closure trampolining, ContinueConversation
+                    // teardown). Capturing here pins the histogram boundary to
+                    // the §6.3 scenario wording exactly.
+                    botConnectorAckTimestamp = Stopwatch.GetTimestamp();
                     deliveredActivityId = response?.Id;
                     deliveredConversationId = turnContext.Activity?.Conversation?.Id;
                 },
@@ -242,8 +269,14 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
             return ClassifyTransportFailure(entry, ex);
         }
 
-        return OutboxDispatchResult.Success(
-            new OutboxDeliveryReceipt(deliveredActivityId, deliveredConversationId, _timeProvider.GetUtcNow()));
+        var receipt = new OutboxDeliveryReceipt(
+            deliveredActivityId,
+            deliveredConversationId,
+            _timeProvider.GetUtcNow());
+
+        return botConnectorAckTimestamp is { } ackTs
+            ? OutboxDispatchResult.Success(receipt, ackTs)
+            : OutboxDispatchResult.Success(receipt);
     }
 
     private async Task<OutboxDispatchResult> DispatchQuestionAsync(
@@ -290,8 +323,13 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
                 entry.OutboxEntryId,
                 question.QuestionId,
                 existingCardState.ActivityId);
+            // Stage 6.3 iter-12 fix item 1 — pin the ack moment to this
+            // decision so the histogram observation is bounded by the engine's
+            // dequeue → "already delivered" detection rather than including
+            // post-DispatchAsync engine wall-clock.
             return OutboxDispatchResult.Success(
-                new OutboxDeliveryReceipt(existingCardState.ActivityId, existingCardState.ConversationId, _timeProvider.GetUtcNow()));
+                new OutboxDeliveryReceipt(existingCardState.ActivityId, existingCardState.ConversationId, _timeProvider.GetUtcNow()),
+                Stopwatch.GetTimestamp());
         }
 
         // Layer-1 idempotency: outbox row has receipt from a prior partial-success
@@ -304,11 +342,21 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
                 entry.OutboxEntryId,
                 entry.ActivityId);
 
+            // Stage 6.3 iter-12 fix item 1 — snapshot the ack moment BEFORE the
+            // post-send persistence retry runs. The BF send happened in a prior
+            // attempt and has already returned its ack; this attempt's
+            // "BF acknowledgement equivalent" is the moment we decide to short-
+            // circuit. PersistPostSendStateAsync threads this timestamp into its
+            // returned Success so the engine's histogram observation excludes the
+            // cardstate-save / conversation-id-update durations even on the
+            // replay path.
+            var replayAckTimestamp = Stopwatch.GetTimestamp();
             var replayResult = await PersistPostSendStateAsync(
                 question,
                 activityId: entry.ActivityId!,
                 conversationId: entry.ConversationId!,
                 referenceJson: entry.ConversationReferenceJson!,
+                botConnectorAckTimestamp: replayAckTimestamp,
                 ct).ConfigureAwait(false);
             return replayResult;
         }
@@ -318,6 +366,7 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
         string? deliveredActivityId = null;
         string? deliveredConversationId = null;
         string? deliveredReferenceJson = null;
+        long? botConnectorAckTimestamp = null;
 
         try
         {
@@ -329,6 +378,16 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
                     var reply = MessageFactory.Attachment(attachment);
                     reply.Text = question.Title;
                     var response = await turnContext.SendActivityAsync(reply, innerCt).ConfigureAwait(false);
+                    // Stage 6.3 iter-12 fix item 1 — snapshot the Stopwatch
+                    // timestamp at the LITERAL Bot Connector HTTP acknowledgement
+                    // moment. The §6.3 scenario fixes the histogram boundary at
+                    // "queue pickup → Bot Connector HTTP acknowledgement"; this
+                    // is that ack. Everything below this line (RecordSendReceipt,
+                    // cardstate save, question conversation-id update) is
+                    // post-ack durability work and MUST be excluded from the P95
+                    // budget. PersistPostSendStateAsync threads this snapshot
+                    // into the final Success result so the engine reads it back.
+                    botConnectorAckTimestamp = Stopwatch.GetTimestamp();
                     deliveredActivityId = response?.Id;
                     deliveredConversationId = turnContext.Activity?.Conversation?.Id;
                     var freshReference = turnContext.Activity?.GetConversationReference();
@@ -386,6 +445,7 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
             activityId: deliveredActivityId!,
             conversationId: deliveredConversationId!,
             referenceJson: deliveredReferenceJson ?? entry.ConversationReferenceJson!,
+            botConnectorAckTimestamp: botConnectorAckTimestamp,
             ct).ConfigureAwait(false);
     }
 
@@ -394,6 +454,7 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
         string activityId,
         string conversationId,
         string referenceJson,
+        long? botConnectorAckTimestamp,
         CancellationToken ct)
     {
         var now = _timeProvider.GetUtcNow();
@@ -447,8 +508,19 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
                 $"Question conversation-id update failed for '{question.QuestionId}': {ex.Message}");
         }
 
-        return OutboxDispatchResult.Success(
-            new OutboxDeliveryReceipt(activityId, conversationId, _timeProvider.GetUtcNow()));
+        // Stage 6.3 iter-12 fix item 1 — when the dispatcher captured a Bot
+        // Connector ack timestamp upstream (the literal moment SendActivityAsync
+        // returned, OR the decision moment on a layer-1 idempotent replay),
+        // thread it through the Success result so the engine's
+        // teams.card.delivery.duration_ms observation EXCLUDES this method's
+        // cardstate-save and conversation-id-update durations. Without this the
+        // engine falls back to the post-DispatchAsync wall-clock which includes
+        // both DB round-trips — historically the P95 inflator that the §6.3
+        // evaluator flagged.
+        var receipt = new OutboxDeliveryReceipt(activityId, conversationId, _timeProvider.GetUtcNow());
+        return botConnectorAckTimestamp is { } ackTs
+            ? OutboxDispatchResult.Success(receipt, ackTs)
+            : OutboxDispatchResult.Success(receipt);
     }
 
     private async Task TryRepairConversationIdAsync(AgentQuestion question, TeamsCardState existingCardState, CancellationToken ct)

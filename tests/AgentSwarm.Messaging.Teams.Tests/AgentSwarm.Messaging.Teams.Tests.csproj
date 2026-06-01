@@ -12,6 +12,16 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <!--
+      Stage 6.3 integration tests for the /health endpoint (mapped via
+      TeamsHealthCheckEndpointRouteBuilderExtensions) need an in-process ASP.NET
+      Core pipeline so the test can issue a real HTTP request and assert on the
+      response body without binding a socket. Microsoft.AspNetCore.TestHost is the
+      first-party, framework-version-aligned helper for that — version 8.0.x
+      matches the Microsoft.AspNetCore.App framework reference + the SDK pinned in
+      global.json.
+    -->
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="8.0.10" />
     <PackageReference Include="xunit" Version="2.5.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
   </ItemGroup>

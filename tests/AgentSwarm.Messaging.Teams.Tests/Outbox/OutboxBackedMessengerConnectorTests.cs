@@ -429,7 +429,7 @@ public sealed class OutboxBackedMessengerConnectorTests
     [Fact]
     public async Task SendMessageAsync_NoDeduplicatorWired_PreservesLegacyBehaviour()
     {
-        // Legacy short-form constructor — must keep enqueueing every send so pre-Stage-6.2
+        // Legacy 5-arg constructor — must keep enqueueing every send so pre-Stage-6.2
         // hosts that opted out of the deduplicator continue to work identically.
         var router = new RecordingConversationReferenceStore();
         router.ConversationIdReferences["conv-1"] = NewReference(tenantId: "tenant-1");

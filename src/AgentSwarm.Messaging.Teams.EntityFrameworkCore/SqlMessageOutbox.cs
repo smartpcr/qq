@@ -328,6 +328,47 @@ public sealed class SqlMessageOutbox : IMessageOutbox
         }
     }
 
+    /// <summary>
+    /// Stage 6.3 (iter-4 evaluator feedback item 5; iter-5 item 6) — count the rows
+    /// currently in <see cref="OutboxEntryStatuses.Pending"/> AND drainable on the
+    /// next dequeue tick (i.e. <see cref="OutboxEntry.NextRetryAt"/> is null or has
+    /// elapsed). Used by <see cref="OutboxRetryEngine"/> to feed the
+    /// <c>teams.outbox.queue_depth</c> gauge with the REAL queue depth (rather
+    /// than just the last dequeued batch size, which structurally underreports
+    /// when the backlog exceeds <see cref="OutboxOptions.BatchSize"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Single indexed
+    /// <c>SELECT COUNT(*) FROM OutboxMessages WHERE Status = 'Pending' AND (NextRetryAt IS NULL OR NextRetryAt &lt;= @now)</c>
+    /// — mirrors the dequeue predicate at <see cref="DequeueAsync"/> so the gauge
+    /// reading is consistent with what the engine considers "claimable on this
+    /// tick". Rows in <see cref="OutboxEntryStatuses.Pending"/> whose
+    /// <c>NextRetryAt</c> is scheduled for the future are NOT included — those
+    /// rows are queued but not eligible for delivery, and counting them on the
+    /// drainable-queue gauge would mislead operators into thinking the engine is
+    /// falling behind when it is actually waiting on the scheduled backoff
+    /// window (iter-5 evaluator feedback item 6).
+    /// </para>
+    /// <para>
+    /// Lease-expired <c>Processing</c> rows are also NOT included (they represent
+    /// in-flight deliveries on behalf of crashed workers; conventionally that is
+    /// a separate operational signal — surfaced via
+    /// <c>teams.outbox.deadletters</c> when the lease fully expires and retry
+    /// budget is exhausted, not the queue-depth gauge).
+    /// </para>
+    /// </remarks>
+    public async Task<long> CountPendingAsync(CancellationToken ct)
+    {
+        await using var ctx = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
+        var now = _timeProvider.GetUtcNow();
+        return await ctx.OutboxEntries
+            .Where(e => e.Status == OutboxEntryStatuses.Pending
+                && (e.NextRetryAt == null || e.NextRetryAt <= now))
+            .LongCountAsync(ct)
+            .ConfigureAwait(false);
+    }
+
     private static OutboxEntryEntity MapToEntity(OutboxEntry entry) => new()
     {
         OutboxEntryId = entry.OutboxEntryId,

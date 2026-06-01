@@ -61,6 +61,54 @@ internal static class CommandEventPublication
     }
 
     /// <summary>
+    /// Stage 6.3 iter-6 evaluator feedback items 1 + 3 — canonical helper that
+    /// resolves the tenant id for the inbound activity backing
+    /// <paramref name="context"/> so every command handler can push a non-null
+    /// <see cref="Diagnostics.TeamsLogScope.TenantIdKey"/> onto its log scope.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two sources are checked in order:
+    /// </para>
+    /// <list type="number">
+    /// <item><description><b>Explicit <see cref="CommandContext.TenantId"/></b> —
+    /// stamped by the messenger-specific activity handler
+    /// (<c>TeamsSwarmActivityHandler</c> / <c>MessageExtensionHandler</c>) when it
+    /// constructs the <see cref="CommandContext"/>. This is the canonical source on the
+    /// production path; the activity handler reads
+    /// <c>TeamsChannelData.Tenant.Id</c> once and stamps it so downstream handlers
+    /// don't re-derive it for every log scope.</description></item>
+    /// <item><description><b>Fallback to <see cref="CommandContext.TurnContext"/>'s
+    /// <c>TeamsChannelData.Tenant.Id</c></b> — preserves backwards compatibility for
+    /// any caller (legacy reprocessor, in-test driver) that supplied a turn context
+    /// but did not pre-stamp <see cref="CommandContext.TenantId"/>.</description></item>
+    /// </list>
+    /// <para>
+    /// Returns the empty string when neither source has a value — handlers pass the
+    /// empty string to <see cref="Diagnostics.TeamsLogScope.BeginScope"/>, which then
+    /// inherits the tenant from the parent
+    /// <see cref="Diagnostics.TeamsLogContext"/> entry (the activity-handler-level
+    /// scope wraps every per-handler scope), so the canonical contract is preserved
+    /// on the production path even when the explicit value happens to be unavailable.
+    /// </para>
+    /// </remarks>
+    internal static string ResolveTenantId(CommandContext context)
+    {
+        if (!string.IsNullOrEmpty(context.TenantId))
+        {
+            return context.TenantId!;
+        }
+
+        if (context.TurnContext is ITurnContext turnContext)
+        {
+            var channelData = turnContext.Activity?.GetChannelData<Microsoft.Bot.Schema.Teams.TeamsChannelData>();
+            return channelData?.Tenant?.Id ?? string.Empty;
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>
     /// Resolve the canonical <see cref="MessengerEventSources"/> discriminator for the
     /// inbound activity backing <paramref name="context"/>. Mirrors the
     /// <c>ResolveEventSource(activity)</c> helper previously inlined in

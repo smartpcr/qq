@@ -1,3 +1,5 @@
+using Serilog.Context;
+
 namespace AgentSwarm.Messaging.Teams.Diagnostics;
 
 /// <summary>
@@ -24,6 +26,20 @@ namespace AgentSwarm.Messaging.Teams.Diagnostics;
 /// preserves the enrichment without explicit plumbing. AsyncLocal allocations are
 /// O(1) per push.
 /// </para>
+/// <para>
+/// <b>Stage 6.3 iter-5 evaluator feedback item 1 — Serilog auto-wiring.</b>
+/// <see cref="Push"/> additionally invokes
+/// <see cref="LogContext.PushProperty(string, object?, bool)"/> for each non-empty
+/// enrichment key. Any host whose Serilog configuration includes the canonical
+/// <c>Enrich.FromLogContext()</c> call — which is the default ASP.NET Core /
+/// <c>Serilog.Extensions.Hosting</c> pattern — therefore receives the
+/// <c>CorrelationId</c>, <c>TenantId</c>, and <c>UserId</c> properties on every
+/// <see cref="Serilog.Events.LogEvent"/> emitted inside the scope <i>without</i>
+/// having to wire <see cref="TeamsLogEnricher"/> or
+/// <see cref="LoggerEnrichmentConfigurationExtensions.WithTeamsContext"/>
+/// explicitly. The <see cref="TeamsLogEnricher"/> path is preserved as a defence
+/// in depth for hosts that disable <c>FromLogContext</c>.
+/// </para>
 /// </remarks>
 public static class TeamsLogContext
 {
@@ -44,21 +60,13 @@ public static class TeamsLogContext
 
         var effectiveCorrelationId = !string.IsNullOrEmpty(correlationId)
             ? correlationId
-            : parent?.CorrelationId;
+            : parent?.CorrelationId ?? TeamsLogScope.EmptyValueSentinel;
         var effectiveTenantId = !string.IsNullOrEmpty(tenantId)
             ? tenantId
-            : parent?.TenantId;
+            : parent?.TenantId ?? TeamsLogScope.EmptyValueSentinel;
         var effectiveUserId = !string.IsNullOrEmpty(userId)
             ? userId
-            : parent?.UserId;
-
-        // If nothing changed (every supplied value was empty AND the parent already
-        // carries the same data), return a cheap no-op instead of allocating a new
-        // entry — keeps the hot path on the connector free of pointless GC pressure.
-        if (effectiveCorrelationId is null && effectiveTenantId is null && effectiveUserId is null)
-        {
-            return NoopToken.Instance;
-        }
+            : parent?.UserId ?? TeamsLogScope.EmptyValueSentinel;
 
         var entry = new TeamsLogContextEntry(
             effectiveCorrelationId,
@@ -66,7 +74,24 @@ public static class TeamsLogContext
             effectiveUserId);
 
         CurrentEntry.Value = entry;
-        return new PopToken(parent);
+
+        // Iter-10 evaluator fix item 3 — Stage 6.3 step 5 "every log entry" contract
+        // requires ALL three keys on every emitted LogEvent. Push effective values
+        // (sentinel-substituted for null/empty) for ALL three keys so the canonical
+        // Serilog `Enrich.FromLogContext()` enricher always sees a complete frame.
+        // We push EFFECTIVE values (not just caller-supplied) so the inner scope's
+        // LogContext frame shadows the parent's per-key — a log entry emitted inside
+        // the inner scope sees the inner scope's effective key set, including the
+        // parent values that were inherited (rather than the parent's frame leaking
+        // a different value if the inner caller passed a sentinel).
+        var serilogTokens = new List<IDisposable>(capacity: 3)
+        {
+            LogContext.PushProperty(TeamsLogScope.CorrelationIdKey, effectiveCorrelationId),
+            LogContext.PushProperty(TeamsLogScope.TenantIdKey, effectiveTenantId),
+            LogContext.PushProperty(TeamsLogScope.UserIdKey, effectiveUserId),
+        };
+
+        return new CompositeContextToken(parent, serilogTokens);
     }
 
     /// <summary>
@@ -95,14 +120,26 @@ public static class TeamsLogContext
         public string? UserId { get; }
     }
 
-    private sealed class PopToken : IDisposable
+    /// <summary>
+    /// Iter-5 item 1 — disposes both the AsyncLocal pop (restoring
+    /// <see cref="CurrentEntry"/> to its parent) and every
+    /// <see cref="LogContext.PushProperty(string, object?, bool)"/> token returned
+    /// during <see cref="Push"/>. Serilog pops are invoked in reverse-push order
+    /// (the canonical LIFO contract for <c>LogContext</c>) so a parent scope's
+    /// <c>CorrelationId</c> remains the active frame after an inner scope ends.
+    /// Pops are guarded so a single throw does not leak ambient state — the
+    /// AsyncLocal pop is in a <c>finally</c> so it always runs.
+    /// </summary>
+    private sealed class CompositeContextToken : IDisposable
     {
         private readonly TeamsLogContextEntry? _previous;
+        private readonly List<IDisposable> _serilogTokens;
         private bool _disposed;
 
-        public PopToken(TeamsLogContextEntry? previous)
+        public CompositeContextToken(TeamsLogContextEntry? previous, List<IDisposable> serilogTokens)
         {
             _previous = previous;
+            _serilogTokens = serilogTokens;
         }
 
         public void Dispose()
@@ -113,20 +150,30 @@ public static class TeamsLogContext
             }
 
             _disposed = true;
-            CurrentEntry.Value = _previous;
-        }
-    }
 
-    private sealed class NoopToken : IDisposable
-    {
-        public static readonly NoopToken Instance = new();
-
-        private NoopToken()
-        {
-        }
-
-        public void Dispose()
-        {
+            try
+            {
+                // LIFO pop matches the order Serilog's LogContext maintains its
+                // internal stack — dispose newest first so older frames are
+                // restored as the active enrichment.
+                for (var i = _serilogTokens.Count - 1; i >= 0; i--)
+                {
+                    try
+                    {
+                        _serilogTokens[i].Dispose();
+                    }
+                    catch
+                    {
+                        // A single Serilog pop failure must not strand the
+                        // AsyncLocal pop — swallow per-token exceptions so the
+                        // finally block still restores CurrentEntry to the parent.
+                    }
+                }
+            }
+            finally
+            {
+                CurrentEntry.Value = _previous;
+            }
         }
     }
 }

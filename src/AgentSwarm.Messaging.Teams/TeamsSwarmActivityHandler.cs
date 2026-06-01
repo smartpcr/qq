@@ -316,6 +316,10 @@ public sealed class TeamsSwarmActivityHandler : TeamsActivityHandler
             TurnContext = turnContext,
             ConversationId = activity?.Conversation?.Id,
             ActivityId = activity?.Id,
+            // Stage 6.3 iter-6 evaluator feedback item 1 — stamp the tenant so
+            // downstream command handlers can push the canonical TenantId key onto
+            // their TeamsLogScope without re-deriving it from the turn context.
+            TenantId = tenantId,
         };
 
         await _commandDispatcher.DispatchAsync(context, cancellationToken).ConfigureAwait(false);

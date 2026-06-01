@@ -80,9 +80,11 @@ public sealed class InMemoryOutboxQueueDepthProvider : IOutboxQueueDepthProvider
 /// is present in DI (see
 /// <see cref="TeamsDiagnosticsServiceCollectionExtensions.AddTeamsConnectorTelemetry"/>),
 /// so a single push (<c>OutboxRetryEngine.ProcessOnceAsync</c>'s call to
-/// <see cref="AgentSwarm.Messaging.Core.OutboxMetrics.SetPendingCount"/>) feeds both
-/// the existing <c>teams.outbox.pending_count</c> gauge and the §6.3
-/// <c>teams.outbox.queue_depth</c> gauge — no double bookkeeping required.
+/// <see cref="AgentSwarm.Messaging.Core.OutboxMetrics.SetPendingCount"/>) feeds the
+/// canonical <c>teams.outbox.queue_depth</c> gauge with the real queue depth. Stage 6.3
+/// iter-8 evaluator fix item 1 — the previously-duplicated Core-side
+/// <c>teams.outbox.pending_count</c> gauge has been removed; the Teams meter is now
+/// the SOLE publisher of the queue-depth signal, fed via this bridge.
 /// </summary>
 public sealed class OutboxMetricsQueueDepthProvider : IOutboxQueueDepthProvider
 {

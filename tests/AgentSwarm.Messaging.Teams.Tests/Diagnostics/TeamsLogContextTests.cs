@@ -76,15 +76,31 @@ public sealed class TeamsLogContextTests
     }
 
     [Fact]
-    public void Push_AllNullArgs_ReturnsNoopToken_AndLeavesContextEmpty()
+    public void Push_AllNullArgs_NoParent_StoresSentinelsForAllThreeKeys()
     {
+        // Stage 6.3 iter-10 evaluator fix item 3 — Push with no caller-supplied values
+        // and no parent frame still stores TeamsLogScope.EmptyValueSentinel ("-") for
+        // each key so a Serilog Enrich.FromLogContext()-wired sink ALWAYS sees the
+        // three-key shape, never a missing property. The dispose path still restores
+        // the previous (null) entry so the AsyncLocal does not leak the sentinels
+        // outside the scope.
+        var (corrBefore, tenantBefore, userBefore) = TeamsLogContext.Snapshot();
+        Assert.Null(corrBefore);
+        Assert.Null(tenantBefore);
+        Assert.Null(userBefore);
+
         using (TeamsLogContext.Push(null, null, null))
         {
             var (corr, tenant, user) = TeamsLogContext.Snapshot();
-            Assert.Null(corr);
-            Assert.Null(tenant);
-            Assert.Null(user);
+            Assert.Equal(TeamsLogScope.EmptyValueSentinel, corr);
+            Assert.Equal(TeamsLogScope.EmptyValueSentinel, tenant);
+            Assert.Equal(TeamsLogScope.EmptyValueSentinel, user);
         }
+
+        var (corrAfter, tenantAfter, userAfter) = TeamsLogContext.Snapshot();
+        Assert.Null(corrAfter);
+        Assert.Null(tenantAfter);
+        Assert.Null(userAfter);
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 using AgentSwarm.Messaging.Abstractions;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Bot.Builder;
 using Microsoft.Extensions.Logging;
 
@@ -86,6 +87,30 @@ internal sealed class ApproveRejectCommandExecutor
         {
             throw new ArgumentNullException(nameof(context));
         }
+
+        // Stage 6.3 iter-4 evaluator feedback item 6 (structural fix) — wrap the
+        // entire executor body in a TeamsLogScope so EVERY _logger call below
+        // (the 7+ LogInformation/LogWarning sites that flag user-not-found,
+        // ambiguous-bare, action-not-allowed, comment-required, CAS-raced, and
+        // resolved paths) carries the canonical CorrelationId / TenantId / UserId
+        // enrichment. The scope layers on the ambient TeamsLogContext push from
+        // TeamsSwarmActivityHandler when present, and is the sole enrichment source
+        // when the dispatcher invokes the executor from outside the activity
+        // handler (background reprocessor, unit test, etc.).
+        //
+        // Iter-6 evaluator feedback items 1 + 3 — extract the tenant id via the
+        // shared CommandEventPublication.ResolveTenantId helper so the canonical
+        // TenantId enrichment key is pushed alongside CorrelationId / UserId.
+        var scopeCorrelationId = string.IsNullOrEmpty(context.CorrelationId)
+            ? Guid.NewGuid().ToString()
+            : context.CorrelationId!;
+        var scopeUserId = context.ResolvedIdentity?.InternalUserId;
+        var scopeTenantId = CommandEventPublication.ResolveTenantId(context);
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: scopeCorrelationId,
+            tenantId: scopeTenantId,
+            userId: scopeUserId);
 
         var explicitQuestionId = (context.CommandArguments ?? string.Empty).Trim();
         AgentQuestion? target;

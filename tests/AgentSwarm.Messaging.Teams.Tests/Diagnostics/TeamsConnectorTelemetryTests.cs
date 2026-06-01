@@ -101,13 +101,16 @@ public sealed class TeamsConnectorTelemetryTests
 
         using var telemetry = new TeamsConnectorTelemetry(NullOutboxQueueDepthProvider.Instance);
         telemetry.RecordMessageSent(
-            correlationId: "corr-1",
             messageType: TeamsConnectorTelemetry.MessageTypeAgentQuestion,
             destinationType: TeamsConnectorTelemetry.DestinationTypeUser);
 
         var sample = Assert.Single(observations);
         Assert.Equal(1, sample.Value);
-        Assert.Equal("corr-1", sample.Tags[TeamsConnectorTelemetry.CorrelationIdTag]);
+        // Iter-7 evaluator fix item 4 — correlationId is deliberately ABSENT from the
+        // metric tag tuple to keep cardinality bounded. The bounded classifiers below
+        // are the only allowed tags on counters / histograms.
+        Assert.False(sample.Tags.ContainsKey(TeamsConnectorTelemetry.CorrelationIdTag),
+            "correlationId must not be applied to counter tags — see TeamsConnectorTelemetry remarks.");
         Assert.Equal(TeamsConnectorTelemetry.MessageTypeAgentQuestion, sample.Tags[TeamsConnectorTelemetry.MessageTypeTag]);
         Assert.Equal(TeamsConnectorTelemetry.DestinationTypeUser, sample.Tags[TeamsConnectorTelemetry.DestinationTypeTag]);
     }
@@ -133,7 +136,7 @@ public sealed class TeamsConnectorTelemetryTests
         using var telemetry = new TeamsConnectorTelemetry(NullOutboxQueueDepthProvider.Instance);
         for (var i = 1; i <= 5; i++)
         {
-            telemetry.RecordCardDeliveryDurationMs(i * 10.0, "corr", TeamsConnectorTelemetry.MessageTypeMessengerMessage, TeamsConnectorTelemetry.DestinationTypeConversation);
+            telemetry.RecordCardDeliveryDurationMs(i * 10.0, TeamsConnectorTelemetry.MessageTypeMessengerMessage, TeamsConnectorTelemetry.DestinationTypeConversation);
         }
 
         Assert.Equal(new[] { 10.0, 20.0, 30.0, 40.0, 50.0 }, observations);

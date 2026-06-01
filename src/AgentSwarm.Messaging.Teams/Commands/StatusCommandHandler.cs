@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Teams.Cards;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Bot.Builder;
 using Microsoft.Extensions.Logging;
 
@@ -65,8 +66,26 @@ public sealed class StatusCommandHandler : ICommandHandler
         var correlationId = string.IsNullOrEmpty(context.CorrelationId)
             ? Guid.NewGuid().ToString()
             : context.CorrelationId!;
-        var tenantId = context.ResolvedIdentity is null ? string.Empty : ResolveTenantFromTurn(context);
+        // Iter-6 — delegate tenant resolution to the shared
+        // CommandEventPublication.ResolveTenantId helper so every command handler
+        // uses an identical extraction shape (CommandContext.TenantId first,
+        // TeamsChannelData fallback).
+        var tenantId = CommandEventPublication.ResolveTenantId(context);
         var identity = context.ResolvedIdentity ?? new UserIdentity(string.Empty, string.Empty, string.Empty, string.Empty);
+
+        // Stage 6.3 iter-4 evaluator feedback item 6 — wrap the handler body in a
+        // TeamsLogScope so the LogInformation/LogError below AND any downstream
+        // logging (status provider call, send-reply, error-card path) carry the
+        // CorrelationId / TenantId / UserId enrichment. The scope is layered on
+        // top of the ambient TeamsLogContext push from TeamsSwarmActivityHandler
+        // when present, and is the only enrichment source when the dispatcher is
+        // invoked from outside the activity handler (background reprocessor,
+        // unit test, etc.).
+        using var logScope = TeamsLogScope.BeginScope(
+            _logger,
+            correlationId: correlationId,
+            tenantId: tenantId,
+            userId: identity.InternalUserId);
 
         _logger.LogInformation(
             "StatusCommandHandler querying swarm status (correlation {CorrelationId}, user {UserId}).",
@@ -124,23 +143,5 @@ public sealed class StatusCommandHandler : ICommandHandler
 
         var reply = CommandReplyCards.BuildStatusReply(_cardRenderer, agents);
         await CommandEventPublication.SendReplyAsync(context, reply, ct).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Best-effort tenant extraction from the Bot Framework turn context. Used to scope
-    /// the <see cref="IAgentSwarmStatusProvider"/> query when an explicit tenant is not
-    /// supplied on <see cref="CommandContext"/>. Returns the empty string when no tenant
-    /// can be determined — providers MUST treat the empty value as "all tenants" or refuse
-    /// the query, NEVER as a wildcard that bypasses RBAC.
-    /// </summary>
-    private static string ResolveTenantFromTurn(CommandContext context)
-    {
-        if (context.TurnContext is ITurnContext turnContext)
-        {
-            var channelData = turnContext.Activity?.GetChannelData<Microsoft.Bot.Schema.Teams.TeamsChannelData>();
-            return channelData?.Tenant?.Id ?? string.Empty;
-        }
-
-        return string.Empty;
     }
 }

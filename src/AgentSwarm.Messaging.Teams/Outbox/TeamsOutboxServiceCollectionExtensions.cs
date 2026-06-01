@@ -1,5 +1,6 @@
 using AgentSwarm.Messaging.Abstractions;
 using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Teams.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -178,22 +179,15 @@ public static class TeamsOutboxServiceCollectionExtensions
         services.TryAddSingleton<OutboxMetrics>();
         services.TryAddSingleton<TokenBucketRateLimiter>();
 
-        // Register the TeamsDirectSendBypassGuard sentinel singleton so the inner
-        // concrete TeamsMessengerConnector / TeamsProactiveNotifier reject every
-        // direct send when the outbox engine is composed. Without the guard,
-        // production code that resolved the concrete type (or the IInnerTeams*
-        // marker's Inner accessor) and called a send method would silently bypass
-        // IMessageOutbox.EnqueueAsync, violating the implementation-plan.md §6.1
-        // requirement that every send flows through the outbox. The connectors' DI
-        // factories in TeamsServiceCollectionExtensions resolve this guard as an
-        // optional dependency and assign it via the DirectSendGuard property
-        // initializer — so legacy hosts / tests that do NOT call
-        // AddTeamsOutboxEngine keep their direct-send semantics unchanged (the
-        // guard simply isn't in the container). TryAddSingleton lets a host or test
-        // pre-register a different singleton instance BEFORE AddTeamsOutboxEngine
-        // runs and have that registration win, for the rare scenarios that
-        // legitimately need to disable the guard at the inner-concrete level (the
-        // guard class is `sealed` so subclassing is not the override path).
+        // Stage 6.1 — direct-send bypass guard singleton. The doc on AddTeamsOutboxEngine
+        // (and the sibling DecorateMessengerConnector / DecorateProactiveNotifier helpers)
+        // promises a `TryAddSingleton<TeamsDirectSendBypassGuard>()` so that the inner
+        // concrete TeamsMessengerConnector / TeamsProactiveNotifier can resolve the guard
+        // through DI and throw on direct invocation that bypasses the outbox engine.
+        // Without this registration the guard is null and direct sends silently slip
+        // around IMessageOutbox.EnqueueAsync — the regression that
+        // TeamsDirectSendBypassGuardTests.AddTeamsOutboxEngine_RegistersTeamsDirectSendBypassGuardSingleton
+        // pins. Idempotent under repeated AddTeamsOutboxEngine composition via TryAdd*.
         services.TryAddSingleton<TeamsDirectSendBypassGuard>();
 
         // Stage 6.2 step 4 — outbound deduplication singleton + background eviction
@@ -360,6 +354,11 @@ public static class TeamsOutboxServiceCollectionExtensions
         // GetRequiredService<IMessengerConnector>() resolves to. Stage 6.2 step 4: the
         // wrapper receives the OutboundMessageDeduplicator so duplicate (CorrelationId,
         // ConversationId) sends are suppressed before an OutboxEntry is enqueued.
+        // Stage 6.3 iter-6 evaluator feedback item 2 — also resolves the optional
+        // TeamsConnectorTelemetry singleton so the wrapper increments the canonical
+        // teams.messages.sent counter on every accepted enqueue (the production
+        // path that the in-process TeamsMessengerConnector never sees in the
+        // outbox-engine composition).
         services.AddSingleton<IMessengerConnector>(sp => new OutboxBackedMessengerConnector(
             sp.GetRequiredService<IInnerTeamsMessengerConnector>().Inner,
             sp.GetRequiredService<IMessageOutbox>(),
@@ -368,7 +367,8 @@ public static class TeamsOutboxServiceCollectionExtensions
             sp.GetRequiredService<IAgentQuestionStore>(),
             sp.GetRequiredService<ILogger<OutboxBackedMessengerConnector>>(),
             sp.GetService<TimeProvider>(),
-            sp.GetService<OutboundMessageDeduplicator>()));
+            sp.GetService<OutboundMessageDeduplicator>(),
+            sp.GetService<TeamsConnectorTelemetry>()));
 
         // Rebind the keyed "teams" alias to the wrapper ONLY when the host originally
         // registered a keyed alias (critique #3). The concrete TeamsMessengerConnector
