@@ -7,6 +7,20 @@ using Microsoft.Extensions.Configuration;
 
 namespace AgentSwarm.Messaging.Worker;
 
+using AgentSwarm.Messaging.Core;
+using AgentSwarm.Messaging.Core.Secrets;
+using AgentSwarm.Messaging.Persistence;
+using AgentSwarm.Messaging.Slack.Configuration;
+using AgentSwarm.Messaging.Slack.Diagnostics;
+using AgentSwarm.Messaging.Slack.Persistence;
+using AgentSwarm.Messaging.Slack.Pipeline;
+using AgentSwarm.Messaging.Slack.Security;
+using AgentSwarm.Messaging.Slack.Transport;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+
 /// <summary>
 /// Entry point for the AgentSwarm messaging gateway host. The host owns the
 /// HTTP surface used by Slack (and other connector) inbound endpoints and
@@ -15,6 +29,30 @@ namespace AgentSwarm.Messaging.Worker;
 /// <c>/api/slack</c> is HMAC-verified before later stages add the
 /// authorization filter, idempotency guard, and command handlers.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Stage 8.1 (workstream:
+/// <c>ws-qq-slack-messenger-supp-phase-connector-wiring-and-acceptance-validation-stage-slackconnector-facade-and-di-wiring</c>):
+/// the composition root collapses every per-stage <c>AddSlack*</c> call into
+/// the single <see cref="SlackMessengerServiceCollectionExtensions.AddSlackMessenger(IServiceCollection, IConfiguration)"/>
+/// facade. The cross-platform primitives are now requested through
+/// <see cref="MessagingCoreServiceCollectionExtensions.AddMessagingCore"/> and
+/// <see cref="MessagingPersistenceServiceCollectionExtensions.AddMessagingPersistence"/>
+/// so future connector additions (Telegram, Discord, Teams) inherit the same
+/// host shape without per-connector edits here. The HTTP pipeline calls
+/// (<see cref="SlackSignatureValidator"/> middleware, controllers, health
+/// endpoints, EnsureCreated bootstrap, production durability guard) remain
+/// here because they require <see cref="WebApplication"/>.
+/// </para>
+/// <para>
+/// The host -- not the facade -- owns the SQLite-provider
+/// <see cref="DbContextOptionsBuilder.UseSqlite"/> call so the Slack
+/// assembly stays decoupled from any single EF provider. A future host
+/// that targets PostgreSQL or SQL Server swaps only the registration
+/// here; <see cref="SlackMessengerServiceCollectionExtensions.AddSlackMessenger(IServiceCollection, IConfiguration)"/>
+/// is unchanged.
+/// </para>
+/// </remarks>
 public class Program
 {
     /// <summary>
@@ -42,6 +80,8 @@ public class Program
     public static WebApplication BuildApp(string[] args)
     {
         WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
+
+        // MVC routing is host-level, not connector-level.
         builder.Services.AddRouting();
         builder.Services.AddSlackConnectorOptions(builder.Configuration);
 

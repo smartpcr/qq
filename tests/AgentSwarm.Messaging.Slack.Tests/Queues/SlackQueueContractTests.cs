@@ -137,6 +137,23 @@ public sealed class SlackQueueContractTests
         // Pinning the field surface here means Stage 3.1 (Slack Inbound
         // Transport) can adopt the record without re-litigating the field
         // list spelled out in implementation-plan.md line 193.
+        //
+        // Stage 8.2 AC-5 added ONE optional init-only member
+        // (ResponseUrl) so the pipeline-side SlackInboundAuthorizer
+        // can deliver an ephemeral rejection to the originating user
+        // via Slack's per-invocation response_url after the controller
+        // has already ACK'd HTTP 200. The primary constructor
+        // parameter list is UNCHANGED so the seven production
+        // `new SlackInboundEnvelope(...)` call-sites (the factory
+        // methods, the DLQ rehydrator, the Socket Mode normalizer)
+        // and the test-side construction helpers all continue to
+        // compile without edits; only the envelope factory uses the
+        // object-initializer syntax to set the new field. The test
+        // below asserts the FULL public surface (which now includes
+        // ResponseUrl) AND independently pins the brief-mandated 8
+        // positional ctor parameters so a future refactor cannot
+        // accidentally promote ResponseUrl into the positional list
+        // (which WOULD break call-site back-compat).
         Type t = typeof(SlackInboundEnvelope);
         string[] props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Select(p => p.Name)
@@ -144,6 +161,35 @@ public sealed class SlackQueueContractTests
             .OrderBy(n => n)
             .ToArray();
         props.Should().BeEquivalentTo(new[]
+        {
+            nameof(SlackInboundEnvelope.IdempotencyKey),
+            nameof(SlackInboundEnvelope.SourceType),
+            nameof(SlackInboundEnvelope.TeamId),
+            nameof(SlackInboundEnvelope.ChannelId),
+            nameof(SlackInboundEnvelope.UserId),
+            nameof(SlackInboundEnvelope.RawPayload),
+            nameof(SlackInboundEnvelope.TriggerId),
+            nameof(SlackInboundEnvelope.ReceivedAt),
+            nameof(SlackInboundEnvelope.ResponseUrl),
+        });
+
+        // Independently assert that the PRIMARY-CONSTRUCTOR positional
+        // parameter list remains EXACTLY the Stage 1.3 brief-mandated
+        // 8 fields so existing producers (the factory's BuildEvent /
+        // BuildCommand / BuildInteraction methods, the DLQ rehydrator,
+        // the Socket Mode normalizer, every `new SlackInboundEnvelope(
+        // IdempotencyKey: ..., ..., ReceivedAt: ...)` call) keep
+        // compiling unchanged. ResponseUrl is intentionally NOT a
+        // positional ctor parameter -- it is exposed as an init-only
+        // property so it is set via object-initializer syntax only
+        // by call-sites that have a response_url to carry.
+        var ctorParams = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
+            .OrderByDescending(c => c.GetParameters().Length)
+            .First()
+            .GetParameters()
+            .Select(p => p.Name)
+            .ToArray();
+        ctorParams.Should().BeEquivalentTo(new[]
         {
             nameof(SlackInboundEnvelope.IdempotencyKey),
             nameof(SlackInboundEnvelope.SourceType),
@@ -162,6 +208,16 @@ public sealed class SlackQueueContractTests
         // Pinning the field surface here means Stage 4.1 (Slack Outbound
         // Dispatcher) can adopt the record without re-litigating the field
         // list spelled out in implementation-plan.md line 355.
+        //
+        // Stage 6.3 iter 2 added three OPTIONAL init-only members
+        // (MessageTs / ViewId / EnvelopeId) so the dispatcher can
+        // address chat.update / views.update targets end-to-end and
+        // the durable FileSystemSlackOutboundQueue can identify
+        // individual journal entries to delete after a terminal
+        // disposition. The primary constructor parameter list is
+        // unchanged so all existing SendMessage / SendQuestion
+        // call-sites continue to compile; the test below asserts the
+        // FULL public-surface, which now includes those extensions.
         Type t = typeof(SlackOutboundEnvelope);
         string[] props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Select(p => p.Name)
@@ -169,6 +225,29 @@ public sealed class SlackQueueContractTests
             .OrderBy(n => n)
             .ToArray();
         props.Should().BeEquivalentTo(new[]
+        {
+            nameof(SlackOutboundEnvelope.TaskId),
+            nameof(SlackOutboundEnvelope.CorrelationId),
+            nameof(SlackOutboundEnvelope.MessageType),
+            nameof(SlackOutboundEnvelope.BlockKitPayload),
+            nameof(SlackOutboundEnvelope.ThreadTs),
+            nameof(SlackOutboundEnvelope.MessageTs),
+            nameof(SlackOutboundEnvelope.ViewId),
+            nameof(SlackOutboundEnvelope.EnvelopeId),
+        });
+
+        // Independently assert that the PRIMARY-CONSTRUCTOR positional
+        // parameter list remains EXACTLY the brief-mandated 5 fields
+        // so existing producers (SendMessageAsync / SendQuestionAsync)
+        // do not have to update their `new SlackOutboundEnvelope(...)`
+        // call-sites.
+        var ctorParams = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
+            .OrderByDescending(c => c.GetParameters().Length)
+            .First()
+            .GetParameters()
+            .Select(p => p.Name)
+            .ToArray();
+        ctorParams.Should().BeEquivalentTo(new[]
         {
             nameof(SlackOutboundEnvelope.TaskId),
             nameof(SlackOutboundEnvelope.CorrelationId),

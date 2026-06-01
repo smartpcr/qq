@@ -64,6 +64,81 @@ public sealed class SlackConnectorOptions
     /// <c>SlackDirectApiClient</c>.
     /// </summary>
     public SlackRateLimitOptions RateLimits { get; set; } = new();
+
+    /// <summary>
+    /// Lease parameters consumed by <c>SlackIdempotencyGuard</c> /
+    /// <c>InMemorySlackIdempotencyGuard</c> when deciding whether an
+    /// existing <c>processing</c> row represents an in-flight worker
+    /// (defer the redelivery) or an orphaned lease left behind by a
+    /// crashed worker (reclaim the row for crash recovery). See
+    /// architecture.md §2.6 and §4.4.
+    /// </summary>
+    public SlackIdempotencyOptions Idempotency { get; set; } = new();
+}
+
+/// <summary>
+/// Lease-aware idempotency knobs used by the Stage 4.3 inbound
+/// pipeline to differentiate between an in-flight <c>processing</c>
+/// row (defer the redelivery so the live worker is not preempted)
+/// and an orphaned <c>processing</c> row left behind by a crashed
+/// worker (reclaim the lease so a future Slack retry can recover
+/// the envelope).
+/// </summary>
+/// <remarks>
+/// Stage 4.3 of
+/// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>.
+/// Bound from the <c>"Slack:Idempotency"</c> configuration section.
+/// </remarks>
+public sealed class SlackIdempotencyOptions
+{
+    /// <summary>
+    /// Configuration section name (<c>"Slack:Idempotency"</c>) the
+    /// options are bound from.
+    /// </summary>
+    public const string SectionName = "Slack:Idempotency";
+
+    /// <summary>
+    /// Age (in seconds) past which a row whose
+    /// <c>processing_status = "processing"</c> is considered an
+    /// orphaned lease and is reclaimed by the next redelivery via
+    /// optimistic concurrency control. Defaults to <c>300</c>
+    /// seconds (5 minutes) -- long enough to cover the worst-case
+    /// retry budget for a single envelope without leaving a crashed
+    /// worker's row stuck forever. Values are clamped to a minimum
+    /// of <c>1</c> at consumption time.
+    /// </summary>
+    public int StaleProcessingThresholdSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// Bounded retry budget for the terminal-status write performed
+    /// by <c>MarkCompletedAsync</c> / <c>MarkFailedAsync</c>. Each
+    /// attempt is a fresh DI scope + fresh <c>SaveChangesAsync</c>;
+    /// the loop keeps trying until the row reaches its terminal
+    /// state OR this budget is exhausted, at which point the guard
+    /// logs critically and surrenders. Defaults to <c>4</c> attempts
+    /// (3 retries after the initial try). Clamped to a minimum of
+    /// <c>1</c> at consumption time.
+    /// </summary>
+    /// <remarks>
+    /// Iter-6 evaluator item #2: without bounded retry a single
+    /// transient DB blip during completion left the dedup row in
+    /// <c>processing</c>, where the stale-reclaim path could re-
+    /// execute the handler after <see cref="StaleProcessingThresholdSeconds"/>.
+    /// Retrying inside the guard absorbs the common transient
+    /// failure modes and keeps successful work from being replayed.
+    /// </remarks>
+    public int CompletionMaxAttempts { get; set; } = 4;
+
+    /// <summary>
+    /// Initial backoff in milliseconds between
+    /// <c>MarkCompletedAsync</c> / <c>MarkFailedAsync</c> retry
+    /// attempts. The guard applies exponential growth (50ms, 100ms,
+    /// 200ms, ...) capped at one second so the dispatch loop never
+    /// stalls for long. Defaults to <c>50</c>. Clamped to a minimum
+    /// of <c>0</c> at consumption time (use <c>0</c> in tests to
+    /// remove the artificial delay).
+    /// </summary>
+    public int CompletionInitialDelayMilliseconds { get; set; } = 50;
 }
 
 /// <summary>
@@ -123,14 +198,19 @@ public sealed class SlackRateLimitOptions
     };
 
     /// <summary>
-    /// Tier 2 (~20+ requests/min). Applies to <c>chat.postMessage</c>,
-    /// which Slack documents as "roughly 1 message per second per
-    /// channel". Default <see cref="SlackRateLimitTier.Scope"/> is
-    /// <see cref="SlackRateLimitScope.Channel"/>.
+    /// Tier 2 (~20+ requests/min general; <c>chat.postMessage</c>
+    /// specifically ~1 message/sec/channel). The default is therefore
+    /// 60 req/min per channel rather than the umbrella 20 req/min,
+    /// because the Stage 6.3 brief and architecture.md §2.12 both
+    /// pin the connector's outbound rate at "~1 req/s/channel". A
+    /// small <see cref="SlackRateLimitTier.BurstCapacity"/> of 5
+    /// absorbs short producer bursts without exceeding Slack's
+    /// short-window ceiling. Default <see cref="SlackRateLimitTier.Scope"/>
+    /// is <see cref="SlackRateLimitScope.Channel"/>.
     /// </summary>
     public SlackRateLimitTier Tier2 { get; set; } = new()
     {
-        RequestsPerMinute = 20,
+        RequestsPerMinute = 60,
         BurstCapacity = 5,
         Scope = SlackRateLimitScope.Channel,
     };

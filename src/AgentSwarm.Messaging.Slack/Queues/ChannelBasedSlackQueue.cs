@@ -97,6 +97,36 @@ internal sealed class ChannelBasedSlackQueue<T>
     }
 
     /// <summary>
+    /// Returns the current number of buffered items, when the
+    /// underlying channel exposes a count. Both
+    /// <see cref="Channel.CreateUnbounded{T}(UnboundedChannelOptions)"/>
+    /// and <see cref="Channel.CreateBounded{T}(BoundedChannelOptions)"/>
+    /// support <see cref="ChannelReader{T}.Count"/> in .NET 6+; callers
+    /// that inject a custom channel through
+    /// <see cref="ChannelBasedSlackQueue{T}(Channel{T})"/> SHOULD
+    /// honour the same. Returns <c>0</c> when the reader reports
+    /// <see cref="ChannelReader{T}.CanCount"/> = <see langword="false"/>
+    /// so the Stage 7.3 health check never misreports unknown depth
+    /// as zero load.
+    /// </summary>
+    /// <remarks>
+    /// Stage 7.3 of
+    /// <c>docs/stories/qq-SLACK-MESSENGER-SUPP/implementation-plan.md</c>
+    /// step 2: the outbound-queue-depth health check samples this
+    /// value through the
+    /// <c>ISlackOutboundQueueDepthProbe</c> adapter implemented by
+    /// <see cref="ChannelBasedSlackOutboundQueue"/>.
+    /// </remarks>
+    public int Count
+    {
+        get
+        {
+            ChannelReader<T> reader = this.channel.Reader;
+            return reader.CanCount ? reader.Count : 0;
+        }
+    }
+
+    /// <summary>
     /// Signals that no further items will be enqueued. Subsequent
     /// <see cref="DequeueAsync"/> calls drain remaining items and then
     /// throw <see cref="ChannelClosedException"/>. Idempotent.
