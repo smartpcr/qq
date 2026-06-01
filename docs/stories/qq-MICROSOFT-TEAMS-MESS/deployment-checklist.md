@@ -132,6 +132,54 @@ These settings live in `appsettings.json` / Key Vault and are loaded
 by the host's `Program.cs` into the options objects exposed by
 `AgentSwarm.Messaging.Teams.Security`.
 
+### 4.0 Canonical `appsettings.json` shape
+
+The host binds `TeamsMessagingOptions` from the `TeamsMessaging` section
+and `TeamsAppPolicyOptions` from the `TeamsAppPolicy` section. The
+binding shape below is the one auto-wired by
+`services.AddTeamsSecurity()` — every consumer in the security graph
+(`TenantValidationMiddleware`, `InstallationStateGate`,
+`EntraBotFrameworkAuthentication`, `TeamsAppPolicyHealthCheck`)
+resolves through `IOptionsMonitor<TeamsMessagingOptions>` /
+`IOptionsMonitor<TeamsAppPolicyOptions>` so hot-reload of
+`AllowedTenantIds` and `AllowedCallers` propagates without restart:
+
+```json
+{
+  "TeamsMessaging": {
+    "MicrosoftAppId": "<bot-app-id-guid>",
+    "MicrosoftAppPassword": "<bound-from-key-vault>",
+    "MicrosoftAppTenantId": "<entra-tenant-id-guid>",
+    "AllowedTenantIds": [ "<entra-tenant-id-guid>" ],
+    "BotEndpoint": "https://<bot-host>/api/messages",
+    "RateLimitPerTenantPerMinute": 60
+  },
+  "TeamsAppPolicy": {
+    "RequireAdminConsent": true,
+    "AllowedAppCatalogScopes": [ "organization" ],
+    "BlockSideloading": true
+  }
+}
+```
+
+The matching `Program.cs` binding is:
+
+```csharp
+services.Configure<TeamsMessagingOptions>(
+    builder.Configuration.GetSection("TeamsMessaging"));
+services.Configure<TeamsAppPolicyOptions>(
+    builder.Configuration.GetSection("TeamsAppPolicy"));
+services.AddTeamsSecurity();
+```
+
+`AddTeamsSecurity()` does NOT probe the configuration shape itself;
+it composes `IConfigureOptions` chains for both options types and the
+underlying `BotFrameworkAuthentication` factory resolves
+`TeamsMessagingOptions` through DI — so hosts may use any binding
+convention `Microsoft.Extensions.Configuration` supports (section bind
+above, environment variables `TeamsMessaging__MicrosoftAppId=...`,
+Key Vault references, etc.).
+
 - [ ] **`TeamsAppPolicyOptions.RequireAdminConsent = true`** (production
       default). When true, the runtime only trusts installations that
       were produced via an admin-driven app setup policy. The flag is

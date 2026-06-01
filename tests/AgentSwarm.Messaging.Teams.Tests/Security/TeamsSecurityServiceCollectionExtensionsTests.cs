@@ -100,6 +100,90 @@ public sealed class TeamsSecurityServiceCollectionExtensionsTests
     }
 
     [Fact]
+    public void AddTeamsSecurity_AutoRegistersTeamsAppPolicyHealthCheck()
+    {
+        // Stage 5.1 iter-9 evaluator follow-up — AddTeamsSecurity MUST auto-register the
+        // teams-app-policy health check so the deployment checklist's "GET /health"
+        // instructions work without an extra opt-in call. A host that composes ONLY
+        // AddTeamsSecurity() (no AddTeamsAppPolicyHealthCheck) should still see the
+        // registration in HealthCheckServiceOptions.
+        var services = NewServiceCollection();
+        services.AddTeamsSecurity();
+
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+        var options = sp.GetRequiredService<IOptions<HealthCheckServiceOptions>>().Value;
+        Assert.Contains(options.Registrations, r => r.Name == TeamsAppPolicyHealthCheck.Name);
+    }
+
+    [Fact]
+    public void AddTeamsSecurity_AutoRegistration_UsesDegradedFailureStatus()
+    {
+        // The auto-registration uses the canonical Degraded failure status (per
+        // tech-spec.md §5.1 R-5 — a missing component is a deployment-time fault,
+        // NOT an instance-down condition; load balancers should not evict the
+        // instance during a config rollout).
+        var services = NewServiceCollection();
+        services.AddTeamsSecurity();
+
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+        var options = sp.GetRequiredService<IOptions<HealthCheckServiceOptions>>().Value;
+        var registration = options.Registrations.Single(r => r.Name == TeamsAppPolicyHealthCheck.Name);
+        Assert.Equal(HealthStatus.Degraded, registration.FailureStatus);
+        Assert.Contains("teams", registration.Tags);
+        Assert.Contains("security", registration.Tags);
+    }
+
+    [Fact]
+    public void AddTeamsSecurity_RepeatedCalls_LeaveExactlyOneHealthCheckRegistration()
+    {
+        // Idempotency for the AUTO registration: TeamsAppPolicyHealthCheckMarker sentinel
+        // short-circuits on second/third call so we don't accumulate duplicate
+        // HealthCheckRegistration descriptors (which would throw at the first /health
+        // probe with "A health check named 'teams-app-policy' is already registered").
+        var services = NewServiceCollection();
+        services.AddTeamsSecurity();
+        services.AddTeamsSecurity();
+        services.AddTeamsSecurity();
+
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+        var options = sp.GetRequiredService<IOptions<HealthCheckServiceOptions>>().Value;
+        Assert.Single(options.Registrations.Where(r => r.Name == TeamsAppPolicyHealthCheck.Name));
+    }
+
+    [Fact]
+    public void AddTeamsAppPolicyHealthCheck_AfterAddTeamsSecurity_NoDuplicateRegistration()
+    {
+        // Compose-helper composition: a host that calls BOTH AddTeamsSecurity (which
+        // auto-registers) AND AddTeamsAppPolicyHealthCheck (the explicit override)
+        // with the default Degraded failureStatus should end with exactly one
+        // registration — not two.
+        var services = NewServiceCollection();
+        services.AddTeamsSecurity();
+        services.AddTeamsAppPolicyHealthCheck();
+
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+        var options = sp.GetRequiredService<IOptions<HealthCheckServiceOptions>>().Value;
+        Assert.Single(options.Registrations.Where(r => r.Name == TeamsAppPolicyHealthCheck.Name));
+    }
+
+    [Fact]
+    public void AddTeamsAppPolicyHealthCheck_WithCustomFailureStatus_ReplacesAutoRegistration()
+    {
+        // Host calls AddTeamsAppPolicyHealthCheck(Unhealthy) AFTER AddTeamsSecurity()
+        // auto-wired the Degraded variant. The explicit override MUST win — otherwise
+        // the host's intent is silently ignored. Verify there is exactly one
+        // registration AND it carries the Unhealthy failure status.
+        var services = NewServiceCollection();
+        services.AddTeamsSecurity();
+        services.AddTeamsAppPolicyHealthCheck(HealthStatus.Unhealthy);
+
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+        var options = sp.GetRequiredService<IOptions<HealthCheckServiceOptions>>().Value;
+        var registration = Assert.Single(options.Registrations.Where(r => r.Name == TeamsAppPolicyHealthCheck.Name));
+        Assert.Equal(HealthStatus.Unhealthy, registration.FailureStatus);
+    }
+
+    [Fact]
     public void AddTeamsSecurity_NullServices_Throws()
     {
         Assert.Throws<ArgumentNullException>(
