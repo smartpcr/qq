@@ -44,57 +44,38 @@ public static class TeamsSecurityServiceCollectionExtensions
         // PostConfigure / Configure delegates over the initial instance.
         services.AddOptions<RbacOptions>().Configure(o => o.WithDefaultRoleMatrix());
 
-        // Stage 5.1 iter-5 evaluator feedback item 1 — unified TeamsMessagingOptions
-        // surface. The connector/notifier resolve concrete TeamsMessagingOptions
-        // (legacy direct-singleton pattern) while TenantValidationMiddleware and the
-        // Entra BotFrameworkAuthentication factory resolve
-        // IOptionsMonitor<TeamsMessagingOptions> (canonical IOptions pattern). Without
-        // a bridge, a host wiring options via ONLY one pattern leaves the other consumer
-        // with empty defaults — tenant validation refuses every request while the
-        // connector sends with the wrong AppId, or vice versa.
+        // Bridge the two TeamsMessagingOptions resolution surfaces so all host
+        // registration styles produce one observable options instance.
         //
-        // The bridge below makes all the host-registration shapes produce the same
-        // observable result. Three forward-bridge variants are supported (case A —
-        // a TeamsMessagingOptions singleton pre-registered by the host) plus one
-        // backward-bridge variant (case B):
-        //   * Case A.1 — services.AddSingleton(new TeamsMessagingOptions{...}) →
-        //     descriptor has ImplementationInstance set; project the captured instance
-        //     via services.Configure<>(o => Copy(instance, o)).
-        //   * Case A.2 — services.AddSingleton<TeamsMessagingOptions>(sp => factory(sp)) →
-        //     descriptor has ImplementationFactory set. The bridge does NOT capture and
-        //     re-invoke the factory delegate from inside IConfigureOptions (the iter-5
-        //     approach that exhibited non-deterministic divergence when the host's
-        //     factory was non-idempotent). Instead the IConfigureOptions resolves the
-        //     SAME cached singleton instance through sp.GetRequiredService<TeamsMessagingOptions>()
-        //     so both the concrete-type surface and the IOptionsMonitor surface project
-        //     from one instance — see the "Recursion safety" remarks on
-        //     BridgeTeamsMessagingOptions below for why this is safe.
-        //   * Case A.3 — services.AddSingleton<TeamsMessagingOptions>() (type-based) →
-        //     descriptor has ImplementationType set. The bridge does NOT call
-        //     ActivatorUtilities.CreateInstance from inside IConfigureOptions; it
-        //     resolves the singleton the same way as Case A.2 above, again projecting
-        //     from one cached instance shared by both surfaces.
-        //   * Case B — host called services.Configure<TeamsMessagingOptions>(...) only,
-        //     without registering a concrete singleton; the backward bridge resolves the
-        //     concrete-type request via TryAddSingleton sp.GetRequiredService<IOptionsMonitor>().CurrentValue.
+        // Why a bridge: the connector and proactive notifier resolve the concrete
+        // TeamsMessagingOptions singleton (legacy direct-singleton pattern) while
+        // TenantValidationMiddleware and the Entra BotFrameworkAuthentication factory
+        // resolve IOptionsMonitor<TeamsMessagingOptions> (canonical IOptions pattern).
+        // Without a bridge, a host wiring options via only one pattern leaves the
+        // other consumer with empty defaults — tenant validation refuses every
+        // request while the connector sends with the wrong AppId (or vice versa).
         //
-        // After this block, both Connector-path and Middleware-path resolve to the
-        // SAME observable TeamsMessagingOptions values regardless of host wiring style.
+        // Three forward-bridge variants (host pre-registered a concrete singleton)
+        // plus one backward-bridge variant (host used services.Configure only) are
+        // supported. Each forward variant projects from the SAME cached singleton
+        // (instance / factory-resolved / type-resolved) into the IOptions surface so
+        // both consumers observe identical values regardless of registration shape.
+        // See the BridgeTeamsMessagingOptions remarks below for recursion-safety notes
+        // when the host uses a factory or type-based registration.
         BridgeTeamsMessagingOptions(services);
 
-        // Stage 5.1 step 7 — TeamsAppPolicyOptions startup validation. The
-        // IValidateOptions implementation runs Validate() on every resolution of
-        // IOptions<TeamsAppPolicyOptions>; .ValidateOnStart() (composed with
-        // IHostedService) makes Host.StartAsync fail fast when the bound options are
-        // invalid (eg. unknown AllowedAppCatalogScopes value). This replaces the
-        // previous "errors only surface from the health check" behaviour.
+        // TeamsAppPolicyOptions startup validation. The IValidateOptions implementation
+        // runs Validate() on every resolution of IOptions<TeamsAppPolicyOptions>;
+        // .ValidateOnStart() (composed with IHostedService) makes Host.StartAsync fail
+        // fast when the bound options are invalid (e.g. unknown AllowedAppCatalogScopes
+        // value) instead of deferring the surface to the health check.
         services.AddOptions<TeamsAppPolicyOptions>().ValidateOnStart();
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton<IValidateOptions<TeamsAppPolicyOptions>, TeamsAppPolicyOptionsValidator>());
 
-        // Replace the Stage 2.1 default-deny stubs with the concrete Stage 5.1
-        // implementations. RemoveAll is correct (not TryAdd) because the stubs are
-        // already registered by Stage 2.1 — TryAdd would silently leave them in place.
+        // Replace the Stage 2.1 default-deny stubs with the concrete implementations.
+        // RemoveAll (not TryAdd) is required because the stubs are already registered
+        // by Stage 2.1 — TryAdd would silently leave them in place.
         services.RemoveAll<IIdentityResolver>();
         services.AddSingleton<IIdentityResolver, EntraIdentityResolver>();
 
@@ -105,111 +86,104 @@ public static class TeamsSecurityServiceCollectionExtensions
         services.TryAddSingleton<InstallationStateGate>();
         services.TryAddSingleton<TeamsAppPolicyHealthCheck>();
 
-        // Stage 5.1 iter-9 evaluator feedback (iter-3 item 3 follow-up) — auto-register
-        // the TeamsAppPolicyHealthCheck with the ASP.NET Core health-check pipeline so
-        // the deployment checklist's `GET /health → teams-app-policy: Healthy`
-        // instructions work without an extra opt-in call. Earlier iters required hosts
-        // to call AddTeamsAppPolicyHealthCheck explicitly, which the evaluator flagged
-        // as a surprising deviation from the "AddTeamsSecurity wires the full Stage 5.1
-        // security graph" promise. Idempotency is enforced by the TeamsAppPolicyHealthCheckMarker
-        // sentinel: a second AddTeamsSecurity() call (or AddTeamsAppPolicyHealthCheck()
-        // called explicitly afterwards) short-circuits before a duplicate
-        // HealthCheckRegistration descriptor is appended.
+        // Auto-register the policy health check on the canonical name so the deployment
+        // checklist's `GET /health → teams-app-policy: Healthy` instruction works without
+        // a separate opt-in call. The registration is performed inside a deferred
+        // PostConfigure<HealthCheckServiceOptions> delegate (not directly via
+        // AddHealthChecks().AddCheck) so we can inspect the FINAL registration list at
+        // service-provider build time. Two duplicate-prevention sources are handled:
+        //   (a) repeated AddTeamsSecurity() calls — the TeamsAppPolicyHealthCheckMarker
+        //       sentinel below short-circuits the second invocation;
+        //   (b) a host that pre-registered a check with the same canonical name via
+        //       services.AddHealthChecks().AddCheck("teams-app-policy", ...) before
+        //       calling AddTeamsSecurity() — the PostConfigure delegate skips appending
+        //       when a registration with the canonical name already exists, so the
+        //       host's pre-existing check wins.
         if (!services.Any(d => d.ServiceType == typeof(TeamsAppPolicyHealthCheckMarker)))
         {
             services.AddSingleton<TeamsAppPolicyHealthCheckMarker>(_ => new TeamsAppPolicyHealthCheckMarker());
-            services.AddHealthChecks().AddCheck<TeamsAppPolicyHealthCheck>(
-                TeamsAppPolicyHealthCheck.Name,
-                failureStatus: HealthStatus.Degraded,
-                tags: new[] { "teams", "security" });
+
+            // Ensure the HealthCheckService is registered; PostConfigure has no effect
+            // if the host never composed AddHealthChecks(). Calling AddHealthChecks()
+            // here is idempotent (it uses TryAddSingleton internally).
+            services.AddHealthChecks();
+
+            services.PostConfigure<HealthCheckServiceOptions>(o =>
+            {
+                if (o.Registrations.Any(r => string.Equals(r.Name, TeamsAppPolicyHealthCheck.Name, StringComparison.Ordinal)))
+                {
+                    return;
+                }
+                o.Registrations.Add(new HealthCheckRegistration(
+                    name: TeamsAppPolicyHealthCheck.Name,
+                    factory: sp => sp.GetRequiredService<TeamsAppPolicyHealthCheck>(),
+                    failureStatus: HealthStatus.Degraded,
+                    tags: new[] { "teams", "security" }));
+            });
         }
 
-        // Stage 5.1 iter-4 evaluator feedback item 6 — Entra Bot Framework authentication
-        // hardening MUST be part of the default security graph. Without this call, hosts
-        // that compose AddTeamsSecurity() alone retain whatever BotFrameworkAuthentication
-        // registration the Bot Framework SDK installed (typically the unrestricted
-        // ConfigurationBotFrameworkAuthentication which does not enforce AllowedCallers /
-        // AllowedTenantIds). The Entra-aware factory below replaces that registration so
-        // every inbound activity's JWT is validated against the configured caller and
-        // tenant allow-lists. Hosts that need explicit configuration of
-        // EntraBotFrameworkAuthenticationOptions can still call
-        // AddEntraBotFrameworkAuthentication(configure) directly — the options builder is
-        // idempotent (AddOptions returns the same builder on repeat calls).
+        // BotFrameworkAuthentication hardening is part of the default security graph so
+        // hosts composing AddTeamsSecurity() alone get JWT-layer AllowedCallers /
+        // AllowedTenantIds enforcement instead of the SDK's unrestricted default
+        // ConfigurationBotFrameworkAuthentication. Hosts that need to bind
+        // EntraBotFrameworkAuthenticationOptions explicitly (e.g. from configuration)
+        // can still call AddEntraBotFrameworkAuthentication(configure) directly — the
+        // options builder is additive and the singleton registration RemoveAll+AddSingleton
+        // pattern leaves exactly one descriptor regardless of call order.
         services.AddEntraBotFrameworkAuthentication();
 
         return services;
     }
 
     /// <summary>
-    /// Stage 5.1 iter-5 evaluator feedback item 1 — bridge the two
-    /// <see cref="TeamsMessagingOptions"/> resolution patterns so both produce identical
-    /// observable values. See the comment block in <see cref="AddTeamsSecurity"/> for
-    /// rationale. Stage 5.1 iter-6 evaluator feedback item 1 — the bridge now handles
-    /// ALL three host-registration shapes (instance, factory, type) for the forward
-    /// direction (singleton → IOptionsMonitor), not just <c>ImplementationInstance</c>.
-    /// Stage 5.1 iter-7 evaluator feedback items 1+2 — the bridge is now guarded by a
-    /// sentinel marker service so subsequent invocations short-circuit before the
-    /// host-descriptor inspection logic, and Patterns B/C now resolve the host's
-    /// singleton through the <see cref="IServiceProvider"/> so non-deterministic host
-    /// factories produce one cached value observed by both surfaces.
+    /// Bridge the concrete-singleton and IOptionsMonitor resolution surfaces for
+    /// <see cref="TeamsMessagingOptions"/> so all host registration shapes produce
+    /// identical observable values regardless of which surface consumers resolve.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Idempotent: the helper always calls <c>AddOptions&lt;TeamsMessagingOptions&gt;</c>
-    /// (no-op on the second invocation) and uses <c>TryAddSingleton</c> for the
-    /// concrete-type fallback (no-op when the host already registered the type). The
-    /// sentinel-marker check at the top of the method short-circuits every subsequent
-    /// invocation before any new descriptors are added, so the helper is safely
-    /// re-entrant — calling <c>AddTeamsSecurity()</c> twice (or composing it with
-    /// <c>AddTeamsMessengerConnector()</c> which calls it transitively) leaves exactly
-    /// one bridge installation.
+    /// Supports all three forward-bridge patterns when the host pre-registers a
+    /// concrete singleton (instance, factory, or type), plus a backward bridge when
+    /// the host called <c>services.Configure&lt;TeamsMessagingOptions&gt;</c> alone
+    /// without a singleton. Idempotent across composed callers
+    /// (<see cref="AddTeamsSecurity"/> and <c>AddTeamsMessengerConnector</c> both
+    /// invoke it transitively): a sentinel marker short-circuits every call after
+    /// the first, the <c>AddOptions</c> call is a no-op on second invocation, and
+    /// the backward-bridge <c>TryAddSingleton</c> respects the host's prior descriptor.
     /// </para>
     /// <para>
-    /// <b>Recursion safety.</b> The forward-bridge <c>IConfigureOptions</c> for the
-    /// factory / type cases resolves the host's options through
-    /// <c>sp.GetRequiredService&lt;TeamsMessagingOptions&gt;()</c>. This is safe
-    /// (no infinite recursion) because the sentinel guard prevents
-    /// <see cref="BridgeTeamsMessagingOptions"/> from running twice, which in turn
-    /// guarantees the only <see cref="TeamsMessagingOptions"/> descriptor at SP-build
-    /// time is the HOST's (the backward-bridge <c>TryAddSingleton</c> is a no-op when
-    /// the host descriptor is already present). The DI container caches the host's
-    /// factory/type result as a singleton on first resolution; both the concrete-type
-    /// surface and the <see cref="IOptionsMonitor{TOptions}"/> surface project from
-    /// that SAME cached singleton — eliminating the value divergence that earlier iters'
-    /// "invoke captured factory directly" approach exhibited for non-deterministic
-    /// host factories.
+    /// <b>Recursion safety.</b> The factory / type forward bridges resolve the host's
+    /// options via <c>sp.GetRequiredService&lt;TeamsMessagingOptions&gt;()</c> from
+    /// inside <see cref="IConfigureOptions{TOptions}"/>. This is safe — no infinite
+    /// recursion — because the sentinel guarantees this method runs at most once, so
+    /// at SP-build time the host's descriptor wins over the backward-bridge
+    /// <c>TryAddSingleton</c>; both surfaces (concrete-type and IOptionsMonitor)
+    /// then project from the SAME cached singleton, even when the host's factory is
+    /// non-deterministic (e.g. <c>sp =&gt; new TeamsMessagingOptions { MicrosoftAppId = Guid.NewGuid() }</c>).
     /// </para>
     /// </remarks>
     private static void BridgeTeamsMessagingOptions(IServiceCollection services)
     {
         services.AddOptions<TeamsMessagingOptions>();
 
-        // Stage 5.1 iter-7 evaluator feedback item 1 — sentinel-based idempotency guard.
-        // Once the bridge has run, the service collection contains BOTH a backward-bridge
-        // TeamsMessagingOptions descriptor (whose ImplementationFactory invokes
-        // IOptionsMonitor<TeamsMessagingOptions>.CurrentValue) AND any forward-bridge
-        // IConfigureOptions the host's registration triggered. A SECOND call to
-        // BridgeTeamsMessagingOptions (e.g. host calls AddTeamsSecurity() twice, or
-        // composes AddTeamsSecurity() with AddTeamsMessengerConnector() which also calls
-        // it transitively) would find the backward-bridge factory as
-        // FirstOrDefault(d => d.ServiceType == typeof(TeamsMessagingOptions)) and register
-        // a new IConfigureOptions whose body invokes that factory — which itself reads
-        // IOptionsMonitor.CurrentValue, re-entering the configure chain and triggering
-        // either re-entrancy throw or stack overflow. The sentinel below prevents that
-        // by short-circuiting all subsequent invocations BEFORE the host-descriptor
-        // inspection logic runs.
+        // Sentinel-based idempotency guard. After the first bridge installation, the
+        // service collection contains both the backward-bridge factory (whose body
+        // reads IOptionsMonitor.CurrentValue) and any forward-bridge IConfigureOptions
+        // the host's registration triggered. Re-entering this method would treat the
+        // backward-bridge factory as the "host" descriptor and register a new
+        // IConfigureOptions that reads IOptionsMonitor — re-entering the configure
+        // chain and producing either a re-entrancy throw or a stack overflow.
         if (services.Any(d => d.ServiceType == typeof(TeamsMessagingOptionsBridgeMarker)))
         {
             return;
         }
         services.AddSingleton<TeamsMessagingOptionsBridgeMarker>(_ => new TeamsMessagingOptionsBridgeMarker());
 
-        // Snapshot the FIRST host-registered TeamsMessagingOptions descriptor (if any).
-        // We snapshot the descriptor reference at registration time — later mutations to
-        // the service collection do not retroactively affect the bridge. Hosts that
-        // register their options AFTER calling AddTeamsSecurity / AddTeamsMessengerConnector
-        // intentionally bypass the bridge (matches the standard DI "register options
-        // first" guidance).
+        // Snapshot the host-registered descriptor (if any). The reference is captured
+        // at registration time; later mutations to the service collection do not
+        // retroactively affect the bridge. Hosts that register options AFTER calling
+        // AddTeamsSecurity / AddTeamsMessengerConnector intentionally bypass the
+        // bridge (matches the standard DI "register options first" guidance).
         var preRegistered = services
             .FirstOrDefault(d => d.ServiceType == typeof(TeamsMessagingOptions));
 
@@ -218,8 +192,8 @@ public static class TeamsSecurityServiceCollectionExtensions
             if (preRegistered.ImplementationInstance is TeamsMessagingOptions instance)
             {
                 // Pattern A — services.AddSingleton(new TeamsMessagingOptions{...}).
-                // The simplest forward bridge: project the captured instance via a plain
-                // Configure delegate. No SP needed; no recursion possible.
+                // Project the captured instance via a plain Configure delegate. No SP
+                // needed, no recursion possible.
                 services.Configure<TeamsMessagingOptions>(o => CopyTeamsMessagingOptions(instance, o));
             }
             else if (preRegistered.ImplementationFactory is not null
@@ -228,24 +202,13 @@ public static class TeamsSecurityServiceCollectionExtensions
                 // Pattern B — services.AddSingleton<TeamsMessagingOptions>(sp => factory(sp)).
                 // Pattern C — services.AddSingleton<TeamsMessagingOptions>() (type-based).
                 //
-                // Stage 5.1 iter-7 evaluator feedback item 2 — resolve the host's
-                // TeamsMessagingOptions THROUGH THE SERVICE PROVIDER from inside
-                // IConfigureOptions. The host's descriptor is registered FIRST (its factory
-                // / type appears earlier in the descriptor list); the backward-bridge
-                // TryAddSingleton below is a NO-OP when the host descriptor is already
-                // present. So sp.GetRequiredService<TeamsMessagingOptions>() resolves the
-                // HOST's descriptor (NOT the backward bridge) and the SP caches the result
-                // as a true singleton — meaning the concrete-type surface and the
-                // IOptionsMonitor surface project from the SAME singleton instance, even
-                // when the host's factory is non-deterministic (e.g.
-                // sp => new TeamsMessagingOptions { MicrosoftAppId = Guid.NewGuid() }).
-                //
-                // Previous iters invoked the captured factory (hostFactory(sp)) or
-                // Activator.CreateInstance directly to avoid a recursion trap; the
-                // sentinel-based idempotency guard above (iter-7 item 1) plus the fact
-                // that the host descriptor wins over our TryAddSingleton means that trap
-                // is now unreachable, so the SP route is safe and gives the
-                // single-instance guarantee.
+                // Resolve the host's TeamsMessagingOptions through the SP from inside
+                // IConfigureOptions. The host's descriptor wins over the backward-bridge
+                // TryAddSingleton below, so sp.GetRequiredService<TeamsMessagingOptions>()
+                // returns the host's instance and the DI container caches it — both
+                // the concrete-type surface and the IOptionsMonitor surface then
+                // project from the SAME singleton, eliminating value divergence when
+                // the host's factory is non-deterministic.
                 services.AddSingleton<IConfigureOptions<TeamsMessagingOptions>>(sp =>
                 {
                     var hostInstance = sp.GetRequiredService<TeamsMessagingOptions>();
@@ -257,37 +220,37 @@ public static class TeamsSecurityServiceCollectionExtensions
         }
 
         // Backward bridge: when the host wired options via
-        // services.Configure<TeamsMessagingOptions>(cfg.GetSection("Teams")) and did NOT
-        // also register a concrete singleton, resolve the concrete type from the
+        // services.Configure<TeamsMessagingOptions>(cfg.GetSection("Teams")) and did
+        // NOT also register a concrete singleton, resolve the concrete type from the
         // IOptionsMonitor's CurrentValue. TryAddSingleton ensures the forward-bridge
         // case (where a host singleton is already present) keeps the host's instance —
-        // the bridge in that path runs in the OTHER direction (singleton -> monitor).
+        // the bridge in that path runs in the OTHER direction (singleton → monitor).
         services.TryAddSingleton<TeamsMessagingOptions>(sp =>
             sp.GetRequiredService<IOptionsMonitor<TeamsMessagingOptions>>().CurrentValue);
     }
 
     /// <summary>
-    /// Sentinel marker registered by <see cref="BridgeTeamsMessagingOptions"/> after its
-    /// first run. Subsequent invocations detect this marker and short-circuit before the
-    /// host-descriptor inspection logic — preventing the re-entrant configure loop the
-    /// Stage 5.1 iter-7 evaluator (item 1) flagged for the
-    /// <c>AddTeamsSecurity() x2 with Configure-only options</c> case.
+    /// Sentinel marker registered by <see cref="BridgeTeamsMessagingOptions"/> after
+    /// its first run. Subsequent invocations detect this marker and short-circuit
+    /// before the host-descriptor inspection logic — preventing the re-entrant
+    /// configure loop that would otherwise occur when a host calls
+    /// <c>AddTeamsSecurity()</c> multiple times (directly or transitively via
+    /// <c>AddTeamsMessengerConnector</c>) with <c>Configure</c>-only options wiring.
     /// </summary>
     private sealed class TeamsMessagingOptionsBridgeMarker
     {
     }
 
     /// <summary>
-    /// Sentinel marker registered by <see cref="AddTeamsSecurity"/> after the
-    /// auto-wired <see cref="TeamsAppPolicyHealthCheck"/> registration. Subsequent
-    /// invocations of either <see cref="AddTeamsSecurity"/> OR
-    /// <see cref="AddTeamsAppPolicyHealthCheck"/> detect this marker and short-circuit
-    /// the <c>AddHealthChecks().AddCheck</c> call — preventing duplicate
-    /// <c>HealthCheckRegistration</c> descriptors with the same canonical name
-    /// (<see cref="TeamsAppPolicyHealthCheck.Name"/>) which would otherwise cause the
-    /// ASP.NET Core health-check pipeline to throw at startup. Stage 5.1 iter-9
-    /// evaluator follow-up (iter-3 feedback item 3 truncation) — see the comment
-    /// at the AddCheck call site for rationale.
+    /// Idempotency sentinel for the auto-registered <see cref="TeamsAppPolicyHealthCheck"/>
+    /// inside <see cref="AddTeamsSecurity"/>. Presence of this descriptor means the
+    /// health-check registration block has already run, so subsequent calls to
+    /// <see cref="AddTeamsSecurity"/> short-circuit before adding another
+    /// <c>PostConfigure&lt;HealthCheckServiceOptions&gt;</c> delegate. A second source
+    /// of duplicate prevention lives inside that delegate itself: it skips appending
+    /// when a registration with <see cref="TeamsAppPolicyHealthCheck.Name"/> already
+    /// exists, so a host that pre-registered the check with the same canonical name
+    /// retains its own registration.
     /// </summary>
     private sealed class TeamsAppPolicyHealthCheckMarker
     {
@@ -322,8 +285,21 @@ public static class TeamsSecurityServiceCollectionExtensions
     /// <summary>
     /// Register <see cref="TeamsAppPolicyHealthCheck"/> with the standard ASP.NET Core
     /// health-check pipeline under <see cref="TeamsAppPolicyHealthCheck.Name"/>. Composes
-    /// <see cref="AddTeamsSecurity"/> first so the health-check type itself is wired.
+    /// <see cref="AddTeamsSecurity"/> first, so calling this helper alone is sufficient
+    /// to wire the full Stage 5.1 security graph plus the explicit failure-status choice.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="AddTeamsSecurity"/> already auto-registers the check with
+    /// <see cref="HealthStatus.Degraded"/> failure status; this helper exists so hosts can
+    /// override that status (e.g. <see cref="HealthStatus.Unhealthy"/> so load balancers
+    /// evict the instance when the policy probe fails). The override is performed via
+    /// <see cref="OptionsServiceCollectionExtensions.PostConfigure{TOptions}(IServiceCollection, Action{TOptions})"/>
+    /// against <see cref="HealthCheckServiceOptions"/> so the host's status replaces the
+    /// auto-registered descriptor (matched by canonical <see cref="TeamsAppPolicyHealthCheck.Name"/>),
+    /// preventing the runtime "duplicate health check name" startup throw.
+    /// </para>
+    /// </remarks>
     /// <param name="services">The service collection to mutate.</param>
     /// <param name="failureStatus">Status returned when the check reports unhealthy. Defaults to <see cref="HealthStatus.Degraded"/>.</param>
     /// <returns>The same <paramref name="services"/> instance (fluent).</returns>
@@ -336,14 +312,6 @@ public static class TeamsSecurityServiceCollectionExtensions
 
         services.AddTeamsSecurity();
 
-        // Stage 5.1 iter-9 evaluator follow-up — AddTeamsSecurity now auto-registers the
-        // health check with the canonical Degraded failure status. When the host calls
-        // this helper explicitly to override the failure status, REPLACE the
-        // auto-registration so the host's failureStatus wins; otherwise we'd accumulate
-        // two HealthCheckRegistration descriptors with the same Name and the runtime
-        // throws InvalidOperationException at first probe. When the host accepts the
-        // default Degraded status (the auto-registered value), the sentinel marker
-        // short-circuits and no duplicate is added.
         if (failureStatus != HealthStatus.Degraded)
         {
             services.PostConfigure<HealthCheckServiceOptions>(o =>
@@ -380,7 +348,7 @@ public static class TeamsSecurityServiceCollectionExtensions
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Hot-reload contract — Stage 5.1 iter-8 evaluator feedback.</b> The
+    /// <b>Hot-reload contract.</b> The
     /// <see cref="EntraBotFrameworkAuthenticationOptions.AllowedCallers"/> and
     /// <see cref="EntraBotFrameworkAuthenticationOptions.AllowedTenantIds"/> allow-lists
     /// are read by the registered claims validator on EVERY inbound activity (via
@@ -422,23 +390,19 @@ public static class TeamsSecurityServiceCollectionExtensions
         services.RemoveAll<BotFrameworkAuthentication>();
         services.AddSingleton<BotFrameworkAuthentication>(sp =>
         {
-            // Stage 5.1 iter-8 evaluator feedback item — close the hot-reload asymmetry
-            // between the HTTP-layer TenantValidationMiddleware (which reads
-            // _options.CurrentValue per request and observes IConfiguration reloads
-            // immediately) and the JWT-layer claims validator (which previously
-            // snapshotted AllowedTenantIds / AllowedCallers here at singleton
-            // construction time, leaving the JWT layer enforcing the stale list after a
-            // configuration reload). HotReloadEntraTenantAwareClaimsValidator below
-            // resolves the option monitors on EVERY ValidateClaimsAsync call, so an
-            // operator allow-list edit takes effect at both defence-in-depth layers in
-            // lockstep without a host restart.
+            // Hot-reload contract — close the asymmetry between the HTTP-layer
+            // TenantValidationMiddleware (which reads _options.CurrentValue per request
+            // and observes IConfiguration reloads immediately) and the JWT-layer claims
+            // validator. HotReloadEntraTenantAwareClaimsValidator below resolves the
+            // option monitors on EVERY ValidateClaimsAsync call so an operator
+            // allow-list edit takes effect at both defence-in-depth layers in lockstep
+            // without a host restart.
             //
-            // The fields below that ARE snapshotted (credentials, channel service,
-            // validate-authority bool) cannot hot-reload because
-            // BotFrameworkAuthenticationFactory.Create bakes them into the returned
-            // singleton — the BF SDK does not expose a refresh hook. The XML-doc
-            // remarks on AddEntraBotFrameworkAuthentication state this contract
-            // explicitly for operators.
+            // The fields snapshotted below (credentials, channel service, validate-
+            // authority bool) CANNOT hot-reload because BotFrameworkAuthenticationFactory
+            // .Create bakes them into the returned singleton — the BF SDK does not expose
+            // a refresh hook. The XML-doc remarks on AddEntraBotFrameworkAuthentication
+            // state this contract explicitly for operators.
             var authOptionsMonitor = sp.GetRequiredService<IOptionsMonitor<EntraBotFrameworkAuthenticationOptions>>();
             var messagingOptionsMonitor = sp.GetService<IOptionsMonitor<TeamsMessagingOptions>>();
             var messagingSingletonAccessor = new Func<TeamsMessagingOptions?>(() => sp.GetService<TeamsMessagingOptions>());
@@ -448,13 +412,12 @@ public static class TeamsSecurityServiceCollectionExtensions
             // allow-lists are NOT read here — the validator reads them per-request.
             var authOptions = authOptionsMonitor.CurrentValue;
 
-            // Stage 5.1 iter-5 evaluator feedback item 3 — resolve TeamsMessagingOptions
-            // by trying the concrete singleton FIRST and only falling back to
-            // IOptionsMonitor when no singleton is registered. The connector/notifier DI
-            // path historically registered TeamsMessagingOptions as a concrete singleton
-            // (either via services.AddSingleton(instance) or via a factory); reading the
-            // monitor first as in earlier iters could return blank defaults for those
-            // hosts. The BridgeTeamsMessagingOptions helper in AddTeamsSecurity now also
+            // Resolve TeamsMessagingOptions by trying the concrete singleton FIRST and
+            // only falling back to IOptionsMonitor when no singleton is registered. The
+            // connector/notifier DI path historically registered TeamsMessagingOptions
+            // as a concrete singleton (either via services.AddSingleton(instance) or via
+            // a factory); reading the monitor first would return blank defaults for
+            // those hosts. BridgeTeamsMessagingOptions in AddTeamsSecurity now also
             // projects instance-registered singletons into the monitor chain, so this
             // double-lookup is belt-and-braces — singleton wins when present, monitor
             // covers the IOptions.Configure-only wiring style.
@@ -513,7 +476,7 @@ public static class TeamsSecurityServiceCollectionExtensions
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Why this wrapper exists — Stage 5.1 iter-8 evaluator feedback.</b> The
+/// <b>Why this wrapper exists.</b> The
 /// <see cref="TenantValidationMiddleware"/> reads
 /// <see cref="IOptionsMonitor{TOptions}.CurrentValue"/> on every request and therefore
 /// observes runtime configuration reloads immediately. If the JWT-layer claims

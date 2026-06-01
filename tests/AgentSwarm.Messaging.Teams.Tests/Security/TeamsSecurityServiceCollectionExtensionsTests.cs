@@ -184,6 +184,42 @@ public sealed class TeamsSecurityServiceCollectionExtensionsTests
     }
 
     [Fact]
+    public void AddTeamsSecurity_AfterExternalHealthCheckRegistration_DoesNotDuplicate()
+    {
+        // Pre-existing-registration edge: a host that wires a check under the canonical
+        // `teams-app-policy` name BEFORE AddTeamsSecurity() must retain its own
+        // registration. Auto-registration uses PostConfigure<HealthCheckServiceOptions>
+        // and inspects the FINAL Registrations list at SP-build time, so it sees the
+        // host's entry and skips appending — preventing the runtime startup throw
+        // "A health check named 'teams-app-policy' is already registered".
+        var services = NewServiceCollection();
+        services.AddHealthChecks().AddCheck<ExternalPolicyHealthCheckProbe>(
+            name: TeamsAppPolicyHealthCheck.Name,
+            failureStatus: HealthStatus.Unhealthy,
+            tags: new[] { "external" });
+
+        services.AddTeamsSecurity();
+
+        using var sp = services.BuildServiceProvider(validateScopes: true);
+        var options = sp.GetRequiredService<IOptions<HealthCheckServiceOptions>>().Value;
+        var registration = Assert.Single(options.Registrations.Where(r => r.Name == TeamsAppPolicyHealthCheck.Name));
+
+        // The HOST's registration must win — verified by failure status (Unhealthy)
+        // and tag set (external), neither of which the auto-registered Degraded/teams/security
+        // variant would produce.
+        Assert.Equal(HealthStatus.Unhealthy, registration.FailureStatus);
+        Assert.Contains("external", registration.Tags);
+    }
+
+    private sealed class ExternalPolicyHealthCheckProbe : IHealthCheck
+    {
+        public Task<HealthCheckResult> CheckHealthAsync(
+            HealthCheckContext context,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult(HealthCheckResult.Healthy());
+    }
+
+    [Fact]
     public void AddTeamsSecurity_NullServices_Throws()
     {
         Assert.Throws<ArgumentNullException>(

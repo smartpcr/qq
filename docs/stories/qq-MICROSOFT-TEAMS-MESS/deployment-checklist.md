@@ -134,15 +134,32 @@ by the host's `Program.cs` into the options objects exposed by
 
 ### 4.0 Canonical `appsettings.json` shape
 
-The host binds `TeamsMessagingOptions` from the `TeamsMessaging` section
-and `TeamsAppPolicyOptions` from the `TeamsAppPolicy` section. The
-binding shape below is the one auto-wired by
-`services.AddTeamsSecurity()` — every consumer in the security graph
+The host binds three options surfaces from configuration:
+
+- `TeamsMessagingOptions` — connector/notifier and `TenantValidationMiddleware`
+  identity + tenant allow-list, from the `TeamsMessaging` section.
+- `TeamsAppPolicyOptions` — admin-deployment policy surfaces consumed by
+  `TeamsAppPolicyHealthCheck`, from the `TeamsAppPolicy` section.
+- `EntraBotFrameworkAuthenticationOptions` — JWT-layer
+  `AllowedCallers` allow-list (parent-bot app IDs permitted to call this bot)
+  and optional `AllowedTenantIds` override, from the
+  `Teams:BotFrameworkAuthentication` section
+  (`EntraBotFrameworkAuthenticationOptions.SectionName`).
+
+The binding shape below matches what every consumer in the security graph
 (`TenantValidationMiddleware`, `InstallationStateGate`,
-`EntraBotFrameworkAuthentication`, `TeamsAppPolicyHealthCheck`)
-resolves through `IOptionsMonitor<TeamsMessagingOptions>` /
-`IOptionsMonitor<TeamsAppPolicyOptions>` so hot-reload of
-`AllowedTenantIds` and `AllowedCallers` propagates without restart:
+`EntraBotFrameworkAuthentication`, `TeamsAppPolicyHealthCheck`) reads.
+`TenantValidationMiddleware` and the JWT-layer
+`HotReloadEntraTenantAwareClaimsValidator` both resolve their allow-lists
+through `IOptionsMonitor` on every request, so an edit to
+`TeamsMessaging:AllowedTenantIds` or
+`Teams:BotFrameworkAuthentication:AllowedCallers` propagates to both
+defence-in-depth layers without a host restart. `TeamsAppPolicyOptions`
+fields are read by the health check on every probe and likewise hot-reload.
+The bot SDK credentials (`MicrosoftAppId`, `MicrosoftAppPassword`,
+`MicrosoftAppTenantId`) are baked into the `BotFrameworkAuthentication`
+singleton at first resolution and require a restart to change — this matches
+the SDK contract (no refresh hook on `BotFrameworkAuthenticationFactory.Create`).
 
 ```json
 {
@@ -158,6 +175,14 @@ resolves through `IOptionsMonitor<TeamsMessagingOptions>` /
     "RequireAdminConsent": true,
     "AllowedAppCatalogScopes": [ "organization" ],
     "BlockSideloading": true
+  },
+  "Teams": {
+    "BotFrameworkAuthentication": {
+      "AllowedCallers": [ "<parent-bot-app-id-guid-1>" ],
+      "AllowedTenantIds": [ "<entra-tenant-id-guid>" ],
+      "ChannelService": null,
+      "ValidateAuthority": true
+    }
   }
 }
 ```
@@ -169,16 +194,24 @@ services.Configure<TeamsMessagingOptions>(
     builder.Configuration.GetSection("TeamsMessaging"));
 services.Configure<TeamsAppPolicyOptions>(
     builder.Configuration.GetSection("TeamsAppPolicy"));
+services.Configure<EntraBotFrameworkAuthenticationOptions>(
+    builder.Configuration.GetSection(
+        EntraBotFrameworkAuthenticationOptions.SectionName));
 services.AddTeamsSecurity();
 ```
 
-`AddTeamsSecurity()` does NOT probe the configuration shape itself;
-it composes `IConfigureOptions` chains for both options types and the
+`AddTeamsSecurity()` does NOT probe the configuration shape itself; it
+composes `IConfigureOptions` chains for the three options types and the
 underlying `BotFrameworkAuthentication` factory resolves
-`TeamsMessagingOptions` through DI — so hosts may use any binding
-convention `Microsoft.Extensions.Configuration` supports (section bind
-above, environment variables `TeamsMessaging__MicrosoftAppId=...`,
-Key Vault references, etc.).
+`TeamsMessagingOptions` and `EntraBotFrameworkAuthenticationOptions`
+through DI — so hosts may use any binding convention
+`Microsoft.Extensions.Configuration` supports (section bind above,
+environment variables `TeamsMessaging__MicrosoftAppId=...` or
+`Teams__BotFrameworkAuthentication__AllowedCallers__0=...`,
+Key Vault references, etc.). When the `Teams:BotFrameworkAuthentication`
+section is omitted, the JWT-layer validator falls back to
+`TeamsMessaging:AllowedTenantIds` for tenant restriction and treats
+`AllowedCallers` as empty (no parent-bot allow-list).
 
 - [ ] **`TeamsAppPolicyOptions.RequireAdminConsent = true`** (production
       default). When true, the runtime only trusts installations that
