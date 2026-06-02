@@ -223,17 +223,42 @@ public sealed class SqlMessageOutbox : IMessageOutbox
 
         await using var ctx = await _contextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
 
-        var affected = await ctx.OutboxEntries
-            .Where(e => e.OutboxEntryId == outboxEntryId)
-            .ExecuteUpdateAsync(
-                s => s.SetProperty(p => p.Status, OutboxEntryStatuses.Sent)
-                      .SetProperty(p => p.DeliveredAt, (DateTimeOffset?)receipt.DeliveredAt)
-                      .SetProperty(p => p.ActivityId, receipt.ActivityId)
-                      .SetProperty(p => p.ConversationId, receipt.ConversationId)
-                      .SetProperty(p => p.LeaseExpiresAt, (DateTimeOffset?)null)
-                      .SetProperty(p => p.LastError, (string?)null),
-                ct)
-            .ConfigureAwait(false);
+        // Stage 6.1 iter-4 evaluator feedback — persist the DELIVERED
+        // ConversationReferenceJson when the receipt carries one (AgentQuestion
+        // paths). When the receipt's ref is null (plain MessengerMessage paths),
+        // leave the row's existing ConversationReferenceJson untouched — the
+        // RecordSendReceiptAsync that ran mid-flight may have already persisted
+        // it, and we must not regress to null here.
+        int affected;
+        if (receipt.ConversationReferenceJson is not null)
+        {
+            affected = await ctx.OutboxEntries
+                .Where(e => e.OutboxEntryId == outboxEntryId)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(p => p.Status, OutboxEntryStatuses.Sent)
+                          .SetProperty(p => p.DeliveredAt, (DateTimeOffset?)receipt.DeliveredAt)
+                          .SetProperty(p => p.ActivityId, receipt.ActivityId)
+                          .SetProperty(p => p.ConversationId, receipt.ConversationId)
+                          .SetProperty(p => p.ConversationReferenceJson, receipt.ConversationReferenceJson)
+                          .SetProperty(p => p.LeaseExpiresAt, (DateTimeOffset?)null)
+                          .SetProperty(p => p.LastError, (string?)null),
+                    ct)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            affected = await ctx.OutboxEntries
+                .Where(e => e.OutboxEntryId == outboxEntryId)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(p => p.Status, OutboxEntryStatuses.Sent)
+                          .SetProperty(p => p.DeliveredAt, (DateTimeOffset?)receipt.DeliveredAt)
+                          .SetProperty(p => p.ActivityId, receipt.ActivityId)
+                          .SetProperty(p => p.ConversationId, receipt.ConversationId)
+                          .SetProperty(p => p.LeaseExpiresAt, (DateTimeOffset?)null)
+                          .SetProperty(p => p.LastError, (string?)null),
+                    ct)
+                .ConfigureAwait(false);
+        }
 
         if (affected == 0)
         {
@@ -258,13 +283,36 @@ public sealed class SqlMessageOutbox : IMessageOutbox
         // untouched: a subsequent failure that requires a retry will simply observe the
         // persisted ActivityId and skip the redundant Bot Framework send via the
         // dispatcher's idempotency check.
-        var affected = await ctx.OutboxEntries
-            .Where(e => e.OutboxEntryId == outboxEntryId)
-            .ExecuteUpdateAsync(
-                s => s.SetProperty(p => p.ActivityId, receipt.ActivityId)
-                      .SetProperty(p => p.ConversationId, receipt.ConversationId),
-                ct)
-            .ConfigureAwait(false);
+        // Stage 6.1 iter-4 evaluator feedback — when the receipt carries the
+        // post-send ConversationReferenceJson (AgentQuestion path), persist it on
+        // the row TOO. This way a layer-1 idempotent replay later in
+        // TeamsOutboxDispatcher reads back the DELIVERED reference (rather than the
+        // stale enqueue-time one), so PersistPostSendStateAsync saves a card-state
+        // row whose ConversationReferenceJson matches what the fresh-send path
+        // would have produced. When the receipt's ref is null (plain
+        // MessengerMessage path), the existing column is preserved.
+        int affected;
+        if (receipt.ConversationReferenceJson is not null)
+        {
+            affected = await ctx.OutboxEntries
+                .Where(e => e.OutboxEntryId == outboxEntryId)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(p => p.ActivityId, receipt.ActivityId)
+                          .SetProperty(p => p.ConversationId, receipt.ConversationId)
+                          .SetProperty(p => p.ConversationReferenceJson, receipt.ConversationReferenceJson),
+                    ct)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            affected = await ctx.OutboxEntries
+                .Where(e => e.OutboxEntryId == outboxEntryId)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(p => p.ActivityId, receipt.ActivityId)
+                          .SetProperty(p => p.ConversationId, receipt.ConversationId),
+                    ct)
+                .ConfigureAwait(false);
+        }
 
         if (affected == 0)
         {

@@ -327,8 +327,16 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
             // decision so the histogram observation is bounded by the engine's
             // dequeue → "already delivered" detection rather than including
             // post-DispatchAsync engine wall-clock.
+            // Stage 6.1 iter-4 evaluator feedback — include the card-state's
+            // ConversationReferenceJson on the receipt so the engine's
+            // subsequent AcknowledgeAsync persists the delivered reference on
+            // the row (parity with the fresh-send + RecordSendReceiptAsync
+            // path), eliminating original-vs-delivered drift on the audit row.
             return OutboxDispatchResult.Success(
-                new OutboxDeliveryReceipt(existingCardState.ActivityId, existingCardState.ConversationId, _timeProvider.GetUtcNow()),
+                new OutboxDeliveryReceipt(existingCardState.ActivityId, existingCardState.ConversationId, _timeProvider.GetUtcNow())
+                {
+                    ConversationReferenceJson = existingCardState.ConversationReferenceJson,
+                },
                 Stopwatch.GetTimestamp());
         }
 
@@ -420,9 +428,22 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
         // re-send.
         try
         {
+            // Stage 6.1 iter-4 evaluator feedback — durably capture the DELIVERED
+            // conversation reference onto the outbox row, not just the
+            // ActivityId/ConversationId. The fresh-send capture above
+            // (`turnContext.Activity.GetConversationReference()`) is the
+            // post-send reference; persisting it on the row via the receipt means
+            // a subsequent layer-1 idempotent replay reads back the DELIVERED
+            // reference from `entry.ConversationReferenceJson` and hands it
+            // through to `PersistPostSendStateAsync`, eliminating the prior
+            // asymmetry where the replay path used the stale enqueue-time
+            // reference and the fresh-send path used the post-send one.
             await _outbox.RecordSendReceiptAsync(
                 entry.OutboxEntryId,
-                new OutboxDeliveryReceipt(deliveredActivityId, deliveredConversationId, _timeProvider.GetUtcNow()),
+                new OutboxDeliveryReceipt(deliveredActivityId, deliveredConversationId, _timeProvider.GetUtcNow())
+                {
+                    ConversationReferenceJson = deliveredReferenceJson,
+                },
                 ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -517,7 +538,16 @@ public sealed class TeamsOutboxDispatcher : IOutboxDispatcher
         // engine falls back to the post-DispatchAsync wall-clock which includes
         // both DB round-trips — historically the P95 inflator that the §6.3
         // evaluator flagged.
-        var receipt = new OutboxDeliveryReceipt(activityId, conversationId, _timeProvider.GetUtcNow());
+        // Stage 6.1 iter-4 evaluator feedback — also carry the captured
+        // ConversationReferenceJson on the receipt so the engine's
+        // AcknowledgeAsync persists the SAME reference that was just saved to
+        // ICardStateStore. The replay path passes `entry.ConversationReferenceJson`
+        // (which itself was populated by the prior attempt's
+        // RecordSendReceiptAsync), so AcknowledgeAsync stays idempotent.
+        var receipt = new OutboxDeliveryReceipt(activityId, conversationId, _timeProvider.GetUtcNow())
+        {
+            ConversationReferenceJson = referenceJson,
+        };
         return botConnectorAckTimestamp is { } ackTs
             ? OutboxDispatchResult.Success(receipt, ackTs)
             : OutboxDispatchResult.Success(receipt);
