@@ -376,6 +376,13 @@ public sealed class OutboxToCardManagerIntegrationTests
     /// row's identifiers. Proven by configuring a <see cref="HybridCloudAdapter"/>
     /// that records ALL outbound calls and asserting they remain at zero after the
     /// replay dispatch returns Success.
+    ///
+    /// Iter-4 evaluator feedback — also asserts the saved
+    /// <see cref="TeamsCardState.ConversationReferenceJson"/> matches whatever the
+    /// entry carried (which, after the iter-4 production fix, is the DELIVERED
+    /// reference persisted by the prior attempt's
+    /// <see cref="IMessageOutbox.RecordSendReceiptAsync"/>). Eliminates the
+    /// original-vs-delivered drift the iter-3 evaluator flagged.
     /// </summary>
     [Fact]
     public async Task DispatchAsync_Layer1IdempotentReplay_EntryHasActivityId_HydratesCardStateWithoutResending()
@@ -401,11 +408,14 @@ public sealed class OutboxToCardManagerIntegrationTests
             NullLogger<TeamsOutboxDispatcher>.Instance);
 
         var question = BuildQuestion("q-it-replay");
-        // Build the entry as if a prior attempt already completed the BF send and
-        // persisted the receipt onto the row via RecordSendReceiptAsync. The
-        // dispatcher's Layer-1 idempotency check MUST detect this and replay only
-        // the post-send persistence.
-        var entry = BuildOutboxEntry("e-it-replay", question, BuildConversationReferenceJson()) with
+        // Iter-4 fix: the entry's ConversationReferenceJson now carries the
+        // DELIVERED reference (simulating the prior attempt's
+        // RecordSendReceiptAsync persisted it back onto the row). The replay
+        // path MUST faithfully thread this through to PersistPostSendStateAsync
+        // so the cardstate row matches what a fresh-send path would have
+        // produced.
+        var deliveredReferenceJson = BuildDeliveredConversationReferenceJson();
+        var entry = BuildOutboxEntry("e-it-replay", question, deliveredReferenceJson) with
         {
             ActivityId = priorAttemptActivityId,
             ConversationId = priorAttemptConversationId,
@@ -428,11 +438,25 @@ public sealed class OutboxToCardManagerIntegrationTests
         Assert.Equal(priorAttemptActivityId, saved.ActivityId);
         Assert.Equal(priorAttemptConversationId, saved.ConversationId);
 
+        // Iter-4 fix — the saved row's ConversationReferenceJson MUST equal the
+        // entry's reference exactly, proving the replay path is reference-faithful.
+        // Because the entry carried the DELIVERED reference, the saved row carries
+        // it too — there is NO original-vs-delivered drift between the fresh-send
+        // path and the replay path.
+        Assert.Equal(deliveredReferenceJson, saved.ConversationReferenceJson);
+        var savedReference = JsonConvert.DeserializeObject<ConversationReference>(saved.ConversationReferenceJson!);
+        Assert.Equal(DeliveredConversationId, savedReference!.Conversation?.Id);
+
         // Receipt on the dispatcher result MUST also reflect the prior-attempt
         // identifiers so the engine acknowledges the row with the canonical receipt.
         Assert.NotNull(result.Receipt);
         Assert.Equal(priorAttemptActivityId, result.Receipt!.Value.ActivityId);
         Assert.Equal(priorAttemptConversationId, result.Receipt!.Value.ConversationId);
+        // Iter-4 fix — the result receipt also carries the reference so the
+        // engine's AcknowledgeAsync persists it onto the row (parity with the
+        // fresh-send path). This is what closes the audit-trail asymmetry on the
+        // replay path.
+        Assert.Equal(deliveredReferenceJson, result.Receipt!.Value.ConversationReferenceJson);
 
         // The AgentQuestion's conversation id MUST also be stamped during the replay
         // so CardActionHandler's bare approve/reject resolution path works even when
@@ -440,6 +464,161 @@ public sealed class OutboxToCardManagerIntegrationTests
         var convoUpdate = Assert.Single(questionStore.ConversationIdUpdates);
         Assert.Equal(question.QuestionId, convoUpdate.QuestionId);
         Assert.Equal(priorAttemptConversationId, convoUpdate.ConversationId);
+    }
+
+    /// <summary>
+    /// Iter-4 evaluator feedback — closes the production gap directly: on a
+    /// FRESH-SEND of an AgentQuestion, <see cref="TeamsOutboxDispatcher"/> MUST
+    /// hand the DELIVERED <see cref="ConversationReference"/> (captured via
+    /// <c>turnContext.Activity.GetConversationReference()</c> after
+    /// <c>SendActivityAsync</c>) into <see cref="IMessageOutbox.RecordSendReceiptAsync"/>
+    /// — not just <see cref="OutboxEntry.ActivityId"/>/<see cref="OutboxEntry.ConversationId"/>.
+    /// This is the durable bridge that makes the layer-1 replay path
+    /// reference-symmetric with the fresh-send path: a partial-success retry now
+    /// reads the DELIVERED reference back out of
+    /// <see cref="OutboxEntry.ConversationReferenceJson"/> (because
+    /// <see cref="SqlMessageOutbox.RecordSendReceiptAsync"/> persisted it
+    /// in-place on the column), so <see cref="TeamsCardState.ConversationReferenceJson"/>
+    /// saved on replay matches what a fresh save would have produced.
+    /// </summary>
+    [Fact]
+    public async Task FreshSend_RecordSendReceiptAsync_ReceivesReceiptCarryingDeliveredConversationReferenceJson()
+    {
+        var adapter = new HybridCloudAdapter
+        {
+            FixedActivityId = DeliveredActivityId,
+            FixedConversationId = DeliveredConversationId,
+        };
+        var sharedCardStore = new ProductionLikeCardStateStore();
+        var questionStore = new RecordingAgentQuestionStore();
+        var outbox = new InMemoryOutbox();
+        var renderer = new AdaptiveCardBuilder();
+        var options = new TeamsMessagingOptions { MicrosoftAppId = AppId };
+
+        var dispatcher = new TeamsOutboxDispatcher(
+            adapter, options, outbox, sharedCardStore, questionStore, renderer,
+            NullLogger<TeamsOutboxDispatcher>.Instance);
+        var question = BuildQuestion("q-it-fresh-receipt");
+        var entry = BuildOutboxEntry("e-it-fresh-receipt", question, BuildConversationReferenceJson());
+
+        var result = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+        Assert.Equal(OutboxDispatchOutcome.Success, result.Outcome);
+
+        // The dispatcher MUST have called RecordSendReceiptAsync exactly once.
+        var receipt = Assert.Single(outbox.Receipts);
+        Assert.Equal(entry.OutboxEntryId, receipt.EntryId);
+
+        // Critical assertion — receipt carries the captured post-send reference,
+        // NOT null.
+        Assert.False(string.IsNullOrWhiteSpace(receipt.Receipt.ConversationReferenceJson));
+
+        // Deeper assertion — the receipt's reference holds the DELIVERED
+        // conversation id (the adapter's FixedConversationId rewrite), proving the
+        // dispatcher captured it from turnContext.Activity.GetConversationReference()
+        // AFTER SendActivityAsync, not from the original entry reference.
+        var capturedReference = JsonConvert.DeserializeObject<ConversationReference>(receipt.Receipt.ConversationReferenceJson!);
+        Assert.NotNull(capturedReference);
+        Assert.Equal(DeliveredConversationId, capturedReference!.Conversation?.Id);
+        Assert.NotEqual(OriginalConversationId, capturedReference.Conversation?.Id);
+
+        // The receipt's ActivityId/ConversationId align with the captured reference.
+        Assert.Equal(DeliveredActivityId, receipt.Receipt.ActivityId);
+        Assert.Equal(DeliveredConversationId, receipt.Receipt.ConversationId);
+    }
+
+    /// <summary>
+    /// Iter-4 evaluator feedback — proves the dispatcher's Success result
+    /// (which the engine threads into <see cref="IMessageOutbox.AcknowledgeAsync"/>)
+    /// also carries the delivered <see cref="OutboxDeliveryReceipt.ConversationReferenceJson"/>.
+    /// Combined with the SqlMessageOutbox EF tests, this guarantees the canonical
+    /// audit row's <see cref="OutboxEntry.ConversationReferenceJson"/> column ends
+    /// the lifecycle holding the DELIVERED reference rather than the enqueue-time
+    /// snapshot.
+    /// </summary>
+    [Fact]
+    public async Task FreshSend_DispatchResultReceipt_CarriesDeliveredConversationReferenceJson()
+    {
+        var adapter = new HybridCloudAdapter
+        {
+            FixedActivityId = DeliveredActivityId,
+            FixedConversationId = DeliveredConversationId,
+        };
+        var sharedCardStore = new ProductionLikeCardStateStore();
+        var questionStore = new RecordingAgentQuestionStore();
+        var outbox = new InMemoryOutbox();
+        var renderer = new AdaptiveCardBuilder();
+        var options = new TeamsMessagingOptions { MicrosoftAppId = AppId };
+
+        var dispatcher = new TeamsOutboxDispatcher(
+            adapter, options, outbox, sharedCardStore, questionStore, renderer,
+            NullLogger<TeamsOutboxDispatcher>.Instance);
+        var question = BuildQuestion("q-it-success-receipt");
+        var entry = BuildOutboxEntry("e-it-success-receipt", question, BuildConversationReferenceJson());
+
+        var result = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+
+        Assert.Equal(OutboxDispatchOutcome.Success, result.Outcome);
+        Assert.NotNull(result.Receipt);
+        Assert.False(string.IsNullOrWhiteSpace(result.Receipt!.Value.ConversationReferenceJson));
+
+        var capturedReference = JsonConvert.DeserializeObject<ConversationReference>(result.Receipt.Value.ConversationReferenceJson!);
+        Assert.NotNull(capturedReference);
+        Assert.Equal(DeliveredConversationId, capturedReference!.Conversation?.Id);
+
+        // The cardstate row's reference and the result receipt's reference must
+        // agree — both flow from the same post-send capture in
+        // PersistPostSendStateAsync. This is the symmetry guarantee.
+        var saved = Assert.Single(sharedCardStore.Saved);
+        Assert.Equal(saved.ConversationReferenceJson, result.Receipt.Value.ConversationReferenceJson);
+    }
+
+    /// <summary>
+    /// Iter-4 evaluator feedback — strict ordering proof: the dispatcher MUST
+    /// stamp the delivered reference onto the outbox row (via
+    /// <see cref="IMessageOutbox.RecordSendReceiptAsync"/>) BEFORE it persists the
+    /// card-state row (via <see cref="ICardStateStore.SaveAsync"/>). This ensures
+    /// that if the card-state save fails and the engine reschedules, the
+    /// next attempt's Layer-1 replay reads the DELIVERED reference from the row
+    /// rather than the stale enqueue-time one.
+    /// </summary>
+    [Fact]
+    public async Task FreshSend_DeliveredReference_PersistedToOutboxRowBeforeCardStateSave()
+    {
+        var callOrder = new List<string>();
+        var adapter = new HybridCloudAdapter
+        {
+            FixedActivityId = DeliveredActivityId,
+            FixedConversationId = DeliveredConversationId,
+        };
+        var sharedCardStore = new ProductionLikeCardStateStore(call => callOrder.Add(call));
+        var outbox = new InMemoryOutbox(call => callOrder.Add(call));
+        var questionStore = new RecordingAgentQuestionStore();
+        var renderer = new AdaptiveCardBuilder();
+        var options = new TeamsMessagingOptions { MicrosoftAppId = AppId };
+
+        var dispatcher = new TeamsOutboxDispatcher(
+            adapter, options, outbox, sharedCardStore, questionStore, renderer,
+            NullLogger<TeamsOutboxDispatcher>.Instance);
+        var question = BuildQuestion("q-it-ref-order");
+        var entry = BuildOutboxEntry("e-it-ref-order", question, BuildConversationReferenceJson());
+
+        var result = await dispatcher.DispatchAsync(entry, CancellationToken.None);
+        Assert.Equal(OutboxDispatchOutcome.Success, result.Outcome);
+
+        // The RecordSendReceiptAsync call must precede the cardstate Save call AND
+        // it must carry the delivered reference — proving the durability ordering
+        // and that the row is reference-correct before the cardstate write
+        // happens.
+        var receiptIdx = callOrder.IndexOf("outbox.RecordSendReceipt");
+        var saveIdx = callOrder.IndexOf("cardstate.Save");
+        Assert.True(receiptIdx >= 0 && saveIdx >= 0, $"Expected both calls, saw [{string.Join(", ", callOrder)}].");
+        Assert.True(receiptIdx < saveIdx,
+            $"RecordSendReceiptAsync must precede ICardStateStore.SaveAsync; got receipt {receiptIdx} vs save {saveIdx}.");
+
+        var receipt = Assert.Single(outbox.Receipts);
+        Assert.False(string.IsNullOrWhiteSpace(receipt.Receipt.ConversationReferenceJson));
+        var capturedReference = JsonConvert.DeserializeObject<ConversationReference>(receipt.Receipt.ConversationReferenceJson!);
+        Assert.Equal(DeliveredConversationId, capturedReference!.Conversation?.Id);
     }
 
     // ----- helpers --------------------------------------------------------------
@@ -489,6 +668,32 @@ public sealed class OutboxToCardManagerIntegrationTests
             ChannelId = "msteams",
             ServiceUrl = "https://smba.trafficmanager.net/teams/",
             Conversation = new ConversationAccount(id: OriginalConversationId, tenantId: TenantId),
+            User = new ChannelAccount(id: $"29:{UserId}", aadObjectId: UserId, name: "Integration Test User"),
+            Bot = new ChannelAccount(id: $"28:{AppId}"),
+        };
+        return JsonConvert.SerializeObject(reference);
+    }
+
+    /// <summary>
+    /// Build a serialized <see cref="ConversationReference"/> that mirrors what the
+    /// dispatcher would have captured from <c>turnContext.Activity.GetConversationReference()</c>
+    /// AFTER <see cref="HybridCloudAdapter"/> rewrote the synthesized turn context's
+    /// <see cref="ConversationAccount.Id"/> to <see cref="DeliveredConversationId"/>.
+    /// Used to seed <see cref="OutboxEntry.ConversationReferenceJson"/> on a Layer-1
+    /// idempotent replay test, simulating that a prior attempt's
+    /// <see cref="IMessageOutbox.RecordSendReceiptAsync"/> already persisted the
+    /// DELIVERED reference back onto the row (per the Stage 6.1 iter-4 production
+    /// fix). A regression that did NOT persist the delivered reference would surface
+    /// here as <c>saved.ConversationReferenceJson</c> still containing
+    /// <see cref="OriginalConversationId"/>.
+    /// </summary>
+    private static string BuildDeliveredConversationReferenceJson()
+    {
+        var reference = new ConversationReference
+        {
+            ChannelId = "msteams",
+            ServiceUrl = "https://smba.trafficmanager.net/teams/",
+            Conversation = new ConversationAccount(id: DeliveredConversationId, tenantId: TenantId),
             User = new ChannelAccount(id: $"29:{UserId}", aadObjectId: UserId, name: "Integration Test User"),
             Bot = new ChannelAccount(id: $"28:{AppId}"),
         };

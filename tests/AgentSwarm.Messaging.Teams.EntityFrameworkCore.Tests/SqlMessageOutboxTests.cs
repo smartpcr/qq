@@ -351,6 +351,139 @@ public sealed class SqlMessageOutboxTests
                 CancellationToken.None));
     }
 
+    /// <summary>
+    /// Stage 6.1 iter-4 evaluator feedback — when the dispatcher captures the
+    /// post-send <see cref="OutboxDeliveryReceipt.ConversationReferenceJson"/>
+    /// for an AgentQuestion send, <see cref="SqlMessageOutbox.RecordSendReceiptAsync"/>
+    /// MUST persist it onto <see cref="OutboxEntry.ConversationReferenceJson"/>.
+    /// This is the durable bridge that lets a subsequent layer-1 idempotent
+    /// replay in <c>TeamsOutboxDispatcher.DispatchQuestionAsync</c> read back the
+    /// DELIVERED reference (rather than the stale enqueue-time one), so the
+    /// card-state row saved on replay matches what the fresh-send path would
+    /// have produced — eliminating the original-vs-delivered drift the iter-3
+    /// evaluator flagged.
+    /// </summary>
+    [Fact]
+    public async Task RecordSendReceiptAsync_PersistsDeliveredConversationReferenceJson_WhenReceiptCarriesIt()
+    {
+        await using var fixture = new OutboxStoreFixture();
+        var entry = NewEntry("e1") with { ConversationReferenceJson = "{\"original\":true,\"conv\":\"19:original@thread.tacv2\"}" };
+        await fixture.Store.EnqueueAsync(entry, CancellationToken.None);
+        await fixture.Store.DequeueAsync(batchSize: 1, CancellationToken.None);
+
+        const string deliveredReference = "{\"delivered\":true,\"conv\":\"19:delivered@thread.tacv2\",\"serviceUrl\":\"https://smba.trafficmanager.net/teams/\"}";
+        await fixture.Store.RecordSendReceiptAsync(
+            "e1",
+            new OutboxDeliveryReceipt("act-deliv", "19:delivered@thread.tacv2", DateTimeOffset.UtcNow)
+            {
+                ConversationReferenceJson = deliveredReference,
+            },
+            CancellationToken.None);
+
+        await using var ctx = fixture.CreateContext();
+        var row = await ctx.OutboxEntries.SingleAsync();
+        Assert.Equal("act-deliv", row.ActivityId);
+        Assert.Equal("19:delivered@thread.tacv2", row.ConversationId);
+        // Critical assertion — DELIVERED reference must replace the original
+        // enqueue-time reference, so a later layer-1 replay reads the delivered
+        // one back out of the row.
+        Assert.Equal(deliveredReference, row.ConversationReferenceJson);
+        Assert.NotEqual(entry.ConversationReferenceJson, row.ConversationReferenceJson);
+        // Status invariant — receipt persistence must NOT transition the row.
+        Assert.Equal(OutboxEntryStatuses.Processing, row.Status);
+    }
+
+    /// <summary>
+    /// Stage 6.1 iter-4 evaluator feedback — when the receipt's
+    /// <see cref="OutboxDeliveryReceipt.ConversationReferenceJson"/> is <c>null</c>
+    /// (plain <c>MessengerMessage</c> path, no AgentQuestion capture), the
+    /// existing column value MUST be preserved. A regression that nulled the
+    /// column would lose the enqueue-time reference and break any subsequent
+    /// retry that needs to rehydrate the proactive turn.
+    /// </summary>
+    [Fact]
+    public async Task RecordSendReceiptAsync_NullReferenceJson_PreservesExistingColumnValue()
+    {
+        await using var fixture = new OutboxStoreFixture();
+        const string enqueueTimeReference = "{\"enqueueTime\":true}";
+        var entry = NewEntry("e1") with { ConversationReferenceJson = enqueueTimeReference };
+        await fixture.Store.EnqueueAsync(entry, CancellationToken.None);
+        await fixture.Store.DequeueAsync(batchSize: 1, CancellationToken.None);
+
+        // Plain message path — receipt has no ConversationReferenceJson.
+        await fixture.Store.RecordSendReceiptAsync(
+            "e1",
+            new OutboxDeliveryReceipt("act-plain", "conv-plain", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        await using var ctx = fixture.CreateContext();
+        var row = await ctx.OutboxEntries.SingleAsync();
+        Assert.Equal("act-plain", row.ActivityId);
+        Assert.Equal("conv-plain", row.ConversationId);
+        // The column MUST remain the enqueue-time reference — not regressed to null.
+        Assert.Equal(enqueueTimeReference, row.ConversationReferenceJson);
+    }
+
+    /// <summary>
+    /// Stage 6.1 iter-4 evaluator feedback — <see cref="SqlMessageOutbox.AcknowledgeAsync"/>
+    /// also persists the receipt's
+    /// <see cref="OutboxDeliveryReceipt.ConversationReferenceJson"/> when present,
+    /// so the canonical audit row carries the DELIVERED reference even when the
+    /// dispatcher took an idempotent path (layer-2 cardstate hit, or layer-1
+    /// replay) and did not call <see cref="SqlMessageOutbox.RecordSendReceiptAsync"/>
+    /// mid-flight on this attempt.
+    /// </summary>
+    [Fact]
+    public async Task AcknowledgeAsync_PersistsDeliveredConversationReferenceJson_WhenReceiptCarriesIt()
+    {
+        await using var fixture = new OutboxStoreFixture();
+        var entry = NewEntry("e1") with { ConversationReferenceJson = "{\"original\":true}" };
+        await fixture.Store.EnqueueAsync(entry, CancellationToken.None);
+        await fixture.Store.DequeueAsync(batchSize: 1, CancellationToken.None);
+
+        const string deliveredReference = "{\"delivered\":true,\"conv\":\"19:delivered@thread.tacv2\"}";
+        await fixture.Store.AcknowledgeAsync(
+            "e1",
+            new OutboxDeliveryReceipt("act-ack", "19:delivered@thread.tacv2", DateTimeOffset.UtcNow)
+            {
+                ConversationReferenceJson = deliveredReference,
+            },
+            CancellationToken.None);
+
+        await using var ctx = fixture.CreateContext();
+        var row = await ctx.OutboxEntries.SingleAsync();
+        Assert.Equal(OutboxEntryStatuses.Sent, row.Status);
+        Assert.Equal("act-ack", row.ActivityId);
+        Assert.Equal("19:delivered@thread.tacv2", row.ConversationId);
+        Assert.Equal(deliveredReference, row.ConversationReferenceJson);
+    }
+
+    /// <summary>
+    /// Stage 6.1 iter-4 evaluator feedback — <see cref="SqlMessageOutbox.AcknowledgeAsync"/>
+    /// with a <c>null</c> reference on the receipt MUST preserve any value
+    /// already on the row (typically persisted earlier by
+    /// <see cref="SqlMessageOutbox.RecordSendReceiptAsync"/>).
+    /// </summary>
+    [Fact]
+    public async Task AcknowledgeAsync_NullReferenceJson_PreservesExistingColumnValue()
+    {
+        await using var fixture = new OutboxStoreFixture();
+        const string preAckReference = "{\"preAck\":true}";
+        var entry = NewEntry("e1") with { ConversationReferenceJson = preAckReference };
+        await fixture.Store.EnqueueAsync(entry, CancellationToken.None);
+        await fixture.Store.DequeueAsync(batchSize: 1, CancellationToken.None);
+
+        await fixture.Store.AcknowledgeAsync(
+            "e1",
+            new OutboxDeliveryReceipt("act", "conv", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        await using var ctx = fixture.CreateContext();
+        var row = await ctx.OutboxEntries.SingleAsync();
+        Assert.Equal(OutboxEntryStatuses.Sent, row.Status);
+        Assert.Equal(preAckReference, row.ConversationReferenceJson);
+    }
+
     [Fact]
     public async Task EnqueueAsync_DeadLetteredEntryIsNotResurrected()
     {
