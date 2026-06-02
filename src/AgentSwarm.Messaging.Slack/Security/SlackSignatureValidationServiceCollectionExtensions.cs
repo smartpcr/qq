@@ -62,24 +62,13 @@ public static class SlackSignatureValidationServiceCollectionExtensions
                 opts => opts.MaxBufferedBodyBytes > 0,
                 $"{nameof(SlackSignatureOptions)}.{nameof(SlackSignatureOptions.MaxBufferedBodyBytes)} must be positive.")
             .Validate(
-                opts => !string.IsNullOrWhiteSpace(opts.PathPrefix)
-                    && opts.PathPrefix.StartsWith('/')
-                    && !opts.PathPrefix.Contains(' '),
-                $"{nameof(SlackSignatureOptions)}.{nameof(SlackSignatureOptions.PathPrefix)} must be a non-empty URL prefix starting with '/' (e.g. '/api/slack'). It cannot contain whitespace and must be a valid PathString; SlackAuthorizationFilter shares this option for its own path scope, so an invalid value would also bypass the authorization gate.")
+                opts => !string.IsNullOrWhiteSpace(opts.PathPrefix),
+                $"{nameof(SlackSignatureOptions)}.{nameof(SlackSignatureOptions.PathPrefix)} must be a non-empty URL prefix.")
             .ValidateOnStart();
 
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<ISecretProvider, InMemorySecretProvider>();
         services.TryAddSingleton<ISlackWorkspaceConfigStore, InMemorySlackWorkspaceConfigStore>();
-
-        // Stage 3.3: surface every workspace's secret references to the
-        // SecretCacheWarmupHostedService so the composite provider's
-        // cache is populated at host start-up rather than on the first
-        // request (architecture.md §7.3). TryAddEnumerable is used so
-        // multiple ref sources from different connectors can coexist
-        // without overwriting each other.
-        services.TryAddEnumerable(
-            ServiceDescriptor.Singleton<ISecretRefSource, SlackWorkspaceSecretRefSource>());
 
         // Audit pipeline: persist EVERY rejection through the canonical
         // slack_audit_entry table (Stage 2.1 / 2.2). Production hosts

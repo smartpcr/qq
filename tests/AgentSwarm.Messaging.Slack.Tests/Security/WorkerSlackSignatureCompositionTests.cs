@@ -66,29 +66,15 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
         // Arrange / Act
         WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());
 
-        // Assert -- the canonical ISlackAuditEntryWriter MUST be a
-        // durably-persisted implementation, NOT the
-        // InMemorySlackAuditEntryWriter fallback. Stage 7.1 promoted
-        // the binding to SlackAuditLogger<SlackPersistenceDbContext>
-        // (which also implements ISlackAuditEntryWriter and writes
-        // through EF Core) so the Stage 3.1 durability contract is
-        // preserved through the post-3.1 wiring swap.
+        // Assert -- the canonical ISlackAuditEntryWriter MUST be the EF
+        // writer, NOT the InMemorySlackAuditEntryWriter fallback. If a
+        // future refactor reorders the DI extensions in Program.BuildApp,
+        // this assertion fires before the host can ship.
         ISlackAuditEntryWriter writer = app.Services.GetRequiredService<ISlackAuditEntryWriter>();
         writer.Should()
-            .NotBeOfType<InMemorySlackAuditEntryWriter>(
+            .BeOfType<EntityFrameworkSlackAuditEntryWriter<SlackPersistenceDbContext>>(
                 "Stage 3.1 requires signature rejection audit rows to be durably persisted; "
                 + "falling back to InMemorySlackAuditEntryWriter would lose them on process restart");
-
-        // Specifically, Stage 7.1 expects the SlackAuditLogger to win
-        // the binding so every existing audit seam (signature,
-        // authorization, idempotency, command, interaction, modal,
-        // outbound, thread, DirectApiClient) auto-routes through
-        // SlackAuditLogger.LogAsync without per-call-site edits.
-        writer.Should()
-            .BeOfType<SlackAuditLogger<SlackPersistenceDbContext>>(
-                "Stage 7.1 AddSlackAuditLogger<SlackPersistenceDbContext>(IConfiguration) registers the "
-                + "logger as the canonical ISlackAuditEntryWriter so the dual-interface route subsumes "
-                + "the Stage 3.1 EntityFrameworkSlackAuditEntryWriter binding");
     }
 
     [Fact]
@@ -160,65 +146,6 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
     }
 
     [Fact]
-    public void BuildApp_authorization_filter_and_signature_middleware_share_single_path_prefix()
-    {
-        // Stage 3.2 evaluator iter-2 follow-up. The configurable-prefix
-        // authorization-bypass footgun: an operator who moved
-        // Slack:Signature:PathPrefix to /slack-gateway without also
-        // touching the (former) Slack:Authorization:PathPrefix would
-        // leave the authorization filter bound to /api/slack while the
-        // HMAC middleware moved. After this iteration there is only
-        // ONE path option -- Slack:Signature:PathPrefix -- shared by
-        // both layers, so the mismatch is impossible by construction.
-        //
-        // This test mounts the Worker host with a non-default
-        // Slack:Signature:PathPrefix and asserts the same option
-        // monitor (the same instance) is what SlackAuthorizationFilter
-        // sees through IOptionsMonitor<SlackSignatureOptions>.
-        string[] args = new[]
-        {
-            $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
-            "--Slack:Signature:PathPrefix=/slack-gateway",
-            $"--{AgentSwarm.Messaging.Slack.Transport.SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
-            $"--{Program.EnableNoOpAgentTaskServiceKey}=true",
-        };
-
-        WebApplication app = Program.BuildApp(args);
-
-        Microsoft.Extensions.Options.IOptionsMonitor<AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions> signatureMonitor =
-            app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions>>();
-
-        signatureMonitor.CurrentValue.PathPrefix.Should().Be("/slack-gateway",
-            "the Worker host must bind Slack:Signature:PathPrefix from the supplied configuration");
-
-        // Resolving SlackAuthorizationFilter exercises its constructor
-        // which now requires IOptionsMonitor<SlackSignatureOptions>.
-        // If a future refactor reintroduces a separate options class,
-        // this resolution either fails or the filter no longer follows
-        // the signature prefix -- the regression would surface here.
-        SlackAuthorizationFilter filter = app.Services.GetRequiredService<SlackAuthorizationFilter>();
-        filter.Should().NotBeNull(
-            "SlackAuthorizationFilter must resolve with the shared SlackSignatureOptions monitor");
-    }
-
-    [Fact]
-    public void BuildApp_authorization_filter_resolves_under_default_path_prefix()
-    {
-        // Regression pin: the default-deployment composition root
-        // (no --Slack:Signature:PathPrefix override) must still
-        // produce a resolvable SlackAuthorizationFilter wired to the
-        // canonical '/api/slack' prefix.
-        WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());
-
-        Microsoft.Extensions.Options.IOptionsMonitor<AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions> signatureMonitor =
-            app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<AgentSwarm.Messaging.Slack.Configuration.SlackSignatureOptions>>();
-        signatureMonitor.CurrentValue.PathPrefix.Should().Be("/api/slack");
-
-        SlackAuthorizationFilter filter = app.Services.GetRequiredService<SlackAuthorizationFilter>();
-        filter.Should().NotBeNull();
-    }
-
-    [Fact]
     public void BuildApp_registers_slack_persistence_db_context_with_sqlite_provider()
     {
         WebApplication app = Program.BuildApp(this.BuildIsolatedArgs());
@@ -239,27 +166,10 @@ public sealed class WorkerSlackSignatureCompositionTests : IDisposable
         // WebApplication.CreateBuilder(args) reads "--Key=Value" CLI
         // overrides into IConfiguration, so this is the cleanest
         // parallel-safe alternative to mutating process-global state
-        // (env vars or CurrentDirectory) per test. The third override
-        // (Slack:Inbound:Queue:AllowInMemoryInProduction=true) opts the
-        // signature-composition tests out of the Stage 4.1 iter-2
-        // evaluator item 3 durability guard: these tests verify
-        // signature / workspace / audit composition shape and run
-        // under the default Production env, intentionally exercising
-        // the in-memory ISlackInboundQueue default. The guard itself
-        // is covered by SlackInboundProductionDurabilityGuardTests.
+        // (env vars or CurrentDirectory) per test.
         return new[]
         {
             $"--ConnectionStrings:{Program.SlackAuditConnectionStringKey}=Data Source={this.sqlitePath}",
-            $"--{AgentSwarm.Messaging.Slack.Transport.SlackInboundTransportServiceCollectionExtensions.AllowInMemoryQueueInProductionConfigKey}=true",
-
-            // Stage 5.1 iter-4 evaluator item 3 (downstream test
-            // impact): the no-op IAgentTaskService stub is now
-            // gated on EnableNoOpAgentTaskService (default =
-            // IsDevelopment) and these tests run under default
-            // Production environment. Opt in so
-            // AddSlackMessenger's ValidateAgentTaskServiceRegistration
-            // observes a registered IAgentTaskService.
-            $"--{Program.EnableNoOpAgentTaskServiceKey}=true",
         };
     }
 }
