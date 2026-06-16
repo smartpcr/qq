@@ -1,17 +1,4 @@
-
-# Story-attachment directory. By default the directory is excluded so generated
-# scratch content cannot leak into commits; specific files that the workstream
-# needs under version control are added back via the explicit negation pattern
-# below. The file-level `*` form (not the whole-directory form) is required so
-# git recurses into the directory to evaluate the negations.
-.forge-attachments/*
-
-# Stage 5.1 user-stories reference, pinned under version control so the code,
-# the planning artifacts in docs/stories/qq-MICROSOFT-TEAMS-MESS/, and the
-# story-attachment reference document evolve together. The operator's upload
-# pipeline may overwrite this file at any time; the operator-supplied copy is
-# the canonical version when both exist.
-!.forge-attachments/agent_swarm_messenger_user_stories.md
+.forge-attachments/
 
 # .NET build output
 [Bb]in/
@@ -42,3 +29,7 @@ coverage.json
 src/AgentSwarm.Messaging.Teams/Manifest/bin/
 
 .forge/
+
+# Local NuGet package cache (when NuGet.Config sets globalPackagesFolder=.nuget-packages
+# to avoid touching the machine-level cache during isolated builds).
+.nuget-packages/
